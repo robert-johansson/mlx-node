@@ -8,7 +8,7 @@
  *
  * @example
  * ```typescript
- * import { GRPOTrainer, GRPOConfig, Adam, loadLocalGsm8kDataset } from '@mlx-node/trl';
+ * import { GRPOTrainer, GRPOConfig, loadLocalGsm8kDataset } from '@mlx-node/trl';
  * import { ModelLoader } from '@mlx-node/lm';
  *
  * const model = await ModelLoader.loadPretrained('./models/qwen3-0.6b');
@@ -20,27 +20,19 @@
 // Re-exports from @mlx-node/core for training
 // =============================================================================
 
-// Optimizers
-export { Adam, AdamW, SGD, RMSprop, LRScheduler } from '@mlx-node/core';
-
 // Tool calling types (for tool-use training)
 export type { ToolDefinition, FunctionDefinition, FunctionParameters } from '@mlx-node/core';
-
-// Gradient utilities
-export { GradientUtils } from '@mlx-node/core';
 
 // Core tensor (for custom rewards/models)
 export { MxArray } from '@mlx-node/core';
 
-// Low-level layers (for custom architectures)
-export { Linear, RMSNorm, LayerNorm, Embedding, Activations, Losses } from '@mlx-node/core';
+// Activations are internal-only (Rust) - used by transformers, sampling, GRPO
 
-// Transformer components
-export { Attention, FusedAttention, TransformerBlock, MLP, RoPE } from '@mlx-node/core';
-export { KVCache, BatchKVCache, RotatingKVCache } from '@mlx-node/core';
+// Transformer components are now internal-only (Rust)
+// Use model.chat() or model.generate() instead
 
-// GRPO utilities
-export { computeAdvantages, computeEntropy, getHighEntropyMask } from '@mlx-node/core';
+// GRPO utilities (computeAdvantages, computeEntropy, getHighEntropyMask) are internal-only
+// They are used by GRPOTrainingEngine in Rust
 
 // Model conversion
 export { convertModel, convertParquetToJsonl } from '@mlx-node/core';

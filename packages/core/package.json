@@ -16,6 +16,14 @@
       "require": "./index.cjs"
     }
   },
+  "scripts": {
+    "build": "oxnode ./build.ts --release"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.5.1",
+    "@oxc-node/cli": "^0.0.35",
+    "oxfmt": "^0.27.0"
+  },
   "napi": {
     "binaryName": "mlx-core",
     "targets": [

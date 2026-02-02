@@ -9,15 +9,14 @@
   "type": "module",
   "scripts": {
     "build": "yarn build:native && yarn build:ts",
-    "build:native": "napi build --manifest-path crates/mlx-core/Cargo.toml --platform -o packages/core --js index.cjs --dts index.d.cts --release",
-    "build:debug": "napi build --manifest-path crates/mlx-core/Cargo.toml --platform -o packages/core --js index.cjs --dts index.d.cts",
+    "build:native": "yarn workspace @mlx-node/core build",
     "build:ts": "tsc -b",
     "clean": "rm -rf packages/*/dist",
-    "lint": "vite lint",
+    "lint": "vite lint --type-aware --type-check",
     "format": "vite fmt",
     "typecheck": "tsc -b",
     "download:gsm8k": "yarn oxnode scripts/download-gsm8k.ts",
-    "download:qwen3": "yarn oxnode scripts/download-qwen3.ts"
+    "download:qwen3": "yarn oxnode scripts/download-model.ts"
   },
   "devDependencies": {
     "@ast-grep/napi": "^0.40.5",
