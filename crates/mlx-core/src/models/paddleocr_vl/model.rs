@@ -3,7 +3,7 @@
  *
  * Combines vision encoder and language model for vision-language tasks.
  */
-use crate::array::MxArray;
+use crate::array::{MxArray, clear_cache};
 use crate::models::paddleocr_vl::chat::{ChatRole, VLMChatConfig, VLMChatMessage, VLMChatResult};
 use crate::models::paddleocr_vl::config::{ModelConfig, TextConfig, VisionConfig};
 use crate::models::paddleocr_vl::language::{ERNIELanguageModel, PaddleOCRDecoderLayer};
@@ -13,6 +13,7 @@ use crate::models::paddleocr_vl::vision::PaddleOCRVisionModel;
 use crate::models::qwen3::{GenerationConfig, GenerationResult};
 use crate::nn::LayerNorm;
 use crate::sampling::{SamplingConfig, apply_repetition_penalty, sample, sample_and_logprobs};
+use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::SafeTensorsFile;
 use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
@@ -324,6 +325,14 @@ impl VLModel {
         // Get vision features
         let hidden_states = visual.forward(pixel_values, grid_thw)?;
 
+        // Cast vision features to match embedding dtype to prevent float32 promotion
+        let embed_dtype = inputs_embeds.dtype()?;
+        let hidden_states = if hidden_states.dtype()? != embed_dtype {
+            hidden_states.astype(embed_dtype)?
+        } else {
+            hidden_states
+        };
+
         // Merge vision features into text embeddings at image token positions
         self.merge_input_ids_with_image_features(
             self.config.image_token_id,
@@ -536,8 +545,6 @@ impl VLModel {
         let image_token = MxArray::scalar_int(image_token_id)?;
         let image_positions = input_ids.equal(&image_token)?;
 
-        // Get input IDs as i32 for processing
-        let _input_ids_data = input_ids.to_int32()?;
         let inputs_embeds_shape = inputs_embeds.shape()?;
         let hidden_dim = inputs_embeds_shape[2];
 
@@ -677,6 +684,11 @@ impl VLModel {
             max_new_tokens, temperature, top_k, top_p, repetition_penalty
         );
 
+        // Create dedicated generation stream for GPU-CPU pipelining.
+        // Forward pass runs on this stream, async_eval queues work, while CPU
+        // extracts the previous token. Gives ~25% decode speedup.
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
         // Prepare sampling config
         let sampling_config = SamplingConfig {
             temperature: Some(temperature),
@@ -697,21 +709,25 @@ impl VLModel {
             )
         })?;
 
-        // Initialize KV caches for this generation
-        lm_guard.init_kv_caches();
+        // Initialize fused KV caches for this generation (C++ forward pass)
+        lm_guard.init_fused_kv_caches();
 
         // Reset position state for new generation (critical for multimodal)
         lm_guard.reset_position_state();
 
         // === STEP 1: Compute vision features ONCE ===
-        let vision_features = if let (Some(pv), Some(grid)) = (pixel_values, image_grid_thw) {
-            let visual = self
-                .visual
-                .as_ref()
-                .ok_or_else(|| Error::new(Status::GenericFailure, "Vision model not set"))?;
-            Some(visual.forward(pv, grid)?)
-        } else {
-            None
+        // Run vision encoding inside stream context for GPU-CPU overlap
+        let vision_features = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            if let (Some(pv), Some(grid)) = (pixel_values, image_grid_thw) {
+                let visual = self
+                    .visual
+                    .as_ref()
+                    .ok_or_else(|| Error::new(Status::GenericFailure, "Vision model not set"))?;
+                Some(visual.forward(pv, grid)?)
+            } else {
+                None
+            }
         };
 
         // === STEP 2: Compute proper position IDs for mRoPE ===
@@ -722,32 +738,92 @@ impl VLModel {
         // Store position state for decode phase (critical for proper multimodal attention)
         lm_guard.set_position_state(position_ids.clone(), rope_deltas);
 
-        // === STEP 3: Prefill - process full prompt with vision features ===
-        // Get text embeddings and merge with vision features
-        let inputs_embeds = lm_guard.get_embeddings(input_ids)?;
-        let inputs_embeds = if let Some(ref vf) = vision_features {
-            self.merge_input_ids_with_image_features(
-                self.config.image_token_id,
-                vf,
-                &inputs_embeds,
-                input_ids,
-            )?
-        } else {
-            inputs_embeds
+        // === STEP 3: Prefill - process prompt with vision features ===
+        // Get text embeddings and merge with vision features (in stream context)
+        let inputs_embeds = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            let embeds = lm_guard.get_embeddings(input_ids)?;
+            if let Some(ref vf) = vision_features {
+                // Cast vision features to match language model dtype (e.g. bfloat16).
+                // Vision encoder outputs float32 (from float32 pixel inputs), but the
+                // language model operates in bfloat16. Without this cast, the merged
+                // embeddings become float32, causing the KV cache and all decode steps
+                // to run in float32 (2x memory bandwidth → ~3-4x slower decode).
+                let embed_dtype = embeds.dtype()?;
+                let vf_cast = if vf.dtype()? != embed_dtype {
+                    vf.astype(embed_dtype)?
+                } else {
+                    vf.clone()
+                };
+                self.merge_input_ids_with_image_features(
+                    self.config.image_token_id,
+                    &vf_cast,
+                    &embeds,
+                    input_ids,
+                )?
+            } else {
+                embeds
+            }
         };
 
-        // Initial forward pass with cache (prefill) - pass position_ids for proper mRoPE
-        let logits = lm_guard.forward_with_cache(
-            input_ids,
-            Some(&inputs_embeds),
-            None,
-            Some(&position_ids),
-            true,
-        )?;
-        let seq_len = logits.shape_at(1)?;
-        let mut last_logits = logits
-            .slice_axis(1, seq_len - 1, seq_len)?
-            .squeeze(Some(&[0, 1]))?;
+        // Chunked prefill: process long sequences in chunks to bound memory usage
+        // and keep computation graphs manageable. Matching Python mlx-vlm's approach.
+        let prefill_step_size: i64 = 2048;
+        let seq_len = inputs_embeds.shape_at(1)?;
+
+        let mut last_logits = if seq_len > prefill_step_size {
+            // Chunked prefill for long sequences (common with images)
+            let mut offset: i64 = 0;
+            let mut chunk_logits = None;
+
+            while offset < seq_len {
+                let chunk_end = std::cmp::min(offset + prefill_step_size, seq_len);
+                // For all chunks except the last, process up to chunk_end
+                // For the last chunk, process the rest
+                let n_to_process = if chunk_end < seq_len {
+                    // Not the last chunk: process prefill_step_size tokens
+                    chunk_end - offset
+                } else {
+                    // Last chunk: process remaining
+                    seq_len - offset
+                };
+
+                let chunk_embeds = inputs_embeds.slice_axis(1, offset, offset + n_to_process)?;
+                let chunk_pos = position_ids.slice_axis(2, offset, offset + n_to_process)?;
+
+                {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    chunk_logits = Some(lm_guard.forward_fused(&chunk_embeds, &chunk_pos)?);
+                }
+
+                // Eval KV caches between chunks to materialize results and bound graph size
+                lm_guard.eval_fused_kv_caches();
+                clear_cache();
+
+                offset += n_to_process;
+            }
+
+            // Extract last position logits from the final chunk
+            let logits = chunk_logits.unwrap();
+            let last_seq = logits.shape_at(1)?;
+            logits
+                .slice_axis(1, last_seq - 1, last_seq)?
+                .squeeze(Some(&[0, 1]))?
+        } else {
+            // Short sequence: single forward pass (text-only or short prompts)
+            let logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                lm_guard.forward_fused(&inputs_embeds, &position_ids)?
+            };
+            // Evaluate KV caches to materialize them and break dependency chain
+            // from prefill (especially vision encoder graph). Without this, every
+            // decode step drags the full prefill graph as a dependency.
+            lm_guard.eval_fused_kv_caches();
+            clear_cache();
+            logits
+                .slice_axis(1, seq_len - 1, seq_len)?
+                .squeeze(Some(&[0, 1]))?
+        };
 
         // Get input tokens for repetition penalty context
         let input_tokens = input_ids.to_uint32()?;
@@ -772,8 +848,10 @@ impl VLModel {
             (tok, None)
         };
 
-        // Async eval for GPU-CPU pipelining - starts GPU work, returns immediately
-        // This allows overlap: GPU computes while CPU extracts from previous iteration
+        // Synchronously evaluate the first token so that prefill cost is fully paid
+        // before entering the decode loop. Without this, step 0's async_eval blocks
+        // for 30-40ms waiting for the deferred prefill graph to complete.
+        // This matches Python mlx-vlm's pattern: mx.eval(y) after first generate_step.
         if return_logprobs {
             if let Some(ref lp) = logprobs_arr {
                 MxArray::async_eval_arrays(&[&token, lp]);
@@ -783,6 +861,7 @@ impl VLModel {
         } else {
             MxArray::async_eval_arrays(&[&token]);
         }
+        token.eval();
 
         // Track generated tokens
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
@@ -794,19 +873,75 @@ impl VLModel {
         let mut finish_reason = "length";
 
         // N-gram repetition detection: max pattern length to check (stop on first repeat)
-        let ngram_size = config.ngram_size.unwrap_or(20);
+        // Default to 0 (disabled) for VLM - mlx-vlm does NOT have this aggressive check.
+        // VLM outputs structured data that can trigger false positives.
+        let ngram_size = config.ngram_size.unwrap_or(0);
 
-        // === STEP 4: Decode loop - process one token at a time with KV cache ===
+        // === STEP 4: Pipelined decode loop ===
+        // Structure: Build next graph → async_eval → extract current token
+        // This overlaps GPU evaluation of the next step with CPU extraction of the current step,
+        // matching the pipelining pattern used by Python mlx-vlm's generate_step.
         #[allow(clippy::needless_range_loop)]
-        for _ in 0..max_new_tokens {
+        for step in 0..max_new_tokens {
+            // --- Phase 1: Build next step's graph while GPU evaluates current token ---
+            let (next_tok, next_lp) = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+
+                // Zero-copy reshape: keep token on GPU instead of CPU round-trip
+                let token_2d = token.reshape(&[1, 1])?;
+                let input_embeds = lm_guard.get_embeddings(&token_2d)?;
+
+                // Position from Rust-side state (no GPU dependency)
+                let rope_deltas = lm_guard.get_rope_deltas().unwrap_or(0);
+                let cache_offset = lm_guard.get_fused_cache_offset() as i64;
+                let pos_value = (cache_offset + rope_deltas) as f32;
+                let decode_pos =
+                    MxArray::from_float32(&[pos_value], &[1, 1, 1])?.broadcast_to(&[3, 1, 1])?;
+
+                let logits = lm_guard.forward_fused(&input_embeds, &decode_pos)?;
+                let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
+
+                // Apply repetition penalty if enabled
+                if repetition_penalty != 1.0 {
+                    next_logits = apply_repetition_penalty(
+                        &next_logits,
+                        &all_tokens,
+                        repetition_penalty,
+                        Some(repetition_context_size),
+                    )?;
+                }
+
+                // Sample next token
+                let (tok, lp): (MxArray, Option<MxArray>) = if return_logprobs {
+                    let (t, l) = sample_and_logprobs(&next_logits, Some(sampling_config))?;
+                    (t, Some(l))
+                } else {
+                    (sample(&next_logits, Some(sampling_config))?, None)
+                };
+
+                (tok, lp)
+            };
+
+            // Submit next step's graph to GPU (starts processing while we do CPU work below)
+            if return_logprobs {
+                if let Some(ref lp) = next_lp {
+                    MxArray::async_eval_arrays(&[&next_tok, lp]);
+                } else {
+                    MxArray::async_eval_arrays(&[&next_tok]);
+                }
+            } else {
+                MxArray::async_eval_arrays(&[&next_tok]);
+            }
+
+            // --- Phase 2: Extract current token (GPU already working on next step) ---
             token.eval();
             let token_value = token.item_at_int32(0)? as u32;
+
             generated_tokens.push(token_value);
             all_tokens.push(token_value);
 
             // Extract logprob if needed
             if return_logprobs && let Some(ref lp) = logprobs_arr {
-                // Must eval() logprobs array before item extraction
                 lp.eval();
                 let token_logprob = lp.item_at_float32(token_value as usize)?;
                 generated_logprobs.push(token_logprob);
@@ -821,7 +956,8 @@ impl VLModel {
             // Check for repetition (loop detection) - find any repeating pattern
             let min_pattern_len = 8; // Minimum pattern length to consider
             let max_pattern_len = ngram_size as usize;
-            if generated_tokens.len() >= (min_pattern_len * 2) {
+            // Skip repetition check entirely if ngram_size is 0 (disabled)
+            if ngram_size > 0 && generated_tokens.len() >= (min_pattern_len * 2) {
                 let len = generated_tokens.len();
 
                 // Check for patterns of various lengths
@@ -851,50 +987,19 @@ impl VLModel {
                 }
             }
 
-            // Forward pass with ONLY the new token (KV cache handles context)
-            // Position IDs are computed by the language model using stored rope_deltas
-            let new_token = MxArray::from_uint32(&[token_value], &[1, 1])?;
-            let logits = lm_guard.forward_with_cache(&new_token, None, None, None, true)?;
-
-            // Get logits (seq_len should be 1)
-            let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
-
-            // Apply repetition penalty if enabled
-            if repetition_penalty != 1.0 {
-                next_logits = apply_repetition_penalty(
-                    &next_logits,
-                    &all_tokens,
-                    repetition_penalty,
-                    Some(repetition_context_size),
-                )?;
-            }
-
-            // Sample next token
-            let (next_tok, next_lp): (MxArray, Option<MxArray>) = if return_logprobs {
-                let (tok, lp) = sample_and_logprobs(&next_logits, Some(sampling_config))?;
-                (tok, Some(lp))
-            } else {
-                (sample(&next_logits, Some(sampling_config))?, None)
-            };
-
-            // Async eval for next token - enables GPU-CPU pipelining
-            // GPU starts computing next forward pass while CPU extracts current token
-            if return_logprobs {
-                if let Some(ref lp) = next_lp {
-                    MxArray::async_eval_arrays(&[&next_tok, lp]);
-                } else {
-                    MxArray::async_eval_arrays(&[&next_tok]);
-                }
-            } else {
-                MxArray::async_eval_arrays(&[&next_tok]);
+            // Periodic cleanup to release intermediate tensors and prevent memory accumulation
+            // Every 256 tokens is a good balance (aligned with mlx-vlm)
+            // Only clear cache - do NOT synchronize, as that kills GPU-CPU pipelining
+            if step > 0 && step % 256 == 0 {
+                clear_cache();
             }
 
             token = next_tok;
             logprobs_arr = next_lp;
         }
 
-        // Reset caches after generation
-        lm_guard.reset_kv_caches();
+        // Reset fused caches after generation
+        lm_guard.reset_fused_kv_caches();
 
         // Build result
         let tokens_array =

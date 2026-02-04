@@ -264,6 +264,14 @@ export declare class MxArray {
    * Default: alpha=1.0, beta=1.0, giving D = C + (self @ B)
    */
   addmm(c: MxArray, b: MxArray, alpha?: number | undefined | null, beta?: number | undefined | null): MxArray;
+  /**
+   * Fused multimodal rotary position embedding (mRoPE)
+   *
+   * Applies rotary position embedding with multimodal section interleaving.
+   * Replaces ~38 individual graph ops per call with a single fused C++ operation.
+   *
+   * # Arguments
+   */
   transpose(axes?: Int32Array | undefined | null): MxArray;
   take(indices: MxArray, axis: number): MxArray;
   takeAlongAxis(indices: MxArray, axis: number): MxArray;
@@ -1748,6 +1756,8 @@ export interface ConversionOptions {
   dtype?: string;
   /** Whether to verbose logging (default: false) */
   verbose?: boolean;
+  /** Model type for model-specific weight sanitization (e.g., "paddleocr-vl") */
+  modelType?: string;
 }
 
 export interface ConversionResult {
@@ -1805,6 +1815,24 @@ export interface DocumentElement {
   /** Paragraph data (only present if element_type is Paragraph) */
   paragraph?: Paragraph;
 }
+
+/**
+ * Convert a ParsedDocument to an XLSX buffer.
+ *
+ * Each Table element becomes a separate worksheet with bold headers.
+ * Paragraph elements are collected into a "Text" worksheet.
+ *
+ * # Example
+ * ```typescript
+ * import { parseVlmOutput, documentToXlsx } from '@mlx-node/core';
+ * import { writeFileSync } from 'fs';
+ *
+ * const doc = parseVlmOutput(vlmResult.text);
+ * const buffer = documentToXlsx(doc);
+ * writeFileSync('output.xlsx', buffer);
+ * ```
+ */
+export declare function documentToXlsx(doc: ParsedDocument): Buffer;
 
 export declare const enum DType {
   Float32 = 0,
@@ -2166,6 +2194,8 @@ export declare const enum OutputFormat {
   Markdown = 'Markdown',
   /** HTML tables */
   Html = 'Html',
+  /** JSON structured output */
+  Json = 'Json',
 }
 
 /** Configuration for creating an OutputStore connection */
@@ -2415,6 +2445,20 @@ export interface SamplingConfig {
   /** Minimum probability threshold relative to max (min-p sampling). 0 = disabled */
   minP?: number;
 }
+
+/**
+ * Parse VLM output and save directly as XLSX file.
+ *
+ * Convenience function that parses VLM output and writes it to an XLSX file.
+ *
+ * # Example
+ * ```typescript
+ * import { saveToXlsx } from '@mlx-node/core';
+ *
+ * saveToXlsx(vlmResult.text, 'output.xlsx');
+ * ```
+ */
+export declare function saveToXlsx(text: string, filePath: string): void;
 
 /** Scheduler statistics (NAPI-compatible) */
 export interface SchedulerStatsNapi {
