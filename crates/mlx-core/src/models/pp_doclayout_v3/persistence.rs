@@ -1010,7 +1010,7 @@ pub fn load_model(model_path: &str) -> Result<PPDocLayoutV3Model> {
     // Global pointer
     let gp_dense = load_linear(&params, "decoder_global_pointer.dense")?;
     let decoder_global_pointer =
-        GlobalPointer::from_weights(gp_dense, config.global_pointer_head_size);
+        GlobalPointer::from_weights(gp_dense, config.global_pointer_head_size)?;
 
     // Decoder norm
     let decoder_norm = load_layer_norm(&params, "decoder_norm", config.layer_norm_eps)?;

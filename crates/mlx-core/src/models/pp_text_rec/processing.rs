@@ -200,6 +200,9 @@ impl TextRecImageProcessor {
         let default_ratio = self.max_width as f64 / self.target_height as f64;
         let mut max_wh_ratio: f64 = 0.0;
         for (_rgb_data, width, height) in images.iter() {
+            if *height == 0 {
+                continue;
+            }
             let ratio = *width as f64 / *height as f64;
             if ratio > max_wh_ratio {
                 max_wh_ratio = ratio;

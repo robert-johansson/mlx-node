@@ -352,7 +352,7 @@ export class StructureV3Pipeline {
 // ============================================================================
 
 /** Format a single element as markdown. */
-function formatElement(label: string, text: string): string {
+function formatElement(label: string, text: string, order: number): string {
   const trimmed = text.trim();
   if (!trimmed) return '';
 
@@ -384,7 +384,7 @@ function formatElement(label: string, text: string): string {
       return `<!-- ${label}: ${trimmed} -->\n`;
     case 'footnote':
     case 'table_footnote':
-      return `[^note]: ${trimmed}\n`;
+      return `[^note-${order}]: ${trimmed}\n`;
     case 'list':
       return `${trimmed}\n`;
     case 'seal':
@@ -399,7 +399,7 @@ function assembleMarkdown(elements: StructuredElement[]): string {
   const parts: string[] = [];
 
   for (const el of elements) {
-    const formatted = formatElement(el.label, el.text);
+    const formatted = formatElement(el.label, el.text, el.order);
     if (formatted) {
       parts.push(formatted);
     }

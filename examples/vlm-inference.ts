@@ -170,7 +170,7 @@ const ocrLabels = new Set([
 ]);
 
 /** Format OCR text based on element type */
-function formatElement(labelName: string, text: string): string {
+function formatElement(labelName: string, text: string, order: number): string {
   const trimmed = text.trim();
   if (!trimmed) return '';
 
@@ -202,7 +202,7 @@ function formatElement(labelName: string, text: string): string {
       return `<!-- ${labelName}: ${trimmed} -->\n`;
     case 'footnote':
     case 'table_footnote':
-      return `[^note]: ${trimmed}\n`;
+      return `[^note-${order}]: ${trimmed}\n`;
     case 'list':
       return `${trimmed}\n`;
     default:
@@ -211,7 +211,7 @@ function formatElement(labelName: string, text: string): string {
 }
 
 // Step 3: Crop all elements and prepare batch OCR items
-type OcrItem = { index: number; label: string; cropPath: string; prompt: string };
+type OcrItem = { index: number; label: string; cropPath: string; prompt: string; order: number };
 const ocrItems: OcrItem[] = [];
 const nonOcrParts: Map<number, string> = new Map(); // index -> markdown for non-OCR elements
 
@@ -238,7 +238,7 @@ for (const el of elements) {
   const cropPath = await cropElement(el);
   const prompt = getPrompt(label);
   console.log(`  [${el.order}] ${label} (${el.score.toFixed(2)})`);
-  ocrItems.push({ index: idx, label, cropPath, prompt });
+  ocrItems.push({ index: idx, label, cropPath, prompt, order: el.order });
   idx++;
 }
 
@@ -265,7 +265,7 @@ for (let i = 0; i < idx; i++) {
     const item = ocrItems[ocrResultIdx];
     const result = batchResults[ocrResultIdx];
     const text = parsePaddleResponse(result.text, { format: OutputFormat.Markdown });
-    const formatted = formatElement(item.label, text);
+    const formatted = formatElement(item.label, text, item.order);
     if (formatted) {
       markdownParts.push(formatted);
     }

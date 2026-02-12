@@ -132,8 +132,14 @@ impl GlobalPointer {
     }
 
     /// Create from pre-loaded weights.
-    pub fn from_weights(dense: Linear, head_size: i32) -> Self {
-        Self { dense, head_size }
+    pub fn from_weights(dense: Linear, head_size: i32) -> Result<Self> {
+        if head_size <= 0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("head_size must be positive, got {head_size}"),
+            ));
+        }
+        Ok(Self { dense, head_size })
     }
 
     /// Forward pass: compute reading order logits.
