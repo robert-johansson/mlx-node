@@ -25,7 +25,7 @@ pub use padding::{
 pub use memory::{
     check_memory_safety, clear_cache, compile_clear_cache, get_active_memory, get_cache_memory,
     get_memory_limit, get_peak_memory, heavy_cleanup, reset_peak_memory, set_cache_limit,
-    set_memory_limit, synchronize_and_clear_cache,
+    set_memory_limit, synchronize, synchronize_and_clear_cache,
 };
 
 use mlx_sys as sys;
@@ -42,11 +42,22 @@ pub enum DType {
     Float16 = 2,
     BFloat16 = 3,
     Uint32 = 4,
+    Uint8 = 5,
 }
 
 impl DType {
     fn code(self) -> i32 {
         self as i32
+    }
+
+    /// Byte size per element for this dtype.
+    /// Used to pre-compute SafeTensors data offsets without materializing tensors.
+    pub(crate) fn byte_size(self) -> usize {
+        match self {
+            DType::Float32 | DType::Int32 | DType::Uint32 => 4,
+            DType::Float16 | DType::BFloat16 => 2,
+            DType::Uint8 => 1,
+        }
     }
 }
 
@@ -60,6 +71,7 @@ impl TryFrom<i32> for DType {
             2 => Ok(DType::Float16),
             3 => Ok(DType::BFloat16),
             4 => Ok(DType::Uint32),
+            5 => Ok(DType::Uint8),
             other => Err(Error::from_reason(format!(
                 "Unsupported dtype code {other}"
             ))),

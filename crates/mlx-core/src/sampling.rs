@@ -530,6 +530,87 @@ pub(crate) fn apply_repetition_penalty(
     Ok(result)
 }
 
+/// Check if generation has fallen into a repetitive loop.
+///
+/// Detect degenerate repetitive generation and signal early termination.
+///
+/// Uses a two-tier approach inspired by vLLM's `RepetitionDetectionParams`:
+///
+/// 1. **Consecutive identical tokens** — fast O(n) scan from the tail.
+///    Triggers when the same token repeats `max_consecutive` times in a row.
+///
+/// 2. **Range-based n-gram pattern detection** — checks ALL pattern sizes from 2
+///    up to `max_pattern_size` (the `ngram_size` parameter). For each size, verifies
+///    whether the tail contains `max_ngram_repeats` consecutive identical blocks.
+///    This catches both short loops (2-token) and long phrase-level repetition
+///    (50-100 tokens) that small models are prone to.
+///
+/// Cost per decode step: O(max_pattern_size × max_ngram_repeats), typically ~200 comparisons.
+pub(crate) fn check_repetition_cutoff(
+    tokens: &[u32],
+    max_consecutive: i32,
+    max_ngram_repeats: i32,
+    ngram_size: i32, // treated as max_pattern_size
+) -> Option<&'static str> {
+    let len = tokens.len();
+    if len < 2 {
+        return None;
+    }
+
+    let check_consecutive = max_consecutive > 0;
+    let check_ngram = max_ngram_repeats > 0 && ngram_size > 0;
+
+    // 1. Check consecutive identical tokens (fast path)
+    if check_consecutive {
+        let last = tokens[len - 1];
+        let mut consecutive = 1usize;
+        for i in (0..len - 1).rev() {
+            if tokens[i] == last {
+                consecutive += 1;
+                if consecutive >= max_consecutive as usize {
+                    return Some("repetition");
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    // 2. Range-based pattern detection (vLLM-style)
+    // Check all pattern sizes from 2 up to max_pattern_size. For each size,
+    // verify if the last `pattern_len * min_count` tokens form a repeating block.
+    if check_ngram {
+        let max_pattern_size = ngram_size as usize;
+        let min_count = max_ngram_repeats as usize;
+
+        for pattern_len in 2..=max_pattern_size {
+            let required = pattern_len * min_count;
+            if len < required {
+                continue;
+            }
+
+            let pattern = &tokens[len - pattern_len..];
+            let mut repeats = 1usize;
+            let mut pos = len - pattern_len;
+
+            while repeats < min_count && pos >= pattern_len {
+                pos -= pattern_len;
+                if &tokens[pos..pos + pattern_len] == pattern {
+                    repeats += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if repeats >= min_count {
+                return Some("repetition");
+            }
+        }
+    }
+
+    None
+}
+
 // Unit tests for repetition_penalty (pub(crate) function) remain here
 // Public API tests have been moved to node/tests/sampling_tests.rs
 

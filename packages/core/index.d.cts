@@ -711,6 +711,26 @@ export declare class Qwen35Model {
 export type Qwen3_5Model = Qwen35Model;
 
 /**
+ * Qwen3.5 MoE Model -- hybrid linear/full attention with Mixture-of-Experts.
+ *
+ * Supports C++ MoE forward path (non-compiled, builds fresh graph per step)
+ * when weights are registered via `register_moe_weights_with_cpp`.
+ * Falls back to Rust forward_inner path for test models without stored weights.
+ */
+export declare class Qwen35MoeModel {
+  constructor(config: Qwen35MoeConfig);
+  initCaches(): void;
+  resetCaches(): void;
+  forward(inputIds: MxArray): MxArray;
+  forwardWithCache(inputIds: MxArray): MxArray;
+  static loadPretrained(path: string): Promise<Qwen35MoeModel>;
+  generate(promptTokens: MxArray, config: Qwen35MoeGenerationConfig): Promise<Qwen35MoeGenerationResult>;
+  chat(messages: Array<ChatMessage>, config?: Qwen35MoeChatConfig | undefined | null): Promise<Qwen35MoeChatResult>;
+  numParameters(): number;
+}
+export type Qwen3_5MoeModel = Qwen35MoeModel;
+
+/**
  * Qwen3 Model with automatic differentiation support
  *
  * Uses interior mutability (RwLock) for layers, final_norm, and lm_head
@@ -1805,35 +1825,6 @@ export declare class VLModel {
  *
  * Parses tool calls and thinking from completions, creating structured outputs
  * aligned with the ChatResult structure.
- *
- * # Arguments
- * * `prompts` - Array of prompt texts (one per unique prompt, will be expanded by group_size)
- * * `completions` - Array of completion texts (prompts.len() * group_size total)
- * * `token_counts` - Array of token counts for each completion
- * * `finish_reasons` - Array of finish reasons from generation ("eos", "length", "stop", "repetition")
- * * `group_size` - Number of completions per prompt
- *
- * # Returns
- * Array of RewardOutput objects with structured completion data
- *
- * # Example
- * ```typescript
- * import { buildRewardOutputs } from '@mlx-node/core';
- *
- * const outputs = buildRewardOutputs(
- *   ['What is 2+2?'],           // prompts
- *   ['<think>Let me calculate</think>
-
-4', '4'],  // completions (group_size=2)
- *   [10, 5],                     // token counts
- *   ['eos', 'length'],          // finish reasons
- *   2                            // group_size
- * );
- *
- * outputs[0].completion.thinking; // "Let me calculate"
- * outputs[0].completion.text;     // "4"
- * outputs[0].completion.finishReason; // "eos"
- * ```
  */
 export declare function buildRewardOutputs(
   prompts: Array<string>,
@@ -1920,9 +1911,9 @@ export interface ChatConfig {
   repetitionContextSize?: number;
   /** Stop if same token repeats this many times consecutively (default: 16) */
   maxConsecutiveTokens?: number;
-  /** Stop if an n-gram pattern repeats this many times (default: 8) */
+  /** Stop if a pattern repeats this many times consecutively (default: 3) */
   maxNgramRepeats?: number;
-  /** N-gram size for repetition detection (default: 3) */
+  /** Maximum pattern size for repetition detection (default: 64) */
   ngramSize?: number;
   /** EOS token ID (generation stops when this is generated) */
   eosTokenId?: number;
@@ -2008,6 +1999,14 @@ export interface ConversionOptions {
   verbose?: boolean;
   /** Model type for model-specific weight sanitization (e.g., "paddleocr-vl") */
   modelType?: string;
+  /** Enable quantization of converted weights */
+  quantize?: boolean;
+  /** Quantization bits: 4 (default) or 8 */
+  quantBits?: number;
+  /** Quantization group size (default: 64 for affine, 32 for mxfp8) */
+  quantGroupSize?: number;
+  /** Quantization mode: "affine" (default) or "mxfp8" */
+  quantMode?: string;
 }
 
 export interface ConversionResult {
@@ -2092,6 +2091,7 @@ export declare const enum DType {
   Float16 = 2,
   BFloat16 = 3,
   Uint32 = 4,
+  Uint8 = 5,
 }
 
 /** Document element type */
@@ -2223,13 +2223,15 @@ export interface GenerationConfig {
    */
   maxConsecutiveTokens?: number;
   /**
-   * Stop if an n-gram pattern repeats this many times (default: 8)
-   * Set to 0 to disable. Detects patterns like "A B A B A B A B".
+   * Stop if a pattern repeats this many times consecutively (default: 3)
+   * Set to 0 to disable. Detects patterns like "A B A B A B".
+   * Uses range-based detection: checks all pattern sizes from 2 to ngram_size.
    */
   maxNgramRepeats?: number;
   /**
-   * N-gram size for repetition detection (default: 3)
-   * Used with max_ngram_repeats to detect repeating patterns.
+   * Maximum pattern size for repetition detection (default: 64)
+   * All pattern sizes from 2 up to this value are checked each decode step.
+   * Larger values catch long phrase-level repetition common in small models.
    */
   ngramSize?: number;
   /** EOS token ID (generation stops when this is generated) */
@@ -2596,22 +2598,7 @@ export interface ParserConfig {
   collapseEmptyRows?: boolean;
 }
 
-/**
- * Parse tool calls from text (NAPI export)
- *
- * Extracts tool calls from model-generated text and returns both the cleaned text
- * and the parsed tool calls.
- *
- * # Example
- * ```typescript
- * import { parseToolCallsFromText } from '@mlx-node/core';
- *
- * const result = parseToolCallsFromText('<tool_call>{"name": "search", "arguments": {"q": "test"}}</tool_call>');
- * console.log(result.text); // ""
- * console.log(result.toolCalls[0].name); // "search"
- * console.log(result.toolCalls[0].arguments.q); // "test"
- * ```
- */
+/** Parse tool calls from text (NAPI export) */
 export declare function parseToolCallsFromText(text: string): ParseToolCallsResult;
 
 /** Result of parsing tool calls from text */
@@ -2632,22 +2619,33 @@ export interface Qwen35ChatConfig {
   topK?: number | undefined;
   topP?: number | undefined;
   minP?: number | undefined;
+  /** Repetition penalty (1.0 = disabled). Penalizes tokens already in context. */
+  repetitionPenalty?: number | undefined;
+  /** Size of the context window for repetition penalty (default: 256) */
+  repetitionContextSize?: number | undefined;
+  /** Max consecutive identical tokens before stopping (default: 16, 0 = disabled) */
+  maxConsecutiveTokens?: number | undefined;
+  /** Max n-gram repetitions before stopping (default: 8, 0 = disabled) */
+  maxNgramRepeats?: number | undefined;
+  /** N-gram size for repetition detection (default: 3) */
+  ngramSize?: number | undefined;
   tools?: Array<ToolDefinition>;
 }
 
 /** Chat result */
 export interface Qwen35ChatResult {
   text: string;
+  toolCalls: Array<ToolCallResult>;
   thinking?: string;
   numTokens: number;
   finishReason: string;
+  rawText: string;
 }
 
 /**
- * Qwen3.5 model configuration.
+ * Qwen3.5 model configuration (dense variant).
  *
- * Supports both dense and MoE variants. MoE fields are optional -
- * when `num_experts` is 0 or None, the model uses dense MLP layers.
+ * For MoE models, use `Qwen3_5MoeConfig` from `qwen3_5_moe`.
  */
 export interface Qwen35Config {
   vocabSize: number;
@@ -2672,13 +2670,6 @@ export interface Qwen35Config {
   fullAttentionInterval: number;
   partialRotaryFactor: number;
   ropeTheta: number;
-  numExperts?: number | undefined;
-  numExpertsPerTok?: number | undefined;
-  decoderSparseStep?: number | undefined;
-  sharedExpertIntermediateSize?: number | undefined;
-  moeIntermediateSize?: number | undefined;
-  normTopkProb?: boolean | undefined;
-  mlpOnlyLayers?: number[] | undefined;
 }
 
 /** Generation configuration for Qwen3.5 */
@@ -2692,6 +2683,90 @@ export interface Qwen35GenerationConfig {
 
 /** Generation result */
 export interface Qwen35GenerationResult {
+  tokens: Array<number>;
+  text: string;
+  numTokens: number;
+  finishReason: string;
+}
+
+/** Chat configuration for Qwen3.5 MoE */
+export interface Qwen35MoeChatConfig {
+  maxNewTokens?: number | undefined;
+  temperature?: number | undefined;
+  topK?: number | undefined;
+  topP?: number | undefined;
+  minP?: number | undefined;
+  /** Repetition penalty (1.0 = disabled). Penalizes tokens already in context. */
+  repetitionPenalty?: number | undefined;
+  /** Size of the context window for repetition penalty (default: 256) */
+  repetitionContextSize?: number | undefined;
+  /** Max consecutive identical tokens before stopping (default: 16, 0 = disabled) */
+  maxConsecutiveTokens?: number | undefined;
+  /** Max n-gram repetitions before stopping (default: 8, 0 = disabled) */
+  maxNgramRepeats?: number | undefined;
+  /** N-gram size for repetition detection (default: 3) */
+  ngramSize?: number | undefined;
+  tools?: Array<ToolDefinition>;
+}
+
+/** Chat result */
+export interface Qwen35MoeChatResult {
+  text: string;
+  toolCalls: Array<ToolCallResult>;
+  thinking?: string;
+  numTokens: number;
+  finishReason: string;
+  rawText: string;
+}
+
+/**
+ * Qwen3.5 MoE model configuration.
+ *
+ * Contains all fields including MoE-specific ones (num_experts, etc.).
+ */
+export interface Qwen35MoeConfig {
+  vocabSize: number;
+  hiddenSize: number;
+  numLayers: number;
+  numHeads: number;
+  numKvHeads: number;
+  intermediateSize: number;
+  rmsNormEps: number;
+  headDim: number;
+  tieWordEmbeddings: boolean;
+  attentionBias: boolean;
+  maxPositionEmbeddings: number;
+  padTokenId: number;
+  eosTokenId: number;
+  bosTokenId: number;
+  linearNumValueHeads: number;
+  linearNumKeyHeads: number;
+  linearKeyHeadDim: number;
+  linearValueHeadDim: number;
+  linearConvKernelDim: number;
+  fullAttentionInterval: number;
+  partialRotaryFactor: number;
+  ropeTheta: number;
+  numExperts: number;
+  numExpertsPerTok: number;
+  decoderSparseStep: number;
+  sharedExpertIntermediateSize?: number | undefined;
+  moeIntermediateSize?: number | undefined;
+  normTopkProb: boolean;
+  mlpOnlyLayers?: number[] | undefined;
+}
+
+/** Generation configuration for Qwen3.5 MoE */
+export interface Qwen35MoeGenerationConfig {
+  maxNewTokens: number;
+  temperature?: number | undefined;
+  topK?: number | undefined;
+  topP?: number | undefined;
+  minP?: number | undefined;
+}
+
+/** Generation result */
+export interface Qwen35MoeGenerationResult {
   tokens: Array<number>;
   text: string;
   numTokens: number;

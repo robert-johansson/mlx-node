@@ -4,17 +4,20 @@ use crate::transformer::MLP;
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5Config;
+use super::quantized_linear::{LinearProj, MLPVariant, QuantizedLinear};
 use super::switch_glu::SwitchGLU;
 
 /// SparseMoeBlock: Mixture-of-Experts block with shared expert.
 ///
 /// Routes tokens to top-k experts via learned gating, then adds
 /// a dedicated shared expert (gated by sigmoid) to all tokens.
+///
+/// Supports both standard (bf16) and quantized (4-bit/8-bit) modes.
 pub struct SparseMoeBlock {
-    gate: Linear,               // hidden -> num_experts (routing logits)
-    switch_mlp: SwitchGLU,      // expert MLP with gather_mm
-    shared_expert: MLP,         // dedicated shared expert
-    shared_expert_gate: Linear, // hidden -> 1 (sigmoid gating for shared expert)
+    gate: LinearProj,           // hidden -> num_experts (routing logits)
+    switch_mlp: SwitchGLU,      // expert MLP with gather_mm/gather_qmm
+    shared_expert: MLPVariant,  // dedicated shared expert
+    shared_expert_gate: LinearProj, // hidden -> 1 (sigmoid gating for shared expert)
     num_experts: i32,
     num_experts_per_tok: i32,
     norm_topk_prob: bool,
@@ -57,10 +60,33 @@ impl SparseMoeBlock {
         let shared_expert_gate = Linear::new(hidden_size as u32, 1, Some(false))?;
 
         Ok(Self {
-            gate,
+            gate: LinearProj::Standard(gate),
+            switch_mlp,
+            shared_expert: MLPVariant::Standard(shared_expert),
+            shared_expert_gate: LinearProj::Standard(shared_expert_gate),
+            num_experts,
+            num_experts_per_tok,
+            norm_topk_prob,
+        })
+    }
+
+    /// Create a quantized SparseMoeBlock.
+    pub fn new_quantized(
+        config: &Qwen3_5Config,
+        gate: QuantizedLinear,
+        switch_mlp: SwitchGLU,
+        shared_expert: MLPVariant,
+        shared_expert_gate: QuantizedLinear,
+    ) -> Result<Self> {
+        let num_experts = config.num_experts.unwrap_or(0);
+        let num_experts_per_tok = config.num_experts_per_tok.unwrap_or(1);
+        let norm_topk_prob = config.norm_topk_prob.unwrap_or(true);
+
+        Ok(Self {
+            gate: LinearProj::Quantized(gate),
             switch_mlp,
             shared_expert,
-            shared_expert_gate,
+            shared_expert_gate: LinearProj::Quantized(shared_expert_gate),
             num_experts,
             num_experts_per_tok,
             norm_topk_prob,
@@ -95,7 +121,7 @@ impl SparseMoeBlock {
         // Routing logits: [B*T, num_experts]
         let router_logits = self.gate.forward(&x_flat)?;
 
-        // Softmax over experts: [B*T, num_experts]
+        // Softmax over experts (bf16 — precision is sufficient for top-k selection)
         let routing_weights = Activations::softmax(&router_logits, Some(-1))?;
 
         // Top-k: argpartition to find k largest routing weights.
@@ -106,13 +132,11 @@ impl SparseMoeBlock {
         // Gather top-k weights: [B*T, k]
         let top_weights = routing_weights.take_along_axis(&top_indices, -1)?;
 
-        // Normalize weights if configured
+        // Normalize weights if configured (matches mlx-vlm: simple division, no epsilon).
+        // Top-k weights from softmax are always positive, so sum is never zero.
         let top_weights = if self.norm_topk_prob {
             let sum = top_weights.sum(Some(&[-1]), Some(true))?;
-            // Cast epsilon to match input dtype to avoid f32 promotion for bf16/f16 models
-            let eps = MxArray::scalar_float(1e-8)?.astype(x.dtype()?)?;
-            let safe_sum = sum.add(&eps)?;
-            top_weights.div(&safe_sum)?
+            top_weights.div(&sum)?
         } else {
             top_weights
         };
@@ -138,10 +162,10 @@ impl SparseMoeBlock {
         output.reshape(&[batch, seq_len, hidden_size])
     }
 
-    // ========== Weight accessors ==========
+    // ========== Weight accessors (standard mode) ==========
 
     pub fn set_gate_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.gate.set_weight(w)
+        self.gate.set_weight(w, "gate")
     }
 
     pub fn set_switch_mlp_gate_proj_weight(&mut self, w: &MxArray) {
@@ -155,15 +179,64 @@ impl SparseMoeBlock {
     }
 
     pub fn set_shared_expert_gate_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.shared_expert.set_gate_proj_weight(w)
+        match &mut self.shared_expert {
+            MLPVariant::Standard(mlp) => mlp.set_gate_proj_weight(w),
+            MLPVariant::Quantized { .. } => Err(Error::from_reason(
+                "Cannot set weight on quantized shared expert",
+            )),
+        }
     }
     pub fn set_shared_expert_up_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.shared_expert.set_up_proj_weight(w)
+        match &mut self.shared_expert {
+            MLPVariant::Standard(mlp) => mlp.set_up_proj_weight(w),
+            MLPVariant::Quantized { .. } => Err(Error::from_reason(
+                "Cannot set weight on quantized shared expert",
+            )),
+        }
     }
     pub fn set_shared_expert_down_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.shared_expert.set_down_proj_weight(w)
+        match &mut self.shared_expert {
+            MLPVariant::Standard(mlp) => mlp.set_down_proj_weight(w),
+            MLPVariant::Quantized { .. } => Err(Error::from_reason(
+                "Cannot set weight on quantized shared expert",
+            )),
+        }
     }
     pub fn set_shared_expert_gate_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.shared_expert_gate.set_weight(w)
+        self.shared_expert_gate.set_weight(w, "shared_expert_gate")
+    }
+
+    /// Get a mutable reference to the switch_mlp for setting quantized projections.
+    pub fn switch_mlp_mut(&mut self) -> &mut SwitchGLU {
+        &mut self.switch_mlp
+    }
+
+    /// Replace the switch_mlp entirely (used during quantized weight loading).
+    pub fn set_switch_mlp(&mut self, mlp: SwitchGLU) {
+        self.switch_mlp = mlp;
+    }
+
+    /// Replace the gate with a quantized version.
+    pub fn set_quantized_gate(&mut self, gate: QuantizedLinear) {
+        self.gate.set_quantized(gate);
+    }
+
+    /// Replace the shared_expert_gate with a quantized version.
+    pub fn set_quantized_shared_expert_gate(&mut self, gate: QuantizedLinear) {
+        self.shared_expert_gate.set_quantized(gate);
+    }
+
+    /// Replace the shared expert with a quantized version.
+    pub fn set_quantized_shared_expert(
+        &mut self,
+        gate_proj: QuantizedLinear,
+        up_proj: QuantizedLinear,
+        down_proj: QuantizedLinear,
+    ) {
+        self.shared_expert = MLPVariant::Quantized {
+            gate_proj,
+            up_proj,
+            down_proj,
+        };
     }
 }

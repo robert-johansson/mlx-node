@@ -4,37 +4,57 @@
  * Handles loading pretrained weights from MLX format or converting from HuggingFace.
  */
 
-import { Qwen3Model, Qwen35Model } from '@mlx-node/core';
-import type { Qwen3_5Model } from '@mlx-node/core';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { Qwen3Model, Qwen35Model, Qwen35MoeModel } from '@mlx-node/core';
+import type { Qwen3_5Model, Qwen3_5MoeModel } from '@mlx-node/core';
 
 /**
- * Model loader for Qwen3 models
+ * Model loader for Qwen3 and Qwen3.5 models
  */
 export class ModelLoader {
   /**
-   * Load a pretrained Qwen3 model from disk
+   * Load a pretrained Qwen3 model from disk.
    *
-   * Delegates to Rust implementation for efficient loading without JavaScript memory limits.
+   * For Qwen3.5 models, use {@link loadQwen35} instead.
+   * If the config.json indicates a qwen3_5 model, this method will
+   * automatically delegate to loadQwen35.
    *
    * @param modelPath - Path to the model directory or file
-   * @param _deviceMap - Device placement (not used in MLX, kept for compatibility)
    * @returns Loaded model
    */
-  static async loadPretrained(modelPath: string, _deviceMap: string = 'auto'): Promise<Qwen3Model> {
-    // Delegate to Rust implementation for efficient loading
+  static async loadPretrained(modelPath: string): Promise<Qwen3Model | Qwen3_5Model | Qwen3_5MoeModel> {
+    const modelType = await detectModelType(modelPath);
+
+    if (modelType === 'qwen3_5_moe') {
+      return await Qwen35MoeModel.loadPretrained(modelPath);
+    }
+
+    if (modelType === 'qwen3_5') {
+      return await Qwen35Model.loadPretrained(modelPath);
+    }
+
     return await Qwen3Model.loadPretrained(modelPath);
   }
 
   /**
-   * Load a pretrained Qwen3.5 model from disk
-   *
-   * Supports both dense and MoE variants.
+   * Load a pretrained Qwen3.5 dense model from disk
    *
    * @param modelPath - Path to the model directory
    * @returns Loaded Qwen3.5 model
    */
   static async loadQwen35(modelPath: string): Promise<Qwen3_5Model> {
     return await Qwen35Model.loadPretrained(modelPath);
+  }
+
+  /**
+   * Load a pretrained Qwen3.5 MoE model from disk
+   *
+   * @param modelPath - Path to the model directory
+   * @returns Loaded Qwen3.5 MoE model
+   */
+  static async loadQwen35Moe(modelPath: string): Promise<Qwen3_5MoeModel> {
+    return await Qwen35MoeModel.loadPretrained(modelPath);
   }
 
   /**
@@ -49,5 +69,15 @@ export class ModelLoader {
   static saveModel(model: Qwen3Model, savePath: string): Promise<void> {
     // Delegate to Rust implementation for efficient saving
     return model.saveModel(savePath);
+  }
+}
+
+async function detectModelType(modelPath: string): Promise<string> {
+  try {
+    const raw = await readFile(join(modelPath, 'config.json'), 'utf-8');
+    const config = JSON.parse(raw);
+    return config.model_type ?? 'qwen3';
+  } catch {
+    return 'qwen3';
   }
 }

@@ -1,11 +1,11 @@
 use crate::array::MxArray;
 use crate::nn::{Activations, Conv1d, Linear};
-use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
 use super::arrays_cache::ArraysCache;
 use super::config::Qwen3_5Config;
 use super::gated_delta::gated_delta_update;
+use super::quantized_linear::{LinearProj, QuantizedLinear};
 use super::rms_norm_gated::RMSNormGated;
 
 /// GatedDeltaNet: Linear attention module using gated delta recurrence.
@@ -14,11 +14,11 @@ use super::rms_norm_gated::RMSNormGated;
 /// Uses depthwise convolution + state-space recurrence instead of softmax attention.
 pub struct GatedDeltaNet {
     // Projections
-    in_proj_qkvz: Linear, // hidden → key_dim*2 + value_dim*2 (q,k,v,z combined)
-    in_proj_ba: Linear,   // hidden → num_v_heads * 2 (b and a combined)
-    conv1d: Conv1d,       // depthwise conv, groups = conv_dim
-    norm: RMSNormGated,   // per-head norm: weight dim = value_head_dim
-    out_proj: Linear,     // value_dim → hidden
+    in_proj_qkvz: LinearProj, // hidden → key_dim*2 + value_dim*2 (q,k,v,z combined)
+    in_proj_ba: LinearProj,   // hidden → num_v_heads * 2 (b and a combined)
+    conv1d: Conv1d,           // depthwise conv, groups = conv_dim
+    norm: RMSNormGated,       // per-head norm: weight dim = value_head_dim
+    out_proj: LinearProj,     // value_dim → hidden
 
     // Learnable parameters
     dt_bias: MxArray, // [num_v_heads]
@@ -81,11 +81,11 @@ impl GatedDeltaNet {
         let a_log = MxArray::zeros(&[num_v_heads as i64], None)?; // Will be loaded from weights
 
         Ok(Self {
-            in_proj_qkvz,
-            in_proj_ba,
+            in_proj_qkvz: LinearProj::Standard(in_proj_qkvz),
+            in_proj_ba: LinearProj::Standard(in_proj_ba),
             conv1d,
             norm,
-            out_proj,
+            out_proj: LinearProj::Standard(out_proj),
             dt_bias,
             a_log,
             num_k_heads,
@@ -269,53 +269,58 @@ impl GatedDeltaNet {
         self.out_proj.forward(&y_flat)
     }
 
-    // ========== Weight accessors ==========
+    // ========== Weight accessors (standard mode) ==========
 
     pub fn set_in_proj_qkvz_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.in_proj_qkvz.set_weight(w)
+        self.in_proj_qkvz.set_weight(w, "in_proj_qkvz")
     }
     pub fn set_in_proj_ba_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.in_proj_ba.set_weight(w)
+        self.in_proj_ba.set_weight(w, "in_proj_ba")
     }
     pub fn set_conv1d_weight(&mut self, w: &MxArray) -> Result<()> {
         self.conv1d.set_weight(w)
     }
     pub fn set_norm_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.norm.set_weight(w)
+        // norm.weight may be stored as f32 in checkpoints for precision,
+        // but must match model dtype to avoid cascading f32 promotion.
+        let target_dtype = self.dt_bias.dtype()?;
+        let w_dtype = w.dtype()?;
+        if w_dtype != target_dtype {
+            let casted = w.astype(target_dtype)?;
+            self.norm.set_weight(&casted)
+        } else {
+            self.norm.set_weight(w)
+        }
     }
     pub fn set_out_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.out_proj.set_weight(w)
+        self.out_proj.set_weight(w, "out_proj")
     }
     pub fn set_dt_bias(&mut self, w: &MxArray) {
         self.dt_bias = w.clone();
     }
-    pub fn set_a_log(&mut self, w: &MxArray) {
-        self.a_log = w.clone();
+    pub fn set_a_log(&mut self, w: &MxArray) -> Result<()> {
+        // Cast A_log to model dtype (bf16) to avoid f32→bf16 promotion overhead.
+        // The precision difference is negligible for inference.
+        self.a_log = w.astype(self.dt_bias.dtype()?)?;
+        Ok(())
     }
 
-    pub fn get_parameters(&self) -> Vec<(&str, MxArray)> {
-        vec![
-            ("in_proj_qkvz.weight", self.in_proj_qkvz.get_weight()),
-            ("in_proj_ba.weight", self.in_proj_ba.get_weight()),
-            ("conv1d.weight", self.conv1d.get_weight()),
-            ("norm.weight", self.norm.get_weight()),
-            ("out_proj.weight", self.out_proj.get_weight()),
-            ("dt_bias", self.dt_bias.clone()),
-            ("A_log", self.a_log.clone()),
-        ]
+    // ========== Quantized setters ==========
+
+    pub fn set_quantized_in_proj_qkvz(&mut self, ql: QuantizedLinear) {
+        self.in_proj_qkvz.set_quantized(ql);
+    }
+    pub fn set_quantized_in_proj_ba(&mut self, ql: QuantizedLinear) {
+        self.in_proj_ba.set_quantized(ql);
+    }
+    pub fn set_quantized_out_proj(&mut self, ql: QuantizedLinear) {
+        self.out_proj.set_quantized(ql);
     }
 }
 
 /// RMS normalization without learnable weight (weight=None in Python).
-/// Uses mlx_fast_rms_norm with a ones weight vector.
+/// Uses mlx_fast_rms_norm with nullptr weight (C++ handles nullptr → std::nullopt).
 fn rms_norm_no_weight(x: &MxArray, eps: f32) -> Result<MxArray> {
-    // Get the last dimension size for the ones weight
-    let shape = x.shape()?;
-    let last_dim = *shape
-        .last()
-        .ok_or_else(|| Error::from_reason("empty shape"))?;
-    // Use input's dtype to avoid f32 promotion for bf16/f16 models
-    let ones = MxArray::ones(&[last_dim], Some(x.dtype()?))?;
-    let handle = unsafe { sys::mlx_fast_rms_norm(x.handle.0, ones.handle.0, eps) };
+    let handle = unsafe { mlx_sys::mlx_fast_rms_norm(x.handle.0, std::ptr::null_mut(), eps) };
     MxArray::from_handle(handle, "rms_norm_no_weight")
 }

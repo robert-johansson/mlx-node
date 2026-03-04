@@ -5,6 +5,7 @@ use crate::transformer::KVCache;
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5Config;
+use super::quantized_linear::{LinearProj, QuantizedLinear};
 
 /// Qwen3.5 full attention with gating and partial RoPE.
 ///
@@ -13,10 +14,10 @@ use super::config::Qwen3_5Config;
 /// 2. Partial RoPE: only rotates `head_dim * partial_rotary_factor` dimensions
 /// 3. Output is gated: `o_proj(sdpa_output * sigmoid(gate))`
 pub struct Qwen3_5Attention {
-    q_proj: Linear, // hidden → num_heads * head_dim * 2 (queries + gate)
-    k_proj: Linear, // hidden → num_kv_heads * head_dim
-    v_proj: Linear, // hidden → num_kv_heads * head_dim
-    o_proj: Linear, // num_heads * head_dim → hidden
+    q_proj: LinearProj, // hidden → num_heads * head_dim * 2 (queries + gate)
+    k_proj: LinearProj, // hidden → num_kv_heads * head_dim
+    v_proj: LinearProj, // hidden → num_kv_heads * head_dim
+    o_proj: LinearProj, // num_heads * head_dim → hidden
 
     q_norm: RMSNorm, // [head_dim]
     k_norm: RMSNorm, // [head_dim]
@@ -69,10 +70,10 @@ impl Qwen3_5Attention {
         let scale = (head_dim as f32).powf(-0.5);
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
+            q_proj: LinearProj::Standard(q_proj),
+            k_proj: LinearProj::Standard(k_proj),
+            v_proj: LinearProj::Standard(v_proj),
+            o_proj: LinearProj::Standard(o_proj),
             q_norm,
             k_norm,
             rope,
@@ -175,36 +176,51 @@ impl Qwen3_5Attention {
         self.o_proj.forward(&gated_output)
     }
 
-    // ========== Weight accessors ==========
+    // ========== Weight accessors (standard mode) ==========
 
     pub fn set_q_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.q_proj.set_weight(w)
+        self.q_proj.set_weight(w, "q_proj")
     }
     pub fn set_k_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.k_proj.set_weight(w)
+        self.k_proj.set_weight(w, "k_proj")
     }
     pub fn set_v_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.v_proj.set_weight(w)
+        self.v_proj.set_weight(w, "v_proj")
     }
     pub fn set_o_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.o_proj.set_weight(w)
+        self.o_proj.set_weight(w, "o_proj")
     }
     pub fn set_q_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
-        self.q_proj.set_bias(b)
+        self.q_proj.set_bias(b, "q_proj")
     }
     pub fn set_k_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
-        self.k_proj.set_bias(b)
+        self.k_proj.set_bias(b, "k_proj")
     }
     pub fn set_v_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
-        self.v_proj.set_bias(b)
+        self.v_proj.set_bias(b, "v_proj")
     }
     pub fn set_o_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
-        self.o_proj.set_bias(b)
+        self.o_proj.set_bias(b, "o_proj")
     }
     pub fn set_q_norm_weight(&mut self, w: &MxArray) -> Result<()> {
         self.q_norm.set_weight(w)
     }
     pub fn set_k_norm_weight(&mut self, w: &MxArray) -> Result<()> {
         self.k_norm.set_weight(w)
+    }
+
+    // ========== Quantized setters ==========
+
+    pub fn set_quantized_q_proj(&mut self, ql: QuantizedLinear) {
+        self.q_proj.set_quantized(ql);
+    }
+    pub fn set_quantized_k_proj(&mut self, ql: QuantizedLinear) {
+        self.k_proj.set_quantized(ql);
+    }
+    pub fn set_quantized_v_proj(&mut self, ql: QuantizedLinear) {
+        self.v_proj.set_quantized(ql);
+    }
+    pub fn set_quantized_o_proj(&mut self, ql: QuantizedLinear) {
+        self.o_proj.set_quantized(ql);
     }
 }

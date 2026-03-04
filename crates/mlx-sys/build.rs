@@ -18,8 +18,30 @@ fn add_link_search(path: &Path) {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/mlx.cpp");
     println!("cargo:rerun-if-changed=mlx");
+    // Watch all C++ source files, headers, and Metal kernel includes
+    let src_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("src");
+    if let Ok(entries) = std::fs::read_dir(&src_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(ext) = path.extension()
+                && (ext == "cpp" || ext == "h")
+            {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+    }
+    let metal_dir = src_dir.join("metal");
+    if let Ok(entries) = std::fs::read_dir(&metal_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(ext) = path.extension()
+                && ext == "inc"
+            {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+    }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let mlx_dir = manifest_dir.join("mlx");
@@ -121,9 +143,18 @@ fn main() {
     if include_generated.exists() {
         bridge.include(&include_generated);
     }
-    bridge
-        .file(manifest_dir.join("src/mlx.cpp"))
-        .compile("mlx_ffi");
+    // Add src/ as include path for metal/*.metal.inc includes
+    bridge.include(&src_dir);
+
+    // Compile all .cpp files in src/ (split from original monolithic mlx.cpp)
+    for entry in std::fs::read_dir(&src_dir).expect("Failed to read src directory") {
+        let entry = entry.expect("Failed to read directory entry");
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "cpp") {
+            bridge.file(&path);
+        }
+    }
+    bridge.compile("mlx_ffi");
 
     println!("cargo:rustc-link-lib=static=mlx_ffi");
 }

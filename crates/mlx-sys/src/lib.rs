@@ -25,6 +25,7 @@ unsafe extern "C" {
         shape: *const i64,
         ndim: usize,
     ) -> *mut mlx_array;
+    pub fn mlx_array_from_uint8(data: *const u8, shape: *const i64, ndim: usize) -> *mut mlx_array;
     pub fn mlx_array_from_float32(
         data: *const f32,
         shape: *const i64,
@@ -40,6 +41,7 @@ unsafe extern "C" {
         shape: *const i64,
         ndim: usize,
     ) -> *mut mlx_array;
+    pub fn mlx_from_fp8(handle: *mut mlx_array, target_dtype: i32) -> *mut mlx_array;
     pub fn mlx_array_scalar_float(value: f64) -> *mut mlx_array;
     pub fn mlx_array_scalar_int(value: i32) -> *mut mlx_array;
     pub fn mlx_array_zeros(shape: *const i64, ndim: usize, dtype: i32) -> *mut mlx_array;
@@ -66,6 +68,7 @@ unsafe extern "C" {
         keepdims: bool,
     ) -> *mut mlx_array;
     pub fn mlx_array_softmax(handle: *mut mlx_array, axis: i32) -> *mut mlx_array;
+    pub fn mlx_array_softmax_precise(handle: *mut mlx_array, axis: i32) -> *mut mlx_array;
     pub fn mlx_array_sigmoid(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_exp(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_log(handle: *mut mlx_array) -> *mut mlx_array;
@@ -366,6 +369,8 @@ unsafe extern "C" {
     pub fn mlx_array_to_int32(handle: *mut mlx_array, out: *mut i32, len: usize) -> bool;
     pub fn mlx_array_to_int32_noeval(handle: *mut mlx_array, out: *mut i32, len: usize) -> bool;
     pub fn mlx_array_to_uint32(handle: *mut mlx_array, out: *mut u32, len: usize) -> bool;
+    pub fn mlx_array_to_uint8(handle: *mut mlx_array, out: *mut u8, len: usize) -> bool;
+    pub fn mlx_array_to_uint16(handle: *mut mlx_array, out: *mut u16, len: usize) -> bool;
     pub fn mlx_array_delete(arr: *mut mlx_array);
     pub fn mlx_synchronize();
     pub fn mlx_clear_cache();
@@ -770,6 +775,7 @@ unsafe extern "C" {
     /// Synchronize - ensure all MLX operations are complete
     /// Call this before dispatching external Metal kernels
     pub fn mlx_metal_synchronize();
+
 }
 
 // ================================================================================
@@ -777,19 +783,20 @@ unsafe extern "C" {
 // ================================================================================
 
 unsafe extern "C" {
-    /// Quantize a matrix along its last axis using affine quantization.
-    /// Returns quantized weights, scales, and biases via output pointers.
+    /// Quantize a matrix along its last axis.
+    /// Mode: "affine" (returns 3 arrays), "mxfp4"/"mxfp8" (returns 2 arrays, biases=nullptr).
     pub fn mlx_quantize(
         w: *mut mlx_array,
         group_size: i32,
         bits: i32,
+        mode: *const std::os::raw::c_char,
         out_quantized: *mut *mut mlx_array,
         out_scales: *mut *mut mlx_array,
         out_biases: *mut *mut mlx_array,
     ) -> bool;
 
     /// Dequantize a matrix that was quantized with mlx_quantize.
-    /// Reconstructs the original values using: value = quantized * scale + bias
+    /// Mode must match the mode used during quantization.
     pub fn mlx_dequantize(
         quantized: *mut mlx_array,
         scales: *mut mlx_array,
@@ -797,6 +804,7 @@ unsafe extern "C" {
         group_size: i32,
         bits: i32,
         out_dtype: i32, // -1 for input dtype
+        mode: *const std::os::raw::c_char,
     ) -> *mut mlx_array;
 
     // 2D Convolution using MLX native conv2d
@@ -899,6 +907,158 @@ unsafe extern "C" {
         rhs_indices: *mut mlx_array, // nullable
         sorted_indices: bool,
     ) -> *mut mlx_array;
+
+    // ============================================
+    // Quantized Matmul (for QuantizedLinear)
+    // ============================================
+    pub fn mlx_quantized_matmul(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array, // nullable
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+    ) -> *mut mlx_array;
+
+    // ============================================
+    // Gather QMM (for QuantizedSwitchLinear / MoE)
+    // ============================================
+    pub fn mlx_gather_qmm(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,      // nullable
+        lhs_indices: *mut mlx_array, // nullable
+        rhs_indices: *mut mlx_array, // nullable
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+        sorted_indices: bool,
+    ) -> *mut mlx_array;
+
+    // Gated Delta Recurrence Metal Kernel
+    pub fn mlx_gated_delta_kernel(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state: *mut mlx_array,
+        mask: *mut mlx_array, // nullptr if no mask
+        out_y: *mut *mut mlx_array,
+        out_state: *mut *mut mlx_array,
+    ) -> bool;
+
+    // Fused compute_g: g = exp(-exp(A_log) * softplus(a + dt_bias))
+    pub fn mlx_fused_compute_g(
+        a_log: *mut mlx_array,
+        a: *mut mlx_array,
+        dt_bias: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    // ============================================
+    // Qwen3.5 Fused Forward Pass
+    // ============================================
+
+    /// Store a model weight by name (called once per weight during model load)
+    pub fn mlx_qwen35_store_weight(name: *const std::os::raw::c_char, weight: *mut mlx_array);
+
+    /// Clear all stored weights (called on model destruction)
+    pub fn mlx_qwen35_clear_weights();
+
+    /// Get the number of stored weights (for debugging)
+    pub fn mlx_qwen35_weight_count() -> usize;
+
+    /// Initialize compiled forward pass from post-prefill caches.
+    /// Call once after prefill, before decode loop.
+    /// cache_arrays: [num_layers * 2] non-null pointers to prefill cache arrays.
+    pub fn mlx_qwen35_compiled_init_from_prefill(
+        num_layers: i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        rope_dims: i32,
+        rms_norm_eps: f32,
+        full_attention_interval: i32,
+        linear_num_k_heads: i32,
+        linear_num_v_heads: i32,
+        linear_key_head_dim: i32,
+        linear_value_head_dim: i32,
+        linear_conv_kernel_dim: i32,
+        tie_word_embeddings: i32,
+        max_kv_len: i32,
+        batch_size: i32,
+        cache_arrays: *mut *mut mlx_array,
+        prefill_offset: i32,
+    );
+
+    /// Compiled single-token decode step.
+    /// Runs the full 64-layer forward pass with graph caching (mlx::core::compile).
+    /// output_logits receives heap-allocated array; cache_offset_out receives new offset.
+    pub fn mlx_qwen35_forward_compiled(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        output_logits: *mut *mut mlx_array,
+        cache_offset_out: *mut i32,
+    );
+
+    /// Eval next_token and all compiled cache arrays to prevent graph accumulation.
+    pub fn mlx_qwen35_eval_token_and_compiled_caches(next_token: *mut mlx_array);
+
+    /// Reset compiled state (call on model reset / new conversation).
+    pub fn mlx_qwen35_compiled_reset();
+
+    // ============================================
+    // Qwen3.5 MoE Forward Pass (non-compiled)
+    // ============================================
+
+    /// Initialize MoE forward pass from post-prefill caches.
+    pub fn mlx_qwen35_moe_init_from_prefill(
+        num_layers: i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        rope_dims: i32,
+        rms_norm_eps: f32,
+        full_attention_interval: i32,
+        linear_num_k_heads: i32,
+        linear_num_v_heads: i32,
+        linear_key_head_dim: i32,
+        linear_value_head_dim: i32,
+        linear_conv_kernel_dim: i32,
+        tie_word_embeddings: i32,
+        max_kv_len: i32,
+        batch_size: i32,
+        num_experts: i32,
+        num_experts_per_tok: i32,
+        norm_topk_prob: i32,
+        decoder_sparse_step: i32,
+        mlp_only_layers: *const i32,
+        mlp_only_layers_len: i32,
+        cache_arrays: *mut *mut mlx_array,
+        prefill_offset: i32,
+    );
+
+    /// MoE single-token decode step.
+    pub fn mlx_qwen35_moe_forward(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        output_logits: *mut *mut mlx_array,
+        cache_offset_out: *mut i32,
+    );
+
+    /// Eval next_token and all MoE cache arrays to prevent graph accumulation.
+    pub fn mlx_qwen35_moe_eval_token_and_caches(next_token: *mut mlx_array);
+
+    /// Reset MoE state.
+    pub fn mlx_qwen35_moe_reset();
 }
 
 // Gradient computation types

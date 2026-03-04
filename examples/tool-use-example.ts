@@ -15,17 +15,18 @@
  *   yarn oxnode examples/tool-use-example.ts [model-path]
  *
  * Arguments:
- *   model-path  Path to the model directory (default: .cache/models/qwen3-0.6b-mlx-bf16)
+ *   model-path  Path to the model directory (default: .cache/models/qwen3.5-4B-mlx-bf16)
  *
  * Environment:
  *   MODEL_PATH  Alternative way to specify model path
  */
 
 import { resolve } from 'node:path';
-import { ModelLoader, formatToolResponse, createToolDefinition } from '@mlx-node/lm';
+import { Qwen35Model } from '@mlx-node/core';
+import { formatToolResponse, createToolDefinition } from '@mlx-node/lm';
 
 // Get model path from CLI args, environment, or default
-const DEFAULT_MODEL_PATH = resolve(process.cwd(), '.cache', 'models', 'qwen3-0.6b-mlx-bf16');
+const DEFAULT_MODEL_PATH = resolve(process.cwd(), '.cache', 'models', 'qwen3.5-4B-mlx-bf16');
 const MODEL_PATH = process.argv[2] || process.env.MODEL_PATH || DEFAULT_MODEL_PATH;
 
 // Define available tools using the createToolDefinition helper
@@ -90,7 +91,7 @@ async function executeTool(name: string, args: Record<string, unknown>): Promise
   }
 }
 
-async function runToolConversation(model: Awaited<ReturnType<typeof ModelLoader.loadPretrained>>, userPrompt: string) {
+async function runToolConversation(model: Qwen35Model, userPrompt: string) {
   console.log('='.repeat(75));
   console.log(`User: ${userPrompt}`);
   console.log('='.repeat(75));
@@ -101,7 +102,7 @@ async function runToolConversation(model: Awaited<ReturnType<typeof ModelLoader.
   console.log('\n[->] Generating response with tools...');
   const result = await model.chat(messages, {
     tools,
-    maxNewTokens: 2048,
+    maxNewTokens: 32768,
     temperature: 0.7,
   });
 
@@ -139,8 +140,7 @@ async function runToolConversation(model: Awaited<ReturnType<typeof ModelLoader.
         const finalResult = await model.chat(messages, {
           tools,
           maxNewTokens: 2048,
-          temperature: 0.7,
-          topP: 0.9,
+          temperature: 0.9,
         });
 
         // Show thinking if model reasoned through the tool result
@@ -166,7 +166,7 @@ async function main() {
   console.log('+' + '-'.repeat(58) + '+\n');
 
   console.log(`Loading model from: ${MODEL_PATH}\n`);
-  const model = await ModelLoader.loadPretrained(MODEL_PATH);
+  const model = await Qwen35Model.loadPretrained(MODEL_PATH);
   console.log('[OK] Model loaded\n');
 
   // Example prompts that should trigger tool use
