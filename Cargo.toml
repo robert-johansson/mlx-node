@@ -14,8 +14,8 @@ futures = "0.3"
 half = "2.4"
 libc = "0.2"
 mimalloc-safe = { version = "0.1" }
-parquet = { version = "57", features = ["arrow"] }
-rand = "0.8"
+parquet = { version = "58", features = ["arrow"] }
+rand = "0.10"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
@@ -28,9 +28,9 @@ uuid = { version = "1.11", features = ["v4"] }
 regex = "1.11"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 unicode-width = "0.2.2"
-rust_xlsxwriter = "0.93.0"
+rust_xlsxwriter = "0.94.0"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # NAPI-RS
 napi = { version = "3", features = ["napi10", "async", "tokio_fs", "serde-json"] }
