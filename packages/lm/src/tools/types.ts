@@ -112,7 +112,7 @@ export interface ToolCall {
 }
 
 /**
- * Chat message roles
+ * Chat message roles (matches core ChatMessage.role type)
  */
 export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
 
@@ -235,7 +235,7 @@ export function createToolDefinition(
  */
 export function formatToolResponse(content: unknown): string {
   const contentStr = typeof content === 'string' ? content : JSON.stringify(content);
-  return `<tool_response>
-${contentStr}
-</tool_response>`;
+  // Qwen3/3.5 expects <tool_response> XML wrapping for tool results.
+  // Other model families may require a different format.
+  return `<tool_response>\n${contentStr}\n</tool_response>`;
 }

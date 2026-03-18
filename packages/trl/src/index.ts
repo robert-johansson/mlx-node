@@ -9,9 +9,9 @@
  * @example
  * ```typescript
  * import { GRPOTrainer, GRPOConfig, loadLocalGsm8kDataset } from '@mlx-node/trl';
- * import { ModelLoader } from '@mlx-node/lm';
+ * import { loadModel } from '@mlx-node/lm';
  *
- * const model = await ModelLoader.loadPretrained('./models/qwen3-0.6b');
+ * const model = await loadModel('./models/qwen3-0.6b');
  * const trainer = await GRPOTrainer.create({ modelPath: './models/qwen3-0.6b' });
  * ```
  */
@@ -23,35 +23,14 @@
 // Tool calling types (for tool-use training)
 export type { ToolDefinition, FunctionDefinition, FunctionParameters } from '@mlx-node/core';
 
-// Core tensor (for custom rewards/models)
-export { MxArray } from '@mlx-node/core';
-
-// Activations are internal-only (Rust) - used by transformers, sampling, GRPO
-
-// Transformer components are now internal-only (Rust)
-// Use model.chat() or model.generate() instead
-
-// GRPO utilities (computeAdvantages, computeEntropy, getHighEntropyMask) are internal-only
-// They are used by GRPOTrainingEngine in Rust
-
-// Model conversion
-export { convertModel, convertParquetToJsonl } from '@mlx-node/core';
-export type { ConversionOptions, ConversionResult } from '@mlx-node/core';
+// Note: MxArray, convertModel, convertParquetToJsonl are available from @mlx-node/core directly.
+// They are not re-exported here to avoid multiple-package export confusion.
 
 // =============================================================================
 // TRL-specific exports
 // =============================================================================
 
 // Trainers
-export {
-  type MLXGRPOConfig,
-  ConfigError,
-  getDefaultConfig,
-  mergeConfig,
-  loadTomlConfig,
-  applyOverrides,
-} from './trainers/grpo-config';
-
 export {
   GRPOTrainer,
   type GRPOTrainerConfig,
@@ -87,9 +66,6 @@ export {
   type PromptOptions,
 } from './trainers/training-logger';
 
-// Entropy configuration
-export { type EntropyFilteringConfig, DEFAULT_ENTROPY_CONFIG } from './trainers/grpo-entropy';
-
 // SFT Trainer
 export {
   SFTTrainer,
@@ -112,7 +88,14 @@ export {
 } from './trainers/sft-config';
 
 // Data
-export * from './data/dataset';
+export {
+  loadLocalGsm8kDataset,
+  LocalGsm8kDatasetLoader,
+  createDatasetExample,
+  extractGsm8kAnswer,
+  validateDatasetExample,
+  type LocalDatasetOptions,
+} from './data/dataset';
 export {
   SFTDataset,
   loadSFTDataset,
@@ -126,7 +109,7 @@ export {
 } from './data/sft-dataset';
 
 // Utils
-export * from './utils/xml-parser';
+export { parseXmlCot, extractXmlAnswer, extractXmlReasoning, extractHashAnswer } from './utils/xml-parser';
 export {
   validatePathContainment,
   resolveAndValidatePath,

@@ -26,6 +26,7 @@ use super::layer_cache::Qwen3_5LayerCache;
 use super::persistence;
 use super::processing::Qwen35VLImageProcessor;
 use super::vision::Qwen3_5VisionEncoder;
+use crate::models::paddleocr_vl::processing::ProcessedImages;
 
 /// Maximum number of entries in the vision encoder cache before LRU eviction.
 pub(crate) const VISION_CACHE_MAX_ENTRIES: usize = 32;
@@ -54,6 +55,12 @@ pub(crate) fn combine_image_hashes(hashes: &[u64]) -> u64 {
         h.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+/// Compute a combined cache key from raw image bytes.
+pub(crate) fn compute_image_cache_key(all_images: &[Vec<u8>]) -> u64 {
+    let individual_hashes: Vec<u64> = all_images.iter().map(|img| hash_image_bytes(img)).collect();
+    combine_image_hashes(&individual_hashes)
 }
 
 /// Process-wide mutex serializing the dense compiled forward lifecycle.
@@ -128,14 +135,18 @@ pub struct ChatConfig {
     /// Max consecutive identical tokens before stopping (default: 16, 0 = disabled)
     #[napi(ts_type = "number | undefined")]
     pub max_consecutive_tokens: Option<i32>,
-    /// Max n-gram repetitions before stopping (default: 8, 0 = disabled)
+    /// Max n-gram repetitions before stopping (default: 3, 0 = disabled)
     #[napi(ts_type = "number | undefined")]
     pub max_ngram_repeats: Option<i32>,
-    /// N-gram size for repetition detection (default: 3)
+    /// Max pattern size for n-gram repetition detection (default: 64)
     #[napi(ts_type = "number | undefined")]
     pub ngram_size: Option<i32>,
     #[napi(ts_type = "Array<ToolDefinition>")]
     pub tools: Option<Vec<ToolDefinition>>,
+    /// Enable thinking mode (Qwen3's <think> tags). Default: true (model thinks naturally).
+    /// Set to false to suppress thinking by injecting empty <think></think> tags.
+    #[napi(ts_type = "boolean | undefined")]
+    pub enable_thinking: Option<bool>,
     /// When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result
     #[napi(ts_type = "boolean | undefined")]
     pub report_performance: Option<bool>,
@@ -340,8 +351,8 @@ impl Qwen3_5Model {
     /// - model.safetensors (or model-*.safetensors)
     /// - tokenizer.json + tokenizer_config.json
     #[napi]
-    pub async fn load_pretrained(path: String) -> Result<Qwen3_5Model> {
-        persistence::load_pretrained(&path).await
+    pub async fn load(path: String) -> Result<Qwen3_5Model> {
+        persistence::load(&path).await
     }
 
     /// Generate text from a prompt token sequence.
@@ -571,7 +582,7 @@ impl Qwen3_5Model {
                     generated_tokens.push(token_id);
 
                     if token_id == eos_id {
-                        finish_reason = String::from("eos");
+                        finish_reason = String::from("stop");
                         break;
                     }
 
@@ -638,7 +649,7 @@ impl Qwen3_5Model {
                     generated_tokens.push(token_id);
 
                     if token_id == eos_id {
-                        finish_reason = String::from("eos");
+                        finish_reason = String::from("stop");
                         break;
                     }
 
@@ -707,6 +718,7 @@ impl Qwen3_5Model {
             max_ngram_repeats: None,
             ngram_size: None,
             tools: None,
+            enable_thinking: None,
             report_performance: None,
         });
 
@@ -769,8 +781,13 @@ impl Qwen3_5Model {
             let mut first_token_instant: Option<std::time::Instant> = None;
 
             let tool_defs = config.tools.as_deref();
-            let tokens =
-                tokenizer.apply_chat_template_sync(&messages, Some(true), tool_defs, None)?;
+            let enable_thinking = config.enable_thinking;
+            let tokens = tokenizer.apply_chat_template_sync(
+                &messages,
+                Some(true),
+                tool_defs,
+                enable_thinking,
+            )?;
 
             let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
             let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
@@ -780,7 +797,7 @@ impl Qwen3_5Model {
             let ngram_size = config.ngram_size.unwrap_or(64);
             let sampling_config = Some(SamplingConfig {
                 temperature: config.temperature,
-                top_k: config.top_k.or(Some(20)), // Qwen3.5 recommends top_k=20
+                top_k: config.top_k, // Qwen3.5 recommends top_k=20
                 top_p: config.top_p,
                 min_p: config.min_p,
             });
@@ -833,13 +850,16 @@ impl Qwen3_5Model {
                     let num_image_tokens = compute_num_image_tokens(&processed.grid_thw(), sms)?;
                     let final_tokens = inject_image_placeholders(&tokens, num_image_tokens);
 
+                    // Compute vision cache key from raw image bytes
+                    let image_cache_key = compute_image_cache_key(&all_images);
+
                     let input_ids =
                         MxArray::from_uint32(&final_tokens, &[1, final_tokens.len() as i64])?;
 
                     let (logits, _rope_deltas) = vlm_prefill(
                         &input_ids,
-                        &all_images,
-                        img_proc,
+                        image_cache_key,
+                        &processed,
                         vision_enc,
                         sms,
                         &embedding_weight,
@@ -995,7 +1015,7 @@ impl Qwen3_5Model {
                     token_history.push(token_id);
 
                     if token_id == eos_id {
-                        finish_reason = String::from("eos");
+                        finish_reason = String::from("stop");
                         break;
                     }
 
@@ -1119,7 +1139,7 @@ impl Qwen3_5Model {
                     token_history.push(token_id);
 
                     if token_id == eos_id {
-                        finish_reason = String::from("eos");
+                        finish_reason = String::from("stop");
                         break;
                     }
 
@@ -1238,6 +1258,7 @@ impl Qwen3_5Model {
             max_ngram_repeats: None,
             ngram_size: None,
             tools: None,
+            enable_thinking: None,
             report_performance: None,
         });
 
@@ -1309,11 +1330,12 @@ impl Qwen3_5Model {
             let result =
                 napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
                     let tool_defs = config.tools.as_deref();
+                    let enable_thinking = config.enable_thinking;
                     let tokens = tokenizer.apply_chat_template_sync(
                         &messages,
                         Some(true),
                         tool_defs,
-                        None,
+                        enable_thinking,
                     )?;
 
                     let mut first_token_instant: Option<std::time::Instant> = None;
@@ -1326,7 +1348,7 @@ impl Qwen3_5Model {
                     let ngram_size = config.ngram_size.unwrap_or(64);
                     let sampling_config = Some(SamplingConfig {
                         temperature: config.temperature,
-                        top_k: config.top_k.or(Some(20)),
+                        top_k: config.top_k,
                         top_p: config.top_p,
                         min_p: config.min_p,
                     });
@@ -1384,6 +1406,9 @@ impl Qwen3_5Model {
                                 compute_num_image_tokens(&processed.grid_thw(), sms)?;
                             let final_tokens = inject_image_placeholders(&tokens, num_image_tokens);
 
+                            // Compute vision cache key from raw image bytes
+                            let image_cache_key = compute_image_cache_key(&all_images);
+
                             let input_ids = MxArray::from_uint32(
                                 &final_tokens,
                                 &[1, final_tokens.len() as i64],
@@ -1391,8 +1416,8 @@ impl Qwen3_5Model {
 
                             let (logits, _rope_deltas) = vlm_prefill(
                                 &input_ids,
-                                &all_images,
-                                img_proc,
+                                image_cache_key,
+                                &processed,
                                 vision_enc,
                                 sms,
                                 &embedding_weight,
@@ -1564,7 +1589,7 @@ impl Qwen3_5Model {
                             );
 
                             if token_id == eos_id {
-                                finish_reason = String::from("eos");
+                                finish_reason = String::from("stop");
                                 break;
                             }
 
@@ -1643,7 +1668,7 @@ impl Qwen3_5Model {
                             );
 
                             if token_id == eos_id {
-                                finish_reason = String::from("eos");
+                                finish_reason = String::from("stop");
                                 break;
                             }
 
@@ -2577,9 +2602,10 @@ impl Qwen3_5Model {
         tools: Option<&[ToolDefinition]>,
         enable_thinking: Option<bool>,
     ) -> Result<Vec<u32>> {
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
-            Error::from_reason("Tokenizer not loaded - call load_pretrained first")
-        })?;
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded - call load() first"))?;
         tokenizer.apply_chat_template_sync(messages, add_generation_prompt, tools, enable_thinking)
     }
 
@@ -3070,8 +3096,8 @@ pub(crate) fn merge_input_ids_with_image_features(
 #[allow(clippy::too_many_arguments)]
 fn vlm_prefill(
     input_ids: &MxArray,
-    all_images: &[Vec<u8>],
-    image_processor: &Qwen35VLImageProcessor,
+    image_cache_key: u64,
+    pre_processed: &ProcessedImages,
     vision_encoder: &Qwen3_5VisionEncoder,
     spatial_merge_size: i32,
     text_model_embedding: &MxArray,
@@ -3086,88 +3112,16 @@ fn vlm_prefill(
 ) -> Result<(MxArray, i64)> {
     use crate::array::clear_cache;
 
-    // === STEP 1: Compute vision features (with hash cache) ===
-    let individual_hashes: Vec<u64> = all_images.iter().map(|img| hash_image_bytes(img)).collect();
-    let combined_hash = combine_image_hashes(&individual_hashes);
-
-    // Check cache for pre-computed vision features + grid_thw
-    let cached = {
-        let mut cache = vision_cache.lock().unwrap();
-        cache.generation += 1;
-        let lru_gen = cache.generation;
-        if let Some((features, grid, lru)) = cache.entries.get_mut(&combined_hash) {
-            *lru = lru_gen; // bump LRU
-            tracing::debug!("Vision cache HIT for hash {:016x}", combined_hash);
-            Some((features.clone(), grid.clone()))
-        } else {
-            None
-        }
-    };
-
-    let (vision_features, grid) = if let Some((features, grid)) = cached {
-        // Cache hit — skip image processing AND vision encoder
-        (features, grid)
-    } else {
-        // Cache miss — process images and run vision encoder
-        let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
-        let processed = image_processor.process_many(&image_refs)?;
-        let grid = processed.grid_thw();
-        let pv = processed.pixel_values();
-        let pv_shape = pv.shape()?;
-        let pv_5d = pv.reshape(&[1, pv_shape[0], pv_shape[1], pv_shape[2], pv_shape[3]])?;
-
-        let features = {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            vision_encoder.forward(&pv_5d, &grid)?
-        };
-
-        // Store in cache with LRU eviction
-        {
-            let mut cache = vision_cache.lock().unwrap();
-            if cache.entries.len() >= VISION_CACHE_MAX_ENTRIES
-                && let Some((&oldest_key, _)) =
-                    cache.entries.iter().min_by_key(|(_, (_, _, lru))| *lru)
-            {
-                cache.entries.remove(&oldest_key);
-            }
-            cache.generation += 1;
-            let lru_gen = cache.generation;
-            cache
-                .entries
-                .insert(combined_hash, (features.clone(), grid.clone(), lru_gen));
-        }
-        tracing::debug!("Vision cache MISS for hash {:016x}", combined_hash);
-
-        (features, grid)
-    };
-
-    // === STEP 2: Get text embeddings and merge with vision features ===
-    let text_embeds = {
-        let _stream_ctx = StreamContext::new(generation_stream);
-        let embedding = Embedding::from_weight(text_model_embedding)?;
-        embedding.forward(input_ids)?
-    };
-
-    let inputs_embeds = {
-        let _stream_ctx = StreamContext::new(generation_stream);
-        let embed_dtype = text_embeds.dtype()?;
-        let vf_cast = if vision_features.dtype()? != embed_dtype {
-            vision_features.astype(embed_dtype)?
-        } else {
-            vision_features
-        };
-        merge_input_ids_with_image_features(IMAGE_TOKEN_ID, &vf_cast, &text_embeds, input_ids)?
-    };
-
-    // === STEP 3: Compute M-RoPE position IDs ===
-    let (position_ids, rope_deltas) =
-        get_rope_index(input_ids, Some(&grid), spatial_merge_size, IMAGE_TOKEN_ID)?;
-
-    tracing::debug!(
-        "VLM prefill: seq_len={}, rope_deltas={}",
-        inputs_embeds.shape_at(1)?,
-        rope_deltas
-    );
+    let (inputs_embeds, position_ids, rope_deltas) = vlm_prepare_vision_features(
+        input_ids,
+        image_cache_key,
+        pre_processed,
+        vision_encoder,
+        spatial_merge_size,
+        text_model_embedding,
+        generation_stream,
+        vision_cache,
+    )?;
 
     // === STEP 4: Prefill with M-RoPE ===
     let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
@@ -3219,6 +3173,7 @@ fn vlm_prefill(
         }
 
         // Transfer VLM caches to compiled decode path
+        // vlm_get_cache returns heap-allocated copies — we must delete them after use
         let num_caches = unsafe { sys::mlx_qwen35_vlm_cache_count() };
         let mut cache_ptrs: Vec<*mut sys::mlx_array> = Vec::with_capacity(num_caches as usize);
         for idx in 0..num_caches {
@@ -3255,6 +3210,13 @@ fn vlm_prefill(
             // Adjust offset for rope_deltas (VLM positions differ from sequential)
             if rope_deltas != 0 {
                 sys::mlx_qwen35_compiled_adjust_offset(rope_deltas as i32);
+            }
+
+            // Clean up heap-allocated cache copies from vlm_get_cache
+            for ptr in &cache_ptrs {
+                if !ptr.is_null() {
+                    sys::mlx_array_delete(*ptr);
+                }
             }
 
             // Clean up VLM prefill state (caches now owned by compiled decode)
@@ -3341,4 +3303,103 @@ fn vlm_prefill(
     };
 
     Ok((last_logits, rope_deltas))
+}
+
+/// Shared VLM prefill steps 1-3: vision cache lookup, vision encoder,
+/// embedding merge, and M-RoPE position computation.
+///
+/// Returns (inputs_embeds, position_ids, rope_deltas) ready for the
+/// language model forward pass. Used by both dense and MoE VLM prefill.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn vlm_prepare_vision_features(
+    input_ids: &MxArray,
+    image_cache_key: u64,
+    pre_processed: &ProcessedImages,
+    vision_encoder: &Qwen3_5VisionEncoder,
+    spatial_merge_size: i32,
+    text_model_embedding: &MxArray,
+    generation_stream: Stream,
+    vision_cache: &VisionCache,
+) -> Result<(MxArray, MxArray, i64)> {
+    // === STEP 1: Compute vision features (with hash cache) ===
+    let combined_hash = image_cache_key;
+
+    let cached = {
+        let mut cache = vision_cache
+            .lock()
+            .map_err(|_| Error::from_reason("Vision cache mutex poisoned"))?;
+        cache.generation += 1;
+        let lru_gen = cache.generation;
+        if let Some((features, grid, lru)) = cache.entries.get_mut(&combined_hash) {
+            *lru = lru_gen;
+            tracing::debug!("Vision cache HIT for hash {:016x}", combined_hash);
+            Some((features.clone(), grid.clone()))
+        } else {
+            None
+        }
+    };
+
+    let (vision_features, grid) = if let Some((features, grid)) = cached {
+        (features, grid)
+    } else {
+        let grid = pre_processed.grid_thw();
+        let pv = pre_processed.pixel_values();
+        let pv_shape = pv.shape()?;
+        let pv_5d = pv.reshape(&[1, pv_shape[0], pv_shape[1], pv_shape[2], pv_shape[3]])?;
+
+        let features = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            vision_encoder.forward(&pv_5d, &grid)?
+        };
+
+        {
+            let mut cache = vision_cache
+                .lock()
+                .map_err(|_| Error::from_reason("Vision cache mutex poisoned"))?;
+            if cache.entries.len() >= VISION_CACHE_MAX_ENTRIES
+                && let Some((&oldest_key, _)) =
+                    cache.entries.iter().min_by_key(|(_, (_, _, lru))| *lru)
+            {
+                cache.entries.remove(&oldest_key);
+            }
+            cache.generation += 1;
+            let lru_gen = cache.generation;
+            cache
+                .entries
+                .insert(combined_hash, (features.clone(), grid.clone(), lru_gen));
+        }
+        tracing::debug!("Vision cache MISS for hash {:016x}", combined_hash);
+
+        (features, grid)
+    };
+
+    // === STEP 2: Get text embeddings and merge with vision features ===
+    let text_embeds = {
+        let _stream_ctx = StreamContext::new(generation_stream);
+        let embedding = Embedding::from_weight(text_model_embedding)?;
+        embedding.forward(input_ids)?
+    };
+
+    let inputs_embeds = {
+        let _stream_ctx = StreamContext::new(generation_stream);
+        let embed_dtype = text_embeds.dtype()?;
+        let vf_cast = if vision_features.dtype()? != embed_dtype {
+            vision_features.astype(embed_dtype)?
+        } else {
+            vision_features
+        };
+        merge_input_ids_with_image_features(IMAGE_TOKEN_ID, &vf_cast, &text_embeds, input_ids)?
+    };
+
+    // === STEP 3: Compute M-RoPE position IDs ===
+    let (position_ids, rope_deltas) =
+        get_rope_index(input_ids, Some(&grid), spatial_merge_size, IMAGE_TOKEN_ID)?;
+
+    tracing::debug!(
+        "VLM prefill: seq_len={}, rope_deltas={}",
+        inputs_embeds.shape_at(1)?,
+        rope_deltas
+    );
+
+    Ok((inputs_embeds, position_ids, rope_deltas))
 }

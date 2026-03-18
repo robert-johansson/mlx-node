@@ -11,7 +11,7 @@ use crate::array::MxArray;
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct GenerationConfig {
-    /// Maximum number of new tokens to generate (default: 100)
+    /// Maximum number of new tokens to generate (default: 2048)
     pub max_new_tokens: Option<i32>,
 
     /// Sampling temperature (0 = greedy, higher = more random) (default: 1.0)
@@ -88,7 +88,7 @@ pub struct GenerationConfig {
 impl Default for GenerationConfig {
     fn default() -> Self {
         Self {
-            max_new_tokens: Some(100),
+            max_new_tokens: Some(2048),
             temperature: Some(1.0),
             top_k: Some(0),
             top_p: Some(1.0),
@@ -122,7 +122,7 @@ pub struct GenerationResult {
     pub(crate) logprobs: MxArray,
 
     /// Whether generation stopped due to EOS token (true) or max_tokens (false)
-    pub(crate) finish_reason: String, // "eos" or "length"
+    pub(crate) finish_reason: String, // "stop" or "length"
 
     /// Number of tokens generated
     pub(crate) num_tokens: usize,
@@ -152,8 +152,8 @@ impl GenerationResult {
         self.logprobs.clone()
     }
 
-    /// Get the finish reason ("eos", "length", or "repetition")
-    #[napi(getter, ts_return_type = "'eos' | 'length' | 'repetition'")]
+    /// Get the finish reason ("stop", "length", or "repetition")
+    #[napi(getter, ts_return_type = "'stop' | 'length' | 'repetition'")]
     pub fn get_finish_reason(&self) -> String {
         self.finish_reason.clone()
     }

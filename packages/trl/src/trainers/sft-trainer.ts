@@ -38,9 +38,7 @@ import {
   type SftStepMetrics,
   type SftEpochMetrics,
 } from '@mlx-node/core';
-import { detectModelType } from '@mlx-node/lm';
-
-type TrainableModel = Qwen3Model | Qwen35Model | Qwen35MoeModel;
+import { loadModel, type TrainableModel } from '@mlx-node/lm';
 
 import type { SFTTrainerConfig } from './sft-config';
 import { getDefaultSFTConfig, mergeSFTConfig } from './sft-config';
@@ -92,6 +90,7 @@ export class SFTTrainer {
   private stdinInterface?: readline.Interface;
   private logger: TrainingLogger;
   private sampleDisplayMode: 'all' | 'best_worst' | 'random' = 'all';
+  private signalHandlersInstalled: boolean = false;
 
   /**
    * Create a new SFT trainer from a model
@@ -109,8 +108,8 @@ export class SFTTrainer {
   ) {
     // Auto-detect TUI mode from environment variable
     const tuiModeFromEnv = process.env.MLX_TUI_MODE === '1';
-    if (tuiModeFromEnv && config.tui_mode === undefined) {
-      config.tui_mode = true;
+    if (tuiModeFromEnv && config.tuiMode === undefined) {
+      config.tuiMode = true;
     }
 
     this.config = mergeSFTConfig(getDefaultSFTConfig(), config);
@@ -121,21 +120,21 @@ export class SFTTrainer {
     this.logger =
       logger ??
       createTrainingLogger({
-        logConsole: !this.config.tui_mode,
-        logJsonl: this.config.log_jsonl,
-        outputDir: this.config.output_dir,
-        runName: this.config.run_name,
-        logInterval: this.config.logging_steps,
+        logConsole: !this.config.tuiMode,
+        logJsonl: this.config.logJsonl,
+        outputDir: this.config.outputDir,
+        runName: this.config.runName,
+        logInterval: this.config.loggingSteps,
       });
 
     // Convert to native config
     const engineConfig: SftEngineConfig = {
-      learningRate: this.config.learning_rate,
-      gradientAccumulationSteps: this.config.gradient_accumulation_steps,
-      gradientClipNorm: this.config.max_grad_norm,
-      weightDecay: this.config.weight_decay,
-      labelSmoothing: this.config.label_smoothing,
-      gradientCheckpointing: this.config.gradient_checkpointing,
+      learningRate: this.config.learningRate,
+      gradientAccumulationSteps: this.config.gradientAccumulationSteps,
+      gradientClipNorm: this.config.maxGradNorm,
+      weightDecay: this.config.weightDecay,
+      labelSmoothing: this.config.labelSmoothing,
+      gradientCheckpointing: this.config.gradientCheckpointing,
     };
 
     if (model instanceof Qwen35Model) {
@@ -149,16 +148,50 @@ export class SFTTrainer {
     }
 
     // Setup stdin handler if TUI mode
-    if (this.config.tui_mode) {
+    if (this.config.tuiMode) {
       this.setupStdinHandler();
     }
+  }
+
+  /**
+   * Setup OS signal handlers for graceful shutdown on interrupt.
+   * Saves an emergency checkpoint before exiting to prevent progress loss.
+   */
+  private setupSignalHandlers(): void {
+    if (this.signalHandlersInstalled) return;
+    this.signalHandlersInstalled = true;
+
+    const gracefulShutdown = async (signal: string) => {
+      this.logger.warn(`Received ${signal}, initiating graceful shutdown...`);
+      this.stopRequested = true;
+
+      try {
+        if (this.config.outputDir && this.currentStep > 0) {
+          this.logger.info(`Saving emergency checkpoint at step ${this.currentStep}...`);
+          await this.saveCheckpoint(`emergency-checkpoint-${this.currentStep}`);
+          this.logger.info('Emergency checkpoint saved.');
+        }
+      } catch (e) {
+        console.error('Failed to save emergency checkpoint:', e);
+      }
+
+      process.exit(0);
+    };
+
+    process.on('SIGTERM', () => {
+      gracefulShutdown('SIGTERM').catch(console.error);
+    });
+
+    process.on('SIGINT', () => {
+      gracefulShutdown('SIGINT').catch(console.error);
+    });
   }
 
   /**
    * Setup stdin handler for TUI control commands
    */
   private setupStdinHandler(): void {
-    if (!this.config.tui_mode) return;
+    if (!this.config.tuiMode) return;
 
     this.stdinInterface = readline.createInterface({
       input: process.stdin,
@@ -226,28 +259,28 @@ export class SFTTrainer {
    * @returns Promise<SFTTrainer>
    */
   static async create(config: Partial<SFTTrainerConfig>): Promise<SFTTrainer> {
-    if (!config.model_name) {
-      throw new Error('model_name is required when using SFTTrainer.create()');
+    if (!config.modelName) {
+      throw new Error('modelName is required when using SFTTrainer.create()');
     }
 
     // Create logger early
     const logger = createTrainingLogger({
-      logConsole: !config.tui_mode,
-      logJsonl: config.log_jsonl ?? true,
-      outputDir: config.output_dir,
-      runName: config.run_name,
-      logInterval: config.logging_steps ?? 10,
+      logConsole: !config.tuiMode,
+      logJsonl: config.logJsonl ?? true,
+      outputDir: config.outputDir,
+      runName: config.runName,
+      logInterval: config.loggingSteps ?? 10,
     });
 
-    let modelPath = config.model_name;
+    let modelPath = config.modelName;
     let resumedState: SFTTrainingState | null = null;
 
     // Handle checkpoint resumption
-    if (config.resume_from_checkpoint) {
+    if (config.resumeFromCheckpoint) {
       const checkpointPath =
-        config.resume_from_checkpoint === 'latest'
-          ? SFTTrainer.findLatestCheckpoint(config.output_dir)
-          : config.resume_from_checkpoint;
+        config.resumeFromCheckpoint === 'latest'
+          ? SFTTrainer.findLatestCheckpoint(config.outputDir)
+          : config.resumeFromCheckpoint;
 
       if (checkpointPath) {
         const statePath = join(checkpointPath, 'training_state.json');
@@ -258,7 +291,7 @@ export class SFTTrainer {
           );
         }
         modelPath = checkpointPath;
-      } else if (config.resume_from_checkpoint === 'latest') {
+      } else if (config.resumeFromCheckpoint === 'latest') {
         logger.info('No checkpoint found, starting fresh training');
       }
     }
@@ -267,26 +300,16 @@ export class SFTTrainer {
     const modelName = parse(modelPath).base || 'Unknown';
     logger.status('loading', `Loading ${modelName}...`);
 
-    // Detect model type and load appropriate model class
-    const modelType = await detectModelType(modelPath);
-    let model: TrainableModel;
-    if (modelType === 'qwen3_5_moe') {
-      model = await Qwen35MoeModel.loadPretrained(modelPath);
-    } else if (modelType === 'qwen3_5') {
-      model = await Qwen35Model.loadPretrained(modelPath);
-    } else if (modelType === 'qwen3') {
-      model = await Qwen3Model.loadPretrained(modelPath);
-    } else {
-      throw new Error(`Unsupported model_type "${modelType}" in ${modelPath}/config.json`);
-    }
+    // Load model (auto-detects architecture from config.json)
+    const model = await loadModel(modelPath);
 
     const tokenizer = await Qwen3Tokenizer.fromPretrained(join(modelPath, 'tokenizer.json'));
 
-    logger.status('loading', `${modelName} loaded (${modelType})`);
+    logger.status('loading', `${modelName} loaded (${model.constructor.name})`);
 
     // Create trainer
     const trainer = new SFTTrainer(model, tokenizer, config, logger);
-    trainer.originalModelPath = config.model_name;
+    trainer.originalModelPath = config.modelName;
 
     // Restore training state if resuming
     if (resumedState) {
@@ -358,10 +381,10 @@ export class SFTTrainer {
     let sftDataset: SFTDataset;
     if (typeof dataset === 'string') {
       sftDataset = await loadSFTDataset(dataset, this.tokenizer, {
-        maxSeqLength: this.config.max_seq_length,
-        completionOnly: this.config.completion_only,
+        maxSeqLength: this.config.maxSeqLength,
+        completionOnly: this.config.completionOnly,
         seed: this.config.seed,
-        limit: this.config.max_train_samples > 0 ? this.config.max_train_samples : undefined,
+        limit: this.config.maxTrainSamples > 0 ? this.config.maxTrainSamples : undefined,
       });
     } else {
       sftDataset = dataset;
@@ -371,13 +394,16 @@ export class SFTTrainer {
       return;
     }
 
-    const numEpochs = this.config.num_epochs;
-    const batchSize = this.config.batch_size;
-    const saveInterval = this.config.save_steps;
+    // Setup signal handlers for crash recovery
+    this.setupSignalHandlers();
+
+    const numEpochs = this.config.numEpochs;
+    const batchSize = this.config.batchSize;
+    const saveInterval = this.config.saveSteps;
 
     // Create output directory
-    if (this.config.output_dir && !existsSync(this.config.output_dir)) {
-      mkdirSync(this.config.output_dir, { recursive: true });
+    if (this.config.outputDir && !existsSync(this.config.outputDir)) {
+      mkdirSync(this.config.outputDir, { recursive: true });
     }
 
     // Calculate steps per epoch (in batches)
@@ -391,7 +417,7 @@ export class SFTTrainer {
     // Get model name
     const modelName =
       (this.originalModelPath ? parse(this.originalModelPath).base : null) ??
-      (this.config.model_name ? parse(this.config.model_name).base : null) ??
+      (this.config.modelName ? parse(this.config.modelName).base : null) ??
       'Unknown';
 
     // Log training start
@@ -402,7 +428,7 @@ export class SFTTrainer {
         numEpochs,
         batchSize,
         groupSize: 1, // SFT doesn't use groups
-        learningRate: this.config.learning_rate,
+        learningRate: this.config.learningRate,
       },
       sftDataset.length,
     );
@@ -471,7 +497,7 @@ export class SFTTrainer {
           );
 
           // Save checkpoint periodically
-          if (this.config.output_dir && this.currentStep > 0 && this.currentStep % saveInterval === 0) {
+          if (this.config.outputDir && this.currentStep > 0 && this.currentStep % saveInterval === 0) {
             const path = await this.saveCheckpoint();
             if (path) {
               this.logger.checkpoint(path, this.currentStep);
@@ -480,7 +506,7 @@ export class SFTTrainer {
         }
 
         // Check for emergency checkpoint
-        if (this.config.output_dir && this.engine.needsEmergencySave()) {
+        if (this.config.outputDir && this.engine.needsEmergencySave()) {
           this.logger.warn(`[EMERGENCY] Saving emergency checkpoint at step ${this.currentStep} due to NaN gradients`);
           await this.saveCheckpoint(`emergency-checkpoint-${this.currentStep}`);
           this.engine.clearEmergencySave();
@@ -495,7 +521,7 @@ export class SFTTrainer {
         this.currentStep = this.engine.getStep();
 
         // Check if flush step aligns with save interval
-        if (this.config.output_dir && this.currentStep > 0 && this.currentStep % saveInterval === 0) {
+        if (this.config.outputDir && this.currentStep > 0 && this.currentStep % saveInterval === 0) {
           const path = await this.saveCheckpoint();
           if (path) {
             this.logger.checkpoint(path, this.currentStep);
@@ -511,7 +537,7 @@ export class SFTTrainer {
     }
 
     // Save final checkpoint
-    if (this.config.output_dir && !this.stopRequested) {
+    if (this.config.outputDir && !this.stopRequested) {
       const path = await this.saveCheckpoint('final');
       if (path) {
         this.logger.checkpoint(path, this.currentStep);
@@ -535,7 +561,7 @@ export class SFTTrainer {
    */
   async saveCheckpoint(name?: string): Promise<string> {
     const checkpointName = name ?? `checkpoint-${this.currentStep}`;
-    const outputDir = this.config.output_dir ?? './outputs';
+    const outputDir = this.config.outputDir ?? './outputs';
     const checkpointPath = join(outputDir, checkpointName);
 
     // Create checkpoint directory
@@ -557,7 +583,7 @@ export class SFTTrainer {
     await this.model.saveModel(checkpointPath);
 
     // Copy tokenizer files
-    const tokenizerSource = this.originalModelPath ?? this.config.model_name;
+    const tokenizerSource = this.originalModelPath ?? this.config.modelName;
     if (tokenizerSource) {
       const tokenizerFiles = ['tokenizer.json', 'tokenizer_config.json', 'vocab.json', 'merges.txt'];
       for (const file of tokenizerFiles) {
@@ -572,7 +598,7 @@ export class SFTTrainer {
     this.logger.info(`Checkpoint saved: ${checkpointPath}`);
 
     // Clean up old checkpoints
-    const maxCheckpoints = this.config.max_checkpoints;
+    const maxCheckpoints = this.config.maxCheckpoints;
     if (maxCheckpoints > 0) {
       this.cleanupOldCheckpoints(outputDir, maxCheckpoints);
     }
@@ -634,12 +660,13 @@ export class SFTTrainer {
    * Get the underlying model for inference
    */
   getModel(): TrainableModel {
-    if (this.model instanceof Qwen3Model) {
-      return this.engine.getModel();
+    if (this.model instanceof Qwen35MoeModel) {
+      return this.engine.getQwen35MoeModel();
     }
-    // For Qwen3.5 models, return the original model reference
-    // (engine.getModel() only supports Qwen3)
-    return this.model;
+    if (this.model instanceof Qwen35Model) {
+      return this.engine.getQwen35Model();
+    }
+    return this.engine.getModel();
   }
 
   /**

@@ -142,8 +142,8 @@ pub fn dispatch_paged_attention_v1(
     let pipeline = state.get_pipeline(&kernel_name)?;
 
     // Create command buffer and encoder
-    let command_queue = state.device.new_command_queue();
-    let command_buffer = command_queue.new_command_buffer();
+
+    let command_buffer = state.command_queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
 
     encoder.set_compute_pipeline_state(&pipeline);
@@ -266,9 +266,12 @@ pub fn dispatch_paged_attention_v2(
     let exp_sums_size = (params.num_seqs * params.num_heads * max_num_partitions) as usize
         * std::mem::size_of::<f32>();
     let max_logits_size = exp_sums_size;
+    // tmp_out stores partitioned attention outputs in float16 (the I/O type),
+    // NOT the cache dtype. Using dtype.size() here would under-allocate for FP8
+    // (1 byte) when the kernel writes float16 (2 bytes), causing GPU buffer overrun.
     let tmp_out_size = (params.num_seqs * params.num_heads * max_num_partitions * params.head_size)
         as usize
-        * dtype.size();
+        * MetalDtype::Float16.size();
 
     let exp_sums = state.device.new_buffer(
         exp_sums_size as u64,
@@ -294,8 +297,7 @@ pub fn dispatch_paged_attention_v2(
         );
         let pipeline = state.get_pipeline(&kernel_name)?;
 
-        let command_queue = state.device.new_command_queue();
-        let command_buffer = command_queue.new_command_buffer();
+        let command_buffer = state.command_queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
 
         encoder.set_compute_pipeline_state(&pipeline);
@@ -391,8 +393,7 @@ pub fn dispatch_paged_attention_v2(
             MetalState::paged_attention_v2_reduce_kernel_name(dtype, params.head_size);
         let pipeline = state.get_pipeline(&kernel_name)?;
 
-        let command_queue = state.device.new_command_queue();
-        let command_buffer = command_queue.new_command_buffer();
+        let command_buffer = state.command_queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
 
         encoder.set_compute_pipeline_state(&pipeline);
@@ -492,8 +493,8 @@ impl PagedAttentionOutput {
         );
 
         // Blit copy from private to shared
-        let command_queue = state.device.new_command_queue();
-        let command_buffer = command_queue.new_command_buffer();
+
+        let command_buffer = state.command_queue.new_command_buffer();
         let blit_encoder = command_buffer.new_blit_command_encoder();
 
         blit_encoder.copy_from_buffer(&self.buffer, 0, &shared_buffer, 0, size_bytes as u64);
@@ -625,8 +626,8 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
     let pipeline = state.get_pipeline(&kernel_name)?;
 
     // Create command buffer and encoder
-    let command_queue = state.device.new_command_queue();
-    let command_buffer = command_queue.new_command_buffer();
+
+    let command_buffer = state.command_queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
 
     encoder.set_compute_pipeline_state(&pipeline);
@@ -799,8 +800,7 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         );
         let pipeline = state.get_pipeline(&kernel_name)?;
 
-        let command_queue = state.device.new_command_queue();
-        let command_buffer = command_queue.new_command_buffer();
+        let command_buffer = state.command_queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
 
         encoder.set_compute_pipeline_state(&pipeline);
@@ -896,8 +896,7 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
             MetalState::paged_attention_v2_reduce_kernel_name(dtype, params.head_size);
         let pipeline = state.get_pipeline(&kernel_name)?;
 
-        let command_queue = state.device.new_command_queue();
-        let command_buffer = command_queue.new_command_buffer();
+        let command_buffer = state.command_queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
 
         encoder.set_compute_pipeline_state(&pipeline);

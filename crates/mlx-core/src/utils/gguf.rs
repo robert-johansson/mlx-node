@@ -292,8 +292,18 @@ fn read_f64(r: &mut impl Read) -> std::io::Result<f64> {
     Ok(f64::from_le_bytes(buf))
 }
 
+/// Maximum allocation size for a single string/array read (256 MB).
+/// Prevents OOM from crafted GGUF files with huge length fields.
+const MAX_GGUF_ALLOC: usize = 256 * 1024 * 1024;
+
 fn read_string(r: &mut impl Read) -> std::io::Result<String> {
     let len = read_u64(r)? as usize;
+    if len > MAX_GGUF_ALLOC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("GGUF string length {len} exceeds maximum ({MAX_GGUF_ALLOC})"),
+        ));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -326,6 +336,12 @@ fn read_meta_value(r: &mut impl Read, vtype: GgufValueType) -> std::io::Result<G
 fn read_meta_array(r: &mut impl Read) -> std::io::Result<GgufMetaValue> {
     let elem_type = read_u32(r)?;
     let len = read_u64(r)? as usize;
+    if len > MAX_GGUF_ALLOC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("GGUF array length {len} exceeds maximum ({MAX_GGUF_ALLOC})"),
+        ));
+    }
 
     let elem_vtype = GgufValueType::from_u32(elem_type).ok_or_else(|| {
         std::io::Error::new(
@@ -446,12 +462,14 @@ pub fn parse_gguf<P: AsRef<Path>>(path: P) -> Result<GgufFile> {
         let offset = read_u64(&mut reader)
             .map_err(|e| Error::from_reason(format!("Failed to read tensor offset: {e}")))?;
 
-        // We still record unsupported types; we'll error when loading
         let tensor_type = match tensor_type {
             Some(t) => t,
             None => {
-                warn!("Tensor '{name}' has unsupported GGUF type {type_u32}, will skip");
-                continue;
+                return Err(Error::from_reason(format!(
+                    "Tensor '{}' has unsupported GGUF type {} — only F32(0), F16(1), Q4_0(2), Q4_1(3), Q8_0(8), BF16(30) are supported. \
+                     K-quant formats (Q4_K, Q5_K, Q6_K, etc.) require dequantization before conversion.",
+                    name, type_u32
+                )));
             }
         };
 
@@ -736,12 +754,10 @@ pub fn gguf_name_to_hf(name: &str) -> String {
         result = result.replace(".ln2.", ".norm2.");
         return result;
     }
-    if name == "mm.0.weight" || name == "mm.0.bias" {
-        let suffix = name.strip_prefix("mm.0.").unwrap();
+    if let Some(suffix) = name.strip_prefix("mm.0.") {
         return format!("vision_tower.merger.linear_fc1.{suffix}");
     }
-    if name == "mm.2.weight" || name == "mm.2.bias" {
-        let suffix = name.strip_prefix("mm.2.").unwrap();
+    if let Some(suffix) = name.strip_prefix("mm.2.") {
         return format!("vision_tower.merger.linear_fc2.{suffix}");
     }
     if name.starts_with("v.post_ln.") {

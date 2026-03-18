@@ -111,8 +111,8 @@ export declare class GenerationResult {
   get tokens(): MxArray;
   /** Get the log probabilities */
   get logprobs(): MxArray;
-  /** Get the finish reason ("eos", "length", or "repetition") */
-  get finishReason(): 'eos' | 'length' | 'repetition';
+  /** Get the finish reason ("stop", "length", or "repetition") */
+  get finishReason(): 'stop' | 'length' | 'repetition';
   /** Get the number of tokens generated */
   get numTokens(): number;
 }
@@ -673,7 +673,7 @@ export declare class Qwen35Model {
    * - model.safetensors (or model-*.safetensors)
    * - tokenizer.json + tokenizer_config.json
    */
-  static loadPretrained(path: string): Promise<Qwen35Model>;
+  static load(path: string): Promise<Qwen35Model>;
   /**
    * Generate text from a prompt token sequence.
    *
@@ -730,7 +730,7 @@ export declare class Qwen35MoeModel {
   resetCaches(): void;
   forward(inputIds: MxArray): MxArray;
   forwardWithCache(inputIds: MxArray): MxArray;
-  static loadPretrained(path: string): Promise<Qwen35MoeModel>;
+  static load(path: string): Promise<Qwen35MoeModel>;
   generate(promptTokens: MxArray, config: Qwen35MoeGenerationConfig): Promise<Qwen35MoeGenerationResult>;
   chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
@@ -927,8 +927,8 @@ export declare class Qwen3Model {
    *
    * # Example (TypeScript)
    * ```typescript
-   * const targetModel = await ModelLoader.loadPretrained('qwen3-7b');
-   * const draftModel = await ModelLoader.loadPretrained('qwen3-0.5b');
+   * const targetModel = await loadModel('qwen3-7b');
+   * const draftModel = await loadModel('qwen3-0.5b');
    *
    * const result = targetModel.generateSpeculativeSync(draftModel, inputIds, {
    *   numDraftTokens: 5,
@@ -1118,7 +1118,7 @@ export declare class Qwen3Model {
    *
    * # Example
    * ```typescript
-   * const model = await Qwen3Model.loadPretrained("path/to/model");
+   * const model = await Qwen3Model.load("path/to/model");
    * const messages = [
    *   { role: "user", content: "What is 2+2?" }
    * ];
@@ -1247,7 +1247,7 @@ export declare class Qwen3Model {
    * Decode token IDs to text using the internal tokenizer
    *
    * Helper method for decoding generated tokens. The model must have been loaded
-   * via load_pretrained() to have a tokenizer available.
+   * via load() to have a tokenizer available.
    *
    * # Arguments
    * * `token_ids` - Token IDs to decode as Uint32Array
@@ -1261,7 +1261,7 @@ export declare class Qwen3Model {
    * Apply chat template and encode to token IDs
    *
    * Formats messages using ChatML format (or Jinja2 template with tools) and encodes to tokens.
-   * The model must have been loaded via load_pretrained() to have a tokenizer available.
+   * The model must have been loaded via load() to have a tokenizer available.
    *
    * # Arguments
    * * `messages` - Array of chat messages
@@ -1292,7 +1292,7 @@ export declare class Qwen3Model {
    * # Returns
    * * A fully initialized Qwen3Model with loaded weights
    */
-  static loadPretrained(modelPath: string): Promise<Qwen3Model>;
+  static load(modelPath: string): Promise<Qwen3Model>;
   /**
    * Save model configuration and weights to disk
    *
@@ -1499,8 +1499,12 @@ export declare class SftTrainingEngine {
   reset(): void;
   /** Restore training state (for resuming from checkpoint) */
   restoreState(step: number, epoch: number): void;
-  /** Get the underlying Qwen3 model for checkpointing (only works for Qwen3 variant) */
+  /** Get the underlying Qwen3 model for checkpointing */
   getModel(): Qwen3Model;
+  /** Get the underlying Qwen3.5 dense model for checkpointing */
+  getQwen35Model(): Qwen35Model;
+  /** Get the underlying Qwen3.5 MoE model for checkpointing */
+  getQwen35MoeModel(): Qwen35MoeModel;
 }
 
 /**
@@ -1899,7 +1903,7 @@ export declare const enum BuiltinRewardType {
   XmlFormat = 'XmlFormat',
   /** Length-based scoring */
   Length = 'Length',
-  /** JSON schema validation */
+  /** JSON format validation (brace matching + field name check, not full JSON parsing) */
   JsonSchema = 'JsonSchema',
 }
 
@@ -1916,11 +1920,16 @@ export interface ChatConfig {
   repetitionContextSize?: number | undefined;
   /** Max consecutive identical tokens before stopping (default: 16, 0 = disabled) */
   maxConsecutiveTokens?: number | undefined;
-  /** Max n-gram repetitions before stopping (default: 8, 0 = disabled) */
+  /** Max n-gram repetitions before stopping (default: 3, 0 = disabled) */
   maxNgramRepeats?: number | undefined;
-  /** N-gram size for repetition detection (default: 3) */
+  /** Max pattern size for n-gram repetition detection (default: 64) */
   ngramSize?: number | undefined;
   tools?: Array<ToolDefinition>;
+  /**
+   * Enable thinking mode (Qwen3's <think> tags). Default: true (model thinks naturally).
+   * Set to false to suppress thinking by injecting empty <think></think> tags.
+   */
+  enableThinking?: boolean | undefined;
   /** When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result */
   reportPerformance?: boolean | undefined;
 }
@@ -1928,7 +1937,7 @@ export interface ChatConfig {
 /** Chat message with tool calling support */
 export interface ChatMessage {
   /** Role: "system", "user", "assistant", or "tool" */
-  role: string;
+  role: 'system' | 'user' | 'assistant' | 'tool' | (string & {});
   /** Message content */
   content: string;
   /** Tool calls made by the assistant (for assistant messages) */
@@ -1953,14 +1962,16 @@ export interface ChatResult {
   performance?: PerformanceMetrics;
 }
 
-/** Chat message role */
+/** Chat message role (lowercase values matching standard convention) */
 export declare const enum ChatRole {
   /** User message */
-  User = 'User',
+  User = 'user',
   /** Assistant response */
-  Assistant = 'Assistant',
+  Assistant = 'assistant',
   /** System prompt */
-  System = 'System',
+  System = 'system',
+  /** Tool response */
+  Tool = 'tool',
 }
 
 /** A single chunk emitted during streaming chat generation. */
@@ -2237,13 +2248,13 @@ export interface GenerateBatchResult {
   completionLogprobs: Array<number>;
   /** Lengths of each completion (for reconstruction) */
   completionLengths: Array<number>;
-  /** Finish reasons for each completion ("eos", "length", or "repetition") */
+  /** Finish reasons for each completion ("stop", "length", or "repetition") */
   finishReasons: Array<string>;
 }
 
 /** Configuration for text generation */
 export interface GenerationConfig {
-  /** Maximum number of new tokens to generate (default: 100) */
+  /** Maximum number of new tokens to generate (default: 2048) */
   maxNewTokens?: number;
   /** Sampling temperature (0 = greedy, higher = more random) (default: 1.0) */
   temperature?: number;
@@ -2677,7 +2688,7 @@ export interface PagedCompletedSequence {
   requestId: string;
   /** All generated tokens (excluding prompt) */
   tokens: Array<number>;
-  /** Reason for completion ("eos", "max_tokens", etc.) */
+  /** Reason for completion ("stop", "length", "repetition", "tool_calls") */
   finishReason: string;
 }
 

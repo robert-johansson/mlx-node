@@ -23,7 +23,7 @@
 ///
 /// ## Usage
 /// ```ignore
-/// const model = await Qwen3Model.loadPretrained(modelPath);
+/// const model = await Qwen3Model.load(modelPath);
 /// const engine = new GRPOTrainingEngine(model, config);
 /// engine.registerBuiltinReward({ rewardType: 'ToolUse', allowedTools: ['search'] });
 ///
@@ -272,7 +272,7 @@ pub struct GenerateBatchResult {
     pub completion_logprobs: Vec<f64>,
     /// Lengths of each completion (for reconstruction)
     pub completion_lengths: Vec<i32>,
-    /// Finish reasons for each completion ("eos", "length", or "repetition")
+    /// Finish reasons for each completion ("stop", "length", or "repetition")
     pub finish_reasons: Vec<String>,
 }
 
@@ -817,10 +817,9 @@ impl GRPOTrainingEngine {
                 let (mean_reward, std_reward) = compute_reward_stats(&rewards);
                 let total_tokens: i32 = token_counts_all.iter().sum();
 
-                let mut state = state_arc.write().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+                let state = state_arc.read().map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire state read lock")
                 })?;
-                state.step += 1;
 
                 return Ok::<EngineStepMetrics, Error>(EngineStepMetrics {
                     step: state.step,
@@ -903,7 +902,6 @@ impl GRPOTrainingEngine {
                         );
                     }
 
-                    state.step += 1;
                     let current_step = state.step;
                     drop(state);
 
@@ -1426,10 +1424,9 @@ impl GRPOTrainingEngine {
                 let (mean_reward, std_reward) = compute_reward_stats(&rewards);
                 let total_tokens: i32 = token_counts_all.iter().sum();
 
-                let mut state = state_arc.write().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+                let state = state_arc.read().map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire state read lock")
                 })?;
-                state.step += 1;
 
                 return Ok::<EngineStepMetrics, Error>(EngineStepMetrics {
                     step: state.step,
@@ -1504,9 +1501,8 @@ impl GRPOTrainingEngine {
                 let mut state = state_arc.write().map_err(|_| {
                     Error::new(Status::GenericFailure, "Failed to acquire state write lock")
                 })?;
-                state.step += 1;
 
-                // Track NaN gradient occurrences
+                // Track NaN gradient occurrences (step NOT incremented on NaN skip)
                 state.nan_gradient_count += 1;
                 state.consecutive_nan_count += 1;
 
@@ -2119,10 +2115,9 @@ impl GRPOTrainingEngine {
                 let (mean_reward, std_reward) = compute_reward_stats(&rewards_clone);
                 let total_tokens: u32 = filtered_token_counts.iter().sum();
 
-                let mut state = state_arc.write().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+                let state = state_arc.read().map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire state read lock")
                 })?;
-                state.step += 1;
 
                 return Ok::<EngineStepMetrics, Error>(EngineStepMetrics {
                     step: state.step,
@@ -2175,7 +2170,6 @@ impl GRPOTrainingEngine {
                         state.needs_emergency_save = true;
                     }
 
-                    state.step += 1;
                     let current_step = state.step;
                     drop(state);
 
@@ -2643,7 +2637,7 @@ struct IntermediateGenerationResult {
     completion_logprobs: Vec<MxArray>,
     /// Token counts for each completion
     token_counts: Vec<u32>,
-    /// Finish reasons for each completion ("eos", "length", or "repetition")
+    /// Finish reasons for each completion ("stop", "length", or "repetition")
     finish_reasons: Vec<String>,
 }
 

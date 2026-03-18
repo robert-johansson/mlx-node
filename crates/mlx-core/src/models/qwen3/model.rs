@@ -103,7 +103,7 @@ pub struct PagedCompletedSequence {
     pub request_id: String,
     /// All generated tokens (excluding prompt)
     pub tokens: Vec<u32>,
-    /// Reason for completion ("eos", "max_tokens", etc.)
+    /// Reason for completion ("stop", "length", "repetition", "tool_calls")
     pub finish_reason: String,
 }
 
@@ -124,7 +124,7 @@ pub struct Qwen3Model {
     lm_head: Arc<RwLock<Linear>>,
     // KV caches for incremental generation (one per layer)
     kv_caches: Arc<RwLock<Option<Vec<KVCache>>>>,
-    // Tokenizer for text-to-text generation (loaded via load_pretrained)
+    // Tokenizer for text-to-text generation (loaded via load)
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
 
     // Paged attention state (opt-in, for memory-efficient inference)
@@ -1312,7 +1312,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained().",
+                "Tokenizer not available. Model must be loaded via load().",
             )
         })?;
 
@@ -1343,7 +1343,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained().",
+                "Tokenizer not available. Model must be loaded via load().",
             )
         })?;
 
@@ -1388,7 +1388,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained().",
+                "Tokenizer not available. Model must be loaded via load().",
             )
         })?;
 
@@ -1418,7 +1418,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained().",
+                "Tokenizer not available. Model must be loaded via load().",
             )
         })?;
 
@@ -1438,7 +1438,7 @@ impl Qwen3Model {
         let config = config.unwrap_or_default();
         let input_ids = input_ids.clone();
         // Extract configuration with defaults
-        let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
         let temperature = config.temperature.unwrap_or(1.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -1833,8 +1833,8 @@ impl Qwen3Model {
     ///
     /// # Example (TypeScript)
     /// ```typescript
-    /// const targetModel = await ModelLoader.loadPretrained('qwen3-7b');
-    /// const draftModel = await ModelLoader.loadPretrained('qwen3-0.5b');
+    /// const targetModel = await loadModel('qwen3-7b');
+    /// const draftModel = await loadModel('qwen3-0.5b');
     ///
     /// const result = targetModel.generateSpeculativeSync(draftModel, inputIds, {
     ///   numDraftTokens: 5,
@@ -1874,7 +1874,7 @@ impl Qwen3Model {
         let input_ids = input_ids.clone();
 
         // Extract configuration
-        let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
         let temperature = config.temperature.unwrap_or(1.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -2332,7 +2332,7 @@ impl Qwen3Model {
         let total_completions = num_prompts * group_size;
 
         // Extract configuration with defaults
-        let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
         let temperature = config.temperature.unwrap_or(1.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -2947,7 +2947,7 @@ impl Qwen3Model {
         let total_batch_size = num_prompts * group_size;
 
         // Extract configuration with defaults
-        let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
         let temperature = config.temperature.unwrap_or(1.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -3574,22 +3574,22 @@ impl Qwen3Model {
     ///
     /// This matches the TypeScript API for compatibility
     #[napi]
-    pub fn get_parameters(&self) -> HashMap<String, MxArray> {
+    pub fn get_parameters(&self) -> Result<HashMap<String, MxArray>> {
         let mut params = HashMap::new();
 
         // Acquire read locks for model components
         let layers_guard = self
             .layers
             .read()
-            .expect("Failed to acquire layers read lock");
+            .map_err(|_| Error::from_reason("Failed to acquire layers read lock"))?;
         let final_norm_guard = self
             .final_norm
             .read()
-            .expect("Failed to acquire final_norm read lock");
+            .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
         let lm_head_guard = self
             .lm_head
             .read()
-            .expect("Failed to acquire lm_head read lock");
+            .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
 
         // Embedding
         params.insert("embedding.weight".to_string(), self.embedding.get_weight());
@@ -3663,7 +3663,7 @@ impl Qwen3Model {
             params.insert("lm_head.weight".to_string(), lm_head_guard.get_weight());
         }
 
-        params
+        Ok(params)
     }
 
     /// Calculate total memory size of model parameters in bytes
@@ -3673,7 +3673,10 @@ impl Qwen3Model {
     ///
     /// Equivalent to mlx-lm's: `tree_reduce(lambda acc, x: acc + x.nbytes, model, 0)`
     pub fn calculate_memory_size(&self) -> usize {
-        let params = self.get_parameters();
+        let params = match self.get_parameters() {
+            Ok(p) => p,
+            Err(_) => return 0,
+        };
         params.values().map(|p| p.nbytes()).sum()
     }
 
@@ -3950,7 +3953,7 @@ impl Qwen3Model {
         let loss = crate::nn::Losses::cross_entropy(&logits_flat, &labels_flat, None, None, None)?;
 
         // 3. Compute gradients
-        let params = self.get_parameters();
+        let params = self.get_parameters()?;
         let mut gradients = HashMap::new();
 
         // Compute gradient of loss w.r.t. logits (starting point for backprop)
@@ -4075,7 +4078,7 @@ impl Qwen3Model {
         learning_rate: f64,
     ) -> Result<(f64, HashMap<String, f64>)> {
         // 1. Get current model parameters
-        let params = self.get_parameters();
+        let params = self.get_parameters()?;
 
         // 2. Compute loss and gradients using autograd
         let model_type = ModelType::Qwen3(self.config.clone());
@@ -4155,7 +4158,7 @@ impl Qwen3Model {
         config: crate::grpo::loss::GRPOLossConfig,
     ) -> Result<(f64, HashMap<String, MxArray>, HashMap<String, f64>)> {
         // 1. Get current model parameters
-        let params = self.get_parameters();
+        let params = self.get_parameters()?;
 
         // 2. Compute loss and gradients using autograd
         let model_type = ModelType::Qwen3(self.config.clone());
@@ -4312,7 +4315,7 @@ impl Qwen3Model {
         loss.eval();
 
         // 4. Compute gradients (manual for MVP, like compute_loss_and_gradients)
-        let params = self.get_parameters();
+        let params = self.get_parameters()?;
         let mut gradients = HashMap::new();
 
         // For MVP: Use small random gradients scaled by loss
@@ -4413,7 +4416,7 @@ impl Qwen3Model {
         learning_rate: f64,
     ) -> Result<()> {
         // Get current parameters (for NAPI callers who don't have params cached)
-        let params = self.get_parameters();
+        let params = self.get_parameters()?;
         self.apply_gradients_with_params(gradients, learning_rate, &params)
     }
 
@@ -4580,7 +4583,7 @@ impl Qwen3Model {
         let config = config.unwrap_or_default();
         let input_ids = input_ids.clone();
         // Extract configuration with defaults
-        let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
         let temperature = config.temperature.unwrap_or(1.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -5018,7 +5021,7 @@ impl Qwen3Model {
     ///
     /// # Example
     /// ```typescript
-    /// const model = await Qwen3Model.loadPretrained("path/to/model");
+    /// const model = await Qwen3Model.load("path/to/model");
     /// const messages = [
     ///   { role: "user", content: "What is 2+2?" }
     /// ];
@@ -5041,7 +5044,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained() to use generate().",
+                "Tokenizer not available. Model must be loaded via load() to use generate().",
             )
         })?;
 
@@ -5171,12 +5174,13 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained() to use chat().",
+                "Tokenizer not available. Model must be loaded via load() to use chat().",
             )
         })?;
 
-        // Extract tools and report_performance from config
+        // Extract tools, enable_thinking, and report_performance from config
         let tools = config.as_ref().and_then(|c| c.tools.clone());
+        let enable_thinking = config.as_ref().and_then(|c| c.enable_thinking);
         let report_perf = config
             .as_ref()
             .and_then(|c| c.report_performance)
@@ -5219,7 +5223,7 @@ impl Qwen3Model {
                 &messages,
                 Some(true),
                 tools.as_deref(),
-                None,
+                enable_thinking,
             )?;
 
             // Create MxArray from token IDs
@@ -5342,7 +5346,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained() to use generateBatch().",
+                "Tokenizer not available. Model must be loaded via load() to use generateBatch().",
             )
         })?;
 
@@ -5445,7 +5449,7 @@ impl Qwen3Model {
     /// Decode token IDs to text using the internal tokenizer
     ///
     /// Helper method for decoding generated tokens. The model must have been loaded
-    /// via load_pretrained() to have a tokenizer available.
+    /// via load() to have a tokenizer available.
     ///
     /// # Arguments
     /// * `token_ids` - Token IDs to decode as Uint32Array
@@ -5462,7 +5466,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained().",
+                "Tokenizer not available. Model must be loaded via load().",
             )
         })?;
 
@@ -5484,7 +5488,7 @@ impl Qwen3Model {
     /// Apply chat template and encode to token IDs
     ///
     /// Formats messages using ChatML format (or Jinja2 template with tools) and encodes to tokens.
-    /// The model must have been loaded via load_pretrained() to have a tokenizer available.
+    /// The model must have been loaded via load() to have a tokenizer available.
     ///
     /// # Arguments
     /// * `messages` - Array of chat messages
@@ -5506,7 +5510,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained().",
+                "Tokenizer not available. Model must be loaded via load().",
             )
         })?;
 
