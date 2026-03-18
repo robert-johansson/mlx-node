@@ -455,7 +455,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@mlx-node/cli@workspace:packages/cli":
+"@mlx-node/cli@workspace:*, @mlx-node/cli@workspace:packages/cli":
   version: 0.0.0-use.local
   resolution: "@mlx-node/cli@workspace:packages/cli"
   dependencies:
@@ -3429,8 +3429,10 @@ __metadata:
   resolution: "mlx-node@workspace:."
   dependencies:
     "@ast-grep/napi": "npm:^0.41.1"
+    "@mlx-node/cli": "workspace:*"
     "@mlx-node/lm": "workspace:*"
     "@mlx-node/trl": "workspace:*"
+    "@mlx-node/vlm": "workspace:*"
     "@napi-rs/cli": "npm:^3.5.1"
     "@napi-rs/simple-git": "npm:^0.1.22"
     "@oxc-node/cli": "npm:^0.0.35"

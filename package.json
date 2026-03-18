@@ -20,8 +20,10 @@
   },
   "devDependencies": {
     "@ast-grep/napi": "^0.41.1",
+    "@mlx-node/cli": "workspace:*",
     "@mlx-node/lm": "workspace:*",
     "@mlx-node/trl": "workspace:*",
+    "@mlx-node/vlm": "workspace:*",
     "@napi-rs/cli": "^3.5.1",
     "@napi-rs/simple-git": "^0.1.22",
     "@oxc-node/cli": "^0.0.35",
