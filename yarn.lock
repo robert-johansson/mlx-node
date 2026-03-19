@@ -468,13 +468,23 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@mlx-node/core-darwin-arm64@workspace:*, @mlx-node/core-darwin-arm64@workspace:packages/core/npm/darwin-arm64":
+  version: 0.0.0-use.local
+  resolution: "@mlx-node/core-darwin-arm64@workspace:packages/core/npm/darwin-arm64"
+  languageName: unknown
+  linkType: soft
+
 "@mlx-node/core@workspace:*, @mlx-node/core@workspace:packages/core":
   version: 0.0.0-use.local
   resolution: "@mlx-node/core@workspace:packages/core"
   dependencies:
+    "@mlx-node/core-darwin-arm64": "workspace:*"
     "@napi-rs/cli": "npm:^3.5.1"
     "@oxc-node/cli": "npm:^0.0.35"
     oxfmt: "npm:^0.40.0"
+  dependenciesMeta:
+    "@mlx-node/core-darwin-arm64":
+      optional: true
   languageName: unknown
   linkType: soft
 

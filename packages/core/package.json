@@ -1,6 +1,6 @@
 {
   "name": "@mlx-node/core",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "Internal native bindings - import from @mlx-node/lm or @mlx-node/trl instead",
   "homepage": "https://github.com/mlx-node/mlx-node",
   "bugs": {
@@ -28,14 +28,15 @@
   },
   "scripts": {
     "build": "oxnode ./build.ts --release",
-    "prepublishOnly": "napi prepublish -t npm --no-gh-release",
-    "preversion": "oxnode ./build.ts && git add .",
-    "version": "napi version"
+    "preversion": "oxnode ./build.ts && git add ."
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.5.1",
     "@oxc-node/cli": "^0.0.35",
     "oxfmt": "^0.40.0"
+  },
+  "optionalDependencies": {
+    "@mlx-node/core-darwin-arm64": "workspace:*"
   },
   "napi": {
     "binaryName": "mlx-core",
