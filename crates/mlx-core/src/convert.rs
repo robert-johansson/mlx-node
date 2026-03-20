@@ -808,38 +808,75 @@ pub(crate) fn build_qwen35_recipe(
 /// GatedDeltaNet (linear attention/SSM) + full attention architecture:
 /// (https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks)
 ///
-/// Key findings from Unsloth's per-tensor KLD analysis:
+/// Key findings from Unsloth's per-tensor 99.9% KLD analysis (sorted worst→best):
 ///
 /// **Most sensitive (skip quantization — keep bf16):**
-/// - `ssm_out` (`linear_attn.out_proj`): "dramatically increases KLD and the disk
-///   space savings is minuscule" — quantizing even to Q8 degrades quality severely
-/// - `attn_*` (`self_attn.*`): "quantizing any attn_* is especially sensitive for
-///   hybrid architectures, and so leaving them in higher precision works well"
+/// - `ssm_out` (`linear_attn.out_proj`): KLD ~6.0 at q2_k — by far the worst
+/// - `attn_qkv` (`self_attn.*`): KLD ~2.9 — "especially sensitive for hybrid architectures"
+/// - `attn_v/output/q/gate`: KLD ~1.5-2.1 — all attn_* tensors are high sensitivity
 /// - `attn_gate` (`linear_attn.in_proj_z`): "performs poorly with MXFP4"
 /// - `ssm_beta`, `ssm_alpha` (`in_proj_a/b`): degrade significantly with low bits
 ///   (already excluded by `should_quantize()` since they lack `.weight` suffix)
 ///
-/// **Slightly sensitive (default_bits + 1):**
-/// - `ffn_down_exps` (`down_proj`): "slightly more sensitive" than other FFN weights
+/// **Moderate sensitivity (default_bits + 1):**
+/// - `ffn_down` (`down_proj`): "slightly more sensitive" than other FFN weights
 ///
-/// **Safe to quantize aggressively (default bits):**
-/// - `ffn_up_exps`, `ffn_gate_exps`: "generally ok to quantize to 3-bit"
+/// **Safe to quantize aggressively (default bits = 3-bit):**
+/// - `ffn_up`, `ffn_gate`: "generally ok to quantize to 3-bit"
+/// - "leaving ffn_* (down, up, gate) at around iq3_xxs seems to be best compromise"
+///
+/// **Very low sensitivity (quantize at 5-6 bit):**
+/// - `token_embedding`: KLD ~0.15 at q5_k — among the least sensitive tensors
+/// - `output-tensor` (lm_head): KLD ~0.05 at q5_k — the safest tensor to quantize
 ///
 /// **Always 8-bit:**
 /// - Router gates: standard for MoE routing accuracy
 ///
 /// This recipe matches Unsloth Dynamic 2.0's approach of "upcasting important
-/// layers to 8 or 16-bit" while aggressively quantizing FFN expert weights.
-/// Results in larger model size than `qwen3_5` recipe but significantly better
-/// quality, particularly for the hybrid attention/SSM architecture.
+/// layers to 8 or 16-bit" while aggressively quantizing FFN weights to 3-bit.
+/// Embeddings and lm_head are quantized at higher precision (5-6 bit) following
+/// llama.cpp's standard practice — they're dequantized at load time since the
+/// model accesses them every token (savings come from smaller file on disk).
 pub(crate) fn build_unsloth_recipe(
     default_bits: i32,
     default_group_size: i32,
 ) -> Box<dyn Fn(&str) -> QuantDecision + Send + Sync> {
-    let down_proj_bits = (default_bits + 1).min(8);
+    // MLX quantize supports: 2, 3, 4, 5, 6, 8 (no 7)
+    let snap_bits = |b: i32| -> i32 {
+        match b {
+            b if b <= 2 => 2,
+            3 => 3,
+            4 => 4,
+            5 => 5,
+            6 => 6,
+            7 => 8, // 7 not supported, snap up to 8
+            _ => 8,
+        }
+    };
+    let down_proj_bits = snap_bits(default_bits + 1);
+    let embed_bits = snap_bits(default_bits + 2);
+    let lm_head_bits = snap_bits(default_bits + 3);
     let gs = default_group_size;
 
     Box::new(move |key: &str| -> QuantDecision {
+        // Handle embed_tokens and lm_head BEFORE should_quantize (which skips them).
+        // These are among the least sensitive tensors per Unsloth's KLD analysis:
+        // token_embedding KLD ~0.15, output KLD ~0.05 at q5_k
+        if key.contains("embed_tokens") && key.ends_with(".weight") {
+            return QuantDecision::Custom {
+                bits: embed_bits,
+                group_size: gs,
+                mode: "affine".to_string(),
+            };
+        }
+        if key.contains("lm_head") && key.ends_with(".weight") {
+            return QuantDecision::Custom {
+                bits: lm_head_bits,
+                group_size: gs,
+                mode: "affine".to_string(),
+            };
+        }
+
         if !should_quantize(key) {
             return QuantDecision::Skip;
         }
@@ -868,7 +905,7 @@ pub(crate) fn build_unsloth_recipe(
             return QuantDecision::Skip;
         }
 
-        // ffn_down_exps: "slightly more sensitive" than other FFN variants
+        // ffn_down: "slightly more sensitive" than other FFN variants
         if key.contains("down_proj") {
             return QuantDecision::Custom {
                 bits: down_proj_bits,
@@ -877,7 +914,7 @@ pub(crate) fn build_unsloth_recipe(
             };
         }
 
-        // Everything else (ffn_gate_proj, ffn_up_proj, etc.) → default bits
+        // Everything else (ffn_gate_proj, ffn_up_proj, etc.) → default bits (3-bit)
         QuantDecision::Default
     })
 }
@@ -1437,42 +1474,110 @@ fn sanitize_qwen35_moe(
         }
     }
 
-    // Step 3: Stack individual expert weights
-    for l in 0..num_hidden_layers {
-        let prefix = format!("language_model.model.layers.{}.mlp", l);
-        let first_expert_key = format!("{}.experts.0.gate_proj.weight", prefix);
+    // Step 3: Stack/normalize expert weights
+    //
+    // Two source formats:
+    // A) Individual experts: experts.{i}.gate_proj.weight, experts.{i}.up_proj.weight, ...
+    //    → Stack into 3D [num_experts, out, in] → switch_mlp.{proj}.weight
+    // B) Pre-stacked fused: experts.gate_up_proj [E, fused_out, in], experts.down_proj [E, out, in]
+    //    → Split gate_up_proj along dim 1, rename → switch_mlp.{proj}.weight
+    //
+    // Format B comes from HuggingFace models that already fuse gate+up into one tensor
+    // and omit the .weight suffix. Without normalization, should_quantize() skips them
+    // (requires .weight suffix), leaving 60GB of expert weights unquantized.
 
-        if !new_weights.contains_key(&first_expert_key) {
-            continue;
-        }
+    let has_individual_experts = new_weights
+        .keys()
+        .any(|k| k.contains(".experts.0.gate_proj.weight"));
+    let has_prestacked_experts = new_weights
+        .keys()
+        .any(|k| k.contains(".experts.gate_up_proj") || k.contains(".experts.down_proj"));
 
-        info!("  Layer {}: stacking {} experts...", l, num_experts);
-
-        for proj in &["gate_proj", "up_proj", "down_proj"] {
-            let mut to_stack: Vec<MxArray> = Vec::with_capacity(num_experts);
-            for e in 0..num_experts {
-                let k = format!("{}.experts.{}.{}.weight", prefix, e, proj);
-                match new_weights.remove(&k) {
-                    Some(w) => to_stack.push(w),
-                    None => {
-                        return Err(Error::from_reason(format!("Missing expert weight: {}", k)));
-                    }
-                }
-            }
-            let refs: Vec<&MxArray> = to_stack.iter().collect();
-            let stacked = MxArray::stack(refs, Some(0))?;
-            new_weights.insert(format!("{}.switch_mlp.{}.weight", prefix, proj), stacked);
-        }
+    if has_individual_experts && has_prestacked_experts {
+        warn!("Model has both individual and pre-stacked expert weights — using individual format");
     }
 
-    // Clean up any remaining individual expert keys (shouldn't be any after stacking)
-    let expert_keys: Vec<String> = new_weights
-        .keys()
-        .filter(|k| k.contains(".mlp.experts.") && k.ends_with(".weight"))
-        .cloned()
-        .collect();
-    for k in expert_keys {
-        new_weights.remove(&k);
+    if has_individual_experts {
+        // Format A: individual experts → stack
+        for l in 0..num_hidden_layers {
+            let prefix = format!("language_model.model.layers.{}.mlp", l);
+            let first_expert_key = format!("{}.experts.0.gate_proj.weight", prefix);
+
+            if !new_weights.contains_key(&first_expert_key) {
+                continue;
+            }
+
+            info!(
+                "  Layer {}: stacking {} individual experts...",
+                l, num_experts
+            );
+
+            for proj in &["gate_proj", "up_proj", "down_proj"] {
+                let mut to_stack: Vec<MxArray> = Vec::with_capacity(num_experts);
+                for e in 0..num_experts {
+                    let k = format!("{}.experts.{}.{}.weight", prefix, e, proj);
+                    match new_weights.remove(&k) {
+                        Some(w) => to_stack.push(w),
+                        None => {
+                            return Err(Error::from_reason(format!(
+                                "Missing expert weight: {}",
+                                k
+                            )));
+                        }
+                    }
+                }
+                let refs: Vec<&MxArray> = to_stack.iter().collect();
+                let stacked = MxArray::stack(refs, Some(0))?;
+                new_weights.insert(format!("{}.switch_mlp.{}.weight", prefix, proj), stacked);
+            }
+        }
+
+        // Clean up any remaining individual expert keys
+        let expert_keys: Vec<String> = new_weights
+            .keys()
+            .filter(|k| k.contains(".mlp.experts.") && k.ends_with(".weight"))
+            .cloned()
+            .collect();
+        for k in expert_keys {
+            new_weights.remove(&k);
+        }
+    } else if has_prestacked_experts {
+        // Format B: pre-stacked fused experts → split gate_up_proj, rename with .weight suffix
+        let expert_keys: Vec<String> = new_weights
+            .keys()
+            .filter(|k| k.contains(".experts.gate_up_proj") || k.contains(".experts.down_proj"))
+            .cloned()
+            .collect();
+
+        info!(
+            "  Normalizing {} pre-stacked expert tensors (split gate_up_proj, add .weight suffix)",
+            expert_keys.len()
+        );
+
+        for k in expert_keys {
+            let array = new_weights.remove(&k).unwrap();
+
+            if k.ends_with(".experts.gate_up_proj") {
+                // Split fused [E, gate_dim+up_dim, in] → gate [E, dim, in] + up [E, dim, in]
+                let dim1 = array.shape_at(1)?;
+                if dim1 % 2 != 0 {
+                    return Err(Error::from_reason(format!(
+                        "gate_up_proj dim 1 must be even, got {} for '{}'",
+                        dim1, k
+                    )));
+                }
+                let half = dim1 / 2;
+                let gate = array.slice_axis(1, 0, half)?;
+                let up = array.slice_axis(1, half, dim1)?;
+
+                let base = k.strip_suffix(".experts.gate_up_proj").unwrap();
+                new_weights.insert(format!("{}.switch_mlp.gate_proj.weight", base), gate);
+                new_weights.insert(format!("{}.switch_mlp.up_proj.weight", base), up);
+            } else if k.ends_with(".experts.down_proj") {
+                let base = k.strip_suffix(".experts.down_proj").unwrap();
+                new_weights.insert(format!("{}.switch_mlp.down_proj.weight", base), array);
+            }
+        }
     }
 
     info!("  After expert stacking: {} tensors", new_weights.len());

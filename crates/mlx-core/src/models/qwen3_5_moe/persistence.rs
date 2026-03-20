@@ -12,7 +12,7 @@ use crate::models::qwen3_5::persistence::{load_vision_weights, parse_vision_conf
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
 use crate::tokenizer::Qwen3Tokenizer;
-use crate::utils::safetensors::SafeTensorsFile;
+use crate::utils::safetensors::load_safetensors_lazy;
 
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttentionType, MLPType};
@@ -26,6 +26,7 @@ use super::quantized_linear::{
 use super::switch_glu::SwitchGLU;
 
 /// Load all safetensors files from a directory.
+/// Uses MLX's native mmap-backed lazy loader for near-instant loading.
 fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
     let single_path = if dir.join("weights.safetensors").exists() {
         Some(dir.join("weights.safetensors"))
@@ -36,9 +37,8 @@ fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
     };
 
     if let Some(path) = single_path {
-        info!("Loading weights from: {}", path.display());
-        let st_file = SafeTensorsFile::load(&path)?;
-        return st_file.load_tensors(&path);
+        info!("Loading weights from: {} (mmap)", path.display());
+        return load_safetensors_lazy(&path);
     }
 
     let mut shard_files: Vec<std::path::PathBuf> = Vec::new();
@@ -65,13 +65,15 @@ fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
     }
 
     shard_files.sort();
-    info!("Loading {} sharded safetensors files", shard_files.len());
+    info!(
+        "Loading {} sharded safetensors files (mmap)",
+        shard_files.len()
+    );
 
     let mut all_params: HashMap<String, MxArray> = HashMap::new();
     for shard_path in &shard_files {
-        info!("  Loading shard: {}", shard_path.display());
-        let st_file = SafeTensorsFile::load(shard_path)?;
-        let shard_params = st_file.load_tensors(shard_path)?;
+        info!("  Loading shard: {} (mmap)", shard_path.display());
+        let shard_params = load_safetensors_lazy(shard_path)?;
         all_params.extend(shard_params);
     }
 
@@ -233,15 +235,16 @@ fn sanitize_weights(
             .unwrap_or(&name)
             .to_string();
 
-        let name = if name == "embed_tokens.weight" {
-            "embedding.weight".to_string()
+        // Rename special keys (including quantization metadata .scales/.biases)
+        let name = if let Some(suffix) = name.strip_prefix("embed_tokens.") {
+            format!("embedding.{}", suffix)
         } else if name == "norm.weight" {
             "final_norm.weight".to_string()
         } else {
             name
         };
 
-        if config.tie_word_embeddings && name == "lm_head.weight" {
+        if config.tie_word_embeddings && name.starts_with("lm_head.") {
             continue;
         }
 
@@ -456,7 +459,21 @@ fn apply_weights(
         try_build_quantized_switch_linear(params, prefix, gs, bits)
     };
 
-    if let Some(w) = params.get("embedding.weight") {
+    // Embedding — supports both dense and quantized weights
+    if let Some(scales) = params.get("embedding.scales") {
+        let weight = params.get("embedding.weight").ok_or_else(|| {
+            Error::from_reason("Missing embedding.weight for quantized embedding")
+        })?;
+        let biases = params.get("embedding.biases");
+        let (bits, gs) = per_layer_quant
+            .get("embed_tokens")
+            .copied()
+            .unwrap_or((quant_bits, quant_group_size));
+        model
+            .embedding
+            .load_quantized(weight, scales, biases, gs, bits)?;
+        info!("Loaded quantized embedding ({}-bit)", bits);
+    } else if let Some(w) = params.get("embedding.weight") {
         model.embedding.set_weight(w)?;
     }
 
@@ -1027,6 +1044,13 @@ pub async fn load(model_path: &str) -> Result<Qwen3_5MoeModel> {
         // Register weights with C++ MoE forward pass.
         // Works for both quantized and unquantized models (C++ detects quantization at init).
         register_moe_weights_with_cpp(&params);
+
+        // Materialize all mmap-backed weight arrays so the first inference
+        // prefill timing is not inflated by lazy disk reads.
+        {
+            let arrays: Vec<&MxArray> = params.values().collect();
+            crate::array::memory::materialize_weights(&arrays);
+        }
 
         if let Some(tok) = tokenizer {
             model.tokenizer = Some(Arc::new(tok));

@@ -16,7 +16,7 @@ use tracing::info;
 
 use crate::array::MxArray;
 use crate::tokenizer::Qwen3Tokenizer;
-use crate::utils::safetensors::{SafeTensorsFile, save_safetensors};
+use crate::utils::safetensors::{load_safetensors_lazy, save_safetensors};
 
 use super::{Qwen3Config, Qwen3Model};
 
@@ -329,18 +329,12 @@ impl Qwen3Model {
             };
 
             if safetensors_path.exists() {
-                info!("📦 Loading model from SafeTensors format: {}", safetensors_path.display());
+                info!("📦 Loading model from SafeTensors format: {} (mmap)", safetensors_path.display());
 
-                // Load SafeTensors file
-                let st_file = SafeTensorsFile::load(&safetensors_path)?;
+                // Load all tensors via mmap-backed lazy loader
+                let mut param_map = load_safetensors_lazy(&safetensors_path)?;
 
-                info!("  Found {} tensors ({} parameters)",
-                    st_file.tensor_names().len(),
-                    st_file.num_parameters()
-                );
-
-                // Load all tensors
-                let mut param_map = st_file.load_tensors(&safetensors_path)?;
+                info!("  Loaded {} tensors", param_map.len());
 
                 // Log ALL top-level (non-layer) tensor names for debugging
                 info!("📋 Top-level tensors (not in layers):");
@@ -516,6 +510,14 @@ impl Qwen3Model {
             model.load_parameters(
                 param_map.iter().map(|(k, v)| (k.clone(), v)).collect::<HashMap<_, _>>(),
             )?;
+
+            // Materialize all mmap-backed weight arrays so the first inference
+            // prefill timing is not inflated by lazy disk reads.
+            {
+                let arrays: Vec<&MxArray> = param_map.values().collect();
+                crate::array::memory::materialize_weights(&arrays);
+            }
+
             // Set the tokenizer
             model.tokenizer = Some(Arc::new(tokenizer));
             Ok(model)
