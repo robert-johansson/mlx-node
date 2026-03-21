@@ -40,10 +40,10 @@ import {
 } from '@mlx-node/core';
 import { loadModel, type TrainableModel } from '@mlx-node/lm';
 
-import type { SFTTrainerConfig } from './sft-config';
-import { getDefaultSFTConfig, mergeSFTConfig } from './sft-config';
-import { SFTDataset, loadSFTDataset, type SFTBatch } from '../data/sft-dataset';
-import { createTrainingLogger, type TrainingLogger } from './training-logger';
+import { SFTDataset, loadSFTDataset, type SFTBatch } from '../data/sft-dataset.js';
+import type { SFTTrainerConfig } from './sft-config.js';
+import { getDefaultSFTConfig, mergeSFTConfig } from './sft-config.js';
+import { createTrainingLogger, type TrainingLogger } from './training-logger.js';
 
 // Re-export types
 export { SftTrainingEngine } from '@mlx-node/core';

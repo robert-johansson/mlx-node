@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vite-plus/test';
 import { existsSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { OutputStore } from '@mlx-node/core';
+import { describe, it, expect, beforeEach, afterEach } from 'vite-plus/test';
 
 describe('OutputStore', () => {
   let testDbPath: string;

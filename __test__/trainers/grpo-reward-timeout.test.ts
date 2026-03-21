@@ -5,8 +5,9 @@
  * preventing training hangs when reward functions take too long.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
 import { GRPOTrainer, RewardTimeoutError, type RewardOutput } from '@mlx-node/trl';
+import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
+
 import { createTempModel } from '../test-model-utils.js';
 
 describe('GRPO Reward Function Timeout', () => {

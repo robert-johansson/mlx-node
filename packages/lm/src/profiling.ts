@@ -1,5 +1,6 @@
-import { setProfilingEnabled, isProfilingEnabled, getProfilingData, resetProfilingData } from '@mlx-node/core';
 import { writeFile } from 'node:fs/promises';
+
+import { setProfilingEnabled, isProfilingEnabled, getProfilingData, resetProfilingData } from '@mlx-node/core';
 
 const ENV_VAR = 'MLX_PROFILE_DECODE';
 const envVarSet = !!process.env[ENV_VAR];

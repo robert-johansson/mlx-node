@@ -1,7 +1,7 @@
-import { describe, it, expect } from 'vite-plus/test';
 import type { ChatStreamChunk, ChatStreamHandle } from '@mlx-node/core';
 import type { ChatStreamEvent } from '@mlx-node/lm';
 import { _createChatStream } from '@mlx-node/lm';
+import { describe, it, expect } from 'vite-plus/test';
 
 /**
  * Creates a fake native chatStream callback method that emits `numTokens`

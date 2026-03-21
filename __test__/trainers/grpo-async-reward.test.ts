@@ -5,8 +5,9 @@
  * and that the trainer correctly awaits the result.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
 import { GRPOTrainer, type RewardOutput } from '@mlx-node/trl';
+import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
+
 import { createTempModel } from '../test-model-utils.js';
 
 describe('GRPO Async Reward Functions', () => {

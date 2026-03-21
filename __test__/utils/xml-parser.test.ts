@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vite-plus/test';
 import { extractHashAnswer, extractXmlAnswer, parseXmlCot } from '@mlx-node/trl';
+import { describe, expect, it } from 'vite-plus/test';
 
 describe('XML chain-of-thought parser', () => {
   it('parses MLX-style strict XML format with surrounding whitespace', () => {

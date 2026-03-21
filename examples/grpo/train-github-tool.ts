@@ -34,10 +34,13 @@
  *   yarn oxnode examples/grpo/train-github-tool.ts -t get-file-diff --dry-run  # Preview dataset
  */
 
-import { parseArgs } from 'node:util';
-import { resolve, join } from 'node:path';
 import { existsSync } from 'node:fs';
+import { resolve, join } from 'node:path';
+import { parseArgs } from 'node:util';
+
 import { checkbox, Separator } from '@inquirer/prompts';
+import { buildRewardOutputs } from '@mlx-node/core';
+import { createToolDefinition } from '@mlx-node/lm';
 import {
   GRPOTrainer,
   createTrainingLogger,
@@ -46,8 +49,8 @@ import {
   type ChatMessage,
   type ToolDefinition,
 } from '@mlx-node/trl';
-import { buildRewardOutputs } from '@mlx-node/core';
-import { createToolDefinition } from '@mlx-node/lm';
+
+import { SYSTEM_PROMPT } from '../sft/prompts';
 import {
   generateCurriculumDataset,
   generateMultiScenarioDataset,
@@ -57,8 +60,6 @@ import {
 } from './github-dataset';
 import { githubToolReward } from './github-tool-reward';
 import { initLspService, executeToolCall, type LspService } from './lsp';
-
-import { SYSTEM_PROMPT } from '../sft/prompts';
 
 // ============================================================================
 // Helper Functions

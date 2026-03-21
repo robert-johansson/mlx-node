@@ -1,6 +1,7 @@
-import { describe, expect, it, afterEach } from 'vite-plus/test';
 import { resolve } from 'node:path';
+
 import { validatePathContainment, resolveAndValidatePath, getAllowedRoot, PathTraversalError } from '@mlx-node/trl';
+import { describe, expect, it, afterEach } from 'vite-plus/test';
 
 describe('Path Security', () => {
   describe('validatePathContainment', () => {

@@ -1,7 +1,8 @@
-import { camelCase } from 'change-case';
-import { parse as parseToml } from '@std/toml';
 import { readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
+
+import { parse as parseToml } from '@std/toml';
+import { camelCase } from 'change-case';
 
 export class SFTConfigError extends Error {
   constructor(message: string) {

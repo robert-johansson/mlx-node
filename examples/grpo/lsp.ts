@@ -12,10 +12,11 @@
  * TypeScript's language service.
  */
 
-import { parse } from 'oxc-parser';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { parse } from 'oxc-parser';
 
 // Get __dirname equivalent for ESM
 const __filename = fileURLToPath(import.meta.url);

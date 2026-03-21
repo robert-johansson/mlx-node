@@ -27,6 +27,7 @@
  */
 
 import { readFileSync } from 'node:fs';
+
 import {
   DocLayoutModel,
   TextDetModel,

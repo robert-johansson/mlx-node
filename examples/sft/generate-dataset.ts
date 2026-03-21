@@ -1,15 +1,15 @@
-import { parseArgs } from 'node:util';
 import { createWriteStream, existsSync, readFileSync } from 'node:fs';
+import { parseArgs } from 'node:util';
 
+import { input } from '@inquirer/prompts';
 import { AsyncEntry } from '@napi-rs/keyring';
 import { createOpenRouter } from '@openrouter/ai-sdk-provider';
-import { input } from '@inquirer/prompts';
 import { generateText, tool, stepCountIs, hasToolCall, type StepResult } from 'ai';
 import { z } from 'zod';
 
-import { queryMethod, initLspService, type LspService } from '../grpo/lsp';
 import { validateGeneratedCode } from '../grpo/code-validator';
 import { executeGitHubCode } from '../grpo/execute-github-code';
+import { queryMethod, initLspService, type LspService } from '../grpo/lsp';
 import { SYSTEM_PROMPT, GET_PR_PROMPTS } from './prompts';
 
 // ============================================================================

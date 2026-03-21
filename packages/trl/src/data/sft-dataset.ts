@@ -10,9 +10,11 @@
 
 import { readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
+
 import type { Qwen3Tokenizer } from '@mlx-node/core';
-import type { ChatMessage } from '../types';
-import { validatePathContainment, getAllowedRoot, type PathValidationOptions } from '../utils/path-security';
+
+import type { ChatMessage } from '../types.js';
+import { validatePathContainment, getAllowedRoot, type PathValidationOptions } from '../utils/path-security.js';
 
 // -100 is the standard ignore index for cross-entropy loss
 const IGNORE_INDEX = -100;

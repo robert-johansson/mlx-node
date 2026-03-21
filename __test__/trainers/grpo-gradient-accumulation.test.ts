@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vite-plus/test';
 import { MxArray, Qwen3Model } from '@mlx-node/core';
+import { describe, it, expect } from 'vite-plus/test';
+
 import { shape } from '../test-utils';
 
 describe('GRPO Gradient Accumulation', () => {

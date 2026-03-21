@@ -5,8 +5,9 @@
  * the functional forward pass architecture.
  */
 
-import { describe, it, expect, beforeAll } from 'vite-plus/test';
 import { Qwen3Model, type Qwen3Config, MxArray } from '@mlx-node/core';
+import { describe, it, expect, beforeAll } from 'vite-plus/test';
+
 import { shape, int32 } from '../test-utils';
 
 describe('Functional Forward Pass Integration', () => {

@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vite-plus/test';
-import { parseVlmOutput, documentToXlsx, saveToXlsx } from '@mlx-node/vlm';
 import { existsSync, unlinkSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { parseVlmOutput, documentToXlsx, saveToXlsx } from '@mlx-node/vlm';
+import { describe, expect, it } from 'vite-plus/test';
 
 describe('PaddleOCR-VL XLSX Export (Rust)', () => {
   it('should generate xlsx buffer from parsed document with a table', () => {

@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeAll } from 'vite-plus/test';
-import { Qwen3Model, type ChatMessage } from '@mlx-node/core';
 import fs from 'node:fs';
 import path from 'node:path';
+
+import { Qwen3Model, type ChatMessage } from '@mlx-node/core';
+import { describe, it, expect, beforeAll } from 'vite-plus/test';
 
 describe('Qwen3Model - generateBatch', () => {
   let model: Qwen3Model | null = null;

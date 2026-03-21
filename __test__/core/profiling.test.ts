@@ -5,8 +5,8 @@
  * and the DecodeProfiler integration (simulated via the store API).
  */
 
-import { describe, it, expect, beforeEach } from 'vite-plus/test';
 import { setProfilingEnabled, isProfilingEnabled, getProfilingData, resetProfilingData } from '@mlx-node/core';
+import { describe, it, expect, beforeEach } from 'vite-plus/test';
 
 describe('Profiling Infrastructure', () => {
   beforeEach(() => {

@@ -1,3 +1,6 @@
+import { existsSync } from 'node:fs';
+
+import { MxArray } from '@mlx-node/core';
 /**
  * Speculative Decoding Tests
  *
@@ -6,8 +9,6 @@
  * the target model in a single forward pass.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
-import { existsSync } from 'node:fs';
-import { MxArray } from '@mlx-node/core';
 
 // Path to test models - can be configured via environment variable
 const MODEL_PATH = process.env.QWEN3_MODEL_PATH || './models/qwen3-0.6b';

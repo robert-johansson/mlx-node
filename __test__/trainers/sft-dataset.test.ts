@@ -1,5 +1,6 @@
-import { describe, expect, it, beforeAll } from 'vite-plus/test';
 import { resolve } from 'node:path';
+
+import { Qwen3Tokenizer } from '@mlx-node/core';
 import {
   SFTDataset,
   createSFTDataset,
@@ -7,7 +8,7 @@ import {
   type SFTConversationExample,
   type SpecialTokenIds,
 } from '@mlx-node/trl';
-import { Qwen3Tokenizer } from '@mlx-node/core';
+import { describe, expect, it, beforeAll } from 'vite-plus/test';
 
 describe('SFT Dataset', () => {
   let tokenizer: Qwen3Tokenizer;

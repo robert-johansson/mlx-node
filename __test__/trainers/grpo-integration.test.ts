@@ -4,9 +4,11 @@
  * These tests validate the entire training workflow end-to-end
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vite-plus/test';
-import { GRPOTrainer, type RewardOutput } from '@mlx-node/trl';
 import { existsSync, rmSync } from 'node:fs';
+
+import { GRPOTrainer, type RewardOutput } from '@mlx-node/trl';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vite-plus/test';
+
 import { createTempModel } from '../test-model-utils';
 
 const TEST_OUTPUT_DIR = './test-integration-output';

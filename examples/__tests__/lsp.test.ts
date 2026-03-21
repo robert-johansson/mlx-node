@@ -6,6 +6,7 @@
  */
 
 import { describe, it, expect, beforeAll } from 'vite-plus/test';
+
 import {
   initLspService,
   queryMethod,

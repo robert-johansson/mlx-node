@@ -1,3 +1,4 @@
+import { VLModel, createPaddleocrVlConfig } from '@mlx-node/vlm';
 /**
  * PaddleOCR-VL NAPI Binding Smoke Tests
  *
@@ -5,7 +6,6 @@
  * Full unit tests are in Rust: crates/mlx-core/src/models/paddleocr_vl/
  */
 import { describe, expect, it } from 'vite-plus/test';
-import { VLModel, createPaddleocrVlConfig } from '@mlx-node/vlm';
 
 describe('PaddleOCR-VL NAPI Bindings', () => {
   it('should create config via NAPI', () => {

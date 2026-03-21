@@ -3,7 +3,10 @@
   "compilerOptions": {
     "rootDir": ".",
     "outDir": "dist",
-    "composite": true
+    "composite": true,
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler"
   },
   "include": ["./**/*.ts"],
   "references": [{ "path": "../packages/lm" }, { "path": "../packages/trl" }, { "path": "../packages/vlm" }]

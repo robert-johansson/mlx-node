@@ -4,9 +4,10 @@
  * Tests for parameter extraction and loading functionality
  */
 
-import { describe, it, expect } from 'vite-plus/test';
-import type { Qwen3Config } from '@mlx-node/lm';
 import { MxArray, Qwen3Model } from '@mlx-node/core';
+import type { Qwen3Config } from '@mlx-node/lm';
+import { describe, it, expect } from 'vite-plus/test';
+
 import { shape, int32 } from '../test-utils.js';
 
 // Tiny test configuration for fast testing

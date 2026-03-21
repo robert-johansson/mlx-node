@@ -50,7 +50,7 @@ export {
   type EngineStepMetrics,
   type EngineEpochMetrics,
   type BuiltinRewardConfig,
-} from './trainers/grpo-trainer';
+} from './trainers/grpo-trainer.js';
 
 // Unified Training Logger (recommended)
 export {
@@ -64,7 +64,7 @@ export {
   type LogEvent,
   type PromptChoice,
   type PromptOptions,
-} from './trainers/training-logger';
+} from './trainers/training-logger.js';
 
 // SFT Trainer
 export {
@@ -75,7 +75,7 @@ export {
   type SftEngineConfig,
   type SftStepMetrics,
   type SftEpochMetrics,
-} from './trainers/sft-trainer';
+} from './trainers/sft-trainer.js';
 
 export {
   type SFTTrainerConfig,
@@ -85,7 +85,7 @@ export {
   loadSFTTomlConfig,
   applySFTOverrides,
   DEFAULT_SFT_CONFIG,
-} from './trainers/sft-config';
+} from './trainers/sft-config.js';
 
 // Data
 export {
@@ -95,7 +95,7 @@ export {
   extractGsm8kAnswer,
   validateDatasetExample,
   type LocalDatasetOptions,
-} from './data/dataset';
+} from './data/dataset.js';
 export {
   SFTDataset,
   loadSFTDataset,
@@ -106,17 +106,17 @@ export {
   type SFTBatch,
   type SFTDatasetConfig,
   type SpecialTokenIds,
-} from './data/sft-dataset';
+} from './data/sft-dataset.js';
 
 // Utils
-export { parseXmlCot, extractXmlAnswer, extractXmlReasoning, extractHashAnswer } from './utils/xml-parser';
+export { parseXmlCot, extractXmlAnswer, extractXmlReasoning, extractHashAnswer } from './utils/xml-parser.js';
 export {
   validatePathContainment,
   resolveAndValidatePath,
   getAllowedRoot,
   PathTraversalError,
   type PathValidationOptions,
-} from './utils/path-security';
+} from './utils/path-security.js';
 
 // Types
 export type {
@@ -136,4 +136,4 @@ export type {
   // Reward function types
   CompletionInfo,
   RewardOutput,
-} from './types';
+} from './types.js';

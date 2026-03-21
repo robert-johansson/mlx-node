@@ -1,11 +1,12 @@
-import { readdir, copyFile } from 'node:fs/promises';
-import { parseArgs } from 'node:util';
 import { existsSync } from 'node:fs';
+import { readdir, copyFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
+import { parseArgs } from 'node:util';
+
 import { listFiles, whoAmI, downloadFileToCacheDir, type ListFileEntry } from '@huggingface/hub';
-import { AsyncEntry } from '@napi-rs/keyring';
 import { input } from '@inquirer/prompts';
+import { AsyncEntry } from '@napi-rs/keyring';
 
 import { ensureDir, formatBytes } from '../utils.js';
 

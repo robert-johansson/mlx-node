@@ -2,9 +2,9 @@
  * Test script for the execution-based reward system
  */
 
-import { getScenarioSnapshot, getAllSnapshotIds } from './scenario-snapshots.js';
-import { executeGitHubCode } from './execute-github-code.js';
 import { EXAMPLE_VALID_CODE } from './code-validator.js';
+import { executeGitHubCode } from './execute-github-code.js';
+import { getScenarioSnapshot, getAllSnapshotIds } from './scenario-snapshots.js';
 
 async function main() {
   console.log('=== Testing Scenario Snapshots ===');

@@ -1,4 +1,4 @@
-import { type XmlParseResult } from '../types';
+import { type XmlParseResult } from '../types.js';
 
 const REASONING_OPEN = '<reasoning>';
 const REASONING_CLOSE = '</reasoning>';

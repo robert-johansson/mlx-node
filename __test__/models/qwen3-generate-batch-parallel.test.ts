@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeAll } from 'vite-plus/test';
-import { GrpoTrainingEngine, Qwen3Model, type ChatMessage } from '@mlx-node/core';
 import fs from 'node:fs';
 import path from 'node:path';
+
+import { GrpoTrainingEngine, Qwen3Model, type ChatMessage } from '@mlx-node/core';
+import { describe, it, expect, beforeAll } from 'vite-plus/test';
 
 /**
  * Tests for true parallel batch generation using the batched FFI kernel.

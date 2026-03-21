@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
+
 import type {
   DatasetExample,
   ChatMessage,
@@ -8,9 +9,9 @@ import type {
   PromptFormatterOptions,
   PromptTemplate,
   DatasetLoader,
-} from '../types';
-import { extractHashAnswer } from '../utils/xml-parser';
-import { validatePathContainment, getAllowedRoot, type PathValidationOptions } from '../utils/path-security';
+} from '../types.js';
+import { validatePathContainment, getAllowedRoot, type PathValidationOptions } from '../utils/path-security.js';
+import { extractHashAnswer } from '../utils/xml-parser.js';
 
 export interface LocalDatasetOptions extends PromptFormatterOptions, PathValidationOptions {
   basePath?: string;

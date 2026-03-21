@@ -1,6 +1,6 @@
-import { describe, it, expect } from 'vite-plus/test';
 import { Qwen35Model } from '@mlx-node/core';
 import { QWEN35_CONFIGS, getQwen35Config } from '@mlx-node/lm';
+import { describe, it, expect } from 'vite-plus/test';
 
 describe('Qwen3.5 Config', () => {
   it('should have valid config presets', () => {

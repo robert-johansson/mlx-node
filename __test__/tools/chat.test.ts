@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vite-plus/test';
-
+// Import the types to verify they exist and have correct structure
+import type { ToolCallResult, ToolDefinition } from '@mlx-node/lm';
 /**
  * Tests for the model.chat() API
  *
@@ -11,9 +11,7 @@ import { describe, it, expect } from 'vite-plus/test';
  * Note: Full model integration tests are in __test__/models/qwen3.test.ts
  * These tests focus on the type behavior which can be tested without loading a model.
  */
-
-// Import the types to verify they exist and have correct structure
-import type { ToolCallResult, ToolDefinition } from '@mlx-node/lm';
+import { describe, it, expect } from 'vite-plus/test';
 
 describe('chat() API Types', () => {
   describe('ToolCallResult interface', () => {

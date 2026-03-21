@@ -6,9 +6,11 @@
 
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+
 import { Qwen3Model } from '@mlx-node/core';
-import { Qwen35Model, Qwen35MoeModel } from '../stream';
-import type { TrainableModel } from '../interfaces';
+
+import type { TrainableModel } from '../interfaces.js';
+import { Qwen35Model, Qwen35MoeModel } from '../stream.js';
 
 export type ModelType = 'qwen3' | 'qwen3_5' | 'qwen3_5_moe';
 

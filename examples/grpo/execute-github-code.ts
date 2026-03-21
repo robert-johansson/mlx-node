@@ -19,10 +19,10 @@
 
 import { spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync, cpSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createRequire } from 'node:module';
 
 import { getScenarioSnapshot, serializeSnapshot, type ScenarioSnapshot } from './scenario-snapshots.js';
 

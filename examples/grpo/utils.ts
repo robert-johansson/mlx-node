@@ -1,5 +1,5 @@
-import { Repository } from '@napi-rs/simple-git';
 import { AsyncEntry } from '@napi-rs/keyring';
+import { Repository } from '@napi-rs/simple-git';
 import { Octokit } from 'octokit';
 
 const keyringEntry = new AsyncEntry('mlx-node', 'github-token');

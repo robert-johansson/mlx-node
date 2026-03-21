@@ -1,6 +1,7 @@
-import { describe, it, expect } from 'vite-plus/test';
-import { QWEN3_CONFIGS, getQwen3Config } from '@mlx-node/lm';
 import { MxArray, Qwen3Model } from '@mlx-node/core';
+import { QWEN3_CONFIGS, getQwen3Config } from '@mlx-node/lm';
+import { describe, it, expect } from 'vite-plus/test';
+
 import { shape } from '../test-utils';
 
 describe.sequential('Qwen3 Model', () => {

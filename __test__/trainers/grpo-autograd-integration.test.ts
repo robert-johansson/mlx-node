@@ -1,6 +1,7 @@
-import { describe, it, expect } from 'vite-plus/test';
 import { MxArray, Qwen3Model } from '@mlx-node/core';
 import type { Qwen3Config } from '@mlx-node/core';
+import { describe, it, expect } from 'vite-plus/test';
+
 import { shape, int32, float32, float64 } from '../test-utils';
 
 // Tiny config for autograd tests — the full 0.6B model (28 layers, 896 hidden)

@@ -1,6 +1,6 @@
-import { describe, it, expect } from 'vite-plus/test';
 import { DocOrientationModel, DocUnwarpModel } from '@mlx-node/core';
 import type { StructureV3Config, AnalyzeOptions } from '@mlx-node/vlm';
+import { describe, it, expect } from 'vite-plus/test';
 
 describe('DocOrientationModel', () => {
   it('should have a load factory method', () => {

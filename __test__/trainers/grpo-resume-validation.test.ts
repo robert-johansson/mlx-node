@@ -1,8 +1,8 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
 import { mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import {
   GRPOTrainer,
   computeDatasetHash,
@@ -11,6 +11,8 @@ import {
   type DatasetExample,
   type RewardOutput,
 } from '@mlx-node/trl';
+import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
+
 import { createTempModel } from '../test-model-utils';
 
 // Shared temp model for all tests

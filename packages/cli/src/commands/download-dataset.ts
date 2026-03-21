@@ -1,9 +1,9 @@
 import { readdir, stat, copyFile } from 'node:fs/promises';
-import { parseArgs } from 'node:util';
 import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
-import { snapshotDownload } from '@huggingface/hub';
+import { parseArgs } from 'node:util';
 
+import { snapshotDownload } from '@huggingface/hub';
 import { convertParquetToJsonl } from '@mlx-node/core';
 
 import { ensureDir } from '../utils.js';

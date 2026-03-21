@@ -1,6 +1,7 @@
-import { describe, it, expect } from 'vite-plus/test';
 import { Qwen35Model, MxArray } from '@mlx-node/core';
 import type { Qwen35Config } from '@mlx-node/core';
+import { describe, it, expect } from 'vite-plus/test';
+
 import { shape } from '../test-utils';
 
 // Tiny config for generation tests — the full 0.6B config is too slow

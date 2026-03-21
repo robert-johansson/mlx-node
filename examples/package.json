@@ -1,6 +1,7 @@
 {
   "name": "examples",
   "private": true,
+  "type": "module",
   "dependencies": {
     "@mlx-node/core": "workspace:*",
     "@mlx-node/lm": "workspace:*",

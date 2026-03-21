@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
 import { GRPOTrainer, type ChatMessage, type RewardOutput } from '@mlx-node/trl';
+import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
+
 import { createTempModel } from '../test-model-utils';
 
 // Shared temp model for all tests

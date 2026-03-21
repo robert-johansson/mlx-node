@@ -36,9 +36,10 @@
  *   yarn oxnode examples/sft/sft-octokit.ts --dry-run
  */
 
-import { parseArgs } from 'node:util';
-import { resolve, join, parse as parsePath } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
+import { resolve, join, parse as parsePath } from 'node:path';
+import { parseArgs } from 'node:util';
+
 import { SFTTrainer, type SFTTrainerConfig, createTrainingLogger } from '@mlx-node/trl';
 
 // =============================================================================

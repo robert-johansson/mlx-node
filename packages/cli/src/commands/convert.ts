@@ -1,6 +1,7 @@
-import { parseArgs } from 'node:util';
-import { resolve } from 'node:path';
 import { readFileSync, existsSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { parseArgs } from 'node:util';
+
 import { convertModel, convertForeignWeights, convertGgufToSafetensors } from '@mlx-node/core';
 
 function printHelp() {

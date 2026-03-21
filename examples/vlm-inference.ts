@@ -23,6 +23,7 @@
  *   oxnode examples/vlm-inference.ts ./examples/ocr.png --unwarp       # With document unwarping
  */
 import { readFileSync, existsSync } from 'node:fs';
+
 import { ChatRole, DocOrientationModel, DocUnwarpModel, type LayoutElement } from '@mlx-node/core';
 import { DocLayoutModel, VLModel, parsePaddleResponse, OutputFormat } from '@mlx-node/vlm';
 import { Transformer } from '@napi-rs/image';

@@ -2,9 +2,8 @@
  * Shared test utilities for MLX tests
  */
 
-import { expect } from 'vite-plus/test';
-
 import { MxArray as MxArrayClass, type MxArray } from '@mlx-node/core';
+import { expect } from 'vite-plus/test';
 
 /**
  * Helper function to create MxArray from regular arrays (float32)

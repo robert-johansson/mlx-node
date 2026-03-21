@@ -40,6 +40,7 @@
  * ```
  */
 
+import { createHash } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -51,7 +52,6 @@ import {
   rmSync,
   statSync,
 } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import * as readline from 'node:readline';
 
@@ -73,8 +73,8 @@ import {
 } from '@mlx-node/core';
 import { loadModel, type TrainableModel } from '@mlx-node/lm';
 
-import type { ChatMessage, DatasetExample, RewardFunction } from '../types';
-import { createTrainingLogger, type TrainingLogger } from './training-logger';
+import type { ChatMessage, DatasetExample, RewardFunction } from '../types.js';
+import { createTrainingLogger, type TrainingLogger } from './training-logger.js';
 
 // Re-export native types
 export { GrpoTrainingEngine, NativeRewardRegistry, OutputStore } from '@mlx-node/core';

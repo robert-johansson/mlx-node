@@ -28,4 +28,4 @@
  * @module tools
  */
 
-export * from './types';
+export * from './types.js';

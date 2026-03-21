@@ -5,9 +5,10 @@
  * Uses a tiny model with random weights for fast testing.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
 import { loadModel, Qwen3Model, createToolDefinition } from '@mlx-node/lm';
 import type { ToolCallResult } from '@mlx-node/lm';
+import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
+
 import { createTempModel, TINY_TEST_CONFIG } from '../test-model-utils';
 
 describe.sequential('Qwen3 Chat API', () => {

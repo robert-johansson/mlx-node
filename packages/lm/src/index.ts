@@ -15,11 +15,11 @@
 
 // Model classes (for inference)
 export { Qwen3Model, Qwen3Tokenizer } from '@mlx-node/core';
-export { Qwen35Model, Qwen35Model as Qwen3_5Model } from './stream';
+export { Qwen35Model, Qwen35Model as Qwen3_5Model } from './stream.js';
 export type { Qwen35Config, Qwen35GenerationConfig, Qwen35GenerationResult } from '@mlx-node/core';
 
 // MoE variant
-export { Qwen35MoeModel, Qwen35MoeModel as Qwen3_5MoeModel } from './stream';
+export { Qwen35MoeModel, Qwen35MoeModel as Qwen3_5MoeModel } from './stream.js';
 export type { Qwen35MoeConfig, Qwen35MoeGenerationConfig, Qwen35MoeGenerationResult } from '@mlx-node/core';
 
 // Note: Memory management is handled internally by Rust - not exposed to JS
@@ -32,11 +32,11 @@ export type { SamplingConfig, BatchGenerationResult } from '@mlx-node/core';
 export type { ChatConfig, ChatResult, ChatMessage, ToolCallResult, PerformanceMetrics } from '@mlx-node/core';
 
 // Streaming chat API
-export type { ChatStreamDelta, ChatStreamFinal, ChatStreamEvent } from './stream';
+export type { ChatStreamDelta, ChatStreamFinal, ChatStreamEvent } from './stream.js';
 export type { ChatStreamChunk, ChatStreamHandle } from '@mlx-node/core';
 // Internal: exported for testing the callback-to-AsyncGenerator bridge
 // Not part of the public API — may change without notice
-export { _createChatStream } from './stream';
+export { _createChatStream } from './stream.js';
 
 // Model utilities (TypeScript-only)
 export {
@@ -45,18 +45,18 @@ export {
   type GenerationResult,
   type GenerationConfig,
   getQwen3Config,
-} from './models/qwen3-configs';
+} from './models/qwen3-configs.js';
 
 // Model loading
-export { loadModel, detectModelType, type ModelType } from './models/model-loader';
+export { loadModel, detectModelType, type ModelType } from './models/model-loader.js';
 
 // Interfaces
-export type { TrainableModel } from './interfaces';
+export type { TrainableModel } from './interfaces.js';
 
-export { QWEN35_CONFIGS, getQwen35Config } from './models/qwen3_5-configs';
+export { QWEN35_CONFIGS, getQwen35Config } from './models/qwen3_5-configs.js';
 
 // Tool calling utilities
-export * from './tools';
+export * from './tools/index.js';
 
 // Profiling API
-export { enableProfiling, disableProfiling } from './profiling';
+export { enableProfiling, disableProfiling } from './profiling.js';

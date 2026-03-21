@@ -1,6 +1,7 @@
-import { defineConfig } from 'vite-plus';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { defineConfig } from 'vite-plus';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -9,6 +10,18 @@ export default defineConfig({
     printWidth: 120,
     tabWidth: 2,
     singleQuote: true,
+    sortPackageJson: true,
+    sortImports: {
+      groups: [
+        ['type-import'],
+        ['type-builtin', 'value-builtin'],
+        ['type-external', 'value-external', 'type-internal', 'value-internal'],
+        ['type-parent', 'type-sibling', 'type-index', 'value-parent', 'value-sibling', 'value-index'],
+        ['unknown'],
+      ],
+      newlinesBetween: true,
+      order: 'asc',
+    },
     ignorePatterns: [
       '**/dist/**',
       '**/tests/**',

@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vite-plus/test';
 import { MxArray } from '@mlx-node/core';
+import { describe, it, expect } from 'vite-plus/test';
+
 import { shape, float32 } from '../test-utils';
 
 describe('Autograd Training Examples', () => {

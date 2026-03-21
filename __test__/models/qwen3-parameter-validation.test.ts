@@ -5,9 +5,10 @@
  * parameters are loaded with correct shapes after SafeTensors loading.
  */
 
-import { describe, it, expect } from 'vite-plus/test';
-import type { Qwen3Config } from '@mlx-node/lm';
 import { MxArray, Qwen3Model } from '@mlx-node/core';
+import type { Qwen3Config } from '@mlx-node/lm';
+import { describe, it, expect } from 'vite-plus/test';
+
 import { shape } from '../test-utils.js';
 
 // Tiny test configuration without QK norm
