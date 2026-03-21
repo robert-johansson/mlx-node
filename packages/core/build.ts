@@ -1,20 +1,23 @@
 import { readFile, writeFile, copyFile, readdir, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { NapiCli, createBuildCommand } from '@napi-rs/cli';
 import { format } from 'oxfmt';
 
 import viteConfig from '../../vite.config';
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
 const buildCommand = createBuildCommand(process.argv.slice(2));
 const cli = new NapiCli();
 const buildOptions = buildCommand.getOptions();
 
 const { task } = await cli.build({
   ...buildOptions,
-  manifestPath: '../../crates/mlx-core/Cargo.toml',
+  manifestPath: join(__dirname, '../../crates/mlx-core/Cargo.toml'),
+  packageJsonPath: join(__dirname, 'package.json'),
   platform: true,
-  outputDir: '.',
+  outputDir: __dirname,
   jsBinding: 'index.cjs',
   dts: 'index.d.cts',
 });
@@ -37,7 +40,7 @@ for (const output of outputs) {
 await copyMetallib();
 
 async function copyMetallib() {
-  const targetDir = '../../target';
+  const targetDir = join(__dirname, '../../target');
   try {
     // Find mlx.metallib in the build directory
     // Pattern: target/*/release/build/mlx-sys-*/out/lib/mlx.metallib

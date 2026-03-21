@@ -366,9 +366,9 @@ impl DocUnwarpModel {
 
     /// Unwarp a document image and return the corrected image bytes.
     #[napi]
-    pub fn unwarp(&self, image_data: Buffer) -> Result<UnwarpResult> {
+    pub fn unwarp(&self, image_data: &[u8]) -> Result<UnwarpResult> {
         // Preprocess
-        let (pixel_values, _orig_w, _orig_h) = processing::preprocess(&image_data, &self.config)?;
+        let (pixel_values, _orig_w, _orig_h) = processing::preprocess(image_data, &self.config)?;
 
         // Forward pass - get displacement field [1, H', W', 2] in NHWC
         let displacement = self.net.forward(&pixel_values)?;
@@ -383,7 +383,7 @@ impl DocUnwarpModel {
 
         // Apply displacement field to original image
         let image_bytes =
-            processing::apply_displacement_field(&image_data, &grid_vec, grid_h, grid_w)?;
+            processing::apply_displacement_field(image_data, &grid_vec, grid_h, grid_w)?;
 
         Ok(UnwarpResult {
             image: image_bytes.into(),

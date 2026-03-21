@@ -26,5 +26,8 @@
     "@inquirer/prompts": "^8.3.0",
     "@mlx-node/core": "workspace:*",
     "@napi-rs/keyring": "^1.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:"
   }
 }

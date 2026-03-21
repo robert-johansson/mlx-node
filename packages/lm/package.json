@@ -29,5 +29,8 @@
   },
   "dependencies": {
     "@mlx-node/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:"
   }
 }

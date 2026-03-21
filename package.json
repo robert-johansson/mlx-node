@@ -22,6 +22,7 @@
   "devDependencies": {
     "@ast-grep/napi": "^0.41.1",
     "@mlx-node/cli": "workspace:*",
+    "@mlx-node/internal-tools": "workspace:*",
     "@mlx-node/lm": "workspace:*",
     "@mlx-node/trl": "workspace:*",
     "@mlx-node/vlm": "workspace:*",
@@ -30,7 +31,7 @@
     "@oxc-node/cli": "^0.0.35",
     "@oxc-node/core": "^0.0.35",
     "@std/toml": "npm:@jsr/std__toml@^1.0.11",
-    "@types/node": "^25.5.0",
+    "@types/node": "catalog:",
     "octokit": "^5.0.5",
     "oxc-parser": "^0.118.0",
     "prettier": "^3.8.1",

@@ -190,10 +190,10 @@ export class StructureV3Pipeline {
    * @param options - Analysis options
    * @returns Structured document with elements and markdown
    */
-  async analyze(imageData: Buffer | string, options: AnalyzeOptions = {}): Promise<StructuredDocument> {
+  async analyze(imageData: Uint8Array | string, options: AnalyzeOptions = {}): Promise<StructuredDocument> {
     const { layoutThreshold = 0.5, textDetThreshold, includeDetails = false } = options;
 
-    let imageBuffer: Buffer = typeof imageData === 'string' ? readFileSync(imageData) : imageData;
+    let imageBuffer: Uint8Array = typeof imageData === 'string' ? readFileSync(imageData) : imageData;
 
     // Step 0a: Document orientation correction
     if (this.docOrientation && (options.useDocOrientationClassify ?? true)) {
@@ -360,7 +360,7 @@ export class StructureV3Pipeline {
   /**
    * Crop a layout element from the source image and return PNG bytes.
    */
-  private async cropElement(imageBuffer: Buffer, el: LayoutElement): Promise<Buffer> {
+  private async cropElement(imageBuffer: Uint8Array, el: LayoutElement): Promise<Buffer> {
     const [x1, y1, x2, y2] = el.bbox;
     const x = Math.max(0, Math.round(x1));
     const y = Math.max(0, Math.round(y1));
@@ -369,7 +369,7 @@ export class StructureV3Pipeline {
 
     const { Transformer } = await import('@napi-rs/image');
     const cropped = await new Transformer(imageBuffer).crop(x, y, w, h).png();
-    return Buffer.from(cropped);
+    return cropped;
   }
 }
 

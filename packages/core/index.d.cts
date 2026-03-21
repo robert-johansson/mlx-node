@@ -63,7 +63,7 @@ export declare class DocLayoutModel {
    * # Returns
    * * Vec of LayoutElements sorted by reading order
    */
-  detect(imageData: Buffer, threshold?: number | undefined | null): Array<LayoutElement>;
+  detect(imageData: Uint8Array, threshold?: number | undefined | null): Array<LayoutElement>;
 }
 export type PPDocLayoutV3Model = DocLayoutModel;
 
@@ -87,7 +87,7 @@ export declare class DocOrientationModel {
    *
    * Returns classification result plus corrected PNG image bytes.
    */
-  classifyAndRotate(imageData: Buffer): ClassifyRotateResult;
+  classifyAndRotate(imageData: Uint8Array): ClassifyRotateResult;
 }
 
 /**
@@ -100,7 +100,7 @@ export declare class DocUnwarpModel {
   /** Load a DocUnwarpModel from a directory containing model.safetensors. */
   static load(modelPath: string): DocUnwarpModel;
   /** Unwarp a document image and return the corrected image bytes. */
-  unwarp(imageData: Buffer): UnwarpResult;
+  unwarp(imageData: Uint8Array): UnwarpResult;
 }
 
 /** Result from text generation with detailed metadata */
@@ -1996,7 +1996,7 @@ export interface ClassifyRotateResult {
   /** Angle label as string */
   label: string;
   /** Corrected image as PNG bytes (or original bytes if angle=0) */
-  image: Buffer;
+  image: Uint8Array;
 }
 
 /** Statistics about cleanup operations (NAPI wrapper) */

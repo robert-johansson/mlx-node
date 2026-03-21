@@ -215,7 +215,7 @@ pub struct ClassifyRotateResult {
     /// Angle label as string
     pub label: String,
     /// Corrected image as PNG bytes (or original bytes if angle=0)
-    pub image: Buffer,
+    pub image: Uint8Array,
 }
 
 // ============================================================================
@@ -255,21 +255,21 @@ impl DocOrientationModel {
     ///
     /// Returns classification result plus corrected PNG image bytes.
     #[napi]
-    pub fn classify_and_rotate(&self, image_data: Buffer) -> Result<ClassifyRotateResult> {
+    pub fn classify_and_rotate(&self, image_data: Uint8Array) -> Result<ClassifyRotateResult> {
         let result = self.classify_bytes(&image_data)?;
 
         let image = if result.angle != 0 {
             let correction = processing::correction_angle(result.angle);
-            processing::rotate(&image_data, correction)?
+            processing::rotate(&image_data, correction)?.into()
         } else {
-            image_data.to_vec()
+            image_data
         };
 
         Ok(ClassifyRotateResult {
             angle: result.angle,
             score: result.score,
             label: result.label,
-            image: image.into(),
+            image,
         })
     }
 }

@@ -159,11 +159,11 @@ impl PPDocLayoutV3Model {
     /// # Returns
     /// * Vec of LayoutElements sorted by reading order
     #[napi]
-    pub fn detect(&self, image_data: Buffer, threshold: Option<f64>) -> Result<Vec<LayoutElement>> {
+    pub fn detect(&self, image_data: &[u8], threshold: Option<f64>) -> Result<Vec<LayoutElement>> {
         let threshold = threshold.unwrap_or(0.5);
 
         // 1. Preprocess image
-        let (pixel_values, orig_h, orig_w) = self.image_processor.process(&image_data)?;
+        let (pixel_values, orig_h, orig_w) = self.image_processor.process(image_data)?;
 
         // 2. Run backbone
         let features = self.backbone.forward(&pixel_values)?;
