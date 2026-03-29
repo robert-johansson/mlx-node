@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::iter;
 use std::sync::{Arc, RwLock};
+use tokio::sync::Mutex as TokioMutex;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -141,6 +142,10 @@ pub struct Qwen3Model {
     cached_cache_idx: Arc<RwLock<i32>>,
     /// Token history for prefix verification
     cached_token_history: Arc<RwLock<Vec<u32>>>,
+    /// Serializes cache state access: held during the entire chat() lifecycle
+    /// (both prefix-match reads and post-generation writes) to prevent concurrent
+    /// chat()/reset_cache() from splicing state across conversations.
+    generation_lock: Arc<TokioMutex<()>>,
 }
 
 #[napi]
@@ -244,6 +249,7 @@ impl Qwen3Model {
             cached_kv_values: Arc::new(RwLock::new(Vec::new())),
             cached_cache_idx: Arc::new(RwLock::new(0)),
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
+            generation_lock: Arc::new(TokioMutex::new(())),
         })
     }
 
@@ -251,6 +257,9 @@ impl Qwen3Model {
     /// Call this when starting a new conversation to ensure a full prefill.
     #[napi]
     pub fn reset_cache(&self) -> Result<()> {
+        let _guard = self.generation_lock.try_lock().map_err(|_| {
+            Error::from_reason("Cannot reset cache while generation is in progress")
+        })?;
         self.cached_kv_keys
             .write()
             .map_err(|_| Error::from_reason("Poisoned lock"))?
@@ -360,6 +369,9 @@ impl Qwen3Model {
     /// Clears cached key-value states. Call this between different generation sequences.
     #[napi]
     pub fn reset_kv_caches(&self) -> Result<()> {
+        let _guard = self.generation_lock.try_lock().map_err(|_| {
+            Error::from_reason("Cannot reset KV cache while generation is in progress")
+        })?;
         if let Some(caches) = self
             .kv_caches
             .write()
@@ -375,7 +387,6 @@ impl Qwen3Model {
                 cache.reset();
             }
         }
-        // Also clear cached chat state so next chat() does a full prefill
         self.cached_kv_keys
             .write()
             .map_err(|_| Error::from_reason("Poisoned lock"))?
@@ -546,11 +557,6 @@ impl Qwen3Model {
             )
         })?;
 
-        // Embedding lookup: [num_seqs, 1] -> [num_seqs, 1, hidden_dim]
-        let mut hidden_states = self.embedding.forward(input_ids)?;
-        let num_seqs = hidden_states.shape_at(0)?;
-        let seq_len = hidden_states.shape_at(1)?;
-
         // Acquire read lock for paged cache
         let paged_cache_guard = paged_cache.read().map_err(|_| {
             Error::new(
@@ -558,6 +564,31 @@ impl Qwen3Model {
                 "Failed to acquire paged cache read lock",
             )
         })?;
+
+        self.forward_paged_with_cache(
+            input_ids,
+            slot_mapping,
+            seq_ids,
+            positions,
+            &paged_cache_guard,
+        )
+    }
+
+    /// Internal paged forward pass that accepts an already-locked cache reference.
+    /// This avoids deadlock when called from step_paged_generation() which already
+    /// holds a write lock on the same paged_cache RwLock.
+    fn forward_paged_with_cache(
+        &self,
+        input_ids: &MxArray,
+        slot_mapping: &MxArray,
+        seq_ids: Vec<u32>,
+        positions: &MxArray,
+        paged_cache_guard: &mlx_paged_attn::PagedKVCache,
+    ) -> Result<MxArray> {
+        // Embedding lookup: [num_seqs, 1] -> [num_seqs, 1, hidden_dim]
+        let mut hidden_states = self.embedding.forward(input_ids)?;
+        let num_seqs = hidden_states.shape_at(0)?;
+        let seq_len = hidden_states.shape_at(1)?;
 
         // Acquire read locks for model components
         let layers_guard = self.layers.read().map_err(|_| {
@@ -586,7 +617,7 @@ impl Qwen3Model {
         for (layer_idx, layer) in layers_guard.iter().enumerate() {
             hidden_states = layer.forward_paged_metal(
                 &hidden_states,
-                &paged_cache_guard,
+                paged_cache_guard,
                 layer_idx as u32,
                 slot_mapping,
                 &seq_ids,
@@ -752,6 +783,16 @@ impl Qwen3Model {
         max_new_tokens: u32,
         priority: Option<i32>,
     ) -> Result<u32> {
+        if max_new_tokens == 0 {
+            return Err(napi::Error::from_reason(
+                "max_new_tokens must be > 0 for paged generation",
+            ));
+        }
+        if prompt_tokens.is_empty() {
+            return Err(napi::Error::from_reason(
+                "prompt_tokens must not be empty for paged generation",
+            ));
+        }
         let scheduler = self
             .scheduler
             .as_ref()
@@ -829,6 +870,18 @@ impl Qwen3Model {
             min_p: config.min_p,
         };
         let eos_token_id = config.eos_token_id.unwrap_or(self.config.eos_token_id);
+
+        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size = config.presence_context_size.unwrap_or(20);
+        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
+        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+        let ngram_size = config.ngram_size.unwrap_or(64);
+
+        let mut finish_reason_overrides: HashMap<u32, &'static str> = HashMap::new();
 
         // Separate batch into prefill and decode sequences
         let mut prefill_indices: Vec<usize> = Vec::new();
@@ -941,7 +994,49 @@ impl Qwen3Model {
             }
 
             let logit_slice = &logits_data[start..end];
-            let logit_arr = MxArray::from_float32(logit_slice, &[1, 1, vocab_size])?;
+            let mut logit_arr = MxArray::from_float32(logit_slice, &[1, 1, vocab_size])?;
+
+            if let Some((prompt, generated)) = scheduler_guard.get_penalty_context(seq_id) {
+                // Build penalty context from the tail of prompt+generated,
+                // bounded by the largest context_size to cap allocation.
+                let max_ctx = repetition_context_size
+                    .max(presence_context_size)
+                    .max(frequency_context_size) as usize;
+                let total = prompt.len() + generated.len();
+                let skip = total.saturating_sub(max_ctx);
+                let prompt_skip = skip.min(prompt.len());
+                let ctx: Vec<u32> = prompt[prompt_skip..]
+                    .iter()
+                    .chain(generated.iter())
+                    .copied()
+                    .collect();
+                if !ctx.is_empty() {
+                    if repetition_penalty != 1.0 {
+                        logit_arr = crate::sampling::apply_repetition_penalty(
+                            &logit_arr,
+                            &ctx,
+                            repetition_penalty,
+                            Some(repetition_context_size),
+                        )?;
+                    }
+                    if presence_penalty != 0.0 {
+                        logit_arr = crate::sampling::apply_presence_penalty(
+                            &logit_arr,
+                            &ctx,
+                            presence_penalty,
+                            Some(presence_context_size),
+                        )?;
+                    }
+                    if frequency_penalty != 0.0 {
+                        logit_arr = crate::sampling::apply_frequency_penalty(
+                            &logit_arr,
+                            &ctx,
+                            frequency_penalty,
+                            Some(frequency_context_size),
+                        )?;
+                    }
+                }
+            }
 
             let (next_token_arr, logprobs_arr) =
                 crate::sampling::sample_and_logprobs(&logit_arr, Some(sampling_config))?;
@@ -950,7 +1045,34 @@ impl Qwen3Model {
             logprobs_arr.eval();
             let next_token = next_token_arr.item_at_int32(0)? as u32;
             let logprob = logprobs_arr.item_at_float32(next_token as usize)? as f64;
-            let is_finished = next_token == eos_token_id as u32;
+            let is_eos = next_token == eos_token_id as u32;
+            let mut finish_reason_override: Option<&'static str> = None;
+
+            if !is_eos && let Some(gen_tokens) = scheduler_guard.get_generated_tokens(seq_id) {
+                let mut history = gen_tokens.to_vec();
+                history.push(next_token);
+                if let Some(reason) = crate::sampling::check_repetition_cutoff(
+                    &history,
+                    max_consecutive_tokens,
+                    max_ngram_repeats,
+                    ngram_size,
+                ) {
+                    finish_reason_override = Some(reason);
+                }
+            }
+
+            // Check if this token hits the length limit
+            if finish_reason_override.is_none()
+                && !is_eos
+                && scheduler_guard.would_hit_length_limit(seq_id)
+            {
+                finish_reason_override = Some("length");
+            }
+
+            let is_finished = is_eos || finish_reason_override.is_some();
+            if let Some(reason) = finish_reason_override {
+                finish_reason_overrides.insert(seq_id, reason);
+            }
 
             outputs.push(PagedTokenOutput {
                 seq_id,
@@ -1016,12 +1138,14 @@ impl Qwen3Model {
             let slot_mapping_arr =
                 MxArray::from_int64(&slot_mapping, &[slot_mapping.len() as i64])?;
 
-            // Run paged attention forward pass (now takes seq_ids instead of block_tables/context_lens)
-            let logits = self.forward_paged(
+            // Run paged attention forward pass using the already-held write guard
+            // (avoids deadlock — forward_paged() would try to read-lock the same RwLock)
+            let logits = self.forward_paged_with_cache(
                 &input_ids,
                 &slot_mapping_arr,
                 decode_seq_ids.clone(),
                 &positions_arr,
+                &cache_guard,
             )?;
 
             // Sample from logits
@@ -1045,7 +1169,48 @@ impl Qwen3Model {
                 }
 
                 let logit_slice = &logits_data[start..end];
-                let logit_arr = MxArray::from_float32(logit_slice, &[1, 1, vocab_size])?;
+                let mut logit_arr = MxArray::from_float32(logit_slice, &[1, 1, vocab_size])?;
+
+                if let Some((prompt, generated)) = scheduler_guard.get_penalty_context(seq_id) {
+                    let max_ctx = repetition_context_size
+                        .max(presence_context_size)
+                        .max(frequency_context_size) as usize;
+                    let total = prompt.len() + generated.len();
+                    let skip = total.saturating_sub(max_ctx);
+                    let prompt_skip = skip.min(prompt.len());
+                    let gen_skip = skip.saturating_sub(prompt.len());
+                    let ctx: Vec<u32> = prompt[prompt_skip..]
+                        .iter()
+                        .chain(generated[gen_skip..].iter())
+                        .copied()
+                        .collect();
+                    if !ctx.is_empty() {
+                        if repetition_penalty != 1.0 {
+                            logit_arr = crate::sampling::apply_repetition_penalty(
+                                &logit_arr,
+                                &ctx,
+                                repetition_penalty,
+                                Some(repetition_context_size),
+                            )?;
+                        }
+                        if presence_penalty != 0.0 {
+                            logit_arr = crate::sampling::apply_presence_penalty(
+                                &logit_arr,
+                                &ctx,
+                                presence_penalty,
+                                Some(presence_context_size),
+                            )?;
+                        }
+                        if frequency_penalty != 0.0 {
+                            logit_arr = crate::sampling::apply_frequency_penalty(
+                                &logit_arr,
+                                &ctx,
+                                frequency_penalty,
+                                Some(frequency_context_size),
+                            )?;
+                        }
+                    }
+                }
 
                 let (next_token_arr, logprobs_arr) =
                     crate::sampling::sample_and_logprobs(&logit_arr, Some(sampling_config))?;
@@ -1054,7 +1219,34 @@ impl Qwen3Model {
                 logprobs_arr.eval();
                 let next_token = next_token_arr.item_at_int32(0)? as u32;
                 let logprob = logprobs_arr.item_at_float32(next_token as usize)? as f64;
-                let is_finished = next_token == eos_token_id as u32;
+                let is_eos = next_token == eos_token_id as u32;
+                let mut finish_reason_override: Option<&'static str> = None;
+
+                if !is_eos && let Some(gen_tokens) = scheduler_guard.get_generated_tokens(seq_id) {
+                    let mut history = gen_tokens.to_vec();
+                    history.push(next_token);
+                    if let Some(reason) = crate::sampling::check_repetition_cutoff(
+                        &history,
+                        max_consecutive_tokens,
+                        max_ngram_repeats,
+                        ngram_size,
+                    ) {
+                        finish_reason_override = Some(reason);
+                    }
+                }
+
+                // Check if this token hits the length limit
+                if finish_reason_override.is_none()
+                    && !is_eos
+                    && scheduler_guard.would_hit_length_limit(seq_id)
+                {
+                    finish_reason_override = Some("length");
+                }
+
+                let is_finished = is_eos || finish_reason_override.is_some();
+                if let Some(reason) = finish_reason_override {
+                    finish_reason_overrides.insert(seq_id, reason);
+                }
 
                 outputs.push(PagedTokenOutput {
                     seq_id,
@@ -1066,13 +1258,18 @@ impl Qwen3Model {
             }
         }
 
-        // Update scheduler with outputs (handles prefill→decode transition)
         let token_outputs: Vec<_> = outputs
             .iter()
-            .map(|o| crate::transformer::TokenOutput {
-                seq_id: o.seq_id,
-                token: o.token,
-                is_eos: o.is_finished,
+            .map(|o| {
+                let override_reason = finish_reason_overrides.get(&o.seq_id).copied();
+                crate::transformer::TokenOutput {
+                    seq_id: o.seq_id,
+                    token: o.token,
+                    // is_eos should only be true for actual EOS tokens, not for
+                    // length/repetition stops — those flow through finish_reason_override.
+                    is_eos: o.is_finished && override_reason.is_none(),
+                    finish_reason_override: override_reason,
+                }
             })
             .collect();
         scheduler_guard
@@ -1359,6 +1556,7 @@ impl Qwen3Model {
             cached_kv_values: Arc::new(RwLock::new(Vec::new())),
             cached_cache_idx: Arc::new(RwLock::new(0)),
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
+            generation_lock: Arc::new(TokioMutex::new(())),
         })
     }
 
@@ -5522,19 +5720,18 @@ impl Qwen3Model {
             None
         };
 
-        // Apply chat template with tools and encode in a blocking task.
-        // Return both the token IDs (Vec<u32>) and the MxArray for prefix matching.
+        // Hold generation lock for the entire cache-read + generation + cache-write lifecycle.
+        let gen_lock = self.generation_lock.clone();
+        let _gen_guard = gen_lock.lock().await;
+
         let tokenizer_clone = tokenizer.clone();
         let (token_ids_vec, input_ids) = napi::bindgen_prelude::spawn_blocking(move || {
-            // Use the tokenizer's apply_chat_template_sync method which handles Jinja2 + tools
             let token_ids = tokenizer_clone.apply_chat_template_sync(
                 &messages,
                 Some(true),
                 tools.as_deref(),
                 enable_thinking,
             )?;
-
-            // Create MxArray from token IDs
             let arr = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
             Ok::<(Vec<u32>, MxArray), napi::Error>((token_ids, arr))
         })

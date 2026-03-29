@@ -1028,6 +1028,50 @@ impl Qwen3Tokenizer {
             .map_err(|e| Error::from_reason(format!("Failed to decode tokens: {}", e)))
     }
 
+    /// Get a reference to the inner tokenizer for creating a DecodeStream.
+    pub(crate) fn inner(&self) -> &tokenizers::Tokenizer {
+        &self.tokenizer
+    }
+
+    /// Step the decode stream with error recovery. On InvalidPrefix,
+    /// recreates the stream, replays all generated tokens, and returns
+    /// the delta since `streamed_text_len`.
+    pub(crate) fn step_decode_stream<'a>(
+        decode_stream: &mut tokenizers::DecodeStream<
+            'a,
+            tokenizers::ModelWrapper,
+            tokenizers::NormalizerWrapper,
+            tokenizers::PreTokenizerWrapper,
+            tokenizers::PostProcessorWrapper,
+            tokenizers::DecoderWrapper,
+        >,
+        tokenizer: &'a tokenizers::Tokenizer,
+        token_id: u32,
+        generated_tokens: &[u32],
+        streamed_text_len: usize,
+    ) -> String {
+        match decode_stream.step(token_id) {
+            Ok(Some(text)) => text,
+            Ok(None) => String::new(),
+            Err(_) => {
+                // Recreate stream and replay all tokens to recover state
+                let mut new_ds = tokenizer.decode_stream(true);
+                let mut replayed = String::new();
+                for &tid in generated_tokens {
+                    if let Ok(Some(t)) = new_ds.step(tid) {
+                        replayed.push_str(&t);
+                    }
+                }
+                *decode_stream = new_ds;
+                if replayed.len() > streamed_text_len {
+                    replayed[streamed_text_len..].to_string()
+                } else {
+                    String::new()
+                }
+            }
+        }
+    }
+
     /// Apply chat template synchronously (for internal use by chat())
     ///
     /// This is a synchronous version of apply_chat_template for use in blocking tasks.

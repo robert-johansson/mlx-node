@@ -14,7 +14,8 @@
 
 #include <string>
 #include <unordered_map>
-#include <mutex>
+#include <shared_mutex>
+#include <atomic>
 
 namespace qwen35_common {
 
@@ -27,8 +28,8 @@ inline std::unordered_map<std::string, array>& g_weights() {
   return instance;
 }
 
-inline std::mutex& g_weights_mutex() {
-  static std::mutex instance;
+inline std::shared_mutex& g_weights_mutex() {
+  static std::shared_mutex instance;
   return instance;
 }
 
@@ -37,26 +38,38 @@ inline std::unordered_map<std::string, array>& g_weight_transposes() {
   return instance;
 }
 
-inline const array& get_weight(const std::string& name) {
+// Model identity: atomic counter set after all weights are stored.
+// Inference checks this against its own model_id to avoid using another model's weights.
+// Value 0 means no model has registered weights.
+inline std::atomic<uint64_t>& g_active_model_id() {
+  static std::atomic<uint64_t> instance{0};
+  return instance;
+}
+
+// Returns by VALUE (refcount bump) so the caller's copy survives even if a
+// concurrent writer clears the map. MLX arrays are refcounted handles — cheap to copy.
+inline array get_weight(const std::string& name) {
+  std::shared_lock<std::shared_mutex> lock(g_weights_mutex());
   auto it = g_weights().find(name);
   if (it == g_weights().end()) {
     throw std::runtime_error("Weight not found: " + name);
   }
-  return it->second;
+  return it->second;  // copy under lock
 }
 
-inline const array& get_weight_t(const std::string& name) {
+// Pure read — transposes are pre-computed during weight registration.
+// Returns by VALUE for same reason as get_weight().
+inline array get_weight_t(const std::string& name) {
+  std::shared_lock<std::shared_mutex> lock(g_weights_mutex());
   auto it = g_weight_transposes().find(name);
   if (it != g_weight_transposes().end()) {
-    return it->second;
+    return it->second;  // copy under lock
   }
-  const auto& w = get_weight(name);
-  auto wt = transpose(w);
-  auto [inserted_it, _] = g_weight_transposes().emplace(name, std::move(wt));
-  return inserted_it->second;
+  throw std::runtime_error("Transpose not found for weight: " + name);
 }
 
 inline bool has_weight(const std::string& name) {
+  std::shared_lock<std::shared_mutex> lock(g_weights_mutex());
   return g_weights().count(name) > 0;
 }
 
@@ -84,8 +97,8 @@ inline int infer_affine_bits(const array& w, const array& scales, int group_size
 inline array linear_proj(const array& x, const std::string& prefix) {
   std::string scales_key = prefix + ".scales";
   if (has_weight(scales_key)) {
-    const auto& w = get_weight(prefix + ".weight");
-    const auto& scales = get_weight(scales_key);
+    auto w = get_weight(prefix + ".weight");
+    auto scales = get_weight(scales_key);
     std::string biases_key = prefix + ".biases";
     std::optional<array> biases = std::nullopt;
     if (has_weight(biases_key)) {
@@ -408,7 +421,7 @@ inline GDNPureResult gdn_pure_fn(
   int keep = cfg.linear_conv_kernel_dim - 1;
   auto new_conv_state = slice(conv_input, {0, total_len - keep, 0}, {B, total_len, conv_dim});
 
-  const auto& conv_w = get_weight(pfx + "conv1d.weight");
+  auto conv_w = get_weight(pfx + "conv1d.weight");
   auto conv_out = mlx::core::conv1d(conv_input, conv_w, 1, 0, 1, conv_dim);
 
   // SiLU — compiled
@@ -432,8 +445,8 @@ inline GDNPureResult gdn_pure_fn(
 
   // Beta, g
   auto beta_3d = reshape(sigmoid(b), {B, 1, cfg.linear_num_v_heads});
-  const auto& a_log  = get_weight(pfx + "A_log");
-  const auto& dt_b   = get_weight(pfx + "dt_bias");
+  auto a_log  = get_weight(pfx + "A_log");
+  auto dt_b   = get_weight(pfx + "dt_bias");
   auto g_3d = reshape(fused_compute_g(a_log, a, dt_b), {B, 1, cfg.linear_num_v_heads});
 
   // Metal kernel
@@ -441,7 +454,7 @@ inline GDNPureResult gdn_pure_fn(
 
   // RMSNorm gating
   auto z_h = reshape(z, {B, 1, cfg.linear_num_v_heads, cfg.linear_value_head_dim});
-  const auto& nw = get_weight(pfx + "norm.weight");
+  auto nw = get_weight(pfx + "norm.weight");
   auto y_normed = fast::rms_norm(y, nw, cfg.rms_norm_eps);
   y_normed = compiled_silu_mul()({z_h, y_normed})[0];
 
@@ -669,7 +682,7 @@ inline GDNPureResult gdn_prefill_fn(
   int total_len = pad_len + T;
   auto new_conv_state = slice(conv_input, {0, total_len - pad_len, 0}, {B, total_len, conv_dim});
 
-  const auto& conv_w = get_weight(pfx + "conv1d.weight");
+  auto conv_w = get_weight(pfx + "conv1d.weight");
   auto conv_out = mlx::core::conv1d(conv_input, conv_w, 1, 0, 1, conv_dim);  // [B, T, conv_dim]
 
   // SiLU — compiled
@@ -693,8 +706,8 @@ inline GDNPureResult gdn_prefill_fn(
 
   // Beta, g — reshape b/a from [B*T, Hv] to [B, T, Hv]
   auto beta_3d = reshape(sigmoid(b), {B, T, cfg.linear_num_v_heads});
-  const auto& a_log = get_weight(pfx + "A_log");
-  const auto& dt_b  = get_weight(pfx + "dt_bias");
+  auto a_log = get_weight(pfx + "A_log");
+  auto dt_b  = get_weight(pfx + "dt_bias");
   // fused_compute_g works on flat tensors [B*T, Hv]
   auto g_flat = fused_compute_g(a_log, a, dt_b);
   auto g_3d = reshape(g_flat, {B, T, cfg.linear_num_v_heads});
@@ -708,7 +721,7 @@ inline GDNPureResult gdn_prefill_fn(
 
   // RMSNorm gating — z is [B*T, value_dim], reshape to [B, T, Hv, Dv]
   auto z_h = reshape(z, {B, T, cfg.linear_num_v_heads, cfg.linear_value_head_dim});
-  const auto& nw = get_weight(pfx + "norm.weight");
+  auto nw = get_weight(pfx + "norm.weight");
   auto y_normed = fast::rms_norm(y, nw, cfg.rms_norm_eps);
   y_normed = compiled_silu_mul()({z_h, y_normed})[0];
 

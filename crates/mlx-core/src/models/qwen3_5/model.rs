@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use futures::TryFutureExt;
@@ -63,6 +63,33 @@ pub(crate) fn combine_image_hashes(hashes: &[u64]) -> u64 {
 pub(crate) fn compute_image_cache_key(all_images: &[Vec<u8>]) -> u64 {
     let individual_hashes: Vec<u64> = all_images.iter().map(|img| hash_image_bytes(img)).collect();
     combine_image_hashes(&individual_hashes)
+}
+
+/// Monotonically incrementing counter for assigning unique model IDs.
+/// Shared by BOTH dense and MoE models — the C++ weight map is shared,
+/// so IDs must be globally unique across all Qwen3.5 model variants.
+pub(crate) static QWEN35_MODEL_ID_COUNTER: AtomicU64 = AtomicU64::new(1); // 0 = no model
+
+/// RwLock protecting the C++ global weight map against concurrent mutation.
+/// Write-locked during weight registration (model load), read-locked during
+/// compiled inference. This prevents a concurrent model load from swapping
+/// weights underneath an in-flight compiled decode, and eliminates the TOCTOU
+/// between has_weight() / get_weight() in linear_proj().
+pub(crate) static COMPILED_WEIGHTS_RWLOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Acquire the compiled weight read lock and verify model ownership in one step.
+/// Returns `Some(guard)` if this model owns the compiled weights, `None` otherwise.
+/// The guard must be held for the lifetime of the compiled decode to prevent
+/// concurrent model loads from swapping weights mid-generation.
+pub(crate) fn acquire_compiled_weight_guard(
+    model_id: u64,
+) -> Option<std::sync::RwLockReadGuard<'static, ()>> {
+    let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+    if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+        Some(guard)
+    } else {
+        None
+    }
 }
 
 /// Process-wide mutex serializing the dense compiled forward lifecycle.
@@ -255,6 +282,14 @@ pub struct Qwen3_5Model {
     /// Without this, the compiled decode path starts with wrong RoPE positions
     /// when VLM prefill is skipped on Turn 2+.
     cached_rope_deltas: Arc<RwLock<Option<i32>>>,
+    /// Unique model instance ID for compiled path ownership.
+    /// The C++ global weight map is shared across all models — this ID ensures
+    /// inference only uses the compiled path when the weights belong to this model.
+    pub(crate) model_id: u64,
+    /// Serializes cache state access: held during the entire chat()/chatStream()/generate()
+    /// lifecycle. Cache API methods (reset_caches, take_cache, set_cache) use try_lock
+    /// and return an error if generation is in-flight.
+    generation_lock: Arc<TokioMutex<()>>,
 }
 
 #[napi]
@@ -309,12 +344,23 @@ impl Qwen3_5Model {
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
             cached_image_key: Arc::new(RwLock::new(None)),
             cached_rope_deltas: Arc::new(RwLock::new(None)),
+            model_id: QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            generation_lock: Arc::new(TokioMutex::new(())),
         })
     }
 
     /// Initialize caches for incremental generation.
     #[napi]
     pub fn init_caches(&self) -> Result<()> {
+        let _guard = self.generation_lock.try_lock().map_err(|_| {
+            Error::from_reason("Cannot init caches while generation is in progress")
+        })?;
+        self.init_caches_inner()
+    }
+
+    /// Init caches without checking the generation lock (for internal use
+    /// by generate_for_training_sync which already holds the lock).
+    fn init_caches_inner(&self) -> Result<()> {
         let caches = (0..self.config.num_layers as usize)
             .map(|i| {
                 if self.config.is_linear_layer(i) {
@@ -329,12 +375,21 @@ impl Qwen3_5Model {
             .write()
             .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
         *caches_guard = Some(caches);
+        self.clear_reuse_state();
         Ok(())
     }
 
     /// Reset all caches.
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
+        let _guard = self.generation_lock.try_lock().map_err(|_| {
+            Error::from_reason("Cannot reset caches while generation is in progress")
+        })?;
+        self.reset_caches_inner()
+    }
+
+    /// Reset caches without checking the generation lock.
+    fn reset_caches_inner(&self) -> Result<()> {
         let mut caches_guard = self
             .caches
             .write()
@@ -345,15 +400,21 @@ impl Qwen3_5Model {
             }
         }
         *caches_guard = None;
-        // Also clear token history so next chat() does a full prefill
+        self.clear_reuse_state();
+        Ok(())
+    }
+
+    /// Clear cached token history, image key, and rope deltas.
+    fn clear_reuse_state(&self) {
         if let Ok(mut th) = self.cached_token_history.write() {
             th.clear();
         }
-        // Clear cached rope deltas so next VLM prefill recomputes them
+        if let Ok(mut ik) = self.cached_image_key.write() {
+            *ik = None;
+        }
         if let Ok(mut rd) = self.cached_rope_deltas.write() {
             *rd = None;
         }
-        Ok(())
     }
 
     /// Take the KV cache from the model, returning a `PromptCache` handle.
@@ -363,6 +424,7 @@ impl Qwen3_5Model {
     /// before the next `chat()` call for incremental prefill.
     #[napi]
     pub fn take_cache(&self) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
+        let _guard = self.generation_lock.try_lock().ok()?;
         let mut caches_guard = self.caches.write().ok()?;
         let token_history_guard = self.cached_token_history.read().ok()?;
         let caches = caches_guard.take()?;
@@ -380,6 +442,7 @@ impl Qwen3_5Model {
             self.config.num_layers as usize,
             image_key,
             rope_deltas,
+            self.model_id,
         ))
     }
 
@@ -392,6 +455,10 @@ impl Qwen3_5Model {
         &self,
         cache: &mut crate::models::qwen3_5::prompt_cache::PromptCache,
     ) -> Result<()> {
+        let _guard = self
+            .generation_lock
+            .try_lock()
+            .map_err(|_| Error::from_reason("Cannot set cache while generation is in progress"))?;
         if cache.model_type() != "qwen3_5" {
             return Err(Error::from_reason(format!(
                 "Cache type '{}' doesn't match model type 'qwen3_5'",
@@ -404,6 +471,11 @@ impl Qwen3_5Model {
                 cache.num_layers(),
                 self.config.num_layers
             )));
+        }
+        if cache.model_id() != self.model_id {
+            return Err(Error::from_reason(
+                "Cache was created by a different model instance (different checkpoint or config)",
+            ));
         }
         let restored_caches = cache.take_caches().ok_or_else(|| {
             Error::from_reason("PromptCache is empty (already consumed or disposed)")
@@ -496,6 +568,10 @@ impl Qwen3_5Model {
             )));
         }
 
+        // Hold generation lock for the entire cache-read + generation + cache-write lifecycle.
+        let gen_lock = self.generation_lock.clone();
+        let _gen_guard = gen_lock.lock().await;
+
         // Clone Arcs and data needed for the closure
         let embedding_weight = self.embedding.get_weight();
         let layers_arc = self.layers.clone();
@@ -506,10 +582,11 @@ impl Qwen3_5Model {
         let tokenizer = self.tokenizer.clone();
 
         let prompt_tokens = prompt_tokens.clone();
+        let model_id = self.model_id;
 
-        // Check if compiled path will be used (C++ weights loaded from safetensors).
+        // Check if compiled path will be used (C++ weights belong to this model).
         // Must be checked before spawn_blocking so we can acquire the mutex in async context.
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
         // Serialize compiled lifecycle — prevents concurrent C++ global corruption
         let _compiled_lock = if use_compiled {
@@ -519,6 +596,13 @@ impl Qwen3_5Model {
         };
 
         napi::bindgen_prelude::spawn_blocking(move || {
+            let _weight_guard = if use_compiled {
+                acquire_compiled_weight_guard(model_id)
+            } else {
+                None
+            };
+            let use_compiled = _weight_guard.is_some();
+
             // Acquire all locks ONCE for the entire prefill+decode sequence
             let mut layers_guard = layers_arc
                 .write()
@@ -841,7 +925,9 @@ impl Qwen3_5Model {
 
         let reuse_cache = config.reuse_cache.unwrap_or(true);
 
-        // Tokenize messages using chat template
+        let gen_lock = self.generation_lock.clone();
+        let _gen_guard = gen_lock.lock().await;
+
         let tokenizer = self
             .tokenizer
             .clone()
@@ -880,9 +966,10 @@ impl Qwen3_5Model {
         };
         let spatial_merge_size = self.spatial_merge_size;
         let vision_cache = self.vision_cache.clone();
+        let model_id = self.model_id;
 
-        // Check if compiled path will be used (C++ weights loaded from safetensors).
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+        // Check if compiled path will be used (C++ weights belong to this model).
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
         // Capture start time BEFORE compiled mutex + spawn_blocking so TTFT
         // reflects the full user-perceived latency (mutex wait + thread dispatch
@@ -902,6 +989,20 @@ impl Qwen3_5Model {
         };
 
         napi::bindgen_prelude::spawn_blocking(move || {
+            // Re-validate compiled path under weight lock.
+            let mut _weight_guard = None;
+            let use_compiled = if use_compiled {
+                let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+                if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                    _weight_guard = Some(guard);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
             let mut first_token_instant: Option<std::time::Instant> = None;
 
             let tool_defs = config.tools.as_deref();
@@ -925,12 +1026,11 @@ impl Qwen3_5Model {
             let ngram_size = config.ngram_size.unwrap_or(64);
             let sampling_config = Some(SamplingConfig {
                 temperature: config.temperature,
-                top_k: config.top_k, // Qwen3.5 recommends top_k=20
+                top_k: config.top_k,
                 top_p: config.top_p,
                 min_p: config.min_p,
             });
 
-            // Acquire all locks ONCE for the entire prefill+decode sequence
             let mut layers_guard = layers_arc
                 .write()
                 .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
@@ -1044,6 +1144,37 @@ impl Qwen3_5Model {
                 tokens.clone()
             };
 
+            // Zero-delta guard: if entire prompt was cached (exact same input repeated),
+            // reset caches and do a full re-prefill. GDN recurrence state cannot be
+            // rewound, so full re-prefill is the only correct approach for Qwen3.5.
+            // Also reset cached_prefix_len so VLM routing correctly triggers vlm_prefill.
+            let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
+                info!("Zero-delta cache hit: resetting caches for full re-prefill");
+                if let Some(ref mut caches) = *caches_guard {
+                    for cache in caches.iter_mut() {
+                        cache.reset();
+                    }
+                }
+                let new_caches = (0..model_config.num_layers as usize)
+                    .map(|i| {
+                        if model_config.is_linear_layer(i) {
+                            Qwen3_5LayerCache::new_linear()
+                        } else {
+                            Qwen3_5LayerCache::new_full_attention()
+                        }
+                    })
+                    .collect();
+                *caches_guard = Some(new_caches);
+                let tokens = if has_images {
+                    expanded_tokens.clone()
+                } else {
+                    tokens.clone()
+                };
+                (tokens, 0)
+            } else {
+                (prefill_tokens, cached_prefix_len)
+            };
+
             let eos_id = model_config.eos_token_id as u32;
             let mut generated_tokens: Vec<u32> = Vec::new();
             let mut finish_reason = String::from("length");
@@ -1076,7 +1207,7 @@ impl Qwen3_5Model {
                         let input_ids =
                             MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
 
-                        let (logits, rope_deltas) = vlm_prefill(
+                        let (logits, rope_deltas, vlm_compiled) = vlm_prefill(
                             &input_ids,
                             image_cache_key,
                             processed,
@@ -1091,6 +1222,7 @@ impl Qwen3_5Model {
                             max_new_tokens,
                             generation_stream,
                             &vision_cache,
+                            model_id,
                         )?;
 
                         // Save rope_deltas for cache reuse on subsequent turns
@@ -1099,7 +1231,7 @@ impl Qwen3_5Model {
                         }
 
                         let vlm_seq_len = final_tokens.len() as i64;
-                        (logits, vlm_seq_len, use_compiled)
+                        (logits, vlm_seq_len, vlm_compiled)
                     } else {
                         return Err(Error::from_reason(
                             "VLM prefill requested but vision encoder/processor not loaded",
@@ -1638,13 +1770,14 @@ impl Qwen3_5Model {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
-        // Tokenize messages using chat template
+        // Use lock_owned() so the guard is 'static and can be moved into tokio::spawn.
+        let gen_guard = Arc::clone(&self.generation_lock).lock_owned().await;
+
         let tokenizer = self
             .tokenizer
             .clone()
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
 
-        // Detect images in messages
         let has_images = messages
             .iter()
             .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
@@ -1677,9 +1810,10 @@ impl Qwen3_5Model {
         };
         let spatial_merge_size = self.spatial_merge_size;
         let vision_cache_stream = self.vision_cache.clone();
+        let model_id = self.model_id;
 
-        // Check if compiled path will be used (C++ weights loaded from safetensors).
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+        // Check if compiled path will be used (C++ weights belong to this model).
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
         // Capture start time BEFORE compiled mutex + spawn_blocking so TTFT
         // reflects the full user-perceived latency.
@@ -1703,12 +1837,26 @@ impl Qwen3_5Model {
         let callback = Arc::new(callback);
 
         tokio::spawn(async move {
-            // Hold the compiled lock for the duration of generation
+            let _gen_guard = gen_guard;
             let _compiled_lock = compiled_lock;
 
             let callback_err = callback.clone();
             let result =
                 napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
+                    // Re-validate compiled path under weight lock.
+                    let mut _weight_guard = None;
+                    let use_compiled = if use_compiled {
+                        let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+                        if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                            _weight_guard = Some(guard);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
                     let tool_defs = config.tools.as_deref();
                     let enable_thinking = config.enable_thinking;
                     let tokens = tokenizer.apply_chat_template_sync(
@@ -1737,7 +1885,6 @@ impl Qwen3_5Model {
                         min_p: config.min_p,
                     });
 
-                    // Acquire all locks ONCE for the entire prefill+decode sequence
                     let mut layers_guard = layers_arc
                         .write()
                         .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
@@ -1851,9 +1998,39 @@ impl Qwen3_5Model {
                         tokens.clone()
                     };
 
+                    // Zero-delta guard: also reset cached_prefix_len for VLM routing.
+                    let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
+                        info!("Zero-delta cache hit: resetting caches for full re-prefill");
+                        if let Some(ref mut caches) = *caches_guard {
+                            for cache in caches.iter_mut() {
+                                cache.reset();
+                            }
+                        }
+                        let new_caches = (0..model_config.num_layers as usize)
+                            .map(|i| {
+                                if model_config.is_linear_layer(i) {
+                                    Qwen3_5LayerCache::new_linear()
+                                } else {
+                                    Qwen3_5LayerCache::new_full_attention()
+                                }
+                            })
+                            .collect();
+                        *caches_guard = Some(new_caches);
+                        let tokens = if has_images {
+                            expanded_tokens.clone()
+                        } else {
+                            tokens.clone()
+                        };
+                        (tokens, 0)
+                    } else {
+                        (prefill_tokens, cached_prefix_len)
+                    };
+
                     let eos_id = model_config.eos_token_id as u32;
                     let mut generated_tokens: Vec<u32> = Vec::new();
                     let mut finish_reason = String::from("length");
+                    let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);
+                    let mut streamed_text_len: usize = 0;
 
                     let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
                     let generation_stream = Stream::new(DeviceType::Gpu);
@@ -1888,7 +2065,7 @@ impl Qwen3_5Model {
                                     &[1, final_tokens.len() as i64],
                                 )?;
 
-                                let (logits, rope_deltas) = vlm_prefill(
+                                let (logits, rope_deltas, vlm_compiled) = vlm_prefill(
                                     &input_ids,
                                     image_cache_key,
                                     processed,
@@ -1903,6 +2080,7 @@ impl Qwen3_5Model {
                                     max_new_tokens,
                                     generation_stream,
                                     &vision_cache_stream,
+                                    model_id,
                                 )?;
 
                                 // Save rope_deltas for cache reuse on subsequent turns
@@ -1911,7 +2089,7 @@ impl Qwen3_5Model {
                                 }
 
                                 let vlm_seq_len = final_tokens.len() as i64;
-                                (logits, vlm_seq_len, use_compiled)
+                                (logits, vlm_seq_len, vlm_compiled)
                             } else {
                                 return Err(Error::from_reason(
                                     "VLM prefill requested but vision encoder/processor not loaded",
@@ -2116,10 +2294,14 @@ impl Qwen3_5Model {
                                 break;
                             }
 
-                            // Decode and stream this token
-                            let token_text = tokenizer_for_decode
-                                .decode_sync(&[token_id], true)
-                                .unwrap_or_default();
+                            let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                                &mut decode_stream,
+                                tokenizer_for_decode.inner(),
+                                token_id,
+                                &generated_tokens,
+                                streamed_text_len,
+                            );
+                            streamed_text_len += token_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
                                     text: token_text,
@@ -2261,10 +2443,14 @@ impl Qwen3_5Model {
                                 break;
                             }
 
-                            // Decode and stream this token
-                            let token_text = tokenizer_for_decode
-                                .decode_sync(&[token_id], true)
-                                .unwrap_or_default();
+                            let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                                &mut decode_stream,
+                                tokenizer_for_decode.inner(),
+                                token_id,
+                                &generated_tokens,
+                                streamed_text_len,
+                            );
+                            streamed_text_len += token_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
                                     text: token_text,
@@ -2353,13 +2539,31 @@ impl Qwen3_5Model {
                         }
                     }
 
-                    // Decode full text for final chunk
                     let text = tokenizer_for_decode
                         .decode_sync(&generated_tokens, true)
                         .unwrap_or_else(|e| {
                             warn!("Failed to decode generated tokens: {}", e);
                             String::new()
                         });
+
+                    // Flush any residual bytes buffered by DecodeStream that
+                    // weren't emitted as intermediate chunks.
+                    if text.len() > streamed_text_len {
+                        let residual = text[streamed_text_len..].to_string();
+                        callback.call(
+                            Ok(ChatStreamChunk {
+                                text: residual,
+                                done: false,
+                                finish_reason: None,
+                                tool_calls: None,
+                                thinking: None,
+                                num_tokens: None,
+                                raw_text: None,
+                                performance: None,
+                            }),
+                            ThreadsafeFunctionCallMode::NonBlocking,
+                        );
+                    }
 
                     let num_tokens = generated_tokens.len() as u32;
 
@@ -2964,6 +3168,8 @@ impl Qwen3_5Model {
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
             cached_image_key: Arc::new(RwLock::new(None)),
             cached_rope_deltas: Arc::new(RwLock::new(None)),
+            model_id: QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            generation_lock: Arc::new(TokioMutex::new(())),
         })
     }
 
@@ -3247,9 +3453,13 @@ impl Qwen3_5Model {
     ) -> Result<GenerationResult> {
         let config = config.unwrap_or_default();
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
+        let model_id = self.model_id;
 
-        // Check if compiled path is available (C++ weights loaded from safetensors)
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+        // Hold generation lock (blocking — called from spawn_blocking context).
+        let _gen_guard = self.generation_lock.blocking_lock();
+
+        // Check if compiled path is available (C++ weights belong to this model)
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
         // Try to acquire compiled mutex (non-blocking, safe from sync context).
         // If locked (concurrent generate() call), fall back to Rust path.
@@ -3260,8 +3470,14 @@ impl Qwen3_5Model {
         };
         let use_compiled = compiled_lock.is_some();
 
-        // Ensure caches exist
-        self.init_caches()?;
+        let _weight_guard = if use_compiled {
+            acquire_compiled_weight_guard(model_id)
+        } else {
+            None
+        };
+        let use_compiled = _weight_guard.is_some();
+
+        self.init_caches_inner()?;
 
         // Acquire locks
         let embedding_weight = self.embedding.get_weight();
@@ -3401,9 +3617,9 @@ impl Qwen3_5Model {
             result
         };
 
-        // Drop compiled lock before reset_caches
         drop(compiled_lock);
-        self.reset_caches()?;
+        // Use inner variant — we already hold the generation lock
+        self.reset_caches_inner()?;
 
         Ok(result)
     }
@@ -3731,7 +3947,8 @@ fn vlm_prefill(
     max_new_tokens: i32,
     generation_stream: Stream,
     vision_cache: &VisionCache,
-) -> Result<(MxArray, i64)> {
+    model_id: u64,
+) -> Result<(MxArray, i64, bool)> {
     use crate::array::clear_cache;
 
     let (inputs_embeds, position_ids, rope_deltas) = vlm_prepare_vision_features(
@@ -3746,9 +3963,9 @@ fn vlm_prefill(
     )?;
 
     // === STEP 4: Prefill with M-RoPE ===
-    let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+    let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
-    let (last_logits, _seq_len) = if use_compiled {
+    let (last_logits, _seq_len, compiled_init_done) = if use_compiled {
         // C++ VLM prefill: runs all layers in one FFI call with M-RoPE
         use mlx_sys as sys;
 
@@ -3847,7 +4064,7 @@ fn vlm_prefill(
 
         let logits = MxArray::from_handle(output_ptr, "vlm_cpp_prefill")?;
         // logits is already [1, vocab] from C++ prefill
-        (logits, seq_len_i32 as i64)
+        (logits, seq_len_i32 as i64, true) // compiled init done
     } else {
         // Rust fallback prefill (when C++ weights not loaded, e.g. test models)
         // Init fresh caches
@@ -3906,10 +4123,10 @@ fn vlm_prefill(
         let seq_len = logits.shape_at(1)?;
         let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
         let last_logits = last_logits.squeeze(Some(&[1]))?;
-        (last_logits, seq_len)
+        (last_logits, seq_len, false) // compiled init NOT done
     };
 
-    Ok((last_logits, rope_deltas))
+    Ok((last_logits, rope_deltas, compiled_init_done))
 }
 
 /// Shared VLM prefill steps 1-3: vision cache lookup, vision encoder,

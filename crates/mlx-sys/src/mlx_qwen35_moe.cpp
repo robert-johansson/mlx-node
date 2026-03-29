@@ -75,16 +75,14 @@ static std::vector<DenseMLPQuantInfo> g_dense_quant;  // per-layer dense MLP qua
 // Cached 3D transposes for expert weights [E,out,in] → [E,in,out]
 static std::unordered_map<std::string, array> g_weight_transposes_3d;
 
-const array& get_weight_t3d(const std::string& name) {
+// Pure read — 3D transposes are pre-computed in mlx_qwen35_moe_init_from_prefill.
+// Returns by VALUE so the caller's copy survives concurrent map mutations.
+array get_weight_t3d(const std::string& name) {
   auto it = g_weight_transposes_3d.find(name);
   if (it != g_weight_transposes_3d.end()) {
-    return it->second;
+    return it->second;  // copy (refcount bump)
   }
-  const auto& w = get_weight(name);
-  // [E, out, in] → [E, in, out]
-  auto wt = transpose(w, {0, 2, 1});
-  auto [inserted_it, _] = g_weight_transposes_3d.emplace(name, std::move(wt));
-  return inserted_it->second;
+  throw std::runtime_error("3D transpose not found for weight: " + name);
 }
 
 // =====================================================================
@@ -97,8 +95,8 @@ array quantized_linear_forward(
     const std::string& prefix,
     int gs, int bits,
     const std::string& mode) {
-  const auto& w = get_weight(prefix + ".weight");
-  const auto& scales = get_weight(prefix + ".scales");
+  auto w = get_weight(prefix + ".weight");
+  auto scales = get_weight(prefix + ".scales");
   std::optional<array> biases = std::nullopt;
   if (has_weight(prefix + ".biases")) {
     biases = get_weight(prefix + ".biases");
@@ -146,8 +144,8 @@ array switch_linear_fwd(
     bool sorted,
     bool is_quant, int /*gs_hint*/, int /*bits_hint*/, const std::string& /*mode_hint*/) {
   if (is_quant && has_weight(prefix + ".scales")) {
-    const auto& w = get_weight(prefix + ".weight");
-    const auto& scales = get_weight(prefix + ".scales");
+    auto w = get_weight(prefix + ".weight");
+    auto scales = get_weight(prefix + ".scales");
     std::optional<array> biases = std::nullopt;
     if (has_weight(prefix + ".biases")) {
       biases = get_weight(prefix + ".biases");
@@ -614,8 +612,8 @@ void mlx_qwen35_moe_init_from_prefill(
         return {true, 32, 8, "mxfp8"};
       }
       // Affine: infer bits from weight/scales shape ratio
-      const auto& w = get_weight(prefix + ".weight");
-      const auto& scales = get_weight(prefix + ".scales");
+      auto w = get_weight(prefix + ".weight");
+      auto scales = get_weight(prefix + ".scales");
       int bits = infer_affine_bits(w, scales, 64);
       return {true, 64, bits, "affine"};
     };
@@ -659,8 +657,17 @@ void mlx_qwen35_moe_init_from_prefill(
     g_moe_offset_int = prefill_offset;
     g_moe_inited = true;
 
-    // Clear 3D transpose cache
+    // Pre-compute 3D transposes for all expert weights [E,out,in] → [E,in,out].
+    // This eliminates lazy mutation in get_weight_t3d() during inference.
     g_weight_transposes_3d.clear();
+    {
+      std::shared_lock<std::shared_mutex> lock(g_weights_mutex());
+      for (const auto& [name, w] : g_weights()) {
+        if (w.ndim() == 3) {
+          g_weight_transposes_3d.insert_or_assign(name, transpose(w, {0, 2, 1}));
+        }
+      }
+    }
 
     // Break the lazy RNG split chain
     auto rng_key = mlx::core::random::KeySequence::default_().next();

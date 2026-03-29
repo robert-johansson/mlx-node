@@ -52,6 +52,8 @@ pub struct ActiveSequence {
     pub seq_id: u32,
     /// Original request ID
     pub request_id: String,
+    /// Original prompt token IDs (for penalty context)
+    pub prompt_tokens: Vec<u32>,
     /// Tokens generated so far
     pub generated_tokens: Vec<u32>,
     /// Maximum tokens to generate
@@ -107,6 +109,9 @@ pub struct TokenOutput {
     pub token: u32,
     /// Whether this token is an EOS token
     pub is_eos: bool,
+    /// Override finish reason (e.g. "repetition"). When set, takes precedence
+    /// over the default EOS/length logic in process_outputs.
+    pub finish_reason_override: Option<&'static str>,
 }
 
 /// Scheduler configuration
@@ -171,6 +176,33 @@ impl ContinuousBatchingScheduler {
             config,
             block_size,
         }
+    }
+
+    /// Get the penalty context slices (prompt, generated) for an active sequence.
+    /// Returns borrowed slices to avoid per-step allocation. Callers pass both
+    /// to penalty functions which accept &[u32].
+    pub fn get_penalty_context(&self, seq_id: u32) -> Option<(&[u32], &[u32])> {
+        self.running.get(&seq_id).map(|seq| {
+            (
+                seq.prompt_tokens.as_slice(),
+                seq.generated_tokens.as_slice(),
+            )
+        })
+    }
+
+    /// Get just the generated token history for an active sequence.
+    pub fn get_generated_tokens(&self, seq_id: u32) -> Option<&[u32]> {
+        self.running
+            .get(&seq_id)
+            .map(|seq| seq.generated_tokens.as_slice())
+    }
+
+    /// Check if adding one more token would hit or exceed max_new_tokens for a sequence.
+    /// Used by the model to set is_finished on the last token so clients see it immediately.
+    pub fn would_hit_length_limit(&self, seq_id: u32) -> bool {
+        self.running
+            .get(&seq_id)
+            .is_some_and(|seq| seq.generated_tokens.len() + 1 >= seq.max_new_tokens as usize)
     }
 
     /// Add a new request to the waiting queue
@@ -269,6 +301,7 @@ impl ContinuousBatchingScheduler {
                     let seq = ActiveSequence {
                         seq_id, // Use cache's seq_id, not our own counter
                         request_id: request.request_id.clone(),
+                        prompt_tokens: request.prompt_tokens.clone(),
                         generated_tokens: Vec::new(),
                         max_new_tokens: request.max_new_tokens,
                         prompt_len,
@@ -341,29 +374,27 @@ impl ContinuousBatchingScheduler {
         outputs: Vec<TokenOutput>,
         cache: &mut PagedKVCache,
     ) -> Result<(), String> {
-        let eos_token = self.config.eos_token_id.unwrap_or(151645);
-
         for output in outputs {
             if let Some(seq) = self.running.get_mut(&output.seq_id) {
-                // Transition from prefill to decode
                 if seq.is_prefill {
                     seq.is_prefill = false;
                 }
 
-                // Add generated token
                 seq.generated_tokens.push(output.token);
                 seq.position += 1;
 
-                // Extend cache for the new token
-                cache.extend_sequence(output.seq_id, 1)?;
-
-                // Check for completion
+                // The model sets is_eos and finish_reason_override based on
+                // the per-call GenerationConfig.eos_token_id. The scheduler
+                // does NOT duplicate the EOS check — that would use the stale
+                // construction-time config and ignore per-call overrides.
                 let should_stop = output.is_eos
-                    || output.token == eos_token
+                    || output.finish_reason_override.is_some()
                     || seq.generated_tokens.len() >= seq.max_new_tokens as usize;
 
                 if should_stop {
-                    let finish_reason = if output.is_eos || output.token == eos_token {
+                    let finish_reason = if let Some(reason) = output.finish_reason_override {
+                        reason
+                    } else if output.is_eos {
                         "stop"
                     } else {
                         "length"
@@ -381,6 +412,9 @@ impl ContinuousBatchingScheduler {
 
                     // Free memory
                     cache.remove_sequence(output.seq_id)?;
+                } else {
+                    // Only extend cache if sequence continues generating
+                    cache.extend_sequence(output.seq_id, 1)?;
                 }
             }
         }
@@ -594,6 +628,7 @@ mod tests {
                     seq_id,
                     token: 100,
                     is_eos: false,
+                    finish_reason_override: None,
                 }],
                 &mut cache,
             )
@@ -609,6 +644,7 @@ mod tests {
                     seq_id,
                     token: 101,
                     is_eos: false,
+                    finish_reason_override: None,
                 }],
                 &mut cache,
             )
@@ -620,6 +656,7 @@ mod tests {
                     seq_id,
                     token: 102,
                     is_eos: false,
+                    finish_reason_override: None,
                 }],
                 &mut cache,
             )
@@ -662,6 +699,7 @@ mod tests {
                     seq_id,
                     token: 999,
                     is_eos: true,
+                    finish_reason_override: None,
                 }],
                 &mut cache,
             )
@@ -751,6 +789,7 @@ mod tests {
                         seq_id,
                         token: 100,
                         is_eos: false,
+                        finish_reason_override: None,
                     }],
                     &mut cache,
                 )

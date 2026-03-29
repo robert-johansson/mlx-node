@@ -36,7 +36,10 @@ use super::decoder_layer::DecoderLayer;
 use super::layer_cache::Qwen3_5LayerCache;
 use super::persistence;
 
-/// Maximum number of entries in the vision encoder cache before LRU eviction.
+// Import the shared model ID counter from the dense module — dense and MoE
+// share the same C++ weight map, so IDs must be globally unique.
+use crate::models::qwen3_5::model::{QWEN35_MODEL_ID_COUNTER, acquire_compiled_weight_guard};
+
 /// Process-wide mutex serializing the MoE compiled forward lifecycle.
 ///
 /// The C++ MoE forward path uses process-wide globals (separate from dense).
@@ -115,6 +118,10 @@ pub struct Qwen3_5MoeModel {
     cached_image_key: Arc<RwLock<Option<u64>>>,
     /// Rope deltas from VLM prefill, for cache reuse M-RoPE correction
     cached_rope_deltas: Arc<RwLock<Option<i32>>>,
+    /// Unique model instance ID for compiled path ownership.
+    pub(crate) model_id: u64,
+    /// Serializes cache state access during generation.
+    generation_lock: Arc<TokioMutex<()>>,
 }
 
 #[napi]
@@ -167,6 +174,8 @@ impl Qwen3_5MoeModel {
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
             cached_image_key: Arc::new(RwLock::new(None)),
             cached_rope_deltas: Arc::new(RwLock::new(None)),
+            model_id: QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            generation_lock: Arc::new(TokioMutex::new(())),
         })
     }
 
@@ -177,6 +186,7 @@ impl Qwen3_5MoeModel {
     /// before the next `chat()` call for incremental prefill.
     #[napi]
     pub fn take_cache(&self) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
+        let _guard = self.generation_lock.try_lock().ok()?;
         let mut caches_guard = self.caches.write().ok()?;
         let token_history_guard = self.cached_token_history.read().ok()?;
         let caches = caches_guard.take()?;
@@ -194,6 +204,7 @@ impl Qwen3_5MoeModel {
             self.config.num_layers as usize,
             image_key,
             rope_deltas,
+            self.model_id,
         ))
     }
 
@@ -206,6 +217,10 @@ impl Qwen3_5MoeModel {
         &self,
         cache: &mut crate::models::qwen3_5::prompt_cache::PromptCache,
     ) -> Result<()> {
+        let _guard = self
+            .generation_lock
+            .try_lock()
+            .map_err(|_| Error::from_reason("Cannot set cache while generation is in progress"))?;
         if cache.model_type() != "qwen3_5_moe" {
             return Err(Error::from_reason(format!(
                 "Cache type '{}' doesn't match model type 'qwen3_5_moe'",
@@ -218,6 +233,11 @@ impl Qwen3_5MoeModel {
                 cache.num_layers(),
                 self.config.num_layers
             )));
+        }
+        if cache.model_id() != self.model_id {
+            return Err(Error::from_reason(
+                "Cache was created by a different model instance (different checkpoint or config)",
+            ));
         }
         let restored_caches = cache.take_caches().ok_or_else(|| {
             Error::from_reason("PromptCache is empty (already consumed or disposed)")
@@ -243,6 +263,13 @@ impl Qwen3_5MoeModel {
 
     #[napi]
     pub fn init_caches(&self) -> Result<()> {
+        let _guard = self.generation_lock.try_lock().map_err(|_| {
+            Error::from_reason("Cannot init caches while generation is in progress")
+        })?;
+        self.init_caches_inner()
+    }
+
+    fn init_caches_inner(&self) -> Result<()> {
         let caches = (0..self.config.num_layers as usize)
             .map(|i| {
                 if self.config.is_linear_layer(i) {
@@ -257,11 +284,19 @@ impl Qwen3_5MoeModel {
             .write()
             .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
         *caches_guard = Some(caches);
+        self.clear_reuse_state();
         Ok(())
     }
 
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
+        let _guard = self.generation_lock.try_lock().map_err(|_| {
+            Error::from_reason("Cannot reset caches while generation is in progress")
+        })?;
+        self.reset_caches_inner()
+    }
+
+    fn reset_caches_inner(&self) -> Result<()> {
         let mut caches_guard = self
             .caches
             .write()
@@ -272,14 +307,20 @@ impl Qwen3_5MoeModel {
             }
         }
         *caches_guard = None;
-        // Also clear token history so next chat() does a full prefill
+        self.clear_reuse_state();
+        Ok(())
+    }
+
+    fn clear_reuse_state(&self) {
         if let Ok(mut th) = self.cached_token_history.write() {
             th.clear();
+        }
+        if let Ok(mut ik) = self.cached_image_key.write() {
+            *ik = None;
         }
         if let Ok(mut rd) = self.cached_rope_deltas.write() {
             *rd = None;
         }
-        Ok(())
     }
 
     #[napi]
@@ -333,6 +374,10 @@ impl Qwen3_5MoeModel {
             )));
         }
 
+        // Hold generation lock for the entire lifecycle.
+        let gen_lock = self.generation_lock.clone();
+        let _gen_guard = gen_lock.lock().await;
+
         let embedding_weight = self.embedding.get_weight();
         let layers_arc = self.layers.clone();
         let final_norm_arc = self.final_norm.clone();
@@ -342,9 +387,10 @@ impl Qwen3_5MoeModel {
         let tokenizer = self.tokenizer.clone();
         let fa_idx = self.fa_idx;
         let prompt_tokens = prompt_tokens.clone();
+        let model_id = self.model_id;
 
-        // Check if C++ MoE path will be used (weights loaded from safetensors).
-        let use_cpp = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+        // Check if C++ MoE path will be used (weights belong to this model).
+        let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
         // Serialize MoE compiled lifecycle — prevents concurrent C++ global corruption
         let _moe_lock = if use_cpp {
@@ -354,6 +400,13 @@ impl Qwen3_5MoeModel {
         };
 
         napi::bindgen_prelude::spawn_blocking(move || {
+            let _weight_guard = if use_cpp {
+                acquire_compiled_weight_guard(model_id)
+            } else {
+                None
+            };
+            let use_cpp = _weight_guard.is_some();
+
             // Acquire all locks ONCE for the entire prefill+decode sequence
             let mut layers_guard = layers_arc
                 .write()
@@ -679,12 +732,15 @@ impl Qwen3_5MoeModel {
         });
 
         let reuse_cache = config.reuse_cache.unwrap_or(true);
+
+        let gen_lock = self.generation_lock.clone();
+        let _gen_guard = gen_lock.lock().await;
+
         let tokenizer = self
             .tokenizer
             .clone()
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
 
-        // Detect images in messages
         let has_images = messages
             .iter()
             .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
@@ -716,9 +772,10 @@ impl Qwen3_5MoeModel {
         };
         let spatial_merge_size = self.spatial_merge_size;
         let vision_cache = self.vision_cache.clone();
+        let model_id = self.model_id;
 
-        // Check if C++ MoE path will be used (weights loaded from safetensors).
-        let use_cpp = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+        // Check if C++ MoE path will be used (weights belong to this model).
+        let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
         // Capture start time BEFORE mutex + spawn_blocking so TTFT
         // reflects the full user-perceived latency.
@@ -737,6 +794,13 @@ impl Qwen3_5MoeModel {
         };
 
         napi::bindgen_prelude::spawn_blocking(move || {
+            let _weight_guard = if use_cpp {
+                acquire_compiled_weight_guard(model_id)
+            } else {
+                None
+            };
+            let use_cpp = _weight_guard.is_some();
+
             let tool_defs = config.tools.as_deref();
             let enable_thinking = config.enable_thinking;
             let tokens = tokenizer.apply_chat_template_sync(
@@ -758,12 +822,11 @@ impl Qwen3_5MoeModel {
             let ngram_size = config.ngram_size.unwrap_or(64);
             let sampling_config = Some(SamplingConfig {
                 temperature: config.temperature,
-                top_k: config.top_k, // Qwen3.5 recommends top_k=20
+                top_k: config.top_k,
                 top_p: config.top_p,
                 min_p: config.min_p,
             });
 
-            // Acquire all locks ONCE for the entire prefill+decode sequence
             let mut layers_guard = layers_arc
                 .write()
                 .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
@@ -870,6 +933,34 @@ impl Qwen3_5MoeModel {
                 tokens.clone()
             };
 
+            // Zero-delta guard: also reset cached_prefix_len for VLM routing.
+            let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
+                info!("Zero-delta cache hit: resetting caches for full re-prefill");
+                if let Some(ref mut caches) = *caches_guard {
+                    for cache in caches.iter_mut() {
+                        cache.reset();
+                    }
+                }
+                let new_caches = (0..model_config.num_layers as usize)
+                    .map(|i| {
+                        if model_config.is_linear_layer(i) {
+                            Qwen3_5LayerCache::new_linear()
+                        } else {
+                            Qwen3_5LayerCache::new_full_attention()
+                        }
+                    })
+                    .collect();
+                *caches_guard = Some(new_caches);
+                let tokens = if has_images {
+                    expanded_tokens.as_ref().unwrap_or(&tokens).clone()
+                } else {
+                    tokens.clone()
+                };
+                (tokens, 0)
+            } else {
+                (prefill_tokens, cached_prefix_len)
+            };
+
             let eos_id = model_config.eos_token_id as u32;
             let mut generated_tokens: Vec<u32> = Vec::new();
             let mut finish_reason = String::from("length");
@@ -952,13 +1043,6 @@ impl Qwen3_5MoeModel {
                     Some(&embedding_weight_t),
                     &vision_cache,
                 )?;
-
-                // Adjust RoPE offset for VLM M-RoPE position correction
-                if rope_deltas != 0 && use_cpp {
-                    unsafe {
-                        mlx_sys::mlx_qwen35_moe_adjust_offset(rope_deltas as i32);
-                    }
-                }
 
                 // Save rope_deltas for cache reuse on subsequent turns
                 if let Ok(mut rd) = cached_rope_deltas_arc.write() {
@@ -1088,10 +1172,10 @@ impl Qwen3_5MoeModel {
                 // C++ has copied arrays into its own globals — safe to release
                 drop(caches_guard);
 
-                // Reapply rope_deltas from the original VLM prefill
-                // (VLM cache reuse skips vlm_prefill, so C++ offset is unset)
+                // Apply M-RoPE offset correction AFTER init_from_prefill (which sets
+                // g_moe_offset_int = prefill_len). Must come after, not before, or the
+                // correction gets overwritten.
                 if has_images
-                    && cached_prefix_len > 0
                     && let Ok(rd) = cached_rope_deltas_arc.read()
                     && let Some(delta) = *rd
                 {
@@ -1495,12 +1579,13 @@ impl Qwen3_5MoeModel {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
+        let gen_guard = Arc::clone(&self.generation_lock).lock_owned().await;
+
         let tokenizer = self
             .tokenizer
             .clone()
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
 
-        // Detect images in messages
         let has_images = messages
             .iter()
             .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
@@ -1532,9 +1617,10 @@ impl Qwen3_5MoeModel {
         };
         let spatial_merge_size = self.spatial_merge_size;
         let vision_cache_stream = self.vision_cache.clone();
+        let model_id = self.model_id;
 
-        // Check if C++ MoE path will be used (weights loaded from safetensors).
-        let use_cpp = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+        // Check if C++ MoE path will be used (weights belong to this model).
+        let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
         // Capture start time BEFORE mutex + spawn_blocking so TTFT
         // reflects the full user-perceived latency.
@@ -1558,12 +1644,19 @@ impl Qwen3_5MoeModel {
         let callback = Arc::new(callback);
 
         tokio::spawn(async move {
-            // Hold the MoE lock for the duration of generation
+            let _gen_guard = gen_guard;
             let _moe_lock = moe_lock;
 
             let callback_err = callback.clone();
             let result =
                 napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
+                    let _weight_guard = if use_cpp {
+                        acquire_compiled_weight_guard(model_id)
+                    } else {
+                        None
+                    };
+                    let use_cpp = _weight_guard.is_some();
+
                     let tool_defs = config.tools.as_deref();
                     let enable_thinking = config.enable_thinking;
                     let tokens = tokenizer.apply_chat_template_sync(
@@ -1590,7 +1683,6 @@ impl Qwen3_5MoeModel {
                         min_p: config.min_p,
                     });
 
-                    // Acquire all locks ONCE for the entire prefill+decode sequence
                     let mut layers_guard = layers_arc
                         .write()
                         .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
@@ -1699,9 +1791,39 @@ impl Qwen3_5MoeModel {
                         tokens.clone()
                     };
 
+                    // Zero-delta guard: also reset cached_prefix_len for VLM routing.
+                    let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
+                        info!("Zero-delta cache hit: resetting caches for full re-prefill");
+                        if let Some(ref mut caches) = *caches_guard {
+                            for cache in caches.iter_mut() {
+                                cache.reset();
+                            }
+                        }
+                        let new_caches = (0..model_config.num_layers as usize)
+                            .map(|i| {
+                                if model_config.is_linear_layer(i) {
+                                    Qwen3_5LayerCache::new_linear()
+                                } else {
+                                    Qwen3_5LayerCache::new_full_attention()
+                                }
+                            })
+                            .collect();
+                        *caches_guard = Some(new_caches);
+                        let tokens = if has_images {
+                            expanded_tokens.as_ref().unwrap_or(&tokens).clone()
+                        } else {
+                            tokens.clone()
+                        };
+                        (tokens, 0)
+                    } else {
+                        (prefill_tokens, cached_prefix_len)
+                    };
+
                     let eos_id = model_config.eos_token_id as u32;
                     let mut generated_tokens: Vec<u32> = Vec::new();
                     let mut finish_reason = String::from("length");
+                    let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);
+                    let mut streamed_text_len: usize = 0;
 
                     // Track token history for repetition penalty
                     let mut token_history: Vec<u32> = if let Some(ref et) = expanded_tokens {
@@ -1787,13 +1909,6 @@ impl Qwen3_5MoeModel {
                             Some(&embedding_weight_t),
                             &vision_cache_stream,
                         )?;
-
-                        // Adjust RoPE offset for VLM M-RoPE position correction
-                        if rope_deltas != 0 && use_cpp {
-                            unsafe {
-                                mlx_sys::mlx_qwen35_moe_adjust_offset(rope_deltas as i32);
-                            }
-                        }
 
                         // Save rope_deltas for cache reuse on subsequent turns
                         if let Ok(mut rd) = cached_rope_deltas_arc.write() {
@@ -1925,10 +2040,8 @@ impl Qwen3_5MoeModel {
                         // C++ has copied arrays into its own globals — safe to release
                         drop(caches_guard);
 
-                        // Reapply rope_deltas from the original VLM prefill
-                        // (VLM cache reuse skips vlm_prefill, so C++ offset is unset)
+                        // Apply M-RoPE offset correction AFTER init_from_prefill.
                         if has_images
-                            && cached_prefix_len > 0
                             && let Ok(rd) = cached_rope_deltas_arc.read()
                             && let Some(delta) = *rd
                         {
@@ -1995,10 +2108,14 @@ impl Qwen3_5MoeModel {
                                 break;
                             }
 
-                            // Decode and stream this token
-                            let token_text = tokenizer_for_decode
-                                .decode_sync(&[token_id], true)
-                                .unwrap_or_default();
+                            let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                                &mut decode_stream,
+                                tokenizer_for_decode.inner(),
+                                token_id,
+                                &generated_tokens,
+                                streamed_text_len,
+                            );
+                            streamed_text_len += token_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
                                     text: token_text,
@@ -2141,10 +2258,14 @@ impl Qwen3_5MoeModel {
                                 break;
                             }
 
-                            // Decode and stream this token
-                            let token_text = tokenizer_for_decode
-                                .decode_sync(&[token_id], true)
-                                .unwrap_or_default();
+                            let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                                &mut decode_stream,
+                                tokenizer_for_decode.inner(),
+                                token_id,
+                                &generated_tokens,
+                                streamed_text_len,
+                            );
+                            streamed_text_len += token_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
                                     text: token_text,
@@ -2266,13 +2387,30 @@ impl Qwen3_5MoeModel {
                         None
                     };
 
-                    // Decode full text for final chunk
                     let text = tokenizer_for_decode
                         .decode_sync(&generated_tokens, true)
                         .unwrap_or_else(|e| {
                             warn!("Failed to decode generated tokens: {}", e);
                             String::new()
                         });
+
+                    // Flush residual bytes buffered by DecodeStream
+                    if text.len() > streamed_text_len {
+                        let residual = text[streamed_text_len..].to_string();
+                        callback.call(
+                            Ok(ChatStreamChunk {
+                                text: residual,
+                                done: false,
+                                finish_reason: None,
+                                tool_calls: None,
+                                thinking: None,
+                                num_tokens: None,
+                                raw_text: None,
+                                performance: None,
+                            }),
+                            ThreadsafeFunctionCallMode::NonBlocking,
+                        );
+                    }
 
                     let num_tokens = generated_tokens.len() as u32;
 
@@ -2875,6 +3013,8 @@ impl Qwen3_5MoeModel {
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
             cached_image_key: Arc::new(RwLock::new(None)),
             cached_rope_deltas: Arc::new(RwLock::new(None)),
+            model_id: QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            generation_lock: Arc::new(TokioMutex::new(())),
         })
     }
 
@@ -3231,9 +3371,13 @@ impl Qwen3_5MoeModel {
     ) -> Result<GenerationResult> {
         let config = config.unwrap_or_default();
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
+        let model_id = self.model_id;
 
-        // Check if C++ MoE path is available (weights loaded from safetensors)
-        let use_cpp = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+        // Hold generation lock (blocking — called from spawn_blocking context).
+        let _gen_guard = self.generation_lock.blocking_lock();
+
+        // Check if C++ MoE path is available (weights belong to this model)
+        let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
         // Try to acquire MoE compiled mutex (non-blocking, safe from sync context).
         // If locked (concurrent generate() call), fall back to Rust path.
@@ -3244,8 +3388,14 @@ impl Qwen3_5MoeModel {
         };
         let use_cpp = compiled_lock.is_some();
 
-        // Ensure caches exist
-        self.init_caches()?;
+        let _weight_guard = if use_cpp {
+            acquire_compiled_weight_guard(model_id)
+        } else {
+            None
+        };
+        let use_cpp = _weight_guard.is_some();
+
+        self.init_caches_inner()?;
 
         // Acquire locks
         let embedding_weight = self.embedding.get_weight();
@@ -3401,9 +3551,8 @@ impl Qwen3_5MoeModel {
             result
         };
 
-        // Drop compiled lock before reset_caches
         drop(compiled_lock);
-        self.reset_caches()?;
+        self.reset_caches_inner()?;
 
         Ok(result)
     }
