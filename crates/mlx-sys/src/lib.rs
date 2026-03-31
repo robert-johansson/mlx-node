@@ -644,6 +644,41 @@ unsafe extern "C-unwind" {
         right: bool,
     ) -> *mut mlx_array;
 
+    // GenMLX consolidation: vmap and compile transforms
+    pub fn mlx_vmap_apply(
+        fn_ptr: extern "C-unwind" fn(
+            *const *mut mlx_array,
+            usize,
+            *mut std::ffi::c_void,
+        ) -> *mut mlx_array,
+        context: *mut std::ffi::c_void,
+        inputs: *const *mut mlx_array,
+        input_count: usize,
+        in_axes: *const i32,
+        in_axes_len: usize,
+        out_axes: *const i32,
+        out_axes_len: usize,
+        outputs: *mut *mut mlx_array,
+        max_outputs: usize,
+        num_outputs: *mut usize,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_compile_apply(
+        fn_ptr: extern "C-unwind" fn(
+            *const *mut mlx_array,
+            usize,
+            *mut *mut mlx_array,
+            usize,
+            *mut std::ffi::c_void,
+        ) -> usize,
+        context: *mut std::ffi::c_void,
+        inputs: *const *mut mlx_array,
+        input_count: usize,
+        shapeless: bool,
+        outputs: *mut *mut mlx_array,
+        max_outputs: usize,
+    ) -> usize;
+
     // GenMLX consolidation: key-based PRNG
     pub fn mlx_random_key(seed: u64) -> *mut mlx_array;
     pub fn mlx_random_split(
