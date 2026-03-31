@@ -644,6 +644,41 @@ unsafe extern "C-unwind" {
         right: bool,
     ) -> *mut mlx_array;
 
+    // GenMLX consolidation: linear algebra
+    pub fn mlx_linalg_cholesky(handle: *mut mlx_array, upper: bool) -> *mut mlx_array;
+    pub fn mlx_linalg_solve(a: *mut mlx_array, b: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_linalg_solve_triangular(
+        a: *mut mlx_array,
+        b: *mut mlx_array,
+        upper: bool,
+    ) -> *mut mlx_array;
+    pub fn mlx_linalg_inv(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_linalg_tri_inv(handle: *mut mlx_array, upper: bool) -> *mut mlx_array;
+    pub fn mlx_linalg_cholesky_inv(handle: *mut mlx_array, upper: bool) -> *mut mlx_array;
+    pub fn mlx_linalg_qr(
+        handle: *mut mlx_array,
+        q_out: *mut *mut mlx_array,
+        r_out: *mut *mut mlx_array,
+    );
+    pub fn mlx_linalg_svd(
+        handle: *mut mlx_array,
+        u_out: *mut *mut mlx_array,
+        s_out: *mut *mut mlx_array,
+        vt_out: *mut *mut mlx_array,
+    );
+    pub fn mlx_linalg_eigh(
+        handle: *mut mlx_array,
+        uplo: *const std::os::raw::c_char,
+        eigvals_out: *mut *mut mlx_array,
+        eigvecs_out: *mut *mut mlx_array,
+    );
+    pub fn mlx_linalg_eigvalsh(
+        handle: *mut mlx_array,
+        uplo: *const std::os::raw::c_char,
+    ) -> *mut mlx_array;
+    pub fn mlx_linalg_norm(handle: *mut mlx_array, ord: f64) -> *mut mlx_array;
+    pub fn mlx_linalg_norm_default(handle: *mut mlx_array) -> *mut mlx_array;
+
     // GenMLX consolidation: einsum
     pub fn mlx_array_einsum(
         subscripts: *const std::os::raw::c_char,
