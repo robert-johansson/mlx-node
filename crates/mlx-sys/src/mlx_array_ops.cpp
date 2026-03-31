@@ -627,4 +627,166 @@ mlx_array* mlx_array_addmm(mlx_array* c_handle, mlx_array* a_handle, mlx_array* 
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
+// ============================================================================
+// GenMLX consolidation: additional math ops
+// ============================================================================
+
+// --- Unary special functions ---
+
+mlx_array* mlx_array_erf(mlx_array* handle) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = erf(*arr);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+mlx_array* mlx_array_erfinv(mlx_array* handle) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = erfinv(*arr);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+mlx_array* mlx_array_lgamma(mlx_array* handle) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = lgamma(*arr);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+mlx_array* mlx_array_digamma(mlx_array* handle) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = digamma(*arr);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+mlx_array* mlx_array_expm1(mlx_array* handle) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = expm1(*arr);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+mlx_array* mlx_array_bessel_i0e(mlx_array* handle) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = bessel_i0e(*arr);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+mlx_array* mlx_array_bessel_i1e(mlx_array* handle) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = bessel_i1e(*arr);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+// --- Binary ops ---
+
+mlx_array* mlx_array_logaddexp(mlx_array* lhs, mlx_array* rhs) {
+  auto a = reinterpret_cast<array*>(lhs);
+  auto b = reinterpret_cast<array*>(rhs);
+  array result = logaddexp(*a, *b);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+// --- nan_to_num (unary with optional params) ---
+
+mlx_array* mlx_array_nan_to_num(mlx_array* handle,
+                                 float nan_val,
+                                 bool has_posinf, float posinf_val,
+                                 bool has_neginf, float neginf_val) {
+  auto arr = reinterpret_cast<array*>(handle);
+  auto posinf = has_posinf ? std::optional<float>(posinf_val) : std::nullopt;
+  auto neginf = has_neginf ? std::optional<float>(neginf_val) : std::nullopt;
+  array result = nan_to_num(*arr, nan_val, posinf, neginf);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+// --- Shape/matrix ops ---
+
+mlx_array* mlx_array_flatten(mlx_array* handle) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = flatten(*arr);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+mlx_array* mlx_array_inner(mlx_array* lhs, mlx_array* rhs) {
+  auto a = reinterpret_cast<array*>(lhs);
+  auto b = reinterpret_cast<array*>(rhs);
+  array result = inner(*a, *b);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+mlx_array* mlx_array_outer(mlx_array* lhs, mlx_array* rhs) {
+  auto a = reinterpret_cast<array*>(lhs);
+  auto b = reinterpret_cast<array*>(rhs);
+  array result = outer(*a, *b);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+mlx_array* mlx_array_diag(mlx_array* handle, int k) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = diag(*arr, k);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+mlx_array* mlx_array_trace(mlx_array* handle, int offset, int axis1, int axis2) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = trace(*arr, offset, axis1, axis2);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+// --- Reduction ops ---
+
+mlx_array* mlx_array_all(mlx_array* handle,
+                          const int32_t* axes, size_t axes_len,
+                          bool keepdims) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = (axes_len == 0)
+                     ? all(*arr, keepdims)
+                     : all(*arr, make_axes(axes, axes_len), keepdims);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+mlx_array* mlx_array_any(mlx_array* handle,
+                          const int32_t* axes, size_t axes_len,
+                          bool keepdims) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = (axes_len == 0)
+                     ? any(*arr, keepdims)
+                     : any(*arr, make_axes(axes, axes_len), keepdims);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+mlx_array* mlx_array_topk(mlx_array* handle, int k, int axis) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = topk(*arr, k, axis);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+mlx_array* mlx_array_logcumsumexp(mlx_array* handle, int axis, bool reverse) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = logcumsumexp(*arr, axis, reverse);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+mlx_array* mlx_array_searchsorted(mlx_array* sorted_handle,
+                                    mlx_array* values_handle,
+                                    bool right) {
+  auto sorted = reinterpret_cast<array*>(sorted_handle);
+  auto values = reinterpret_cast<array*>(values_handle);
+  array result = searchsorted(*sorted, *values, right);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+// --- Einstein summation ---
+
+mlx_array* mlx_array_einsum(const char* subscripts,
+                             mlx_array* const* operand_handles,
+                             size_t operand_count) {
+  std::vector<array> operands;
+  operands.reserve(operand_count);
+  for (size_t i = 0; i < operand_count; i++) {
+    auto arr = reinterpret_cast<array*>(operand_handles[i]);
+    operands.emplace_back(*arr);
+  }
+  array result = einsum(std::string(subscripts), operands);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
 }  // extern "C"
