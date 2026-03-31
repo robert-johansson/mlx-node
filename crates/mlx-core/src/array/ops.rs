@@ -364,7 +364,7 @@ impl MxArray {
     }
 
     /// Detach tensor from the computation graph (no gradients flow through).
-    /// Used for MoE routing indices during training.
+    #[napi(js_name = "stopGradient")]
     pub fn stop_gradient(&self) -> Result<MxArray> {
         let handle = unsafe { sys::mlx_stop_gradient(self.handle.0) };
         MxArray::from_handle(handle, "stop_gradient")
@@ -384,5 +384,148 @@ impl MxArray {
         sum.eval();
         let count = sum.item_at_int32(0)?;
         Ok(count > 0)
+    }
+
+    // ================================================================
+    // GenMLX consolidation: additional ops
+    // ================================================================
+
+    // --- Activations (FFI exists, NAPI was missing) ---
+
+    #[napi]
+    pub fn sigmoid(&self) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_sigmoid(self.handle.0) };
+        MxArray::from_handle(handle, "sigmoid")
+    }
+
+    #[napi]
+    pub fn softmax(&self, axis: i32) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_softmax(self.handle.0, axis) };
+        MxArray::from_handle(handle, "softmax")
+    }
+
+    // --- Special functions ---
+
+    #[napi]
+    pub fn erf(&self) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_erf(self.handle.0) };
+        MxArray::from_handle(handle, "erf")
+    }
+
+    #[napi]
+    pub fn erfinv(&self) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_erfinv(self.handle.0) };
+        MxArray::from_handle(handle, "erfinv")
+    }
+
+    #[napi]
+    pub fn lgamma(&self) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_lgamma(self.handle.0) };
+        MxArray::from_handle(handle, "lgamma")
+    }
+
+    #[napi]
+    pub fn digamma(&self) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_digamma(self.handle.0) };
+        MxArray::from_handle(handle, "digamma")
+    }
+
+    #[napi]
+    pub fn expm1(&self) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_expm1(self.handle.0) };
+        MxArray::from_handle(handle, "expm1")
+    }
+
+    #[napi(js_name = "besselI0e")]
+    pub fn bessel_i0e(&self) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_bessel_i0e(self.handle.0) };
+        MxArray::from_handle(handle, "bessel_i0e")
+    }
+
+    #[napi(js_name = "besselI1e")]
+    pub fn bessel_i1e(&self) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_bessel_i1e(self.handle.0) };
+        MxArray::from_handle(handle, "bessel_i1e")
+    }
+
+    #[napi]
+    pub fn logaddexp(&self, other: &MxArray) -> Result<MxArray> {
+        let handle =
+            unsafe { sys::mlx_array_logaddexp(self.handle.0, other.handle.0) };
+        MxArray::from_handle(handle, "logaddexp")
+    }
+
+    #[napi(js_name = "nanToNum")]
+    pub fn nan_to_num(
+        &self,
+        nan_val: Option<f64>,
+        posinf_val: Option<f64>,
+        neginf_val: Option<f64>,
+    ) -> Result<MxArray> {
+        let handle = unsafe {
+            sys::mlx_array_nan_to_num(
+                self.handle.0,
+                nan_val.unwrap_or(0.0) as f32,
+                posinf_val.is_some(),
+                posinf_val.unwrap_or(0.0) as f32,
+                neginf_val.is_some(),
+                neginf_val.unwrap_or(0.0) as f32,
+            )
+        };
+        MxArray::from_handle(handle, "nan_to_num")
+    }
+
+    // --- Shape/matrix ops ---
+
+    #[napi]
+    pub fn flatten(&self) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_flatten(self.handle.0) };
+        MxArray::from_handle(handle, "flatten")
+    }
+
+    #[napi]
+    pub fn inner(&self, other: &MxArray) -> Result<MxArray> {
+        let handle =
+            unsafe { sys::mlx_array_inner(self.handle.0, other.handle.0) };
+        MxArray::from_handle(handle, "inner")
+    }
+
+    #[napi]
+    pub fn outer(&self, other: &MxArray) -> Result<MxArray> {
+        let handle =
+            unsafe { sys::mlx_array_outer(self.handle.0, other.handle.0) };
+        MxArray::from_handle(handle, "outer")
+    }
+
+    #[napi]
+    pub fn diag(&self, k: Option<i32>) -> Result<MxArray> {
+        let handle =
+            unsafe { sys::mlx_array_diag(self.handle.0, k.unwrap_or(0)) };
+        MxArray::from_handle(handle, "diag")
+    }
+
+    #[napi]
+    pub fn einsum(subscripts: String, operands: Vec<&MxArray>) -> Result<MxArray> {
+        let c_str = std::ffi::CString::new(subscripts)
+            .map_err(|e| napi::Error::from_reason(format!("Invalid subscripts: {e}")))?;
+        let handles: Vec<*mut sys::mlx_array> =
+            operands.iter().map(|a| a.handle.0).collect();
+        let handle = unsafe {
+            sys::mlx_array_einsum(c_str.as_ptr(), handles.as_ptr(), handles.len())
+        };
+        MxArray::from_handle(handle, "einsum")
+    }
+
+    #[napi(js_name = "trace")]
+    pub fn trace_(&self, offset: Option<i32>, axis1: Option<i32>, axis2: Option<i32>) -> Result<MxArray> {
+        let handle = unsafe {
+            sys::mlx_array_trace(
+                self.handle.0,
+                offset.unwrap_or(0),
+                axis1.unwrap_or(0),
+                axis2.unwrap_or(1),
+            )
+        };
+        MxArray::from_handle(handle, "trace")
     }
 }

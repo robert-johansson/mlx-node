@@ -733,6 +733,33 @@ export declare class MxArray {
    * This is a GPU-native operation that avoids CPU data transfer.
    */
   isfinite(): MxArray;
+  /** Detach tensor from the computation graph (no gradients flow through). */
+  stopGradient(): MxArray;
+  sigmoid(): MxArray;
+  softmax(axis: number): MxArray;
+  erf(): MxArray;
+  erfinv(): MxArray;
+  lgamma(): MxArray;
+  digamma(): MxArray;
+  expm1(): MxArray;
+  besselI0e(): MxArray;
+  besselI1e(): MxArray;
+  logaddexp(other: MxArray): MxArray;
+  nanToNum(
+    nanVal?: number | undefined | null,
+    posinfVal?: number | undefined | null,
+    neginfVal?: number | undefined | null,
+  ): MxArray;
+  flatten(): MxArray;
+  inner(other: MxArray): MxArray;
+  outer(other: MxArray): MxArray;
+  diag(k?: number | undefined | null): MxArray;
+  static einsum(subscripts: string, operands: Array<MxArray>): MxArray;
+  trace(
+    offset?: number | undefined | null,
+    axis1?: number | undefined | null,
+    axis2?: number | undefined | null,
+  ): MxArray;
   static randomUniform(shape: BigInt64Array, low: number, high: number, dtype?: DType | undefined | null): MxArray;
   static randomNormal(shape: BigInt64Array, mean: number, std: number, dtype?: DType | undefined | null): MxArray;
   static randomBernoulli(shape: BigInt64Array, prob: number): MxArray;
@@ -762,6 +789,11 @@ export declare class MxArray {
   logsumexp(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
   cumsum(axis: number): MxArray;
   cumprod(axis: number): MxArray;
+  all(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  any(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  topk(k: number, axis?: number | undefined | null): MxArray;
+  logcumsumexp(axis: number, reverse?: boolean | undefined | null): MxArray;
+  searchsorted(values: MxArray, right?: boolean | undefined | null): MxArray;
   reshape(shape: BigInt64Array): MxArray;
   transpose(axes?: Int32Array | undefined | null): MxArray;
   take(indices: MxArray, axis: number): MxArray;
