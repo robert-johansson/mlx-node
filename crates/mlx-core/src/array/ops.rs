@@ -528,4 +528,121 @@ impl MxArray {
         };
         MxArray::from_handle(handle, "trace")
     }
+
+    // ================================================================
+    // Linear Algebra (CPU-only except norm)
+    // ================================================================
+
+    #[napi]
+    pub fn cholesky(&self, upper: Option<bool>) -> Result<MxArray> {
+        let handle =
+            unsafe { sys::mlx_linalg_cholesky(self.handle.0, upper.unwrap_or(false)) };
+        MxArray::from_handle(handle, "cholesky")
+    }
+
+    #[napi(js_name = "linalgSolve")]
+    pub fn linalg_solve(&self, b: &MxArray) -> Result<MxArray> {
+        let handle =
+            unsafe { sys::mlx_linalg_solve(self.handle.0, b.handle.0) };
+        MxArray::from_handle(handle, "solve")
+    }
+
+    #[napi(js_name = "solveTriangular")]
+    pub fn solve_triangular(&self, b: &MxArray, upper: Option<bool>) -> Result<MxArray> {
+        let handle = unsafe {
+            sys::mlx_linalg_solve_triangular(
+                self.handle.0,
+                b.handle.0,
+                upper.unwrap_or(false),
+            )
+        };
+        MxArray::from_handle(handle, "solve_triangular")
+    }
+
+    #[napi(js_name = "linalgInv")]
+    pub fn linalg_inv(&self) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_linalg_inv(self.handle.0) };
+        MxArray::from_handle(handle, "inv")
+    }
+
+    #[napi(js_name = "triInv")]
+    pub fn tri_inv(&self, upper: Option<bool>) -> Result<MxArray> {
+        let handle =
+            unsafe { sys::mlx_linalg_tri_inv(self.handle.0, upper.unwrap_or(false)) };
+        MxArray::from_handle(handle, "tri_inv")
+    }
+
+    #[napi(js_name = "choleskyInv")]
+    pub fn cholesky_inv(&self, upper: Option<bool>) -> Result<MxArray> {
+        let handle = unsafe {
+            sys::mlx_linalg_cholesky_inv(self.handle.0, upper.unwrap_or(false))
+        };
+        MxArray::from_handle(handle, "cholesky_inv")
+    }
+
+    /// QR decomposition. Returns [Q, R] as a two-element array.
+    #[napi]
+    pub fn qr(&self) -> Result<Vec<MxArray>> {
+        let mut q_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut r_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+        unsafe { sys::mlx_linalg_qr(self.handle.0, &mut q_ptr, &mut r_ptr) };
+        let q = MxArray::from_handle(q_ptr, "qr_q")?;
+        let r = MxArray::from_handle(r_ptr, "qr_r")?;
+        Ok(vec![q, r])
+    }
+
+    /// SVD decomposition. Returns [U, S, Vt] as a three-element array.
+    #[napi]
+    pub fn svd(&self) -> Result<Vec<MxArray>> {
+        let mut u_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut s_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut vt_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+        unsafe {
+            sys::mlx_linalg_svd(self.handle.0, &mut u_ptr, &mut s_ptr, &mut vt_ptr)
+        };
+        let u = MxArray::from_handle(u_ptr, "svd_u")?;
+        let s = MxArray::from_handle(s_ptr, "svd_s")?;
+        let vt = MxArray::from_handle(vt_ptr, "svd_vt")?;
+        Ok(vec![u, s, vt])
+    }
+
+    /// Eigendecomposition of symmetric matrix. Returns [eigenvalues, eigenvectors].
+    #[napi]
+    pub fn eigh(&self, uplo: Option<String>) -> Result<Vec<MxArray>> {
+        let uplo_str = uplo.unwrap_or_else(|| "L".to_string());
+        let c_str = std::ffi::CString::new(uplo_str)
+            .map_err(|e| napi::Error::from_reason(format!("Invalid UPLO: {e}")))?;
+        let mut eigvals_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut eigvecs_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+        unsafe {
+            sys::mlx_linalg_eigh(
+                self.handle.0,
+                c_str.as_ptr(),
+                &mut eigvals_ptr,
+                &mut eigvecs_ptr,
+            )
+        };
+        let eigvals = MxArray::from_handle(eigvals_ptr, "eigh_eigvals")?;
+        let eigvecs = MxArray::from_handle(eigvecs_ptr, "eigh_eigvecs")?;
+        Ok(vec![eigvals, eigvecs])
+    }
+
+    #[napi]
+    pub fn eigvalsh(&self, uplo: Option<String>) -> Result<MxArray> {
+        let uplo_str = uplo.unwrap_or_else(|| "L".to_string());
+        let c_str = std::ffi::CString::new(uplo_str)
+            .map_err(|e| napi::Error::from_reason(format!("Invalid UPLO: {e}")))?;
+        let handle =
+            unsafe { sys::mlx_linalg_eigvalsh(self.handle.0, c_str.as_ptr()) };
+        MxArray::from_handle(handle, "eigvalsh")
+    }
+
+    #[napi(js_name = "linalgNorm")]
+    pub fn linalg_norm(&self, ord: Option<f64>) -> Result<MxArray> {
+        let handle = match ord {
+            Some(o) => unsafe { sys::mlx_linalg_norm(self.handle.0, o) },
+            None => unsafe { sys::mlx_linalg_norm_default(self.handle.0) },
+        };
+        MxArray::from_handle(handle, "norm")
+    }
 }

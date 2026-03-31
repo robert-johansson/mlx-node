@@ -760,6 +760,20 @@ export declare class MxArray {
     axis1?: number | undefined | null,
     axis2?: number | undefined | null,
   ): MxArray;
+  cholesky(upper?: boolean | undefined | null): MxArray;
+  linalgSolve(b: MxArray): MxArray;
+  solveTriangular(b: MxArray, upper?: boolean | undefined | null): MxArray;
+  linalgInv(): MxArray;
+  triInv(upper?: boolean | undefined | null): MxArray;
+  choleskyInv(upper?: boolean | undefined | null): MxArray;
+  /** QR decomposition. Returns [Q, R] as a two-element array. */
+  qr(): Array<MxArray>;
+  /** SVD decomposition. Returns [U, S, Vt] as a three-element array. */
+  svd(): Array<MxArray>;
+  /** Eigendecomposition of symmetric matrix. Returns [eigenvalues, eigenvectors]. */
+  eigh(uplo?: string | undefined | null): Array<MxArray>;
+  eigvalsh(uplo?: string | undefined | null): MxArray;
+  linalgNorm(ord?: number | undefined | null): MxArray;
   static randomUniform(shape: BigInt64Array, low: number, high: number, dtype?: DType | undefined | null): MxArray;
   static randomNormal(shape: BigInt64Array, mean: number, std: number, dtype?: DType | undefined | null): MxArray;
   static randomBernoulli(shape: BigInt64Array, prob: number): MxArray;
