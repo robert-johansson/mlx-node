@@ -576,6 +576,81 @@ unsafe extern "C-unwind" {
     // Compiled logit softcap: tanh(x / softcap) * softcap (fused kernel)
     pub fn mlx_logit_softcap(x: *mut mlx_array, softcap: *mut mlx_array) -> *mut mlx_array;
 
+    // GenMLX consolidation: special functions
+    pub fn mlx_array_erf(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_erfinv(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_lgamma(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_digamma(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_expm1(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_bessel_i0e(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_bessel_i1e(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_logaddexp(
+        lhs: *mut mlx_array,
+        rhs: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_array_nan_to_num(
+        handle: *mut mlx_array,
+        nan_val: f32,
+        has_posinf: bool,
+        posinf_val: f32,
+        has_neginf: bool,
+        neginf_val: f32,
+    ) -> *mut mlx_array;
+
+    // GenMLX consolidation: shape/matrix ops
+    pub fn mlx_array_flatten(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_inner(
+        lhs: *mut mlx_array,
+        rhs: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_array_outer(
+        lhs: *mut mlx_array,
+        rhs: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_array_diag(handle: *mut mlx_array, k: i32) -> *mut mlx_array;
+    pub fn mlx_array_trace(
+        handle: *mut mlx_array,
+        offset: i32,
+        axis1: i32,
+        axis2: i32,
+    ) -> *mut mlx_array;
+
+    // GenMLX consolidation: reduction ops
+    pub fn mlx_array_all(
+        handle: *mut mlx_array,
+        axes: *const i32,
+        axes_len: usize,
+        keepdims: bool,
+    ) -> *mut mlx_array;
+    pub fn mlx_array_any(
+        handle: *mut mlx_array,
+        axes: *const i32,
+        axes_len: usize,
+        keepdims: bool,
+    ) -> *mut mlx_array;
+    pub fn mlx_array_topk(
+        handle: *mut mlx_array,
+        k: i32,
+        axis: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_array_logcumsumexp(
+        handle: *mut mlx_array,
+        axis: i32,
+        reverse: bool,
+    ) -> *mut mlx_array;
+    pub fn mlx_array_searchsorted(
+        sorted_handle: *mut mlx_array,
+        values_handle: *mut mlx_array,
+        right: bool,
+    ) -> *mut mlx_array;
+
+    // GenMLX consolidation: einsum
+    pub fn mlx_array_einsum(
+        subscripts: *const std::os::raw::c_char,
+        operand_handles: *const *mut mlx_array,
+        operand_count: usize,
+    ) -> *mut mlx_array;
+
     // Fast operations (mlx::fast namespace)
     pub fn mlx_fast_rope(
         handle: *mut mlx_array,
