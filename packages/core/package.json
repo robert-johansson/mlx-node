@@ -36,7 +36,7 @@
     "oxfmt": "^0.40.0"
   },
   "optionalDependencies": {
-    "@mlx-node/core-darwin-arm64": "workspace:*"
+    "@mlx-node/core-darwin-arm64": "0.0.6"
   },
   "napi": {
     "binaryName": "mlx-core",

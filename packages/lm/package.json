@@ -28,9 +28,8 @@
     "test": "vite test run"
   },
   "dependencies": {
-    "@mlx-node/core": "workspace:*"
+    "@mlx-node/core": "file:../core"
   },
   "devDependencies": {
-    "@types/node": "catalog:"
   }
 }
