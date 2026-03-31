@@ -2357,6 +2357,10 @@ export interface CleanupStats {
   logsDeleted: number;
 }
 
+export declare function clearCache(): void;
+
+export declare function compileClearCache(): boolean;
+
 /**
  * Structured completion information aligned with ChatResult.
  * Contains pre-parsed tool calls, thinking, and clean text.
@@ -2547,6 +2551,9 @@ export interface EngineStepMetrics {
   activeMemoryMb: number;
 }
 
+/** Evaluate multiple arrays synchronously. */
+export declare function evalArrays(arrays: Array<MxArray>): void;
+
 export interface ForeignConversionOptions {
   /** Path to the input weights file (.pdparams, .pkl, .pt, .pth) */
   inputPath: string;
@@ -2734,11 +2741,21 @@ export interface GenerationWithToolCalls {
   toolCalls: Array<ToolCallRecord>;
 }
 
+export declare function getActiveMemory(): number;
+
+export declare function getCacheMemory(): number;
+
 /** Get expected weight keys for PaddleOCR-VL model */
 export declare function getExpectedWeightKeys(): Array<string>;
 
+export declare function getMemoryLimit(): number;
+
+export declare function getPeakMemory(): number;
+
 /** Retrieve all collected profiling data as a `ProfilingSession`. */
 export declare function getProfilingData(): ProfilingSession;
+
+export declare function getWiredLimit(): number;
 
 export interface GgufConversionOptions {
   /** Path to the GGUF file */
@@ -2787,6 +2804,8 @@ export interface GgufConversionResult {
   tensorNames: Array<string>;
   sourceFormat: string;
 }
+
+export declare function gpuArchitectureGen(): number;
 
 export interface GpuInfo {
   /** GPU architecture generation (M1=13, M2=14, M3=15, M4=16, M5=17). */
@@ -3035,6 +3054,10 @@ export interface MemorySnapshot {
   /** Cache memory in bytes. */
   cacheBytes: number;
 }
+
+export declare function metalDeviceInfo(): string;
+
+export declare function metalIsAvailable(): boolean;
 
 /** Full model configuration */
 export interface ModelConfig {
@@ -3455,6 +3478,8 @@ export interface RecResult {
   score: number;
 }
 
+export declare function resetPeakMemory(): void;
+
 /** Clear all collected profiling data and reset session timer. */
 export declare function resetProfilingData(): void;
 
@@ -3560,8 +3585,14 @@ export interface SchedulerStatsNapi {
   totalRunningTokens: number;
 }
 
+export declare function setCacheLimit(limit: number): number;
+
+export declare function setMemoryLimit(limit: number): number;
+
 /** Enable or disable profiling globally. */
 export declare function setProfilingEnabled(enabled: boolean): void;
+
+export declare function setWiredLimit(limit: number): number;
 
 /** Configuration for the SFT training engine */
 export interface SftEngineConfig {
@@ -3679,6 +3710,8 @@ export interface StepSummary {
   eosCount: number;
   lengthCount: number;
 }
+
+export declare function synchronize(): void;
 
 /** A table structure */
 export interface Table {
