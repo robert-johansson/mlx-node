@@ -644,6 +644,76 @@ unsafe extern "C-unwind" {
         right: bool,
     ) -> *mut mlx_array;
 
+    // GenMLX consolidation: key-based PRNG
+    pub fn mlx_random_key(seed: u64) -> *mut mlx_array;
+    pub fn mlx_random_split(
+        key: *mut mlx_array,
+        k1_out: *mut *mut mlx_array,
+        k2_out: *mut *mut mlx_array,
+    );
+    pub fn mlx_random_split_n(key: *mut mlx_array, n: i32) -> *mut mlx_array;
+    pub fn mlx_random_uniform_key(
+        key: *mut mlx_array,
+        shape: *const i64,
+        ndim: usize,
+        low: f32,
+        high: f32,
+        dtype: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_random_normal_key(
+        key: *mut mlx_array,
+        shape: *const i64,
+        ndim: usize,
+        dtype: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_random_bernoulli_key(
+        key: *mut mlx_array,
+        prob: f32,
+        shape: *const i64,
+        ndim: usize,
+    ) -> *mut mlx_array;
+    pub fn mlx_random_categorical_key(
+        key: *mut mlx_array,
+        logits: *mut mlx_array,
+        axis: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_random_randint_key(
+        key: *mut mlx_array,
+        low: i32,
+        high: i32,
+        shape: *const i64,
+        ndim: usize,
+        dtype: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_random_gumbel_key(
+        key: *mut mlx_array,
+        shape: *const i64,
+        ndim: usize,
+        dtype: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_random_laplace_key(
+        key: *mut mlx_array,
+        shape: *const i64,
+        ndim: usize,
+        dtype: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_random_truncated_normal_key(
+        key: *mut mlx_array,
+        lower: *mut mlx_array,
+        upper: *mut mlx_array,
+        shape: *const i64,
+        ndim: usize,
+        dtype: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_random_multivariate_normal_key(
+        key: *mut mlx_array,
+        mean: *mut mlx_array,
+        cov: *mut mlx_array,
+        shape: *const i64,
+        ndim: usize,
+        dtype: i32,
+    ) -> *mut mlx_array;
+
     // GenMLX consolidation: linear algebra
     pub fn mlx_linalg_cholesky(handle: *mut mlx_array, upper: bool) -> *mut mlx_array;
     pub fn mlx_linalg_solve(a: *mut mlx_array, b: *mut mlx_array) -> *mut mlx_array;

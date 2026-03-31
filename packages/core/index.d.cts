@@ -783,6 +783,35 @@ export declare class MxArray {
    * Takes logits and returns sampled indices
    */
   categorical(axis?: number | undefined | null): MxArray;
+  /** Create a PRNG key from a seed. */
+  static randomKey(seed: number): MxArray;
+  /** Split a key into two independent sub-keys. Returns [k1, k2]. */
+  randomSplit(): Array<MxArray>;
+  /** Split a key into n independent sub-keys. */
+  randomSplitN(n: number): MxArray;
+  /** Key-based uniform sampling. */
+  keyUniform(
+    shape: BigInt64Array,
+    low?: number | undefined | null,
+    high?: number | undefined | null,
+    dtype?: DType | undefined | null,
+  ): MxArray;
+  /** Key-based normal sampling. */
+  keyNormal(shape: BigInt64Array, dtype?: DType | undefined | null): MxArray;
+  /** Key-based bernoulli sampling. */
+  keyBernoulli(prob: number, shape: BigInt64Array): MxArray;
+  /** Key-based categorical sampling from logits. */
+  keyCategorical(logits: MxArray, axis?: number | undefined | null): MxArray;
+  /** Key-based random integer sampling. */
+  keyRandint(low: number, high: number, shape: BigInt64Array, dtype?: DType | undefined | null): MxArray;
+  /** Key-based Gumbel sampling. */
+  keyGumbel(shape: BigInt64Array, dtype?: DType | undefined | null): MxArray;
+  /** Key-based Laplace sampling. */
+  keyLaplace(shape: BigInt64Array, dtype?: DType | undefined | null): MxArray;
+  /** Key-based truncated normal sampling. */
+  keyTruncatedNormal(lower: MxArray, upper: MxArray, shape: BigInt64Array, dtype?: DType | undefined | null): MxArray;
+  /** Key-based multivariate normal sampling. */
+  keyMultivariateNormal(mean: MxArray, cov: MxArray, shape: BigInt64Array, dtype?: DType | undefined | null): MxArray;
   sum(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
   mean(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
   argmax(axis: number, keepdims?: boolean | undefined | null): MxArray;
