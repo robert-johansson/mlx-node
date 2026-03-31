@@ -890,6 +890,40 @@ export declare class MxArray {
    * Returns `[grad0, grad1, ...]`.
    */
   static computeGradients(lossFn: (...args: MxArray[]) => MxArray, inputs: Array<MxArray>): Array<MxArray>;
+  /**
+   * Apply vmap to a JS function.
+   *
+   * ```js
+   * const result = MxArray.vmap(
+   *   (x) => x.square(),  // function to vectorize
+   *   [x_batched],         // batched inputs
+   *   [0],                 // in_axes
+   *   [0]                  // out_axes
+   * );
+   * ```
+   */
+  static vmap(
+    func: (...args: MxArray[]) => MxArray,
+    inputs: Array<MxArray>,
+    inAxes?: Array<number> | undefined | null,
+    outAxes?: Array<number> | undefined | null,
+  ): Array<MxArray>;
+  /**
+   * Compile and apply a JS function.
+   *
+   * ```js
+   * const result = MxArray.compileFn(
+   *   (x) => x.square().sum(),
+   *   [x],
+   *   false  // shapeless
+   * );
+   * ```
+   */
+  static compileFn(
+    func: (...args: MxArray[]) => MxArray,
+    inputs: Array<MxArray>,
+    shapeless?: boolean | undefined | null,
+  ): Array<MxArray>;
 }
 
 /** NAPI-exported reward registry wrapper */

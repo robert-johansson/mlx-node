@@ -25,6 +25,7 @@ pub mod stream;
 pub mod tensor;
 pub mod tokenizer;
 pub mod tools;
+pub mod transforms;
 pub mod tracing;
 pub mod training_model;
 pub mod training_state;
