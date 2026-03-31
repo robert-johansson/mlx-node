@@ -509,6 +509,136 @@ where
     outputs
 }
 
+// ============================================================================
+// GenMLX consolidation: General-purpose value_and_grad NAPI export
+//
+// Takes a JS function + input arrays, computes gradients via MLX autograd.
+// The JS function is called SYNCHRONOUSLY from within the gradient computation.
+// ============================================================================
+
+use napi_derive::napi;
+
+/// Helper: create a loss closure that calls a JS function via raw NAPI.
+///
+/// The JS function receives MxArray arguments and must return a scalar MxArray.
+/// All calls are synchronous on the JS thread — safe because MLX's
+/// value_and_grad is synchronous.
+fn make_js_loss_closure(
+    raw_env: napi::sys::napi_env,
+    raw_func: napi::sys::napi_value,
+) -> impl FnMut(&[MxArray]) -> Result<MxArray> {
+    move |params: &[MxArray]| -> Result<MxArray> {
+        unsafe {
+            let env_wrapper = Env::from_raw(raw_env);
+
+            // Convert each MxArray param to a JS MxArray instance.
+            // Clone the Arc handle — both Rust and JS hold references.
+            // C++ owns the underlying handles; the Arc prevents premature
+            // Rust-side cleanup during the synchronous callback.
+            let mut js_args: Vec<napi::sys::napi_value> = Vec::with_capacity(params.len());
+            for param in params {
+                let cloned = MxArray {
+                    handle: param.handle.clone(),
+                };
+                let instance = cloned.into_instance(&env_wrapper)?;
+                js_args.push(instance.raw());
+            }
+
+            // Call the JS function synchronously
+            let mut result: napi::sys::napi_value = std::ptr::null_mut();
+            let mut global: napi::sys::napi_value = std::ptr::null_mut();
+            napi::sys::napi_get_global(raw_env, &mut global);
+            let status = napi::sys::napi_call_function(
+                raw_env,
+                global,     // this = global
+                raw_func,   // func
+                js_args.len(),
+                if js_args.is_empty() {
+                    std::ptr::null()
+                } else {
+                    js_args.as_ptr()
+                },
+                &mut result,
+            );
+
+            if status != napi::sys::Status::napi_ok || result.is_null() {
+                return Err(Error::from_reason("JS loss function call failed"));
+            }
+
+            // Extract MxArray from the returned napi_value.
+            // NAPI-RS #[napi] classes are unwrapped via napi_unwrap.
+            let mut wrapped: *mut c_void = std::ptr::null_mut();
+            let unwrap_status =
+                napi::sys::napi_unwrap(raw_env, result, &mut wrapped);
+            if unwrap_status != napi::sys::Status::napi_ok || wrapped.is_null() {
+                return Err(Error::from_reason(
+                    "JS loss function must return an MxArray",
+                ));
+            }
+            // The wrapped pointer is a raw pointer to the MxArray Rust struct.
+            // Clone the handle (increment Arc) so we own it independently.
+            let loss_ref = &*(wrapped as *const MxArray);
+            Ok(MxArray {
+                handle: loss_ref.handle.clone(),
+            })
+        }
+    }
+}
+
+#[napi]
+impl MxArray {
+    /// Compute value and gradients of a JS loss function.
+    ///
+    /// The loss function receives MxArray arguments and must return a scalar MxArray.
+    /// Returns `[lossValue, grad0, grad1, ...]`.
+    ///
+    /// ```js
+    /// const [loss, dx, dy] = MxArray.valueAndGrad(
+    ///   (x, y) => x.mul(y).sum(),
+    ///   [x, y]
+    /// );
+    /// ```
+    #[napi(js_name = "valueAndGrad")]
+    pub fn value_and_grad_js(
+        env: Env,
+        #[napi(ts_arg_type = "(...args: MxArray[]) => MxArray")]
+        loss_fn: napi::bindgen_prelude::Function<'static>,
+        inputs: Vec<&MxArray>,
+    ) -> Result<Vec<MxArray>> {
+        if inputs.is_empty() {
+            return Err(Error::from_reason("valueAndGrad: inputs cannot be empty"));
+        }
+        let raw_env = env.raw();
+        let raw_func = unsafe { napi::bindgen_prelude::ToNapiValue::to_napi_value(raw_env, loss_fn)? };
+        let loss_closure = make_js_loss_closure(raw_env, raw_func);
+        let input_refs: Vec<&MxArray> = inputs.iter().copied().collect();
+        let (loss, grads) = value_and_grad(input_refs, loss_closure)?;
+        let mut result = Vec::with_capacity(1 + grads.len());
+        result.push(loss);
+        result.extend(grads);
+        Ok(result)
+    }
+
+    /// Compute only gradients (not loss value) of a JS function.
+    /// Returns `[grad0, grad1, ...]`.
+    #[napi(js_name = "computeGradients")]
+    pub fn compute_gradients_js(
+        env: Env,
+        #[napi(ts_arg_type = "(...args: MxArray[]) => MxArray")]
+        loss_fn: napi::bindgen_prelude::Function<'static>,
+        inputs: Vec<&MxArray>,
+    ) -> Result<Vec<MxArray>> {
+        if inputs.is_empty() {
+            return Err(Error::from_reason("computeGradients: inputs cannot be empty"));
+        }
+        let raw_env = env.raw();
+        let raw_func = unsafe { napi::bindgen_prelude::ToNapiValue::to_napi_value(raw_env, loss_fn)? };
+        let loss_closure = make_js_loss_closure(raw_env, raw_func);
+        let input_refs: Vec<&MxArray> = inputs.iter().copied().collect();
+        compute_gradients(input_refs, loss_closure)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
