@@ -871,6 +871,25 @@ export declare class MxArray {
   squeeze(axes?: Int32Array | undefined | null): MxArray;
   expandDims(axis: number): MxArray;
   broadcastTo(shape: BigInt64Array): MxArray;
+  /**
+   * Compute value and gradients of a JS loss function.
+   *
+   * The loss function receives MxArray arguments and must return a scalar MxArray.
+   * Returns `[lossValue, grad0, grad1, ...]`.
+   *
+   * ```js
+   * const [loss, dx, dy] = MxArray.valueAndGrad(
+   *   (x, y) => x.mul(y).sum(),
+   *   [x, y]
+   * );
+   * ```
+   */
+  static valueAndGrad(lossFn: (...args: MxArray[]) => MxArray, inputs: Array<MxArray>): Array<MxArray>;
+  /**
+   * Compute only gradients (not loss value) of a JS function.
+   * Returns `[grad0, grad1, ...]`.
+   */
+  static computeGradients(lossFn: (...args: MxArray[]) => MxArray, inputs: Array<MxArray>): Array<MxArray>;
 }
 
 /** NAPI-exported reward registry wrapper */
