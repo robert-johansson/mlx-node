@@ -82,6 +82,16 @@ impl MxArray {
         Ok(shape.into())
     }
 
+    /// Get shape as a regular JS number array (not BigInt64Array).
+    /// Use this from ClojureScript/nbb where BigInt64Array is inconvenient.
+    #[napi(js_name = "shapeArray")]
+    pub fn shape_array(&self) -> Result<Vec<i32>> {
+        let ndim = unsafe { sys::mlx_array_ndim(self.handle.0) };
+        let mut shape = vec![0i64; ndim];
+        unsafe { sys::mlx_array_shape(self.handle.0, shape.as_mut_ptr()) };
+        Ok(shape.into_iter().map(|x| x as i32).collect())
+    }
+
     /// Get a single dimension from the array shape without copying the entire shape
     /// This is more efficient when you only need one dimension
     ///
