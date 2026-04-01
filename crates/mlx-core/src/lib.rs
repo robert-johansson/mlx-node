@@ -26,6 +26,7 @@ pub mod tensor;
 pub mod tokenizer;
 pub mod tools;
 pub mod transforms;
+pub mod genmlx;
 pub mod memory_napi;
 pub mod tracing;
 pub mod training_model;
