@@ -210,19 +210,9 @@ extern "C" size_t mlx_value_and_gradients(LossFunctionPtr loss_fn,
     return 0;
   }
 
-  // Force evaluation AND synchronization to prevent command buffer overflow
-  // Note: the Rust caller also evals, but doing it here ensures the graph is
-  // materialized before we extract handles (avoiding lazy-graph-across-FFI issues)
-  try {
-    value.eval();
-    for (auto& grad : gradients) {
-      grad.eval();
-    }
-    mlx::core::synchronize();
-  } catch (const std::exception& e) {
-    std::cerr << "[MLX AUTOGRAD ERROR] eval/sync failed: " << e.what() << std::endl;
-    return 0;
-  }
+  // Note: Do NOT eval/synchronize here. When value_and_grad is called inside
+  // a compile transform, eval is prohibited. The caller is responsible for
+  // evaluating the lazy result arrays at the appropriate time.
 
   // Store loss value (for scalar functions, value is directly an array)
   *loss_handle = reinterpret_cast<mlx_array*>(new array(std::move(value)));

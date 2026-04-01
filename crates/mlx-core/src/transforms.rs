@@ -242,22 +242,51 @@ extern "C-unwind" fn compile_callback(
             return 0;
         }
 
-        // Extract MxArray from result
-        let mut wrapped: *mut c_void = std::ptr::null_mut();
-        if napi::sys::napi_unwrap(ctx.env, result, &mut wrapped)
-            != napi::sys::Status::napi_ok
-        {
-            ctx.error = Some("compile function must return MxArray".to_string());
-            return 0;
-        }
-        let result_ref = &*(wrapped as *const MxArray);
-        let cloned = MxArray {
-            handle: result_ref.handle.clone(),
-        };
+        // Extract MxArray(s) from result — handles both single and multi-output.
         let output_slice = std::slice::from_raw_parts_mut(outputs, max_outputs);
-        output_slice[0] = cloned.handle.0;
-        std::mem::forget(cloned);
-        1 // one output
+
+        // Check if result is a JS array (multi-output)
+        let mut is_array = false;
+        napi::sys::napi_is_array(ctx.env, result, &mut is_array);
+
+        if is_array {
+            // Multi-output: extract each element
+            let mut length: u32 = 0;
+            napi::sys::napi_get_array_length(ctx.env, result, &mut length);
+            let count = (length as usize).min(max_outputs);
+            for i in 0..count {
+                let mut element: napi::sys::napi_value = std::ptr::null_mut();
+                napi::sys::napi_get_element(ctx.env, result, i as u32, &mut element);
+                let mut wrapped: *mut c_void = std::ptr::null_mut();
+                if napi::sys::napi_unwrap(ctx.env, element, &mut wrapped)
+                    != napi::sys::Status::napi_ok
+                {
+                    ctx.error = Some(format!(
+                        "compile: output[{}] is not MxArray", i
+                    ));
+                    return 0;
+                }
+                let elem_ref = &*(wrapped as *const MxArray);
+                let cloned = MxArray { handle: elem_ref.handle.clone() };
+                output_slice[i] = cloned.handle.0;
+                std::mem::forget(cloned);
+            }
+            count
+        } else {
+            // Single output: unwrap directly
+            let mut wrapped: *mut c_void = std::ptr::null_mut();
+            if napi::sys::napi_unwrap(ctx.env, result, &mut wrapped)
+                != napi::sys::Status::napi_ok
+            {
+                ctx.error = Some("compile function must return MxArray".to_string());
+                return 0;
+            }
+            let result_ref = &*(wrapped as *const MxArray);
+            let cloned = MxArray { handle: result_ref.handle.clone() };
+            output_slice[0] = cloned.handle.0;
+            std::mem::forget(cloned);
+            1
+        }
     }
 }
 
