@@ -494,6 +494,19 @@ pub fn einsum(subscripts: String, operands: Vec<&MxArray>) -> Result<MxArray> {
 // Data accessors
 // ============================================================================
 
+/// Fused eval + scalar extraction. One NAPI call instead of three
+/// (eval + toFloat32 + aget). Handles all dtypes via CPU-side cast.
+#[napi]
+pub fn item(a: &MxArray) -> Result<f64> {
+    let mut value: f64 = 0.0;
+    let ok = unsafe { mlx_sys::mlx_array_item_f64(a.handle.0, &mut value) };
+    if ok {
+        Ok(value)
+    } else {
+        Err(Error::from_reason("item: array must have size 1"))
+    }
+}
+
 #[napi]
 pub fn astype(a: &MxArray, dtype: DType) -> Result<MxArray> {
     a.astype(dtype)
