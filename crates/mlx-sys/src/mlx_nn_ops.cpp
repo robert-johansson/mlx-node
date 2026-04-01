@@ -189,6 +189,19 @@ bool mlx_array_item_at_uint32(mlx_array* handle, size_t index, uint32_t* out) {
   return true;
 }
 
+// Fused eval + scalar extraction. Evaluates if needed (fast path for
+// already-evaluated arrays), then reads the scalar via CPU-side dtype
+// dispatch. Returns as double (lossless for all GenMLX numeric types).
+// One C++ call instead of separate eval + flatten + copy_to_buffer.
+bool mlx_array_item_f64(mlx_array* handle, double* out) {
+  if (!handle || !out) return false;
+  auto arr = reinterpret_cast<array*>(handle);
+  if (arr->size() != 1) return false;
+  arr->eval();
+  *out = read_scalar<double>(*arr, 0);
+  return true;
+}
+
 int32_t mlx_array_dtype(mlx_array* handle) {
   auto arr = reinterpret_cast<array*>(handle);
   if (!arr) {

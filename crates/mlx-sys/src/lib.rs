@@ -280,6 +280,7 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_item_at_int32(handle: *mut mlx_array, index: usize, out: *mut i32) -> bool;
     pub fn mlx_array_item_at_uint32(handle: *mut mlx_array, index: usize, out: *mut u32) -> bool;
     pub fn mlx_array_item_at_float32(handle: *mut mlx_array, index: usize, out: *mut f32) -> bool;
+    pub fn mlx_array_item_f64(handle: *mut mlx_array, out: *mut f64) -> bool;
     pub fn mlx_array_dtype(handle: *mut mlx_array) -> i32;
     pub fn mlx_array_to_float32(handle: *mut mlx_array, out: *mut f32, len: usize) -> bool;
     pub fn mlx_array_to_int32(handle: *mut mlx_array, out: *mut i32, len: usize) -> bool;
