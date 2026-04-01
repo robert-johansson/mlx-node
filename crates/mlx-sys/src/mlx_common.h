@@ -198,69 +198,35 @@ int32_t from_mlx_dtype(mlx::core::Dtype dtype) {
   }
 }
 
+// flatten handles broadcasts and non-contiguous strides, producing a
+// contiguous 1D array. astype converts if needed. Single eval.
 bool copy_to_buffer(const array& arr, float* out, size_t len) {
-  // Force materialization by adding zeros - this ensures broadcast values are
-  // expanded
-  auto zeros_arr = zeros(arr.shape(), arr.dtype());
-  auto materialized = add(arr, zeros_arr);
-  materialized.eval();
-
-  // Now flatten and copy
-  auto flat = flatten(materialized);
-  auto host = (flat.dtype() == mlx::core::float32)
-                  ? flat
-                  : astype(flat, mlx::core::float32);
+  auto host = flatten(arr);
+  if (host.dtype() != mlx::core::float32)
+    host = astype(host, mlx::core::float32);
   host.eval();
-
-  if (host.size() != len) {
-    return false;
-  }
-  const float* data = host.data<float>();
-  std::copy(data, data + len, out);
+  if (host.size() != len) return false;
+  std::copy(host.data<float>(), host.data<float>() + len, out);
   return true;
 }
 
 bool copy_to_buffer(const array& arr, int32_t* out, size_t len) {
-  // Force materialization by adding zeros - this ensures broadcast values are
-  // expanded
-  auto zeros_arr = zeros(arr.shape(), arr.dtype());
-  auto materialized = add(arr, zeros_arr);
-  materialized.eval();
-
-  // Now flatten and copy
-  auto flat = flatten(materialized);
-  auto host = (flat.dtype() == mlx::core::int32)
-                  ? flat
-                  : astype(flat, mlx::core::int32);
+  auto host = flatten(arr);
+  if (host.dtype() != mlx::core::int32)
+    host = astype(host, mlx::core::int32);
   host.eval();
-
-  if (host.size() != len) {
-    return false;
-  }
-  const int32_t* data = host.data<int32_t>();
-  std::copy(data, data + len, out);
+  if (host.size() != len) return false;
+  std::copy(host.data<int32_t>(), host.data<int32_t>() + len, out);
   return true;
 }
 
 bool copy_to_buffer(const array& arr, uint32_t* out, size_t len) {
-  // Force materialization by adding zeros - this ensures broadcast values are
-  // expanded
-  auto zeros_arr = zeros(arr.shape(), arr.dtype());
-  auto materialized = add(arr, zeros_arr);
-  materialized.eval();
-
-  // Now flatten and copy
-  auto flat = flatten(materialized);
-  auto host = (flat.dtype() == mlx::core::uint32)
-                  ? flat
-                  : astype(flat, mlx::core::uint32);
+  auto host = flatten(arr);
+  if (host.dtype() != mlx::core::uint32)
+    host = astype(host, mlx::core::uint32);
   host.eval();
-
-  if (host.size() != len) {
-    return false;
-  }
-  const uint32_t* data = host.data<uint32_t>();
-  std::copy(data, data + len, out);
+  if (host.size() != len) return false;
+  std::copy(host.data<uint32_t>(), host.data<uint32_t>() + len, out);
   return true;
 }
 
