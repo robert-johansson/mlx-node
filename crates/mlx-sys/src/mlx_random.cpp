@@ -3,15 +3,21 @@
 
 namespace rng = mlx::core::random;
 
-// Key management (key, split, split_n): EAGER — eval() materializes keys
-// immediately, breaking reference chains that would retain the entire key
-// derivation graph in GPU memory. Keys are tiny (2 uint32), so eval is cheap.
+// Key management (key, split, split_n): EAGER on CPU stream — eval()
+// materializes keys immediately, breaking reference chains that would
+// retain the key derivation graph. Threefry2x32 on 4 uint32 values is
+// pure integer arithmetic — CPU stream avoids the Metal command buffer
+// round-trip entirely.
 //
 // Sampling functions (normal, uniform, ...): LAZY — no eval(). The sampled
 // array references an already-evaluated key (constant), so no chain growth.
 // stop_gradient prevents autograd from differentiating through RandomBits.
 // Evaluation is deferred to the caller's eval boundary, where it can be
 // batched with other operations for a single GPU sync.
+
+static mlx::core::Stream cpu_stream() {
+  return mlx::core::default_stream(mlx::core::Device::cpu);
+}
 
 extern "C" {
 
@@ -29,7 +35,7 @@ mlx_array* mlx_random_key(uint64_t seed) {
 void mlx_random_split(mlx_array* key_handle,
                       mlx_array** k1_out, mlx_array** k2_out) {
   auto key = reinterpret_cast<array*>(key_handle);
-  auto [k1, k2] = rng::split(*key);
+  auto [k1, k2] = rng::split(*key, cpu_stream());
   k1.eval();
   k2.eval();
   *k1_out = reinterpret_cast<mlx_array*>(new array(std::move(k1)));
@@ -38,7 +44,7 @@ void mlx_random_split(mlx_array* key_handle,
 
 mlx_array* mlx_random_split_n(mlx_array* key_handle, int n) {
   auto key = reinterpret_cast<array*>(key_handle);
-  array result = rng::split(*key, n);
+  array result = rng::split(*key, n, cpu_stream());
   result.eval();
   result = mlx::core::stop_gradient(result);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
