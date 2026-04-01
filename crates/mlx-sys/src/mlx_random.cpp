@@ -3,12 +3,15 @@
 
 namespace rng = mlx::core::random;
 
-// All PRNG functions call result.eval() to materialize the random values.
-// This ensures random arrays are concrete constants — not lazy graph nodes.
-// Without eval(), random ops inside autograd callbacks would create RandomBits
-// nodes in the computation graph, and MLX's VJP can't differentiate through them.
-// With eval(), random values are treated as constants in the backward pass,
-// matching node-mlx's behavior where random ops produce evaluated results.
+// Key management (key, split, split_n): EAGER — eval() materializes keys
+// immediately, breaking reference chains that would retain the entire key
+// derivation graph in GPU memory. Keys are tiny (2 uint32), so eval is cheap.
+//
+// Sampling functions (normal, uniform, ...): LAZY — no eval(). The sampled
+// array references an already-evaluated key (constant), so no chain growth.
+// stop_gradient prevents autograd from differentiating through RandomBits.
+// Evaluation is deferred to the caller's eval boundary, where it can be
+// batched with other operations for a single GPU sync.
 
 extern "C" {
 
@@ -41,7 +44,7 @@ mlx_array* mlx_random_split_n(mlx_array* key_handle, int n) {
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
-// --- Key-based sampling functions ---
+// --- Key-based sampling functions (LAZY — no eval) ---
 
 mlx_array* mlx_random_uniform_key(mlx_array* key_handle,
                                    const int64_t* shape, size_t ndim,
@@ -51,9 +54,8 @@ mlx_array* mlx_random_uniform_key(mlx_array* key_handle,
   auto dt = to_mlx_dtype(dtype);
   array lo = mlx::core::astype(array(low), dt);
   array hi = mlx::core::astype(array(high), dt);
-  array result = rng::uniform(lo, hi, sh, dt, std::optional<array>(*key));
-  result.eval();
-  result = mlx::core::stop_gradient(result);
+  auto result = mlx::core::stop_gradient(
+      rng::uniform(lo, hi, sh, dt, std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
@@ -63,9 +65,8 @@ mlx_array* mlx_random_normal_key(mlx_array* key_handle,
   auto key = reinterpret_cast<array*>(key_handle);
   auto sh = make_shape(shape, ndim);
   auto dt = to_mlx_dtype(dtype);
-  array result = rng::normal(sh, dt, std::optional<array>(*key));
-  result.eval();
-  result = mlx::core::stop_gradient(result);
+  auto result = mlx::core::stop_gradient(
+      rng::normal(sh, dt, std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
@@ -74,9 +75,8 @@ mlx_array* mlx_random_bernoulli_key(mlx_array* key_handle,
                                      const int64_t* shape, size_t ndim) {
   auto key = reinterpret_cast<array*>(key_handle);
   auto sh = make_shape(shape, ndim);
-  array result = rng::bernoulli(prob, sh, std::optional<array>(*key));
-  result.eval();
-  result = mlx::core::stop_gradient(result);
+  auto result = mlx::core::stop_gradient(
+      rng::bernoulli(prob, sh, std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
@@ -85,9 +85,8 @@ mlx_array* mlx_random_categorical_key(mlx_array* key_handle,
                                        int axis) {
   auto key = reinterpret_cast<array*>(key_handle);
   auto logits = reinterpret_cast<array*>(logits_handle);
-  array result = rng::categorical(*logits, axis, std::optional<array>(*key));
-  result.eval();
-  result = mlx::core::stop_gradient(result);
+  auto result = mlx::core::stop_gradient(
+      rng::categorical(*logits, axis, std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
@@ -98,9 +97,8 @@ mlx_array* mlx_random_randint_key(mlx_array* key_handle,
   auto key = reinterpret_cast<array*>(key_handle);
   auto sh = make_shape(shape, ndim);
   auto dt = to_mlx_dtype(dtype);
-  array result = rng::randint(low, high, sh, dt, std::optional<array>(*key));
-  result.eval();
-  result = mlx::core::stop_gradient(result);
+  auto result = mlx::core::stop_gradient(
+      rng::randint(low, high, sh, dt, std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
@@ -110,9 +108,8 @@ mlx_array* mlx_random_gumbel_key(mlx_array* key_handle,
   auto key = reinterpret_cast<array*>(key_handle);
   auto sh = make_shape(shape, ndim);
   auto dt = to_mlx_dtype(dtype);
-  array result = rng::gumbel(sh, dt, std::optional<array>(*key));
-  result.eval();
-  result = mlx::core::stop_gradient(result);
+  auto result = mlx::core::stop_gradient(
+      rng::gumbel(sh, dt, std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
@@ -122,9 +119,8 @@ mlx_array* mlx_random_laplace_key(mlx_array* key_handle,
   auto key = reinterpret_cast<array*>(key_handle);
   auto sh = make_shape(shape, ndim);
   auto dt = to_mlx_dtype(dtype);
-  array result = rng::laplace(sh, dt, std::optional<array>(*key));
-  result.eval();
-  result = mlx::core::stop_gradient(result);
+  auto result = mlx::core::stop_gradient(
+      rng::laplace(sh, dt, std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
@@ -138,10 +134,9 @@ mlx_array* mlx_random_truncated_normal_key(mlx_array* key_handle,
   auto upper = reinterpret_cast<array*>(upper_handle);
   auto sh = make_shape(shape, ndim);
   auto dt = to_mlx_dtype(dtype);
-  array result = rng::truncated_normal(*lower, *upper, sh, dt,
-                                        std::optional<array>(*key));
-  result.eval();
-  result = mlx::core::stop_gradient(result);
+  auto result = mlx::core::stop_gradient(
+      rng::truncated_normal(*lower, *upper, sh, dt,
+                            std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
@@ -156,10 +151,9 @@ mlx_array* mlx_random_multivariate_normal_key(mlx_array* key_handle,
   auto cov = reinterpret_cast<array*>(cov_handle);
   auto sh = make_shape(shape, ndim);
   auto dt = to_mlx_dtype(dtype);
-  array result = rng::multivariate_normal(*mean, *cov, sh, dt,
-                                           std::optional<array>(*key));
-  result.eval();
-  result = mlx::core::stop_gradient(result);
+  auto result = mlx::core::stop_gradient(
+      rng::multivariate_normal(*mean, *cov, sh, dt,
+                               std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
