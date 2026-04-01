@@ -610,6 +610,11 @@ export declare class MxArray {
   ndim(): number;
   shape(): BigInt64Array;
   /**
+   * Get shape as a regular JS number array (not BigInt64Array).
+   * Use this from ClojureScript/nbb where BigInt64Array is inconvenient.
+   */
+  shapeArray(): Array<number>;
+  /**
    * Get a single dimension from the array shape without copying the entire shape
    * This is more efficient when you only need one dimension
    *
