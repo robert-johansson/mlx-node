@@ -207,7 +207,9 @@ impl QianfanOCRModel {
             max_ngram_repeats: None,
             ngram_size: None,
             tools: None,
-            enable_thinking: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
         });
@@ -226,7 +228,8 @@ impl QianfanOCRModel {
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
         let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = config.ngram_size.unwrap_or(64);
-        let enable_thinking = config.enable_thinking.unwrap_or(false);
+        let enable_thinking =
+            crate::models::qwen3_5::chat_common::resolve_enable_thinking(&config).unwrap_or(false);
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
@@ -632,7 +635,9 @@ impl QianfanOCRModel {
             max_ngram_repeats: None,
             ngram_size: None,
             tools: None,
-            enable_thinking: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
         });
@@ -651,7 +656,8 @@ impl QianfanOCRModel {
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
         let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = config.ngram_size.unwrap_or(64);
-        let enable_thinking = config.enable_thinking.unwrap_or(false);
+        let enable_thinking =
+            crate::models::qwen3_5::chat_common::resolve_enable_thinking(&config).unwrap_or(false);
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
@@ -899,6 +905,7 @@ impl QianfanOCRModel {
                                 num_tokens: None,
                                 raw_text: None,
                                 performance: None,
+                                is_reasoning: None,
                             });
 
                             // Check repetition cutoff (after emit so token is streamed)
@@ -1024,6 +1031,7 @@ impl QianfanOCRModel {
                             num_tokens: Some(generated_tokens.len() as u32),
                             raw_text: Some(raw_decoded),
                             performance,
+                            is_reasoning: None,
                         });
 
                         Ok(())

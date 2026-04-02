@@ -442,43 +442,49 @@ pub fn has_tool_calls(text: &str) -> bool {
 /// explaining XML tags), the fallback only applies when `</think>` is followed by
 /// a newline or end-of-text — not when it's embedded mid-sentence.
 pub fn parse_thinking(text: &str) -> (String, Option<String>) {
-    let blocks = extract_tag_blocks(text, "<think>", "</think>");
+    // Check both <think> and <longcat_think> paired blocks.
+    for (open, close) in [
+        ("<think>", "</think>"),
+        ("<longcat_think>", "</longcat_think>"),
+    ] {
+        let blocks = extract_tag_blocks(text, open, close);
+        if !blocks.is_empty() {
+            let thinking_parts: Vec<&str> = blocks
+                .iter()
+                .map(|(_, _, inner)| inner.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
 
-    if !blocks.is_empty() {
-        let thinking_parts: Vec<&str> = blocks
-            .iter()
-            .map(|(_, _, inner)| inner.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        let thinking = if thinking_parts.is_empty() {
-            None
-        } else {
-            Some(thinking_parts.join("\n\n"))
-        };
-
-        let cleaned_text = strip_tag_blocks(text, "<think>", "</think>");
-        return (cleaned_text, thinking);
-    }
-
-    // Handle missing opening <think> tag (template already added it as prefix).
-    // The template adds `<think>\n` as the assistant generation prompt, so the
-    // model's output starts with thinking content + `</think>`.
-    //
-    // To distinguish from literal `</think>` in content (e.g., "Use </think> to
-    // close the tag"), only apply when `</think>` is followed by a newline or
-    // end-of-text — the model always generates `</think>\n\n` before the response.
-    if let Some(close_pos) = text.find("</think>") {
-        let after_tag = &text[close_pos + "</think>".len()..];
-        if after_tag.is_empty() || after_tag.starts_with('\n') {
-            let thinking_content = text[..close_pos].trim();
-            let after = after_tag.trim();
-            let thinking = if thinking_content.is_empty() {
+            let thinking = if thinking_parts.is_empty() {
                 None
             } else {
-                Some(thinking_content.to_string())
+                Some(thinking_parts.join("\n\n"))
             };
-            return (after.to_string(), thinking);
+
+            let cleaned_text = strip_tag_blocks(text, open, close);
+            return (cleaned_text, thinking);
+        }
+    }
+
+    // Handle missing opening tag (template already added it as prefix).
+    // The template adds `<think>\n` (or `<longcat_think>\n`) as the assistant
+    // generation prompt, so the model's output starts with thinking + close tag.
+    //
+    // To distinguish from literal close tags in content, only apply when the
+    // close tag is followed by a newline or end-of-text.
+    for close_tag in ["</think>", "</longcat_think>"] {
+        if let Some(close_pos) = text.find(close_tag) {
+            let after_tag = &text[close_pos + close_tag.len()..];
+            if after_tag.is_empty() || after_tag.starts_with('\n') {
+                let thinking_content = text[..close_pos].trim();
+                let after = after_tag.trim();
+                let thinking = if thinking_content.is_empty() {
+                    None
+                } else {
+                    Some(thinking_content.to_string())
+                };
+                return (after.to_string(), thinking);
+            }
         }
     }
 
@@ -487,7 +493,7 @@ pub fn parse_thinking(text: &str) -> (String, Option<String>) {
 
 /// Check if text contains any thinking tags
 pub fn has_thinking(text: &str) -> bool {
-    text.contains("<think>")
+    text.contains("<think>") || text.contains("<longcat_think>")
 }
 
 /// Result of parsing tool calls from text
@@ -558,29 +564,37 @@ pub fn has_think_end_token(generated_tokens: &[u32], think_end_id: Option<u32>) 
 /// Split generated output using token-level thinking detection.
 ///
 /// When the think-end token was found in generated tokens (`think_end_tag` is Some),
-/// splits at the corresponding text boundary. Supports both `</think>` and
-/// `</longcat_think>` variants. Falls back to `parse_generation_output` when
-/// no think-end token was detected.
+/// splits at the corresponding text boundary. This is the authoritative path that
+/// ensures tool parsing isolation: tool calls are only extracted from the content
+/// portion after `</think>`, never from reasoning text.
+///
+/// Supports both `</think>` and `</longcat_think>` variants, and handles old-style
+/// templates that emit `<think>` in generated text (stripped as a prefix).
+///
+/// Falls back to `parse_generation_output` only when `think_end_tag` is None.
 pub fn split_at_think_end(
     raw_text: &str,
     think_end_tag: Option<&str>,
 ) -> (String, Vec<ToolCallResult>, Option<String>) {
-    // If the text contains paired <think>...</think> blocks, use the standard
-    // tag-pair parser (handles models that emit the full opening tag).
-    if raw_text.contains("<think>") || raw_text.contains("<longcat_think>") {
-        return parse_generation_output(raw_text);
-    }
-    // Token-level split: the template injected <think>\n as a prefix, so the
-    // generated text starts with thinking content followed by </think>.
+    // Token-level split: authoritative when think_end_tag is confirmed.
+    // Always takes priority — even when <think> appears in the text (old templates).
+    // Tool calls are parsed only from content after the boundary.
+    // Uses find (first occurrence): </think> is a special token, so the first
+    // text match is the real boundary. Content after the boundary may mention
+    // </think> literally; rfind would incorrectly split at that later occurrence.
     if let Some(tag) = think_end_tag
         && let Some(close_pos) = raw_text.find(tag)
     {
-        let after_tag = &raw_text[close_pos + tag.len()..];
-        if !after_tag.is_empty() && !after_tag.starts_with('\n') {
-            return parse_generation_output(raw_text);
-        }
         let thinking_text = raw_text[..close_pos].trim();
-        let response_text = after_tag.trim();
+        // Strip opening think tag from old-style templates that emit it
+        // in generated text (newer templates inject it in the prompt).
+        let thinking_text = thinking_text
+            .strip_prefix("<think>")
+            .or_else(|| thinking_text.strip_prefix("<longcat_think>"))
+            .unwrap_or(thinking_text)
+            .trim();
+        let after_tag = &raw_text[close_pos + tag.len()..];
+        let response_text = after_tag.trim_start_matches('\n').trim_start();
         let thinking = if thinking_text.is_empty() {
             None
         } else {
@@ -589,6 +603,8 @@ pub fn split_at_think_end(
         let (clean_text, tool_calls) = parse_tool_calls(response_text);
         return (clean_text.trim().to_string(), tool_calls, thinking);
     }
+    // No token-level confirmation: fall back to generic text-level parsing.
+    // This path is used by callers without token-level info (e.g. build_reward_outputs).
     parse_generation_output(raw_text)
 }
 
@@ -1244,5 +1260,92 @@ The weather in Tokyo is sunny."#;
         // Empty content doesn't start with '{', contain '<function=', or '<name>',
         // so classify_and_parse_tool_call returns None — no tool call produced.
         assert_eq!(calls.len(), 0);
+    }
+
+    // ---- split_at_think_end: tool isolation with token-confirmed boundary ----
+
+    #[test]
+    fn test_split_at_think_end_old_template_tool_in_reasoning() {
+        // Old-style template: explicit <think> + tool_call inside reasoning.
+        // Tool call must NOT be extracted — it's inside the reasoning block.
+        let text = "<think>Let me call <tool_call>{\"name\":\"search\",\"arguments\":{\"q\":\"test\"}}</tool_call> to help</think>\nThe answer is 42";
+        let (clean, tools, thinking) = split_at_think_end(text, Some("</think>"));
+        assert_eq!(clean, "The answer is 42");
+        assert!(
+            tools.is_empty(),
+            "tool_call inside reasoning must not be extracted"
+        );
+        let t = thinking.unwrap();
+        assert!(
+            t.contains("tool_call"),
+            "tool_call text should remain in thinking"
+        );
+        assert!(
+            t.starts_with("Let me call"),
+            "<think> prefix should be stripped"
+        );
+    }
+
+    #[test]
+    fn test_split_at_think_end_tool_only_in_content() {
+        // Tool call in content portion after </think> — should be extracted.
+        let text = "<think>reasoning</think>\n<tool_call>{\"name\":\"search\",\"arguments\":{\"q\":\"test\"}}</tool_call>";
+        let (clean, tools, thinking) = split_at_think_end(text, Some("</think>"));
+        assert_eq!(thinking.unwrap(), "reasoning");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "search");
+        assert!(clean.trim().is_empty());
+    }
+
+    #[test]
+    fn test_split_at_think_end_literal_think_in_reasoning() {
+        // Literal <think> inside reasoning text (e.g., model explaining tags).
+        // Must not cause mis-split — token boundary is authoritative.
+        let text = "The model uses <think> tags for reasoning</think>\ncontent here";
+        let (clean, tools, thinking) = split_at_think_end(text, Some("</think>"));
+        assert_eq!(clean, "content here");
+        assert!(tools.is_empty());
+        let t = thinking.unwrap();
+        assert!(
+            t.contains("<think>"),
+            "literal <think> preserved in thinking"
+        );
+    }
+
+    #[test]
+    fn test_split_at_think_end_longcat_variant() {
+        // longcat_think variant with tool_call inside reasoning.
+        let text = "<longcat_think>reasoning <tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call></longcat_think>\nanswer";
+        let (clean, tools, thinking) = split_at_think_end(text, Some("</longcat_think>"));
+        assert_eq!(clean, "answer");
+        assert!(
+            tools.is_empty(),
+            "tool_call inside longcat reasoning must not be extracted"
+        );
+        assert!(thinking.unwrap().contains("tool_call"));
+    }
+
+    #[test]
+    fn test_split_at_think_end_budget_forced_no_newline() {
+        // Budget-forced </think> with no newline separator (model continues directly).
+        let text = "thinking content</think>immediate content";
+        let (clean, tools, thinking) = split_at_think_end(text, Some("</think>"));
+        assert_eq!(thinking.unwrap(), "thinking content");
+        assert_eq!(clean, "immediate content");
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn test_split_at_think_end_close_tag_in_content() {
+        // Content after the real boundary mentions </think> literally.
+        // find (first occurrence) splits at the real boundary, not the literal.
+        let text = "reasoning here</think>\nThe </think> tag ends reasoning.";
+        let (clean, tools, thinking) = split_at_think_end(text, Some("</think>"));
+        assert_eq!(thinking.unwrap(), "reasoning here");
+        assert!(tools.is_empty());
+        assert!(
+            clean.contains("</think> tag ends reasoning"),
+            "literal </think> in content should be preserved, got: {clean}"
+        );
     }
 }

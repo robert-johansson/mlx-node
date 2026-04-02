@@ -13,15 +13,12 @@ use tracing::{info, warn};
 use crate::array::MxArray;
 use crate::models::qwen3::{BatchGenerationResult, GenerationConfig, GenerationResult};
 use crate::nn::{Embedding, Linear, RMSNorm};
-use crate::sampling::{
-    SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
-    check_repetition_cutoff, sample,
-};
+use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
-use crate::tools;
 use crate::tools::ToolCallResult;
 
+use super::chat_common;
 use super::chat_common::{
     apply_all_penalties, compute_performance_metrics, extract_chat_params, finalize_chat_result,
     save_cache_state, verify_cache_prefix,
@@ -190,10 +187,23 @@ pub struct ChatConfig {
     pub ngram_size: Option<i32>,
     #[napi(ts_type = "Array<ToolDefinition>")]
     pub tools: Option<Vec<ToolDefinition>>,
-    /// Enable thinking mode (Qwen3's <think> tags). Default: true (model thinks naturally).
-    /// Set to false to suppress thinking by injecting empty <think></think> tags.
+    /// Reasoning effort level. Controls whether the model thinks before answering.
+    /// - "none" / "low": thinking disabled (template injects closed think block).
+    ///   "none" also sets includeReasoning to false by default.
+    /// - "medium" / "high": thinking enabled (default behavior).
+    /// - Not set: thinking enabled (model thinks naturally).
+    #[napi(ts_type = "string | undefined")]
+    pub reasoning_effort: Option<String>,
+    /// Maximum number of thinking tokens before forcing </think>.
+    /// When the model has generated this many tokens while in thinking mode,
+    /// the next token is forced to be the think_end token. None = unlimited.
+    #[napi(ts_type = "number | undefined")]
+    pub thinking_token_budget: Option<i32>,
+    /// Whether to include reasoning/thinking content in the output.
+    /// When false, the `thinking` field of ChatResult/ChatStreamChunk will always be None.
+    /// Default: true (false when reasoningEffort is "none").
     #[napi(ts_type = "boolean | undefined")]
-    pub enable_thinking: Option<bool>,
+    pub include_reasoning: Option<bool>,
     /// When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result
     #[napi(ts_type = "boolean | undefined")]
     pub report_performance: Option<bool>,
@@ -233,6 +243,11 @@ pub struct ChatStreamChunk {
     pub raw_text: Option<String>,
     /// Performance metrics (only present in the final chunk when `reportPerformance: true`)
     pub performance: Option<crate::profiling::PerformanceMetrics>,
+    /// Whether this delta chunk contains reasoning/thinking content.
+    /// true = reasoning (inside <think>...</think>), false = content (after </think>).
+    /// Only present on intermediate (non-final) chunks.
+    #[napi(ts_type = "boolean | undefined")]
+    pub is_reasoning: Option<bool>,
 }
 
 /// Handle returned by `chat_stream()` to control an in-progress streaming generation.
@@ -922,7 +937,9 @@ impl Qwen3_5Model {
             max_ngram_repeats: None,
             ngram_size: None,
             tools: None,
-            enable_thinking: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
         });
@@ -1010,7 +1027,7 @@ impl Qwen3_5Model {
             let mut first_token_instant: Option<std::time::Instant> = None;
 
             let tool_defs = config.tools.as_deref();
-            let enable_thinking = config.enable_thinking;
+            let enable_thinking = chat_common::resolve_enable_thinking(&config);
             let tokens = tokenizer.apply_chat_template_sync(
                 &messages,
                 Some(true),
@@ -1324,78 +1341,40 @@ impl Qwen3_5Model {
                 // Compiled C++ decode loop (pipelined — submit N+1 before eval N)
                 profiler.set_label("chat_compiled");
 
-                for step in 0..max_new_tokens {
-                    // Build and submit graph for step N+1 before waiting for N
-                    let next_y = if step + 1 < max_new_tokens {
-                        let _stream_ctx = StreamContext::new(generation_stream);
+                let starts_in_thinking = enable_thinking.unwrap_or(true);
+                let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+                    starts_in_thinking,
+                    p.thinking_token_budget,
+                    think_end_id,
+                );
 
-                        profiler.begin("forward");
-                        let next_ids = y.reshape(&[1, 1])?;
-                        let mut logits = forward_compiled(&next_ids, &embedding_weight)?;
-                        profiler.end();
-
-                        profiler.begin("rep_penalty");
-                        logits = apply_all_penalties(logits, &token_history, &p)?;
-                        profiler.end();
-
-                        profiler.begin("sample");
-                        let next_token = sample(&logits, p.sampling_config)?;
-                        profiler.end();
-
-                        profiler.begin("eval_caches");
-                        eval_token_and_compiled_caches(&next_token);
-                        profiler.end();
-
-                        Some(next_token)
-                    } else {
-                        None
-                    };
-
-                    // Wait for step N (GPU already computing N+1)
-                    profiler.begin("eval_token");
-                    y.eval();
-                    profiler.end();
-
-                    profiler.begin("extract");
-                    let token_id = y.item_at_int32(0)? as u32;
-                    profiler.end();
-                    profiler.mark_first_token();
-                    if p.report_performance && first_token_instant.is_none() {
-                        first_token_instant = Some(std::time::Instant::now());
-                    }
-
-                    generated_tokens.push(token_id);
-                    token_history.push(token_id);
-
-                    if token_id == eos_id {
-                        finish_reason = String::from("stop");
-                        break;
-                    }
-
-                    if let Some(reason) = check_repetition_cutoff(
-                        &generated_tokens,
-                        p.max_consecutive_tokens,
-                        p.max_ngram_repeats,
-                        p.ngram_size,
-                    ) {
-                        finish_reason = reason.to_string();
-                        break;
-                    }
-
-                    match next_y {
-                        Some(next) => y = next,
-                        None => break,
-                    }
-
-                    profiler.step();
-
-                    if (step + 1) % 256 == 0 {
-                        crate::array::synchronize_and_clear_cache();
-                    }
-                }
-
-                profiler.snapshot_memory_after();
-                profiler.report();
+                let mut ops = chat_common::DecodeOps {
+                    forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                        Ok((forward_compiled(ids, emb)?, false))
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                        eval_token_and_compiled_caches(token);
+                        if budget_forced {
+                            logits.eval();
+                        }
+                    },
+                };
+                chat_common::decode_loop!(
+                    ops: ops,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream
+                );
 
                 // === Export caches from C++ before CompiledResetGuard drops ===
                 if reuse_cache {
@@ -1433,90 +1412,49 @@ impl Qwen3_5Model {
                 // Build next step's graph before blocking on current token.
                 profiler.set_label("chat_rust");
 
+                let starts_in_thinking = enable_thinking.unwrap_or(true);
+                let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+                    starts_in_thinking,
+                    p.thinking_token_budget,
+                    think_end_id,
+                );
+
                 // Kick off first token's async eval
                 MxArray::async_eval_arrays(&[&y]);
 
-                for step in 0..max_new_tokens {
-                    // Build NEXT step's graph BEFORE blocking on current token.
-                    let mut next_y_opt: Option<MxArray> = None;
-                    if step + 1 < max_new_tokens {
-                        let _stream_ctx = StreamContext::new(generation_stream);
-
-                        profiler.begin("forward");
-                        let next_ids = y.reshape(&[1, 1])?;
+                let mut ops = chat_common::DecodeOps {
+                    forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                         let logits = forward_inner(
-                            &next_ids,
-                            &embedding_weight,
+                            ids,
+                            emb,
                             &mut layers_guard,
                             &mut caches_guard,
                             &final_norm_guard,
                             &lm_head_guard,
                             Some(&embedding_weight_t),
                         )?;
-                        let mut logits = logits.squeeze(Some(&[1]))?;
-                        profiler.end();
-
-                        profiler.begin("rep_penalty");
-                        logits = apply_all_penalties(logits, &token_history, &p)?;
-                        profiler.end();
-
-                        profiler.begin("sample");
-                        let next_token = sample(&logits, p.sampling_config)?;
-                        profiler.end();
-
-                        profiler.begin("async_eval");
-                        MxArray::async_eval_arrays(&[&next_token]);
-                        profiler.end();
-
-                        next_y_opt = Some(next_token);
-                    }
-
-                    // Block on the CURRENT token
-                    profiler.begin("eval_token");
-                    y.eval();
-                    profiler.end();
-
-                    profiler.begin("extract");
-                    let token_id = y.item_at_int32(0)? as u32;
-                    profiler.end();
-                    profiler.mark_first_token();
-                    if p.report_performance && first_token_instant.is_none() {
-                        first_token_instant = Some(std::time::Instant::now());
-                    }
-
-                    generated_tokens.push(token_id);
-                    token_history.push(token_id);
-
-                    if token_id == eos_id {
-                        finish_reason = String::from("stop");
-                        break;
-                    }
-
-                    if let Some(reason) = check_repetition_cutoff(
-                        &generated_tokens,
-                        p.max_consecutive_tokens,
-                        p.max_ngram_repeats,
-                        p.ngram_size,
-                    ) {
-                        finish_reason = reason.to_string();
-                        break;
-                    }
-
-                    profiler.step();
-
-                    if let Some(next_y) = next_y_opt {
-                        y = next_y;
-                    } else {
-                        break;
-                    }
-
-                    if (step + 1) % 256 == 0 {
-                        crate::array::synchronize_and_clear_cache();
-                    }
-                }
-
-                profiler.snapshot_memory_after();
-                profiler.report();
+                        Ok((logits, true)) // needs squeeze
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, _budget_forced: bool| {
+                        MxArray::async_eval_arrays(&[token, logits]);
+                    },
+                };
+                chat_common::decode_loop!(
+                    ops: ops,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream
+                );
             }
 
             // _compiled_guard dropped here (if Some), calling mlx_qwen35_compiled_reset()
@@ -1551,6 +1489,8 @@ impl Qwen3_5Model {
                 think_end_id,
                 think_end_str.as_deref(),
                 performance,
+                p.include_reasoning,
+                enable_thinking.unwrap_or(true),
             )
         })
         .await
@@ -1587,7 +1527,9 @@ impl Qwen3_5Model {
             max_ngram_repeats: None,
             ngram_size: None,
             tools: None,
-            enable_thinking: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
         });
@@ -1683,7 +1625,7 @@ impl Qwen3_5Model {
                     };
 
                     let tool_defs = config.tools.as_deref();
-                    let enable_thinking = config.enable_thinking;
+                    let enable_thinking = chat_common::resolve_enable_thinking(&config);
                     let tokens = tokenizer.apply_chat_template_sync(
                         &messages,
                         Some(true),
@@ -1693,22 +1635,7 @@ impl Qwen3_5Model {
 
                     let mut first_token_instant: Option<std::time::Instant> = None;
 
-                    let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
-                    let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
-                    let repetition_context_size = config.repetition_context_size.unwrap_or(256);
-                    let presence_penalty = config.presence_penalty.unwrap_or(0.0);
-                    let presence_context_size = config.presence_context_size.unwrap_or(20);
-                    let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
-                    let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-                    let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-                    let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
-                    let ngram_size = config.ngram_size.unwrap_or(64);
-                    let sampling_config = Some(SamplingConfig {
-                        temperature: config.temperature,
-                        top_k: config.top_k,
-                        top_p: config.top_p,
-                        min_p: config.min_p,
-                    });
+                    let p = chat_common::extract_chat_params(&config);
 
                     let mut layers_guard = layers_arc
                         .write()
@@ -1902,7 +1829,7 @@ impl Qwen3_5Model {
                                     &final_norm_guard,
                                     &lm_head_guard,
                                     &model_config,
-                                    max_new_tokens,
+                                    p.max_new_tokens,
                                     generation_stream,
                                     &vision_cache_stream,
                                     model_id,
@@ -1954,33 +1881,10 @@ impl Qwen3_5Model {
                     // Track token history for repetition penalty
                     let mut token_history: Vec<u32> = tokens.clone();
 
-                    // Apply repetition penalty to prefill logits
-                    if repetition_penalty != 1.0 && !token_history.is_empty() {
-                        last_logits = apply_repetition_penalty(
-                            &last_logits,
-                            &token_history,
-                            repetition_penalty,
-                            Some(repetition_context_size),
-                        )?;
-                    }
-                    if presence_penalty != 0.0 {
-                        last_logits = apply_presence_penalty(
-                            &last_logits,
-                            &token_history,
-                            presence_penalty,
-                            Some(presence_context_size),
-                        )?;
-                    }
-                    if frequency_penalty != 0.0 {
-                        last_logits = apply_frequency_penalty(
-                            &last_logits,
-                            &token_history,
-                            frequency_penalty,
-                            Some(frequency_context_size),
-                        )?;
-                    }
+                    // Apply penalties to prefill logits
+                    last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
 
-                    let mut y = sample(&last_logits, sampling_config)?;
+                    let mut y = sample(&last_logits, p.sampling_config)?;
                     MxArray::async_eval_arrays(&[&y]);
 
                     let _compiled_guard = if use_compiled {
@@ -1988,6 +1892,9 @@ impl Qwen3_5Model {
                     } else {
                         None
                     };
+
+                    let starts_in_thinking = enable_thinking.unwrap_or(true);
+                    let mut last_is_reasoning = starts_in_thinking;
 
                     if use_compiled {
                         if vlm_compiled_init_done {
@@ -2000,7 +1907,7 @@ impl Qwen3_5Model {
                         } else {
                             use mlx_sys as sys;
                             let prefill_len = seq_len as i32;
-                            let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+                            let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
                             let num_layers = model_config.num_layers as usize;
                             let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                                 vec![std::ptr::null_mut(); num_layers * 2];
@@ -2067,108 +1974,48 @@ impl Qwen3_5Model {
 
                         // Compiled C++ decode loop (pipelined — submit N+1 before eval N)
                         profiler.set_label("chat_stream_compiled");
-                        for step in 0..max_new_tokens {
-                            // Build and submit graph for step N+1
-                            let next_y = if step + 1 < max_new_tokens {
-                                let _stream_ctx = StreamContext::new(generation_stream);
-                                let next_ids = y.reshape(&[1, 1])?;
-                                let mut logits = forward_compiled(&next_ids, &embedding_weight)?;
-                                if repetition_penalty != 1.0 {
-                                    logits = apply_repetition_penalty(
-                                        &logits,
-                                        &token_history,
-                                        repetition_penalty,
-                                        Some(repetition_context_size),
-                                    )?;
+
+                        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+                            starts_in_thinking,
+                            p.thinking_token_budget,
+                            think_end_id,
+                        );
+
+                        let mut ops = chat_common::DecodeOps {
+                            forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                                Ok((forward_compiled(ids, emb)?, false))
+                            },
+                            eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                                eval_token_and_compiled_caches(token);
+                                if budget_forced {
+                                    logits.eval();
                                 }
-                                if presence_penalty != 0.0 {
-                                    logits = apply_presence_penalty(
-                                        &logits,
-                                        &token_history,
-                                        presence_penalty,
-                                        Some(presence_context_size),
-                                    )?;
-                                }
-                                if frequency_penalty != 0.0 {
-                                    logits = apply_frequency_penalty(
-                                        &logits,
-                                        &token_history,
-                                        frequency_penalty,
-                                        Some(frequency_context_size),
-                                    )?;
-                                }
-                                let next_token = sample(&logits, sampling_config)?;
-                                eval_token_and_compiled_caches(&next_token);
-                                Some(next_token)
-                            } else {
-                                None
-                            };
-
-                            // Wait for step N (GPU already computing N+1)
-                            y.eval();
-                            let token_id = y.item_at_int32(0)? as u32;
-                            profiler.mark_first_token();
-                            if report_perf && first_token_instant.is_none() {
-                                first_token_instant = Some(std::time::Instant::now());
+                            },
+                        };
+                        chat_common::decode_loop!(
+                            ops: ops,
+                            y: y,
+                            embedding_weight: embedding_weight,
+                            params: p,
+                            reasoning_tracker: reasoning_tracker,
+                            profiler: profiler,
+                            max_new_tokens: p.max_new_tokens,
+                            eos_id: eos_id,
+                            generated_tokens: generated_tokens,
+                            token_history: token_history,
+                            finish_reason: finish_reason,
+                            first_token_instant: first_token_instant,
+                            report_perf: p.report_performance,
+                            generation_stream: generation_stream,
+                            streaming: {
+                                callback: callback,
+                                cancelled: cancelled_inner,
+                                decode_stream: decode_stream,
+                                tokenizer: tokenizer_for_decode,
+                                streamed_text_len: streamed_text_len,
+                                last_is_reasoning: last_is_reasoning
                             }
-                            generated_tokens.push(token_id);
-                            token_history.push(token_id);
-
-                            if cancelled_inner.load(Ordering::Relaxed) {
-                                finish_reason = String::from("cancelled");
-                                break;
-                            }
-
-                            let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
-                                &mut decode_stream,
-                                tokenizer_for_decode.inner(),
-                                token_id,
-                                &generated_tokens,
-                                streamed_text_len,
-                            );
-                            streamed_text_len += token_text.len();
-                            callback.call(
-                                Ok(ChatStreamChunk {
-                                    text: token_text,
-                                    done: false,
-                                    finish_reason: None,
-                                    tool_calls: None,
-                                    thinking: None,
-                                    num_tokens: None,
-                                    raw_text: None,
-                                    performance: None,
-                                }),
-                                ThreadsafeFunctionCallMode::NonBlocking,
-                            );
-
-                            if token_id == eos_id {
-                                finish_reason = String::from("stop");
-                                break;
-                            }
-
-                            if let Some(reason) = check_repetition_cutoff(
-                                &generated_tokens,
-                                max_consecutive_tokens,
-                                max_ngram_repeats,
-                                ngram_size,
-                            ) {
-                                finish_reason = reason.to_string();
-                                break;
-                            }
-
-                            match next_y {
-                                Some(next) => y = next,
-                                None => break,
-                            }
-
-                            profiler.step();
-
-                            if (step + 1) % 256 == 0 {
-                                crate::array::synchronize_and_clear_cache();
-                            }
-                        }
-                        profiler.snapshot_memory_after();
-                        profiler.report();
+                        );
 
                         // === Export caches from C++ before CompiledResetGuard drops ===
                         if reuse_cache {
@@ -2207,117 +2054,54 @@ impl Qwen3_5Model {
                     } else {
                         // Rust fallback decode loop (pipelined)
                         profiler.set_label("chat_stream_rust");
-                        for step in 0..max_new_tokens {
-                            // Build and submit graph for step N+1
-                            let next_y = if step + 1 < max_new_tokens {
-                                let _stream_ctx = StreamContext::new(generation_stream);
-                                let next_ids = y.reshape(&[1, 1])?;
+
+                        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+                            starts_in_thinking,
+                            p.thinking_token_budget,
+                            think_end_id,
+                        );
+
+                        let mut ops = chat_common::DecodeOps {
+                            forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                                 let logits = forward_inner(
-                                    &next_ids,
-                                    &embedding_weight,
+                                    ids,
+                                    emb,
                                     &mut layers_guard,
                                     &mut caches_guard,
                                     &final_norm_guard,
                                     &lm_head_guard,
                                     Some(&embedding_weight_t),
                                 )?;
-                                let mut logits = logits.squeeze(Some(&[1]))?;
-                                if repetition_penalty != 1.0 {
-                                    logits = apply_repetition_penalty(
-                                        &logits,
-                                        &token_history,
-                                        repetition_penalty,
-                                        Some(repetition_context_size),
-                                    )?;
-                                }
-                                if presence_penalty != 0.0 {
-                                    logits = apply_presence_penalty(
-                                        &logits,
-                                        &token_history,
-                                        presence_penalty,
-                                        Some(presence_context_size),
-                                    )?;
-                                }
-                                if frequency_penalty != 0.0 {
-                                    logits = apply_frequency_penalty(
-                                        &logits,
-                                        &token_history,
-                                        frequency_penalty,
-                                        Some(frequency_context_size),
-                                    )?;
-                                }
-                                let next_token = sample(&logits, sampling_config)?;
-                                MxArray::async_eval_arrays(&[&next_token]);
-                                Some(next_token)
-                            } else {
-                                None
-                            };
-
-                            // Wait for step N (GPU already computing N+1)
-                            y.eval();
-                            let token_id = y.item_at_int32(0)? as u32;
-                            profiler.mark_first_token();
-                            if report_perf && first_token_instant.is_none() {
-                                first_token_instant = Some(std::time::Instant::now());
+                                Ok((logits, true))
+                            },
+                            eval_step: |token: &MxArray, logits: &MxArray, _budget_forced: bool| {
+                                MxArray::async_eval_arrays(&[token, logits]);
+                            },
+                        };
+                        chat_common::decode_loop!(
+                            ops: ops,
+                            y: y,
+                            embedding_weight: embedding_weight,
+                            params: p,
+                            reasoning_tracker: reasoning_tracker,
+                            profiler: profiler,
+                            max_new_tokens: p.max_new_tokens,
+                            eos_id: eos_id,
+                            generated_tokens: generated_tokens,
+                            token_history: token_history,
+                            finish_reason: finish_reason,
+                            first_token_instant: first_token_instant,
+                            report_perf: p.report_performance,
+                            generation_stream: generation_stream,
+                            streaming: {
+                                callback: callback,
+                                cancelled: cancelled_inner,
+                                decode_stream: decode_stream,
+                                tokenizer: tokenizer_for_decode,
+                                streamed_text_len: streamed_text_len,
+                                last_is_reasoning: last_is_reasoning
                             }
-                            generated_tokens.push(token_id);
-                            token_history.push(token_id);
-
-                            if cancelled_inner.load(Ordering::Relaxed) {
-                                finish_reason = String::from("cancelled");
-                                break;
-                            }
-
-                            let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
-                                &mut decode_stream,
-                                tokenizer_for_decode.inner(),
-                                token_id,
-                                &generated_tokens,
-                                streamed_text_len,
-                            );
-                            streamed_text_len += token_text.len();
-                            callback.call(
-                                Ok(ChatStreamChunk {
-                                    text: token_text,
-                                    done: false,
-                                    finish_reason: None,
-                                    tool_calls: None,
-                                    thinking: None,
-                                    num_tokens: None,
-                                    raw_text: None,
-                                    performance: None,
-                                }),
-                                ThreadsafeFunctionCallMode::NonBlocking,
-                            );
-
-                            if token_id == eos_id {
-                                finish_reason = String::from("stop");
-                                break;
-                            }
-
-                            if let Some(reason) = check_repetition_cutoff(
-                                &generated_tokens,
-                                max_consecutive_tokens,
-                                max_ngram_repeats,
-                                ngram_size,
-                            ) {
-                                finish_reason = reason.to_string();
-                                break;
-                            }
-
-                            match next_y {
-                                Some(next) => y = next,
-                                None => break,
-                            }
-
-                            profiler.step();
-
-                            if (step + 1) % 256 == 0 {
-                                crate::array::synchronize_and_clear_cache();
-                            }
-                        }
-                        profiler.snapshot_memory_after();
-                        profiler.report();
+                        );
                     }
 
                     // _compiled_guard dropped here (if Some), calling mlx_qwen35_compiled_reset()
@@ -2385,6 +2169,7 @@ impl Qwen3_5Model {
                                 num_tokens: None,
                                 raw_text: None,
                                 performance: None,
+                                is_reasoning: Some(last_is_reasoning),
                             }),
                             ThreadsafeFunctionCallMode::NonBlocking,
                         );
@@ -2392,13 +2177,14 @@ impl Qwen3_5Model {
 
                     let num_tokens = generated_tokens.len() as u32;
 
-                    let think_tag = if tools::has_think_end_token(&generated_tokens, think_end_id) {
-                        think_end_str.as_deref()
-                    } else {
-                        None
-                    };
-                    let (clean_text, tool_calls, thinking) =
-                        tools::split_at_think_end(&text, think_tag);
+                    let (clean_text, tool_calls, thinking) = chat_common::parse_thinking_and_tools(
+                        &text,
+                        &generated_tokens,
+                        enable_thinking.unwrap_or(true),
+                        think_end_id,
+                        think_end_str.as_deref(),
+                        p.include_reasoning,
+                    );
 
                     // If we have valid tool calls, override finish reason
                     let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
@@ -2445,6 +2231,7 @@ impl Qwen3_5Model {
                             num_tokens: Some(num_tokens),
                             raw_text: Some(text),
                             performance: perf_metrics,
+                            is_reasoning: None,
                         }),
                         ThreadsafeFunctionCallMode::NonBlocking,
                     );
