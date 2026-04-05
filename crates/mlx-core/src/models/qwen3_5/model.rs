@@ -4310,6 +4310,28 @@ pub struct Qwen3_5GenerationConfig {
     pub min_p: Option<f64>,
 }
 
+/// Processed image ready for VLM prefill.
+/// Holds pixel values and grid dimensions as MxArray references.
+#[napi]
+pub struct VlmProcessedImage {
+    pixel_values: MxArray,
+    grid_thw: MxArray,
+}
+
+#[napi]
+impl VlmProcessedImage {
+    /// Get pixel values [num_patches, 3, patch_h, patch_w]
+    #[napi(getter)]
+    pub fn pixel_values(&self) -> MxArray {
+        self.pixel_values.clone()
+    }
+    /// Get grid dimensions [num_images, 3]
+    #[napi(getter)]
+    pub fn grid_thw(&self) -> MxArray {
+        self.grid_thw.clone()
+    }
+}
+
 /// Generation result
 #[napi(object)]
 #[derive(Debug, Clone)]
@@ -4534,6 +4556,125 @@ impl Qwen3_5Model {
             cache: owned_cache,
             reply,
         })
+    }
+
+    /// Preprocess image bytes for VLM input.
+    ///
+    /// Decodes a PNG/JPEG image, resizes, normalizes, and extracts patches.
+    /// Returns pixel values and grid dimensions needed by `vlmPrefillStep`.
+    ///
+    /// # Arguments
+    /// * `image_data` - Encoded image bytes (PNG or JPEG)
+    ///
+    /// # Returns
+    /// Object with `pixelValues` [num_patches, 3, 16, 16] and `gridThw` [1, 3]
+    #[napi]
+    pub fn process_image(&self, image_data: Buffer) -> Result<VlmProcessedImage> {
+        let processor = self
+            .image_processor
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Image processor not loaded (not a VLM model)"))?;
+        let processed = processor.process_bytes(&image_data)?;
+        // Aggregate single image into ProcessedImages to get MxArray grid_thw
+        let aggregated = crate::models::paddleocr_vl::processing::aggregate_processed_images(
+            vec![processed],
+        )?;
+        Ok(VlmProcessedImage {
+            pixel_values: aggregated.pixel_values(),
+            grid_thw: aggregated.grid_thw(),
+        })
+    }
+
+    /// Compute the number of image tokens for a processed image.
+    ///
+    /// Use this to know how many `<|image_pad|>` tokens to inject into the prompt.
+    #[napi]
+    pub fn compute_image_token_count(&self, grid_thw: &MxArray) -> Result<i32> {
+        let sms = self.spatial_merge_size.unwrap_or(2);
+        let count = compute_num_image_tokens(grid_thw, sms)?;
+        Ok(count as i32)
+    }
+
+    /// VLM prefill: process an image and run the first forward pass.
+    ///
+    /// After calling this, use `forwardWithCache(tokenId)` for subsequent
+    /// decode steps — the KV cache contains vision context.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs with image placeholders [1, seq_len]
+    /// * `pixel_values` - Image patches [num_patches, C, patch_h, patch_w]
+    /// * `image_grid_thw` - Grid dimensions [num_images, 3]
+    ///
+    /// # Returns
+    /// Logits for the last position [1, vocab_size]
+    #[napi]
+    pub fn vlm_prefill_step(
+        &self,
+        input_ids: &MxArray,
+        pixel_values: &MxArray,
+        image_grid_thw: &MxArray,
+    ) -> Result<MxArray> {
+        let vision_encoder = self
+            .vision_encoder
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Vision encoder not loaded"))?;
+
+        let sms = self
+            .spatial_merge_size
+            .unwrap_or(2);
+
+        // Initialize caches if needed
+        {
+            let caches_guard = self
+                .caches
+                .read()
+                .map_err(|_| Error::from_reason("Failed to acquire caches read lock"))?;
+            if caches_guard.is_none() {
+                drop(caches_guard);
+                self.init_caches()?;
+            }
+        }
+
+        // Build ProcessedImages from the provided tensors
+        let processed = crate::models::paddleocr_vl::processing::ProcessedImages::new(
+            pixel_values.clone(),
+            image_grid_thw.clone(),
+        );
+
+        // Get text model embedding weight for merging
+        let embedding_weight = self.embedding.get_weight();
+
+        // Prepare vision features (vision encoder + merge with text embeddings)
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let (inputs_embeds, position_ids, rope_deltas) = vlm_prepare_vision_features(
+            input_ids,
+            0, // No cache key for single-step prefill
+            &processed,
+            vision_encoder,
+            sms,
+            &embedding_weight,
+            generation_stream,
+            &self.vision_cache,
+        )?;
+
+        // Save rope deltas for subsequent forwardWithCache calls
+        if let Ok(mut rd) = self.cached_rope_deltas.write() {
+            *rd = Some(rope_deltas as i32);
+        }
+
+        // Forward pass through the text model with position IDs
+        {
+            let caches_guard = self
+                .caches
+                .read()
+                .map_err(|_| Error::from_reason("Failed to acquire caches read lock"))?;
+            if caches_guard.is_none() {
+                drop(caches_guard);
+                self.init_caches()?;
+            }
+        }
+
+        self.forward_from_embeddings_with_positions(&inputs_embeds, Some(&position_ids))
     }
 
     /// Load a pretrained model from a directory.
