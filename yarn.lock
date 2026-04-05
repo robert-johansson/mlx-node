@@ -448,17 +448,29 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@mlx-node/core-darwin-arm64@workspace:*, @mlx-node/core-darwin-arm64@workspace:packages/core/npm/darwin-arm64":
+"@mlx-node/core-darwin-arm64@npm:0.0.6, @mlx-node/core-darwin-arm64@workspace:packages/core/npm/darwin-arm64":
   version: 0.0.0-use.local
   resolution: "@mlx-node/core-darwin-arm64@workspace:packages/core/npm/darwin-arm64"
   languageName: unknown
   linkType: soft
 
+"@mlx-node/core@file:../core::locator=%40mlx-node%2Flm%40workspace%3Apackages%2Flm":
+  version: 0.0.6
+  resolution: "@mlx-node/core@file:../core#../core::hash=b28008&locator=%40mlx-node%2Flm%40workspace%3Apackages%2Flm"
+  dependencies:
+    "@mlx-node/core-darwin-arm64": "npm:0.0.6"
+  dependenciesMeta:
+    "@mlx-node/core-darwin-arm64":
+      optional: true
+  checksum: 10c0/08e591de58406aaab1449478842628fa6a75b5a9a1643215080aadbcfca71a17e086cc8cf36a09f478e4eaea12df32432c96ba2691598c975858da3d1b09bbdb
+  languageName: node
+  linkType: hard
+
 "@mlx-node/core@workspace:*, @mlx-node/core@workspace:packages/core":
   version: 0.0.0-use.local
   resolution: "@mlx-node/core@workspace:packages/core"
   dependencies:
-    "@mlx-node/core-darwin-arm64": "workspace:*"
+    "@mlx-node/core-darwin-arm64": "npm:0.0.6"
     "@napi-rs/cli": "npm:^3.5.1"
     "@oxc-node/cli": "npm:^0.0.35"
     oxfmt: "npm:^0.40.0"
@@ -486,8 +498,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@mlx-node/lm@workspace:packages/lm"
   dependencies:
-    "@mlx-node/core": "workspace:*"
-    "@types/node": "catalog:"
+    "@mlx-node/core": "file:../core"
   languageName: unknown
   linkType: soft
 

@@ -29,7 +29,5 @@
   },
   "dependencies": {
     "@mlx-node/core": "file:../core"
-  },
-  "devDependencies": {
   }
 }
