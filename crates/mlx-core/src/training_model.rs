@@ -1,27 +1,18 @@
 /// Model-Agnostic Training Support
 ///
-/// Provides a `TrainableModel` trait and `TrainableModelEnum` that allow the GRPO and SFT
-/// training engines to work with any supported model family (Qwen3, Qwen3.5 Dense, Qwen3.5 MoE).
-///
-/// ## Architecture
-///
-/// NAPI-RS cannot use trait objects or generics in `#[napi]` structs. We solve this with:
-/// 1. `TrainableModel` trait (Rust-only) defining the common training interface
-/// 2. `TrainableModelEnum` wrapping all model types, stored in engines
-/// 3. `ModelType` enum carrying config for functional forward passes in autograd
+/// Provides shared types for training engines that route through model threads:
+/// - `ModelType` enum carrying config for functional forward passes in autograd
+/// - `TrainingDispatch` for sending training commands to model threads
+/// - `GenerationPlainData` / `TrainStepPlainMetrics` for cross-thread data
+/// - `compute_sgd_updates` shared SGD helper used by all model implementations
 use std::collections::HashMap;
 
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::models::qwen3::{
-    BatchGenerationResult, GenerationConfig, GenerationResult, Qwen3Config, Qwen3Model,
-};
+use crate::models::qwen3::Qwen3Config;
 use crate::models::qwen3_5::Qwen3_5Config;
-use crate::models::qwen3_5::model::Qwen3_5Model;
 use crate::models::qwen3_5_moe::Qwen3_5MoeConfig;
-use crate::models::qwen3_5_moe::model::Qwen3_5MoeModel;
-use crate::tokenizer::{ChatMessage, ToolDefinition};
 
 /// Dispatch a field access across all ModelType config variants.
 macro_rules! config_field {
@@ -30,17 +21,6 @@ macro_rules! config_field {
             ModelType::Qwen3(c) => c.$field,
             ModelType::Qwen35Dense(c) => c.$field,
             ModelType::Qwen35Moe(c) => c.$field,
-        }
-    };
-}
-
-/// Dispatch a method call across all TrainableModelEnum variants.
-macro_rules! dispatch {
-    ($self:expr, $method:ident ( $($arg:expr),* )) => {
-        match $self {
-            TrainableModelEnum::Qwen3(m) => m.$method($($arg),*),
-            TrainableModelEnum::Qwen35Dense(m) => m.$method($($arg),*),
-            TrainableModelEnum::Qwen35Moe(m) => m.$method($($arg),*),
         }
     };
 }
@@ -77,116 +57,38 @@ impl ModelType {
     }
 }
 
-/// Common training interface for all model families.
-///
-/// This trait is Rust-internal only (not exposed via NAPI). Methods that engines
-/// call through the trait during training steps. Methods like `clone_for_training`,
-/// `calculate_memory_size`, and `save_model_sync` exist on concrete model types
-/// but are NOT in this trait — engines call them on the concrete types before
-/// wrapping in `TrainableModelEnum`.
-pub(crate) trait TrainableModel: Send + Sync {
-    /// Extract all trainable parameters as a name→array map.
-    fn get_parameters(&self) -> Result<HashMap<String, MxArray>>;
-
-    /// Apply gradients using SGD: param = param - lr * grad.
-    fn apply_gradients_with_params(
-        &mut self,
-        grads: HashMap<String, &MxArray>,
-        lr: f64,
-        params: &HashMap<String, MxArray>,
-    ) -> Result<()>;
-
-    /// Tokenize messages using the model's chat template.
-    fn apply_chat_template_sync(
-        &self,
-        messages: &[ChatMessage],
-        add_generation_prompt: Option<bool>,
-        tools: Option<&[ToolDefinition]>,
-        enable_thinking: Option<bool>,
-    ) -> Result<Vec<u32>>;
-
-    /// Generate a single completion with logprob tracking (for GRPO).
-    fn generate_for_training_sync(
-        &self,
-        input_ids: &MxArray,
-        config: Option<GenerationConfig>,
-    ) -> Result<GenerationResult>;
-
-    /// Generate a batch of completions (for GRPO).
-    fn generate_batch_for_training_sync(
-        &self,
-        prompt_arrays: &[MxArray],
-        group_size: usize,
-        config: Option<GenerationConfig>,
-    ) -> Result<BatchGenerationResult>;
-
-    /// Decode token IDs to text.
-    fn decode_tokens_sync(&self, tokens: &MxArray) -> Result<String>;
+/// Plain generation results that cross the thread boundary.
+/// No MxArrays — only plain Rust types (Vec<u32>, Vec<f32>, String, etc.).
+/// The model thread caches the MxArray versions internally for the subsequent training step.
+pub(crate) struct GenerationPlainData {
+    pub completion_texts: Vec<String>,
+    pub prompt_texts: Vec<String>,
+    pub completion_tokens: Vec<Vec<i32>>,
+    pub completion_logprobs: Vec<Vec<f32>>,
+    pub token_counts: Vec<u32>,
+    pub finish_reasons: Vec<String>,
 }
 
-/// Enum wrapping all trainable model types.
-///
-/// Stored inside training engines to allow model-agnostic training.
-pub(crate) enum TrainableModelEnum {
-    Qwen3(Qwen3Model),
-    Qwen35Dense(Qwen3_5Model),
-    Qwen35Moe(Qwen3_5MoeModel),
+/// Plain training metrics that cross the thread boundary.
+/// No MxArrays — only plain numeric types.
+pub(crate) struct TrainStepPlainMetrics {
+    pub loss: f64,
+    pub gradients_applied: bool,
+    pub mean_advantage: f64,
+    pub std_advantage: f64,
+    pub nan_gradient_count: u64,
+    pub peak_memory_mb: f64,
+    pub active_memory_mb: f64,
+    pub total_tokens: i32,
+    pub step: i64,
 }
 
-impl TrainableModel for TrainableModelEnum {
-    fn get_parameters(&self) -> Result<HashMap<String, MxArray>> {
-        match self {
-            TrainableModelEnum::Qwen3(m) => m.get_parameters(),
-            TrainableModelEnum::Qwen35Dense(m) => m.get_parameters_for_training(),
-            TrainableModelEnum::Qwen35Moe(m) => m.get_parameters_for_training(),
-        }
-    }
-
-    fn apply_gradients_with_params(
-        &mut self,
-        grads: HashMap<String, &MxArray>,
-        lr: f64,
-        params: &HashMap<String, MxArray>,
-    ) -> Result<()> {
-        dispatch!(self, apply_gradients_with_params(grads, lr, params))
-    }
-
-    fn apply_chat_template_sync(
-        &self,
-        messages: &[ChatMessage],
-        add_generation_prompt: Option<bool>,
-        tools: Option<&[ToolDefinition]>,
-        enable_thinking: Option<bool>,
-    ) -> Result<Vec<u32>> {
-        dispatch!(
-            self,
-            apply_chat_template_sync(messages, add_generation_prompt, tools, enable_thinking)
-        )
-    }
-
-    fn generate_for_training_sync(
-        &self,
-        input_ids: &MxArray,
-        config: Option<GenerationConfig>,
-    ) -> Result<GenerationResult> {
-        dispatch!(self, generate_for_training_sync(input_ids, config))
-    }
-
-    fn generate_batch_for_training_sync(
-        &self,
-        prompt_arrays: &[MxArray],
-        group_size: usize,
-        config: Option<GenerationConfig>,
-    ) -> Result<BatchGenerationResult> {
-        dispatch!(
-            self,
-            generate_batch_for_training_sync(prompt_arrays, group_size, config)
-        )
-    }
-
-    fn decode_tokens_sync(&self, tokens: &MxArray) -> Result<String> {
-        dispatch!(self, decode_tokens_sync(tokens))
-    }
+/// Dispatch handle for sending training commands to the appropriate model thread.
+/// Training engines hold this to route commands to the correct model's dedicated thread.
+pub(crate) enum TrainingDispatch {
+    Qwen3(tokio::sync::mpsc::UnboundedSender<crate::models::qwen3::Qwen3Cmd>),
+    Qwen35Dense(tokio::sync::mpsc::UnboundedSender<crate::models::qwen3_5::model::Qwen35Cmd>),
+    Qwen35Moe(tokio::sync::mpsc::UnboundedSender<crate::models::qwen3_5_moe::model::Qwen35MoeCmd>),
 }
 
 /// Compute SGD parameter updates: param = param - lr * grad.

@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
+use napi_derive::napi;
 use serde_json::Value;
 use tracing::{info, warn};
 
@@ -20,7 +21,7 @@ use super::persistence_common::{
 
 use super::config::Qwen3_5Config;
 use super::decoder_layer::AttentionType;
-use super::model::Qwen3_5Model;
+use super::model::{Qwen3_5Model, Qwen35Inner, handle_qwen35_cmd};
 use super::processing::Qwen35VLImageProcessor;
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MLPVariant, is_mxfp8_checkpoint,
@@ -218,9 +219,9 @@ fn sanitize_weights(
     Ok(result)
 }
 
-/// Apply weights to a Qwen3.5 dense model.
-fn apply_weights(
-    model: &mut Qwen3_5Model,
+/// Apply weights directly to a Qwen35Inner (no locks needed).
+fn apply_weights_inner(
+    inner: &mut Qwen35Inner,
     params: &HashMap<String, MxArray>,
     config: &Qwen3_5Config,
     quant_bits: i32,
@@ -230,11 +231,6 @@ fn apply_weights(
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
 
-    // Helper: try MXFP8 builder first (if applicable), then affine builder.
-    // Checks per-layer overrides before falling back to global defaults.
-    // For merged projections (in_proj_qkvz, in_proj_ba), also checks the
-    // pre-merge component names (in_proj_qkv, in_proj_z, in_proj_b, in_proj_a)
-    // since config.json stores overrides using the original HuggingFace names.
     let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
         if is_mxfp8 && let Some(ql) = try_build_mxfp8_quantized_linear(params, prefix) {
             return Some(ql);
@@ -243,7 +239,6 @@ fn apply_weights(
             .get(prefix)
             .copied()
             .or_else(|| {
-                // Merged projection fallback: try pre-merge component names
                 if prefix.ends_with(".in_proj_qkvz") {
                     let base = prefix.strip_suffix(".in_proj_qkvz").unwrap();
                     let qkv = per_layer_quant.get(&format!("{}.in_proj_qkv", base));
@@ -251,8 +246,7 @@ fn apply_weights(
                     match (qkv, z) {
                         (Some(&a), Some(&b)) if a != b => {
                             warn!(
-                                "Merged in_proj_qkvz has conflicting overrides: \
-                                 qkv={:?}, z={:?}. Using higher precision.",
+                                "Merged in_proj_qkvz has conflicting overrides: qkv={:?}, z={:?}. Using higher precision.",
                                 a, b
                             );
                             Some(if a.0 > b.0 { a } else { b })
@@ -267,8 +261,7 @@ fn apply_weights(
                     match (b_val, a_val) {
                         (Some(&x), Some(&y)) if x != y => {
                             warn!(
-                                "Merged in_proj_ba has conflicting overrides: \
-                                 b={:?}, a={:?}. Using higher precision.",
+                                "Merged in_proj_ba has conflicting overrides: b={:?}, a={:?}. Using higher precision.",
                                 x, y
                             );
                             Some(if x.0 > y.0 { x } else { y })
@@ -284,7 +277,7 @@ fn apply_weights(
         try_build_quantized_linear(params, prefix, gs, bits)
     };
 
-    // Embedding — supports both dense and quantized weights
+    // Embedding
     if let Some(scales) = params.get("embedding.scales") {
         let weight = params.get("embedding.weight").ok_or_else(|| {
             Error::from_reason("Missing embedding.weight for quantized embedding")
@@ -294,7 +287,7 @@ fn apply_weights(
             .get("embed_tokens")
             .copied()
             .unwrap_or((quant_bits, quant_group_size));
-        model
+        inner
             .embedding
             .load_quantized(weight, scales, biases, gs, bits)?;
         info!(
@@ -302,56 +295,39 @@ fn apply_weights(
             bits
         );
     } else if let Some(w) = params.get("embedding.weight") {
-        model.embedding.set_weight(w)?;
+        inner.embedding.set_weight(w)?;
     }
 
     // Final norm
-    {
-        let mut final_norm = model
-            .final_norm
-            .write()
-            .map_err(|_| Error::from_reason("Failed to acquire final_norm write lock"))?;
-        if let Some(w) = params.get("final_norm.weight") {
-            final_norm.set_weight(w)?;
-        }
+    if let Some(w) = params.get("final_norm.weight") {
+        inner.final_norm.set_weight(w)?;
     }
 
-    // LM head — supports both dense and quantized weights (uses quantized_matmul on forward)
-    {
-        let mut lm_head = model
-            .lm_head
-            .write()
-            .map_err(|_| Error::from_reason("Failed to acquire lm_head write lock"))?;
-        if let Some(ref mut head) = *lm_head {
-            if let Some(scales) = params.get("lm_head.scales") {
-                let weight = params.get("lm_head.weight").ok_or_else(|| {
-                    Error::from_reason("Missing lm_head.weight for quantized lm_head")
-                })?;
-                let biases = params.get("lm_head.biases");
-                let (bits, gs) = per_layer_quant
-                    .get("lm_head")
-                    .copied()
-                    .unwrap_or((quant_bits, quant_group_size));
-                head.load_quantized(weight, scales, biases, gs, bits)?;
-                info!(
-                    "Loaded quantized lm_head ({}-bit, quantized_matmul on forward)",
-                    bits
-                );
-            } else if let Some(w) = params.get("lm_head.weight") {
-                head.set_weight(w)?;
-            }
+    // LM head
+    if let Some(ref mut head) = inner.lm_head {
+        if let Some(scales) = params.get("lm_head.scales") {
+            let weight = params.get("lm_head.weight").ok_or_else(|| {
+                Error::from_reason("Missing lm_head.weight for quantized lm_head")
+            })?;
+            let biases = params.get("lm_head.biases");
+            let (bits, gs) = per_layer_quant
+                .get("lm_head")
+                .copied()
+                .unwrap_or((quant_bits, quant_group_size));
+            head.load_quantized(weight, scales, biases, gs, bits)?;
+            info!(
+                "Loaded quantized lm_head ({}-bit, quantized_matmul on forward)",
+                bits
+            );
+        } else if let Some(w) = params.get("lm_head.weight") {
+            head.set_weight(w)?;
         }
     }
 
     // Per-layer weights
-    let mut layers = model
-        .layers
-        .write()
-        .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
-    for (i, layer) in layers.iter_mut().enumerate() {
+    for (i, layer) in inner.layers.iter_mut().enumerate() {
         let prefix = format!("layers.{}", i);
 
-        // Attention weights
         match &mut layer.attn {
             AttentionType::Linear(gdn) => {
                 if is_quantized {
@@ -364,7 +340,6 @@ fn apply_weights(
                     {
                         gdn.set_in_proj_qkvz_weight(w)?;
                     }
-
                     if let Some(ql) =
                         try_build_ql(params, &format!("{}.linear_attn.in_proj_ba", prefix))
                     {
@@ -374,7 +349,6 @@ fn apply_weights(
                     {
                         gdn.set_in_proj_ba_weight(w)?;
                     }
-
                     if let Some(ql) =
                         try_build_ql(params, &format!("{}.linear_attn.out_proj", prefix))
                     {
@@ -425,8 +399,6 @@ fn apply_weights(
                 if let Some(w) = params.get(&format!("{}.linear_attn.conv1d.weight", prefix)) {
                     gdn.set_conv1d_weight(w)?;
                 }
-                // dt_bias must be loaded first (bf16) — it's used as dtype reference
-                // for A_log and norm.weight which are stored as f32 in checkpoints
                 if let Some(w) = params.get(&format!("{}.linear_attn.dt_bias", prefix)) {
                     gdn.set_dt_bias(w);
                 }
@@ -513,11 +485,9 @@ fn apply_weights(
                     let gate_key = format!("{}.mlp.gate_proj", prefix);
                     let up_key = format!("{}.mlp.up_proj", prefix);
                     let down_key = format!("{}.mlp.down_proj", prefix);
-
                     let q_gate = try_build_ql(params, &gate_key);
                     let q_up = try_build_ql(params, &up_key);
                     let q_down = try_build_ql(params, &down_key);
-
                     if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
                         layer.set_quantized_dense_mlp(qg, qu, qd);
                     } else {
@@ -543,12 +513,9 @@ fn apply_weights(
                     }
                 }
             }
-            MLPVariant::Quantized { .. } => {
-                // Already quantized, skip
-            }
+            MLPVariant::Quantized { .. } => {}
         }
 
-        // Layer norms
         if let Some(w) = params.get(&format!("{}.input_layernorm.weight", prefix)) {
             layer.set_input_layernorm_weight(w)?;
         }
@@ -557,7 +524,18 @@ fn apply_weights(
         }
     }
 
-    // Verify mandatory weights were present
+    // Validate mandatory weights
+    validate_mandatory_weights(params, config, inner.layers.len())?;
+
+    Ok(())
+}
+
+/// Validate mandatory weights presence for `apply_weights_inner`.
+fn validate_mandatory_weights(
+    params: &HashMap<String, MxArray>,
+    config: &Qwen3_5Config,
+    num_layers: usize,
+) -> Result<()> {
     let mut missing_mandatory = Vec::new();
     if !params.contains_key("embedding.weight") {
         missing_mandatory.push("embedding.weight".to_string());
@@ -569,27 +547,22 @@ fn apply_weights(
         missing_mandatory.push("lm_head.weight".to_string());
     }
 
-    let num_layers = layers.len();
     let mut layers_missing_attn: Vec<usize> = Vec::new();
     let mut layers_missing_mlp: Vec<usize> = Vec::new();
 
     for i in 0..num_layers {
         let prefix = format!("layers.{}", i);
-
         let has_attn = params.contains_key(&format!("{}.self_attn.q_proj.weight", prefix))
             || params.contains_key(&format!("{}.self_attn.q_proj.scales", prefix))
             || params.contains_key(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
             || params.contains_key(&format!("{}.linear_attn.in_proj_qkvz.scales", prefix))
             || params.contains_key(&format!("{}.linear_attn.in_proj_qkv.weight", prefix))
             || params.contains_key(&format!("{}.linear_attn.in_proj_qkv.scales", prefix));
-
         if !has_attn {
             layers_missing_attn.push(i);
         }
-
         let has_mlp = params.contains_key(&format!("{}.mlp.gate_proj.weight", prefix))
             || params.contains_key(&format!("{}.mlp.gate_proj.scales", prefix));
-
         if !has_mlp {
             layers_missing_mlp.push(i);
         }
@@ -607,7 +580,6 @@ fn apply_weights(
             ));
         }
     }
-
     if !layers_missing_mlp.is_empty() {
         if layers_missing_mlp.len() == num_layers {
             missing_mandatory.push("layers.*.mlp weights".to_string());
@@ -628,236 +600,225 @@ fn apply_weights(
         )));
     }
 
-    let total_weights = params.len();
-    let expected_prefixes = ["embedding.", "final_norm.", "lm_head.", "layers."];
-    let recognized = params
-        .keys()
-        .filter(|k| expected_prefixes.iter().any(|p| k.starts_with(p)))
-        .count();
-    let unrecognized: Vec<_> = params
-        .keys()
-        .filter(|k| !expected_prefixes.iter().any(|p| k.starts_with(p)))
-        .collect();
-    if !unrecognized.is_empty() {
-        warn!(
-            "{} weights in checkpoint were not recognized: {:?}",
-            unrecognized.len(),
-            &unrecognized[..unrecognized.len().min(10)]
-        );
-    }
-    info!(
-        "Applied weights from checkpoint: {}/{} recognized, {} total in checkpoint",
-        recognized,
-        params.len(),
-        total_weights
-    );
     Ok(())
 }
 
-/// Load a pretrained Qwen3.5 dense model from a directory.
-pub async fn load(model_path: &str) -> Result<Qwen3_5Model> {
+/// Load a Qwen3.5 dense model using a dedicated model thread.
+///
+/// Spawns a `ModelThread<Qwen35Cmd>` that loads all weights inside the init_fn.
+/// Returns a `Qwen3_5Model` thin shell with the thread handle.
+pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
     let model_path = model_path.to_string();
 
-    napi::tokio::task::spawn_blocking(move || {
-        let path = Path::new(&model_path);
+    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+        move || {
+            let path = Path::new(&model_path);
 
-        if !path.exists() {
-            return Err(Error::from_reason(format!(
-                "Model path does not exist: {}",
-                model_path
-            )));
-        }
-
-        // Load config
-        let config_path = path.join("config.json");
-        let config_data = fs::read_to_string(&config_path)
-            .map_err(|e| Error::from_reason(format!("Failed to read config: {}", e)))?;
-        let raw: Value = serde_json::from_str(&config_data)
-            .map_err(|e| Error::from_reason(format!("Failed to parse config: {}", e)))?;
-
-        let config = parse_config(&raw)?;
-
-        info!(
-            "Qwen3.5 config: {} layers, hidden={}, heads={}, kv_heads={}",
-            config.num_layers, config.hidden_size, config.num_heads, config.num_kv_heads,
-        );
-
-        // Load all weights
-        let raw_params = load_all_safetensors(path, true)?;
-        info!("Loaded {} raw tensors", raw_params.len());
-
-        // Check for vision weights and split if present
-        let has_vision = raw_params
-            .keys()
-            .any(|k| k.starts_with("vision_tower.") || k.starts_with("visual."));
-
-        let (text_raw_params, vision_params) = if has_vision {
-            let mut vision_params: HashMap<String, MxArray> = HashMap::new();
-            let mut text_params: HashMap<String, MxArray> = HashMap::new();
-
-            for (name, array) in raw_params {
-                if name.starts_with("vision_tower.") || name.starts_with("visual.") {
-                    // Normalize vision key: strip prefix
-                    let vkey = name
-                        .strip_prefix("vision_tower.")
-                        .or_else(|| name.strip_prefix("visual."))
-                        .unwrap_or(&name)
-                        .to_string();
-                    vision_params.insert(vkey, array);
-                } else {
-                    text_params.insert(name, array);
-                }
+            if !path.exists() {
+                return Err(Error::from_reason(format!(
+                    "Model path does not exist: {}",
+                    model_path
+                )));
             }
 
+            // Load config
+            let config_path = path.join("config.json");
+            let config_data = fs::read_to_string(&config_path)
+                .map_err(|e| Error::from_reason(format!("Failed to read config: {}", e)))?;
+            let raw: Value = serde_json::from_str(&config_data)
+                .map_err(|e| Error::from_reason(format!("Failed to parse config: {}", e)))?;
+
+            let config = parse_config(&raw)?;
+
             info!(
-                "Split: {} vision tensors, {} text tensors",
-                vision_params.len(),
-                text_params.len()
+                "Qwen3.5 config: {} layers, hidden={}, heads={}, kv_heads={}",
+                config.num_layers, config.hidden_size, config.num_heads, config.num_kv_heads,
             );
 
-            (text_params, Some(vision_params))
-        } else {
-            (raw_params, None)
-        };
+            // Load all weights
+            let raw_params = load_all_safetensors(path, true)?;
+            info!("Loaded {} raw tensors", raw_params.len());
 
-        // Sanitize weights (text-only; sanitize doesn't know about vision keys)
-        let params = sanitize_weights(text_raw_params, &config)?;
-        let quantized = is_quantized_checkpoint(&params);
-        info!(
-            "Sanitized to {} parameters (quantized={})",
-            params.len(),
-            quantized
-        );
+            // Split vision/text weights
+            let has_vision = raw_params
+                .keys()
+                .any(|k| k.starts_with("vision_tower.") || k.starts_with("visual."));
 
-        // Parse quantization config from config.json (our format or mlx-lm compat)
-        let quant_cfg = raw
-            .get("quantization")
-            .or_else(|| raw.get("quantization_config"));
-        let quant_bits = quant_cfg
-            .and_then(|q| q["bits"].as_i64())
-            .unwrap_or(DEFAULT_QUANT_BITS as i64) as i32;
-        let quant_group_size = quant_cfg
-            .and_then(|q| q["group_size"].as_i64())
-            .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64) as i32;
-        // Parse per-layer quantization overrides (module path → (bits, group_size)).
-        // Normalize keys by stripping model prefixes so they match the sanitized
-        // weight keys used in apply_weights (e.g. "layers.0.self_attn.q_proj").
-        let per_layer_quant: HashMap<String, (i32, i32)> = quant_cfg
-            .and_then(|q| q.as_object())
-            .map(|obj| {
-                obj.iter()
-                    .filter(|(_, v)| v.is_object()) // per-layer entries are objects, globals are scalars
-                    .filter_map(|(k, v)| {
-                        let bits = v["bits"].as_i64()? as i32;
-                        let gs = v["group_size"]
-                            .as_i64()
-                            .unwrap_or(quant_group_size as i64)
-                            as i32;
-                        let normalized = k
-                            .strip_prefix("model.language_model.")
-                            .or_else(|| k.strip_prefix("language_model.model."))
-                            .or_else(|| k.strip_prefix("language_model."))
-                            .or_else(|| k.strip_prefix("model."))
-                            .unwrap_or(k)
+            let (text_raw_params, vision_params) = if has_vision {
+                let mut vision_params: HashMap<String, MxArray> = HashMap::new();
+                let mut text_params: HashMap<String, MxArray> = HashMap::new();
+                for (name, array) in raw_params {
+                    if name.starts_with("vision_tower.") || name.starts_with("visual.") {
+                        let vkey = name
+                            .strip_prefix("vision_tower.")
+                            .or_else(|| name.strip_prefix("visual."))
+                            .unwrap_or(&name)
                             .to_string();
-                        Some((normalized, (bits, gs)))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+                        vision_params.insert(vkey, array);
+                    } else {
+                        text_params.insert(name, array);
+                    }
+                }
+                info!(
+                    "Split: {} vision tensors, {} text tensors",
+                    vision_params.len(),
+                    text_params.len()
+                );
+                (text_params, Some(vision_params))
+            } else {
+                (raw_params, None)
+            };
 
-        if quant_cfg.is_some() {
+            // Sanitize weights
+            let params = sanitize_weights(text_raw_params, &config)?;
+            let quantized = is_quantized_checkpoint(&params);
             info!(
-                "Using quantization config from config.json: bits={}, group_size={}, per_layer_overrides={}",
-                quant_bits, quant_group_size, per_layer_quant.len()
-            );
-        }
-
-        // Load tokenizer
-        let tokenizer_path = path.join("tokenizer.json");
-        let tokenizer = if tokenizer_path.exists() {
-            info!("Loading tokenizer from: {}", tokenizer_path.display());
-            Some(Qwen3Tokenizer::load_from_file_sync(
-                tokenizer_path
-                    .to_str()
-                    .ok_or_else(|| Error::from_reason("Tokenizer path contains invalid UTF-8"))?,
-            )?)
-        } else {
-            None
-        };
-
-        // Create model
-        let mut model = Qwen3_5Model::new(config.clone())?;
-
-        // Apply weights
-        apply_weights(
-            &mut model,
-            &params,
-            &config,
-            quant_bits,
-            quant_group_size,
-            &per_layer_quant,
-        )?;
-
-        // Register weights with C++ compiled forward pass (dense-only).
-        // Skip for quantized models — C++ path uses dense matmul, not quantized_matmul.
-        if !is_quantized_checkpoint(&params) && !is_mxfp8_checkpoint(&params) {
-            register_weights_with_cpp(&params, model.model_id);
-        } else {
-            info!("Skipping C++ compiled path for quantized model (using Rust quantized_matmul)");
-            // Clear stale weights so a previously-loaded non-quantized model's weights
-            // don't trick this model into the compiled path via weight_count > 0.
-            let _guard = super::model::COMPILED_WEIGHTS_RWLOCK.write().unwrap();
-            unsafe { mlx_sys::mlx_qwen35_clear_weights() };
-        }
-
-        // Materialize all mmap-backed weight arrays so the first inference
-        // prefill timing is not inflated by lazy disk reads.
-        {
-            let arrays: Vec<&MxArray> = params.values().collect();
-            crate::array::memory::materialize_weights(&arrays);
-        }
-
-        // Set tokenizer
-        if let Some(tok) = tokenizer {
-            model.tokenizer = Some(Arc::new(tok));
-        }
-
-        // If vision weights were found, load vision encoder and configure VLM
-        if let Some(ref vparams) = vision_params {
-            let vision_config = parse_vision_config(&raw);
-            info!(
-                "Vision config: {} layers, hidden={}, heads={}, patch={}",
-                vision_config.num_layers,
-                vision_config.hidden_size,
-                vision_config.num_heads,
-                vision_config.patch_size,
+                "Sanitized to {} parameters (quantized={})",
+                params.len(),
+                quantized
             );
 
-            let mut vision_encoder = Qwen3_5VisionEncoder::new(vision_config.clone())?;
-            load_vision_weights(&mut vision_encoder, vparams, &vision_config)?;
+            // Parse quantization config
+            let quant_cfg = raw
+                .get("quantization")
+                .or_else(|| raw.get("quantization_config"));
+            let quant_bits = quant_cfg
+                .and_then(|q| q["bits"].as_i64())
+                .unwrap_or(DEFAULT_QUANT_BITS as i64) as i32;
+            let quant_group_size = quant_cfg
+                .and_then(|q| q["group_size"].as_i64())
+                .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64)
+                as i32;
+            let per_layer_quant: HashMap<String, (i32, i32)> = quant_cfg
+                .and_then(|q| q.as_object())
+                .map(|obj| {
+                    obj.iter()
+                        .filter(|(_, v)| v.is_object())
+                        .filter_map(|(k, v)| {
+                            let bits = v["bits"].as_i64()? as i32;
+                            let gs =
+                                v["group_size"].as_i64().unwrap_or(quant_group_size as i64) as i32;
+                            let normalized = k
+                                .strip_prefix("model.language_model.")
+                                .or_else(|| k.strip_prefix("language_model.model."))
+                                .or_else(|| k.strip_prefix("language_model."))
+                                .or_else(|| k.strip_prefix("model."))
+                                .unwrap_or(k)
+                                .to_string();
+                            Some((normalized, (bits, gs)))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
-            // Initialize M-RoPE on all full attention layers
-            // mrope_section = [11, 11, 10] for Qwen3.5-VL
-            model.init_mrope_layers(
-                vec![11, 11, 10],
-                config.rope_theta,
-                config.max_position_embeddings,
+            if quant_cfg.is_some() {
+                info!(
+                    "Using quantization config: bits={}, group_size={}, per_layer_overrides={}",
+                    quant_bits,
+                    quant_group_size,
+                    per_layer_quant.len()
+                );
+            }
+
+            // Load tokenizer
+            let tokenizer_path = path.join("tokenizer.json");
+            let tokenizer = if tokenizer_path.exists() {
+                info!("Loading tokenizer from: {}", tokenizer_path.display());
+                Some(Qwen3Tokenizer::load_from_file_sync(
+                    tokenizer_path.to_str().ok_or_else(|| {
+                        Error::from_reason("Tokenizer path contains invalid UTF-8")
+                    })?,
+                )?)
+            } else {
+                None
+            };
+
+            // Create inner model
+            let mut inner = Qwen35Inner::new(config.clone())?;
+
+            // Apply weights
+            apply_weights_inner(
+                &mut inner,
+                &params,
+                &config,
+                quant_bits,
+                quant_group_size,
+                &per_layer_quant,
             )?;
 
-            model.set_vision_encoder(vision_encoder);
-            model.set_image_processor(Qwen35VLImageProcessor::new(None));
-            model.set_spatial_merge_size(vision_config.spatial_merge_size);
+            // Register weights with C++
+            if !is_quantized_checkpoint(&params) && !is_mxfp8_checkpoint(&params) {
+                register_weights_with_cpp(&params, inner.model_id);
+            } else {
+                info!(
+                    "Skipping C++ compiled path for quantized model (using Rust quantized_matmul)"
+                );
+                let _guard = super::model::COMPILED_WEIGHTS_RWLOCK.write().unwrap();
+                unsafe { mlx_sys::mlx_clear_weights() };
+            }
 
-            info!("Qwen3.5-VL model loaded successfully (with vision encoder)");
-        } else {
-            info!("Qwen3.5 model loaded successfully");
-        }
+            // Materialize mmap-backed weights
+            {
+                let arrays: Vec<&MxArray> = params.values().collect();
+                crate::array::memory::materialize_weights(&arrays);
+            }
 
-        Ok(model)
+            // Set tokenizer
+            if let Some(tok) = tokenizer {
+                inner.set_tokenizer(Arc::new(tok));
+            }
+
+            // Load vision encoder if present
+            if let Some(ref vparams) = vision_params {
+                let vision_config = parse_vision_config(&raw);
+                info!(
+                    "Vision config: {} layers, hidden={}, heads={}, patch={}",
+                    vision_config.num_layers,
+                    vision_config.hidden_size,
+                    vision_config.num_heads,
+                    vision_config.patch_size,
+                );
+
+                let mut vision_encoder = Qwen3_5VisionEncoder::new(vision_config.clone())?;
+                load_vision_weights(&mut vision_encoder, vparams, &vision_config)?;
+
+                inner.init_mrope_layers(
+                    vec![11, 11, 10],
+                    config.rope_theta,
+                    config.max_position_embeddings,
+                )?;
+
+                inner.set_vision_encoder(vision_encoder);
+                inner.set_image_processor(Qwen35VLImageProcessor::new(None));
+                inner.set_spatial_merge_size(vision_config.spatial_merge_size);
+
+                info!("Qwen3.5-VL model loaded successfully (with vision encoder)");
+            } else {
+                info!("Qwen3.5 model loaded successfully");
+            }
+
+            let model_id = inner.model_id;
+            let config_out = inner.config.clone();
+            let image_processor = inner.image_processor.as_ref().map(Arc::clone);
+            let tokenizer_out = inner.tokenizer.clone();
+
+            Ok((
+                inner,
+                (config_out, model_id, image_processor, tokenizer_out),
+            ))
+        },
+        handle_qwen35_cmd,
+    );
+
+    let (config, model_id, _image_processor, _tokenizer) = init_rx
+        .await
+        .map_err(|_| Error::from_reason("Model thread exited during load"))??;
+
+    Ok(Qwen3_5Model {
+        thread,
+        config,
+        model_id,
     })
-    .await
-    .map_err(|e| Error::from_reason(format!("Failed to load model: {}", e)))?
 }
 
 /// Register all sanitized weights with the C++ fused forward pass.
@@ -871,12 +832,12 @@ fn register_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
     // until registration is complete and model_id is set.
     let _guard = super::model::COMPILED_WEIGHTS_RWLOCK.write().unwrap();
 
-    unsafe { sys::mlx_qwen35_clear_weights() };
+    unsafe { sys::mlx_clear_weights() };
 
     let store = |name: &str, array: &MxArray| {
         let c_name = CString::new(name).expect("Weight name contains null byte");
         unsafe {
-            sys::mlx_qwen35_store_weight(c_name.as_ptr(), array.as_raw_ptr());
+            sys::mlx_store_weight(c_name.as_ptr(), array.as_raw_ptr());
         }
     };
 
@@ -922,12 +883,12 @@ fn register_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
         }
     }
 
-    let count = unsafe { sys::mlx_qwen35_weight_count() };
+    let count = unsafe { sys::mlx_weight_count() };
     info!("Registered {} weights with C++ fused forward pass", count);
 
     // Set model ID AFTER all weights are stored. This ordering ensures no
     // inference sees a partially-populated map with the new model's ID.
-    unsafe { sys::mlx_qwen35_set_model_id(model_id) };
+    unsafe { sys::mlx_set_model_id(model_id) };
 }
 
 /// Parse Qwen3.5 dense config from JSON.
@@ -1169,4 +1130,48 @@ pub(crate) fn load_vision_weights(
         config.num_layers
     );
     Ok(())
+}
+
+/// Create a random-init Qwen3.5 model and save it to disk.
+///
+/// Spawns a dedicated `ModelThread<Qwen35Cmd>` whose init builds a fresh
+/// random-weight `Qwen35Inner` directly, then dispatches `Qwen35Cmd::SaveModel`
+/// on that thread. The thread is dropped at the end of the promise, so the
+/// in-memory model is released once the checkpoint has been written. Used by
+/// TypeScript test fixtures that need an on-disk checkpoint without keeping a
+/// NAPI model instance alive.
+#[napi]
+pub fn create_random_qwen35_checkpoint<'env>(
+    env: &'env Env,
+    config: Qwen3_5Config,
+    save_path: String,
+) -> Result<PromiseRaw<'env, ()>> {
+    use super::model::Qwen35Cmd;
+
+    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+        move || {
+            let inner = Qwen35Inner::new(config)?;
+            Ok((inner, ()))
+        },
+        handle_qwen35_cmd,
+    );
+
+    env.spawn_future(async move {
+        init_rx
+            .await
+            .map_err(|_| napi::Error::from_reason("Model thread exited during init"))??;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        thread.send(Qwen35Cmd::SaveModel {
+            save_path,
+            reply: tx,
+        })?;
+        rx.await
+            .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))??;
+
+        // Drop the thread explicitly so the dedicated OS thread shuts down
+        // now that the checkpoint has been written.
+        drop(thread);
+        Ok(())
+    })
 }

@@ -67,58 +67,55 @@ impl Activations {
         input.mul(&sigmoid)
     }
 
-    /// Gaussian Error Linear Unit (GELU)
+    /// Gaussian Error Linear Unit (GELU) — tanh approximation.
     /// Approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    ///
+    /// Uses a compiled (fused) Metal kernel via `mx.compile(shapeless=True)`,
+    /// matching Python's `nn.gelu_approx`. Operates in native dtype (no f32 upcast)
+    /// for maximum performance — the compile fusion handles numerical stability.
     pub fn gelu(input: &MxArray) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_gelu_approx(input.handle.0) };
+        MxArray::from_handle(handle, "gelu_approx")
+    }
+
+    /// Gaussian Error Linear Unit — exact (non-approximate) variant.
+    /// GELU(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
+    ///
+    /// This matches PyTorch's `F.gelu(x, approximate="none")`.
+    /// Used by Gemma4 MoE experts (vLLM's `activation="gelu"` defaults to exact).
+    pub fn gelu_exact(input: &MxArray) -> Result<MxArray> {
         let handle = unsafe {
-            // Constants
             let half = sys::mlx_array_scalar_float(0.5);
             let one = sys::mlx_array_scalar_float(1.0);
-            let sqrt_2_over_pi = sys::mlx_array_scalar_float(0.7978845608);
-            let coeff = sys::mlx_array_scalar_float(0.044715);
+            let inv_sqrt2 = sys::mlx_array_scalar_float(std::f64::consts::FRAC_1_SQRT_2);
 
-            // x^3
-            let x_squared = sys::mlx_array_square(input.handle.0);
-            let x_cubed = sys::mlx_array_mul(x_squared, input.handle.0);
+            // x / sqrt(2)
+            let x_scaled = sys::mlx_array_mul(input.handle.0, inv_sqrt2);
 
-            // 0.044715 * x^3
-            let scaled_x_cubed = sys::mlx_array_mul_scalar(x_cubed, 0.044715);
+            // erf(x / sqrt(2))
+            let erf_result = sys::mlx_array_erf(x_scaled);
 
-            // x + 0.044715 * x^3
-            let inner = sys::mlx_array_add(input.handle.0, scaled_x_cubed);
+            // 1 + erf(x / sqrt(2))
+            let one_plus_erf = sys::mlx_array_add(one, erf_result);
 
-            // sqrt(2/pi) * (x + 0.044715 * x^3)
-            let scaled_inner = sys::mlx_array_mul(inner, sqrt_2_over_pi);
+            // x * (1 + erf(x / sqrt(2)))
+            let x_times_bracket = sys::mlx_array_mul(input.handle.0, one_plus_erf);
 
-            // tanh(...)
-            let tanh_result = sys::mlx_array_tanh(scaled_inner);
-
-            // 1 + tanh(...)
-            let one_plus_tanh = sys::mlx_array_add(one, tanh_result);
-
-            // x * (1 + tanh(...))
-            let x_times_bracket = sys::mlx_array_mul(input.handle.0, one_plus_tanh);
-
-            // 0.5 * x * (1 + tanh(...))
+            // 0.5 * x * (1 + erf(x / sqrt(2)))
             let result = sys::mlx_array_mul(half, x_times_bracket);
 
             // Clean up
             sys::mlx_array_delete(half);
             sys::mlx_array_delete(one);
-            sys::mlx_array_delete(sqrt_2_over_pi);
-            sys::mlx_array_delete(coeff);
-            sys::mlx_array_delete(x_squared);
-            sys::mlx_array_delete(x_cubed);
-            sys::mlx_array_delete(scaled_x_cubed);
-            sys::mlx_array_delete(inner);
-            sys::mlx_array_delete(scaled_inner);
-            sys::mlx_array_delete(tanh_result);
-            sys::mlx_array_delete(one_plus_tanh);
+            sys::mlx_array_delete(inv_sqrt2);
+            sys::mlx_array_delete(x_scaled);
+            sys::mlx_array_delete(erf_result);
+            sys::mlx_array_delete(one_plus_erf);
             sys::mlx_array_delete(x_times_bracket);
 
             result
         };
-        MxArray::from_handle(handle, "gelu")
+        MxArray::from_handle(handle, "gelu_exact")
     }
 
     /// ReLU: max(0, x)

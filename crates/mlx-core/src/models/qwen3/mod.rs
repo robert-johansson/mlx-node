@@ -9,7 +9,7 @@
 mod config;
 mod generation;
 mod model;
-mod persistence;
+pub mod persistence;
 mod speculative;
 
 // Public re-exports

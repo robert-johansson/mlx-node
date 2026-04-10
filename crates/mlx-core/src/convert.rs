@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use crate::array::{DType, MxArray};
 use crate::models::paddleocr_vl::persistence::load_paddleocr_vl_weights;
 use crate::models::qianfan_ocr::persistence::load_qianfan_ocr_weights;
-use crate::utils::safetensors::{load_safetensors_lazy, save_safetensors};
+use crate::utils::safetensors::load_safetensors_lazy;
 
 /// Structure for parsing model.safetensors.index.json
 #[derive(Debug, Deserialize)]
@@ -415,9 +415,15 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
             );
             load_qianfan_ocr_weights(converted_tensors)?
         }
+        Some("gemma4") => {
+            info!(
+                "Applying Gemma4 weight sanitization (prefix stripping, vision/audio removal)..."
+            );
+            sanitize_gemma4_convert(converted_tensors, tie_word_embeddings, verbose)?
+        }
         Some(other) => {
             return Err(Error::from_reason(format!(
-                "Unknown model type: '{}'. Supported: paddleocr-vl, qwen3_5_moe, qwen3_5, qianfan-ocr",
+                "Unknown model type: '{}'. Supported: paddleocr-vl, qwen3_5_moe, qwen3_5, qianfan-ocr, gemma4",
                 other
             )));
         }
@@ -472,27 +478,17 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
     let mut tensor_names: Vec<String> = converted_tensors.keys().cloned().collect();
     tensor_names.sort();
 
-    // Save converted model
-    let output_weights_path = output_dir.join("model.safetensors");
-    info!(
-        "Saving converted model to: {}",
-        output_weights_path.display()
-    );
+    // Save converted model — sharded output with index file (mlx-lm/mlx-vlm compatible)
+    info!("Saving converted model to: {}", output_dir.display());
 
-    // Create metadata with dtype info
-    let metadata = serde_json::json!({
-        "format": "mlx",
-        "dtype": target_dtype,
-        "converted_from": "huggingface",
-        "source": input_dir.file_name().unwrap_or_default().to_string_lossy(),
-    });
+    crate::utils::safetensors::save_safetensors_sharded(&output_dir, &converted_tensors)?;
 
-    save_safetensors(&output_weights_path, &converted_tensors, Some(metadata))?;
-
-    // Write config.json — inject quantization metadata if quantized
+    // Write config.json — clean and sort keys to match mlx-lm/mlx-vlm save_config
     let output_config_path = output_dir.join("config.json");
+    let mut output_config = config.clone();
+
+    // Inject quantization metadata if quantized
     if do_quantize {
-        let mut output_config = config.clone();
         let mut quant_obj = serde_json::json!({
             "group_size": quant_group_size,
             "bits": quant_bits,
@@ -508,25 +504,28 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
         }
         output_config["quantization"] = quant_obj.clone();
         output_config["quantization_config"] = quant_obj;
-        let config_str = serde_json::to_string_pretty(&output_config)
+    }
+
+    // Clean config: remove keys that mlx-lm/mlx-vlm strip
+    if let Some(obj) = output_config.as_object_mut() {
+        obj.remove("_name_or_path");
+    }
+
+    // Sort config keys for readability (matches mlx-lm/mlx-vlm save_config)
+    if let Some(obj) = output_config.as_object() {
+        let sorted: serde_json::Map<String, serde_json::Value> =
+            obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        // BTreeMap for sorted output
+        let sorted: std::collections::BTreeMap<String, serde_json::Value> =
+            sorted.into_iter().collect();
+        let config_str = serde_json::to_string_pretty(&sorted)
             .map_err(|e| Error::from_reason(format!("Failed to serialize config: {}", e)))?;
         fs::write(&output_config_path, config_str)
             .map_err(|e| Error::from_reason(format!("Failed to write config.json: {}", e)))?;
-        if per_layer_overrides.is_empty() {
-            info!("Wrote config.json with quantization metadata");
-        } else {
-            info!(
-                "Wrote config.json with quantization metadata ({} per-layer overrides)",
-                per_layer_overrides.len()
-            );
-        }
-    } else {
-        info!("Copying config.json to: {}", output_config_path.display());
-        fs::copy(&config_path, &output_config_path)
-            .map_err(|e| Error::from_reason(format!("Failed to copy config.json: {}", e)))?;
     }
+    info!("Wrote config.json");
 
-    // Copy tokenizer and model config files if they exist
+    // Copy tokenizer, model config, and Python model definition files
     let config_files = [
         // Tokenizer files
         "tokenizer.json",
@@ -535,6 +534,8 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
         "merges.txt",
         "special_tokens_map.json",
         "added_tokens.json",
+        // Chat template (Gemma4 and other models use external .jinja files)
+        "chat_template.jinja",
         // Generation config
         "generation_config.json",
         // VLM-specific files
@@ -554,6 +555,26 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
                 .map_err(|e| Error::from_reason(format!("Failed to copy {}: {}", file_name, e)))?;
         } else if verbose {
             warn!("Skipping {} (not found)", file_name);
+        }
+    }
+
+    // Copy *.py model definition files (mlx-lm/mlx-vlm load model classes from these)
+    if let Ok(entries) = fs::read_dir(&input_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("py") {
+                let dst = output_dir.join(entry.file_name());
+                fs::copy(&path, &dst).map_err(|e| {
+                    Error::from_reason(format!(
+                        "Failed to copy {}: {}",
+                        entry.file_name().to_string_lossy(),
+                        e
+                    ))
+                })?;
+                if verbose {
+                    info!("Copying {}", entry.file_name().to_string_lossy());
+                }
+            }
         }
     }
 
@@ -637,6 +658,148 @@ pub(crate) enum QuantDecision {
 }
 
 /// Extract the layer index from a weight key like "model.layers.5.self_attn.q_proj.weight" → Some(5).
+/// Sanitize Gemma4 weights at conversion time.
+///
+/// Produces output compatible with mlx-lm, mlx-vlm, AND our Rust inference.
+/// Matches mlx-lm's gemma4.Model.sanitize() + gemma4_text.Model.sanitize():
+///
+/// 1. Strip HF prefix, remap to mlx-lm attribute tree
+/// 2. Preserve ALL weights (vision/audio/multimodal) — mlx-vlm needs them,
+///    and mlx-lm's sanitize() safely ignores them on load
+/// 3. Remove rotary_emb, calibration tensors
+/// 4. Split fused experts.gate_up_proj into switch_glu.gate_proj + switch_glu.up_proj
+/// 5. Rename experts.down_proj to switch_glu.down_proj.weight
+/// 6. Drop lm_head.weight when tie_word_embeddings=true
+fn sanitize_gemma4_convert(
+    weights: HashMap<String, MxArray>,
+    tie_word_embeddings: bool,
+    verbose: bool,
+) -> Result<HashMap<String, MxArray>> {
+    let mut sanitized: HashMap<String, MxArray> = HashMap::new();
+    let mut skipped = 0usize;
+
+    for (key, array) in weights {
+        // Step 1: Strip HF prefix to get the bare key.
+        // HF stores as: model.language_model.model.layers.N.* or model.layers.N.*
+        let stripped = key
+            .strip_prefix("model.language_model.model.")
+            .or_else(|| key.strip_prefix("model.language_model."))
+            .or_else(|| key.strip_prefix("language_model.model."))
+            .or_else(|| key.strip_prefix("language_model."))
+            .or_else(|| key.strip_prefix("model."))
+            .unwrap_or(&key);
+
+        // Skip rotary_emb keys (precomputed inverse frequencies, unused)
+        if stripped.contains("rotary_emb") {
+            skipped += 1;
+            continue;
+        }
+
+        // Skip calibration tensors for language model weights only.
+        // Keep them for vision_tower/audio_tower — mlx-vlm's ClippableLinear needs them.
+        if stripped.ends_with(".input_max")
+            || stripped.ends_with(".input_min")
+            || stripped.ends_with(".output_max")
+            || stripped.ends_with(".output_min")
+        {
+            let is_multimodal = stripped.starts_with("vision_tower.")
+                || stripped.starts_with("vision_encoder.")
+                || stripped.starts_with("audio_tower.")
+                || stripped.starts_with("audio_encoder.");
+            if !is_multimodal {
+                skipped += 1;
+                continue;
+            }
+        }
+
+        // Skip lm_head.weight when tied embeddings
+        if tie_word_embeddings && stripped == "lm_head.weight" {
+            skipped += 1;
+            continue;
+        }
+
+        // Multimodal weights: keep with their original (stripped) key prefix.
+        // mlx-vlm expects these for vision/audio processing.
+        // mlx-lm's sanitize() skips them harmlessly on load.
+        if stripped.starts_with("vision_tower.")
+            || stripped.starts_with("vision_encoder.")
+            || stripped.starts_with("audio_tower.")
+            || stripped.starts_with("audio_encoder.")
+            || stripped.starts_with("embed_audio.")
+            || stripped.starts_with("embed_vision.")
+            || stripped.starts_with("multi_modal_projector.")
+        {
+            // Apply PyTorch→MLX layout conversions for conv weights
+            // (matches mlx-vlm's sanitize transforms)
+            let ndim = array.ndim()?;
+            let array = if stripped.contains("depthwise_conv1d.weight") && ndim == 3 {
+                // Conv1d: PyTorch [out, in, kW] → MLX [out, kW, in]
+                let transposed = array.transpose(Some(&[0, 2, 1]))?;
+                transposed.eval();
+                transposed
+            } else if stripped.contains("subsample_conv_projection")
+                && stripped.contains("conv.weight")
+                && ndim == 4
+            {
+                // Conv2d: PyTorch [out, in, kH, kW] → MLX [out, kH, kW, in]
+                let transposed = array.transpose(Some(&[0, 2, 3, 1]))?;
+                transposed.eval();
+                transposed
+            } else {
+                array
+            };
+            sanitized.insert(stripped.to_string(), array);
+            continue;
+        }
+
+        // Step 2: Apply mlx-lm gemma4_text sanitize transforms.
+        // Split fused experts.gate_up_proj and rename experts.down_proj.
+        if stripped.ends_with(".experts.gate_up_proj") {
+            // Split [num_experts, 2*moe_inter, hidden] along axis -2 into two halves
+            let base = stripped.strip_suffix(".gate_up_proj").unwrap();
+            let shape = array.shape()?;
+            let mid = shape[1] / 2; // split the output dimension in half
+
+            let gate = array.slice_axis(1, 0, mid)?;
+            let up = array.slice_axis(1, mid, shape[1])?;
+
+            // Ensure contiguous layout for safetensors (matches Python's mx.contiguous)
+            gate.eval();
+            up.eval();
+
+            let gate_key = format!("language_model.model.{base}.switch_glu.gate_proj.weight");
+            let up_key = format!("language_model.model.{base}.switch_glu.up_proj.weight");
+            sanitized.insert(gate_key, gate);
+            sanitized.insert(up_key, up);
+            continue;
+        }
+
+        if stripped.ends_with(".experts.down_proj") {
+            let base = stripped.strip_suffix(".down_proj").unwrap();
+            let out_key = format!("language_model.model.{base}.switch_glu.down_proj.weight");
+            sanitized.insert(out_key, array);
+            continue;
+        }
+
+        // Step 3: Add the mlx-lm attribute tree prefix.
+        // mlx-lm's gemma4.Model has: self.language_model = gemma4_text.Model
+        // gemma4_text.Model has: self.model = Gemma4TextModel
+        // So all text weights get prefix: language_model.model.
+        let out_key = format!("language_model.model.{stripped}");
+        sanitized.insert(out_key, array);
+    }
+
+    if verbose || skipped > 0 {
+        info!(
+            "  Gemma4 sanitize: kept {} tensors, skipped {}",
+            sanitized.len(),
+            skipped
+        );
+    }
+
+    Ok(sanitized)
+}
+
 fn extract_layer_index(key: &str) -> Option<usize> {
     // Look for ".layers.N." or "layers.N."
     let idx = key.find("layers.")?;

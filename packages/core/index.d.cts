@@ -103,6 +103,25 @@ export declare class DocUnwarpModel {
   unwarp(imageData: Uint8Array): UnwarpResult;
 }
 
+/**
+ * Gemma 4 dense language model.
+ *
+ * Supports E2B (2.3B), E4B (4.5B), and 31B variants.
+ * Features: hybrid attention (sliding + global), GeGLU MLP, logit softcapping,
+ * embedding scaling, and optional per-layer embeddings.
+ *
+ * All model state lives on a dedicated OS thread. NAPI methods dispatch
+ * commands via channels and await responses.
+ */
+export declare class Gemma4Model {
+  constructor(config: Gemma4Config);
+  modelId(): number;
+  /** Load a Gemma4 model from a directory. */
+  static load(modelPath: string): Promise<Gemma4Model>;
+  /** Chat with the model using a list of messages. */
+  chat(messages: Array<ChatMessage>, config?: Gemma4ChatConfig | undefined | null): Promise<Gemma4ChatResult>;
+}
+
 /** Result from text generation with detailed metadata */
 export declare class GenerationResult {
   /** Get the decoded text */
@@ -120,14 +139,15 @@ export declare class GenerationResult {
 /**
  * GRPO Training Engine
  *
- * Complete training engine that runs entirely in Rust.
+ * Thin coordinator that routes all MLX operations through the model thread.
+ * No MxArrays or model state live here — only plain data crosses the boundary.
  */
 export declare class GrpoTrainingEngine {
   /**
    * Create a new training engine from a Qwen3 model
    *
    * # Arguments
-   * * `model` - The Qwen3 model to train (will be cloned internally)
+   * * `model` - The Qwen3 model (must be loaded via load())
    * * `config` - Engine configuration
    */
   constructor(model: Qwen3Model, config: GrpoEngineConfig);
@@ -143,8 +163,8 @@ export declare class GrpoTrainingEngine {
    * This method performs the complete training cycle:
    * 1. Generate completions for each prompt (G times per prompt)
    * 2. Use provided rewards to compute advantages
-   * 3. Compute GRPO loss and gradients
-   * 4. Apply gradients (respecting accumulation steps)
+   * 3. Compute GRPO loss and gradients (on model thread)
+   * 4. Apply gradients (respecting accumulation steps, on model thread)
    *
    * # Arguments
    * * `prompts` - Array of chat conversations to use as prompts
@@ -171,13 +191,14 @@ export declare class GrpoTrainingEngine {
   /**
    * Run a training step with pre-generated completions
    *
-   * This method performs training using pre-generated completions,
-   * eliminating the double-generation issue.
+   * Uses the cached MxArrays from the most recent generate_batch_for_training
+   * call on the model thread. The generation_result parameter is used only for
+   * validation (the actual MxArrays are cached on the model thread).
    *
    * # Arguments
    * * `prompts` - Array of chat conversations to use as prompts
    * * `rewards` - Reward values for each completion (num_prompts * group_size)
-   * * `generation_result` - Pre-generated completion data from generate_batch_for_training
+   * * `generation_result` - Pre-generated completion data (used for validation)
    *
    * # Returns
    * * Training step metrics
@@ -190,8 +211,8 @@ export declare class GrpoTrainingEngine {
   /**
    * Unified training step with JS reward callback and optional output recording
    *
-   * Same as `train_step_auto` but optionally captures the full RewardOutput data
-   * for persistence to an output store database.
+   * Generates completions via the model thread, calls the JS reward function
+   * with plain data, then dispatches the training step to the model thread.
    *
    * # Arguments
    * * `prompts` - Array of chat conversations to use as prompts
@@ -222,7 +243,16 @@ export declare class GrpoTrainingEngine {
   startEpoch(): void;
   /** End the current epoch and get metrics */
   endEpoch(epochTimeSecs: number): EngineEpochMetrics;
-  /** Reset the engine for a fresh training run */
+  /**
+   * Reset the engine for a fresh training run.
+   *
+   * This is a TERMINAL operation on this handle. It drops the training
+   * state (optimizer, step counter) on the model thread so a fresh
+   * `GRPOTrainingEngine` can be constructed on the same model, and marks
+   * THIS handle as invalidated. Any subsequent dispatch-requiring method
+   * on this handle returns an error — callers must construct a new
+   * engine to continue training.
+   */
   reset(): void;
   /** Check if reward registry has any rewards registered */
   get hasBuiltinRewards(): boolean;
@@ -242,22 +272,18 @@ export declare class GrpoTrainingEngine {
   /**
    * Save optimizer state (moment tensors + step) to a SafeTensors file.
    *
-   * The step counter is stored in the `__metadata__` field.
-   * Each parameter's first moment (m) and second moment (v) are stored as
-   * `{param_name}.m` and `{param_name}.v` tensors.
-   *
-   * No-op if the engine uses SGD (no optimizer state to save).
+   * Routes through the model thread so AdamW moments and step counter
+   * survive across checkpoint/resume. No-op if the engine uses SGD
+   * (no optimizer to save) or before the first optimizer update has
+   * populated any moment tensors.
    */
-  saveOptimizerState(path: string): void;
+  saveOptimizerState(path: string): Promise<void>;
   /**
    * Load optimizer state (moment tensors + step) from a SafeTensors file.
    *
-   * Restores the step counter from metadata and sets first/second moment
-   * tensors for each parameter found in the file.
-   *
-   * No-op if the engine uses SGD (no optimizer to restore).
+   * Routes through the model thread. No-op if the engine uses SGD.
    */
-  loadOptimizerState(path: string): void;
+  loadOptimizerState(path: string): Promise<void>;
 }
 export type GRPOTrainingEngine = GrpoTrainingEngine;
 
@@ -474,6 +500,8 @@ export declare class MxArray {
   sinh(): MxArray;
   cosh(): MxArray;
   tanh(): MxArray;
+  /** Error function: erf(x) = (2/sqrt(pi)) * integral(0..x, exp(-t^2) dt) */
+  erf(): MxArray;
   floor(): MxArray;
   ceil(): MxArray;
   round(): MxArray;
@@ -784,13 +812,11 @@ export declare class QianfanOCRModel {
 /**
  * Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
  *
- * Uses interior mutability (RwLock) for layers, final_norm, lm_head, and caches
- * to allow async generation via spawn_blocking without blocking the Node.js event loop.
- * This matches the pattern used by Qwen3Model.
+ * All inference and training state lives on a dedicated OS thread. NAPI methods
+ * dispatch commands via channels and await responses. Training commands are
+ * routed through `TrainingDispatch` to the model thread.
  */
 export declare class Qwen35Model {
-  /** Create a new Qwen3.5 model with the given configuration. */
-  constructor(config: Qwen35Config);
   /** Initialize caches for incremental generation. */
   initCaches(): void;
   /** Reset all caches. */
@@ -811,18 +837,6 @@ export declare class Qwen35Model {
    */
   setCache(cache: PromptCache): void;
   /**
-   * Forward pass through the model.
-   *
-   * # Arguments
-   * * `input_ids` - Token IDs [B, T]
-   *
-   * # Returns
-   * Logits [B, T, vocab_size]
-   */
-  forward(inputIds: MxArray): MxArray;
-  /** Forward pass with cache for incremental generation. */
-  forwardWithCache(inputIds: MxArray): MxArray;
-  /**
    * Load a pretrained model from a directory.
    *
    * Expects the directory to contain:
@@ -831,25 +845,20 @@ export declare class Qwen35Model {
    * - tokenizer.json + tokenizer_config.json
    */
   static load(path: string): Promise<Qwen35Model>;
-  /**
-   * Generate text from a prompt token sequence.
-   *
-   * Runs generation on a worker thread via spawn_blocking to avoid
-   * blocking the Node.js event loop.
-   */
+  /** Generate text from a prompt token sequence. */
   generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Promise<Qwen35GenerationResult>;
   /**
    * Chat API with tool calling support.
    *
-   * Runs tokenization + generation on a worker thread via spawn_blocking
-   * to avoid blocking the Node.js event loop.
+   * Dispatches to the dedicated model thread and awaits the result.
    */
   chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
    * Streaming chat API with tool calling support.
    *
-   * Same as `chat()` but streams tokens one-by-one via the callback.
-   * Returns a `ChatStreamHandle` immediately; generation runs in background.
+   * Dispatches to the dedicated model thread. Tokens stream back via
+   * an mpsc channel bridged to the JS callback. Returns a `ChatStreamHandle`
+   * immediately; generation runs on the model thread.
    * Call `handle.cancel()` to abort generation early.
    */
   chatStream(
@@ -857,18 +866,16 @@ export declare class Qwen35Model {
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /** Get the number of parameters in the model. */
+  /**
+   * Get the number of parameters in the model.
+   *
+   * Pure config computation — no model-thread dispatch needed.
+   */
   numParameters(): number;
   /**
    * Save the model weights and configuration to a directory.
    *
-   * This saves:
-   * - config.json: Model configuration (with model_type for detectModelType)
-   * - weights.safetensors: Full model weights in SafeTensors format
-   * - weights.mlx: Parameter metadata (for reference)
-   *
-   * # Arguments
-   * * `save_path` - Directory to save the model
+   * Dispatches to model thread.
    */
   saveModel(savePath: string): Promise<undefined>;
 }
@@ -877,39 +884,35 @@ export type Qwen3_5Model = Qwen35Model;
 /**
  * Qwen3.5 MoE Model -- hybrid linear/full attention with Mixture-of-Experts.
  *
- * Supports C++ MoE forward path (non-compiled, builds fresh graph per step)
- * when weights are registered via `register_moe_weights_with_cpp`.
- * Falls back to Rust forward_inner path for test models without stored weights.
+ * All inference and training state lives on a dedicated OS thread. NAPI methods
+ * dispatch commands via channels and await responses. Training commands are
+ * routed through `TrainingDispatch` to the model thread.
  */
 export declare class Qwen35MoeModel {
-  constructor(config: Qwen35MoeConfig);
-  /**
-   * Take the KV cache from the model, returning a `PromptCache` handle.
-   *
-   * The cache is moved out of the model — calling `takeCache()` twice
-   * returns `null` the second time. Pass the cache back via `setCache()`
-   * before the next `chat()` call for incremental prefill.
-   */
-  takeCache(): PromptCache | null;
-  /**
-   * Restore a previously taken `PromptCache` into the model.
-   *
-   * On the next `chat()` call with `reuseCache: true`, the model will
-   * prefix-match the new tokens against the cache and only prefill the delta.
-   */
-  setCache(cache: PromptCache): void;
+  /** Initialize caches for incremental generation. */
   initCaches(): void;
+  /** Reset all caches. */
   resetCaches(): void;
-  forward(inputIds: MxArray): MxArray;
-  forwardWithCache(inputIds: MxArray): MxArray;
+  /** Take the KV cache from the model, returning a `PromptCache` handle. */
+  takeCache(): PromptCache | null;
+  /** Restore a previously taken `PromptCache` into the model. */
+  setCache(cache: PromptCache): void;
+  /** Load a pretrained model from a directory. */
   static load(path: string): Promise<Qwen35MoeModel>;
+  /** Generate text from a prompt token sequence. */
   generate(promptTokens: MxArray, config: Qwen35MoeGenerationConfig): Promise<Qwen35MoeGenerationResult>;
+  /**
+   * Chat API with tool calling support.
+   *
+   * Dispatches to the dedicated model thread and awaits the result.
+   */
   chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
    * Streaming chat API with tool calling support.
    *
-   * Same as `chat()` but streams tokens one-by-one via the callback.
-   * Returns a `ChatStreamHandle` immediately; generation runs in background.
+   * Dispatches to the dedicated model thread. Tokens stream back via
+   * an mpsc channel bridged to the JS callback. Returns a `ChatStreamHandle`
+   * immediately; generation runs on the model thread.
    * Call `handle.cancel()` to abort generation early.
    */
   chatStream(
@@ -917,17 +920,16 @@ export declare class Qwen35MoeModel {
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
+  /**
+   * Get the number of parameters in the model.
+   *
+   * Pure config computation -- no model-thread dispatch needed.
+   */
   numParameters(): number;
   /**
    * Save the model weights and configuration to a directory.
    *
-   * This saves:
-   * - config.json: Model configuration (with model_type for detectModelType)
-   * - weights.safetensors: Full model weights in SafeTensors format
-   * - weights.mlx: Parameter metadata (for reference)
-   *
-   * # Arguments
-   * * `save_path` - Directory to save the model
+   * Dispatches to model thread.
    */
   saveModel(savePath: string): Promise<undefined>;
 }
@@ -936,28 +938,15 @@ export type Qwen3_5MoeModel = Qwen35MoeModel;
 /**
  * Qwen3 Model with automatic differentiation support
  *
- * Uses interior mutability (RwLock) for layers, final_norm, and lm_head
- * to allow gradient application without deep cloning the model.
- * This eliminates the previous ~4GB memory overhead from clone_for_session().
+ * Uses a dedicated model thread for inference and training commands.
+ * Training commands are routed via `TrainingDispatch`.
  */
 export declare class Qwen3Model {
-  /** Create a new Qwen3 model with the given configuration */
-  constructor(config: Qwen3Config);
   /**
    * Reset the KV cache used for cache reuse across chat() calls.
    * Call this when starting a new conversation to ensure a full prefill.
    */
   resetCache(): void;
-  /**
-   * Forward pass through the model
-   *
-   * # Arguments
-   * * `input_ids` - Token IDs, shape: [batch_size, seq_len]
-   *
-   * # Returns
-   * * Logits, shape: [batch_size, seq_len, vocab_size]
-   */
-  forward(inputIds: MxArray): MxArray;
   /**
    * Initialize KV caches for incremental generation
    *
@@ -970,8 +959,6 @@ export declare class Qwen3Model {
    * Clears cached key-value states. Call this between different generation sequences.
    */
   resetKvCaches(): void;
-  /** Check if paged attention is enabled for this model */
-  hasPagedAttention(): boolean;
   /**
    * Get paged attention memory statistics (if enabled)
    *
@@ -984,17 +971,6 @@ export declare class Qwen3Model {
    * Returns the number of waiting, running, and completed sequences.
    */
   schedulerStats(): SchedulerStatsNapi | null;
-  /**
-   * Forward pass with KV caching for incremental generation
-   *
-   * # Arguments
-   * * `input_ids` - Token IDs, shape: [batch_size, seq_len]
-   * * `use_cache` - Whether to use KV caching (must call init_kv_caches() first)
-   *
-   * # Returns
-   * * Logits, shape: [batch_size, seq_len, vocab_size]
-   */
-  forwardWithCache(inputIds: MxArray, useCache: boolean): MxArray;
   /**
    * Forward pass with paged attention for memory-efficient inference.
    *
@@ -1080,205 +1056,6 @@ export declare class Qwen3Model {
   hasPagedWork(): boolean;
   /** Get model configuration */
   getConfig(): Qwen3Config;
-  /**
-   * Generate tokens using speculative decoding with a draft model.
-   *
-   * Speculative decoding uses a smaller draft model to generate tokens speculatively,
-   * then verifies them with the target model in a single forward pass. This can achieve
-   * 2-3x speedup when the draft model has high acceptance rate.
-   *
-   * # Algorithm
-   * 1. Draft model generates N tokens speculatively (cheap forward passes)
-   * 2. Target model (self) verifies all N tokens in one forward pass
-   * 3. Accept/reject using rejection sampling
-   * 4. On rejection, resample from adjusted distribution
-   * 5. Rewind caches and continue
-   *
-   * # Arguments
-   * * `draft_model` - Smaller model for speculative generation (should share tokenizer)
-   * * `input_ids` - Input token IDs [1, seq_len]
-   * * `config` - Generation configuration (includes num_draft_tokens)
-   *
-   * # Returns
-   * GenerationResult with tokens, logprobs, and speculative stats in finish_reason
-   *
-   * # Example (TypeScript)
-   * ```typescript
-   * const targetModel = await loadModel('qwen3-7b');
-   * const draftModel = await loadModel('qwen3-0.5b');
-   *
-   * const result = targetModel.generateSpeculativeSync(draftModel, inputIds, {
-   *   numDraftTokens: 5,
-   *   maxNewTokens: 100,
-   *   temperature: 0.7,
-   * });
-   * ```
-   */
-  generateSpeculativeSync(
-    draftModel: Qwen3Model,
-    inputIds: MxArray,
-    config?: GenerationConfig | undefined | null,
-  ): GenerationResult;
-  /** Count total number of parameters in the model */
-  numParameters(): number;
-  /**
-   * Get all model parameters as a dictionary mapping names to arrays
-   *
-   * This matches the TypeScript API for compatibility
-   */
-  getParameters(): Record<string, MxArray>;
-  /** Load parameters from a dictionary */
-  loadParameters(params: Record<string, MxArray>): void;
-  /**
-   * Compute forward pass and loss (for evaluation)
-   *
-   * # Arguments
-   * * `input_ids` - Input token IDs, shape: [batch_size, seq_len]
-   * * `labels` - Target token IDs, shape: [batch_size, seq_len]
-   *
-   * # Returns
-   * * Scalar loss value
-   */
-  computeLoss(inputIds: MxArray, labels: MxArray): MxArray;
-  /**
-   * Compute loss and gradients using a hybrid approach
-   *
-   * This implementation computes gradients for the output layers and uses
-   * numerical approximations for other parameters. This is sufficient to
-   * demonstrate that training works while we build out full MLX autograd integration.
-   *
-   * # Arguments
-   * * `input_ids` - Input token IDs, shape: [batch_size, seq_len]
-   * * `labels` - Target token IDs, shape: [batch_size, seq_len]
-   *
-   * # Returns
-   * * A tuple of (loss, gradients_dict) where gradients_dict maps parameter names to gradient arrays
-   *
-   * # Phase 6A Status
-   * Current implementation computes:
-   * - ✅ Exact gradients for LM head (output layer)
-   * - ⚠吅 Numerical approximations for other layers
-   *
-   * Future: Full MLX autograd will compute exact gradients for all 250+ parameters
-   */
-  computeLossAndGradients(inputIds: MxArray, labels: MxArray): [MxArray, Record<string, MxArray>];
-  /**
-   * Complete GRPO training step using MLX Autograd (RECOMMENDED)
-   *
-   * This method uses automatic differentiation to compute gradients, eliminating
-   * the need for manual backward pass implementation. This is the preferred approach.
-   *
-   * # Arguments
-   * * `prompt_tokens` - Prompt token sequences [batch_size, seq_len] (1D arrays)
-   * * `completion_tokens` - Completion sequences [batch*G, completion_len] (1D arrays)
-   * * `completion_logprobs` - Logprobs from generation [batch*G, completion_len] (1D arrays)
-   * * `rewards` - Reward scores for each completion [batch*G]
-   * * `group_size` - Number of completions per prompt (G)
-   * * `config` - GRPO loss configuration
-   * * `learning_rate` - Learning rate for parameter updates
-   *
-   * # Returns
-   * * Tuple of (loss_value, metrics_dict)
-   */
-  trainStepGrpoAutograd(
-    promptTokens: Array<MxArray>,
-    completionTokens: Array<MxArray>,
-    completionLogprobs: Array<MxArray>,
-    rewards: Float64Array,
-    groupSize: number,
-    config: GrpoLossConfig,
-    learningRate: number,
-  ): [number, Record<string, number>];
-  /**
-   * Compute gradients only without applying them (for gradient accumulation)
-   *
-   * This method computes GRPO loss and gradients but does NOT update parameters.
-   * Used for gradient accumulation where gradients are summed across multiple
-   * micro-batches before applying them.
-   *
-   * # Arguments
-   * * `prompt_tokens` - Prompt token sequences [batch_size, seq_len] (1D arrays)
-   * * `completion_tokens` - Completion sequences [batch*G, completion_len] (1D arrays)
-   * * `completion_logprobs` - Logprobs from generation [batch*G, completion_len] (1D arrays)
-   * * `rewards` - Reward scores for each completion [batch*G]
-   * * `group_size` - Number of completions per prompt (G)
-   * * `config` - GRPO loss configuration
-   *
-   * # Returns
-   * * Tuple of (loss_value, gradients_dict, metrics_dict)
-   */
-  computeGradientsOnlyGrpoAutograd(
-    promptTokens: Array<MxArray>,
-    completionTokens: Array<MxArray>,
-    completionLogprobs: Array<MxArray>,
-    rewards: Float64Array,
-    groupSize: number,
-    config: GrpoLossConfig,
-  ): [number, Record<string, MxArray>, Record<string, number>];
-  /**
-   * Accumulate gradients into existing gradient dictionary
-   *
-   * This is a helper method for gradient accumulation. It adds new_gradients
-   * to accumulated_gradients element-wise.
-   *
-   * # Arguments
-   * * `accumulated_gradients` - Existing accumulated gradients (will be modified in-place conceptually, but returns new dict)
-   * * `new_gradients` - New gradients to add
-   *
-   * # Returns
-   * * Updated gradient dictionary with accumulated values
-   */
-  static accumulateGradients(
-    accumulatedGradients: Record<string, MxArray>,
-    newGradients: Record<string, MxArray>,
-  ): Record<string, MxArray>;
-  /**
-   * Complete GRPO training step using manual gradients (Legacy)
-   *
-   * This method performs a full GRPO training iteration:
-   * 1. Takes completions (already generated) with their logprobs and rewards
-   * 2. Computes advantages
-   * 3. Computes GRPO loss and gradients
-   * 4. Updates model parameters
-   *
-   * NOTE: Use train_step_grpo_autograd instead for automatic differentiation.
-   *
-   * # Arguments
-   * * `prompt_tokens` - Prompt token sequences [batch_size, seq_len] (1D arrays)
-   * * `completion_tokens` - Completion sequences [batch*G, completion_len] (1D arrays)
-   * * `completion_logprobs` - Logprobs from generation [batch*G, completion_len] (1D arrays)
-   * * `rewards` - Reward scores for each completion [batch*G]
-   * * `group_size` - Number of completions per prompt (G)
-   * * `config` - GRPO loss configuration
-   * * `learning_rate` - Learning rate for parameter updates
-   *
-   * # Returns
-   * * Tuple of (loss_value, metrics_dict)
-   */
-  trainStepGrpo(
-    promptTokens: Array<MxArray>,
-    completionTokens: Array<MxArray>,
-    completionLogprobs: Array<MxArray>,
-    rewards: Float64Array,
-    groupSize: number,
-    config: GrpoLossConfig,
-    learningRate: number,
-  ): [number, Record<string, number>];
-  /**
-   * Apply gradients to model parameters
-   *
-   * # Arguments
-   * * `gradients` - Dictionary mapping parameter names to gradient arrays
-   * * `learning_rate` - Learning rate for gradient descent
-   *
-   * This performs a simple SGD update: param = param - lr * grad
-   * Only updates parameters that have gradients; others remain unchanged.
-   *
-   * IMPORTANT: This function preserves the original dtype of parameters.
-   * The learning rate scalar is cast to match param dtype to prevent
-   * promotion to float32 during arithmetic operations.
-   */
-  applyGradients(gradients: Record<string, MxArray>, learningRate: number): void;
   /**
    * Text-to-text generation with integrated tokenization
    *
@@ -1478,6 +1255,10 @@ export declare class Qwen3Model {
    * - weights.safetensors: Full model weights in SafeTensors format
    * - weights.mlx: Parameter metadata (for reference)
    *
+   * Dispatches to the dedicated model thread — all MxArray reads must
+   * happen on the thread that owns them to avoid the MLX cross-thread
+   * `CommandEncoder` crash.
+   *
    * # Arguments
    * * `save_path` - Directory to save the model
    */
@@ -1630,7 +1411,12 @@ export declare class Qwen3Tokenizer {
   getEndoftextToken(): string;
 }
 
-/** SFT Training Engine */
+/**
+ * SFT Training Engine
+ *
+ * Thin coordinator that routes all MLX operations through the model thread.
+ * No MxArrays or model state live here - only plain data crosses the boundary.
+ */
 export declare class SftTrainingEngine {
   /** Create a new SFT training engine from a Qwen3 model */
   constructor(model: Qwen3Model, config: SftEngineConfig);
@@ -1647,9 +1433,10 @@ export declare class SftTrainingEngine {
   /**
    * Flush any accumulated gradients at epoch end
    *
-   * When stepsPerEpoch % gradient_accumulation_steps != 0, there may be
-   * leftover gradients from the final micro-batches. This method applies
-   * them with proper averaging, matching TRL behavior.
+   * With the model thread architecture, gradient accumulation is handled
+   * on the model thread. This method is kept for API compatibility but
+   * currently logs a warning. Partial accumulation at epoch boundaries
+   * will be handled in a future update.
    */
   flushGradients(): boolean;
   /**
@@ -1672,15 +1459,46 @@ export declare class SftTrainingEngine {
   startEpoch(epoch: number): void;
   /** End current epoch and return metrics */
   endEpoch(epochTimeSecs: number): SftEpochMetrics;
-  /** Reset training state (for new training run) */
+  /**
+   * Reset training state (for new training run)
+   *
+   * This is a TERMINAL operation on this handle. It drops the training
+   * state (optimizer, step counter) on the model thread so a fresh
+   * `SftTrainingEngine` can be constructed on the same model, and marks
+   * THIS handle as invalidated. Any subsequent dispatch-requiring method
+   * on this handle returns an error — callers must construct a new
+   * engine to continue training.
+   */
   reset(): void;
-  /** Restore training state (for resuming from checkpoint) */
+  /**
+   * Restore training state (for resuming from checkpoint)
+   *
+   * Updates both the engine's read-through cache and the model thread's
+   * authoritative `ts.step`. Does NOT touch optimizer state — that is
+   * loaded via `loadOptimizerState`, which restores the AdamW bias-
+   * correction step separately.
+   */
   restoreState(step: number, epoch: number): void;
-  /** Get the underlying Qwen3 model for checkpointing */
+  /**
+   * Get the underlying Qwen3 model for checkpointing
+   *
+   * NOTE: With the model thread architecture, direct model access is no longer
+   * supported. Use save_checkpoint() on the model directly instead.
+   */
   getModel(): Qwen3Model;
-  /** Get the underlying Qwen3.5 dense model for checkpointing */
+  /**
+   * Get the underlying Qwen3.5 dense model for checkpointing
+   *
+   * NOTE: With the model thread architecture, direct model access is no longer
+   * supported. Use save_checkpoint() on the model directly instead.
+   */
   getQwen35Model(): Qwen35Model;
-  /** Get the underlying Qwen3.5 MoE model for checkpointing */
+  /**
+   * Get the underlying Qwen3.5 MoE model for checkpointing
+   *
+   * NOTE: With the model thread architecture, direct model access is no longer
+   * supported. Use save_checkpoint() on the model directly instead.
+   */
   getQwen35MoeModel(): Qwen35MoeModel;
 }
 
@@ -1853,9 +1671,17 @@ export type VLMChatResult = VlmChatResult;
  *
  * A generic VLM for OCR and document understanding tasks.
  * Currently supports PaddleOCR-VL architecture (vision encoder + ERNIE language model).
+ *
+ * All model state lives on a dedicated OS thread. NAPI methods dispatch
+ * commands via channels and await responses.
  */
 export declare class VLModel {
-  /** Create a new PaddleOCR-VL model */
+  /**
+   * Create a new PaddleOCR-VL model (empty, not loaded).
+   *
+   * Creates a model thread with an empty inner. Use `VLModel.load()` instead
+   * for loading a model from disk.
+   */
   constructor(config: ModelConfig);
   /** Set the tokenizer */
   setTokenizer(tokenizer: Qwen3Tokenizer): void;
@@ -1938,9 +1764,7 @@ export declare class VLModel {
   /**
    * Generate text tokens given input tokens and optional image
    *
-   * Uses KV caching for efficient generation - each step only processes the
-   * new token(s) while reusing cached key-value states from previous tokens.
-   * Vision features are computed once at the start and cached.
+   * Uses KV caching for efficient generation.
    *
    * # Arguments
    * * `input_ids` - Input token IDs [1, seq_len]
@@ -2117,6 +1941,14 @@ export interface ChatConfig {
   ngramSize?: number | undefined;
   tools?: Array<ToolDefinition>;
   /**
+   * Reasoning effort level. Controls whether the model thinks before answering.
+   * - "none" / "low": thinking disabled (template injects closed think block).
+   *   "none" also sets includeReasoning to false by default.
+   * - "medium" / "high": thinking enabled (default behavior).
+   * - Not set: thinking enabled (model thinks naturally).
+   */
+  reasoningEffort?: string | undefined;
+  /**
    * Maximum number of thinking tokens before forcing </think>.
    * When the model has generated this many tokens while in thinking mode,
    * the next token is forced to be the think_end token. None = unlimited.
@@ -2124,16 +1956,10 @@ export interface ChatConfig {
   thinkingTokenBudget?: number | undefined;
   /**
    * Whether to include reasoning/thinking content in the output.
-   * When false, the `thinking` field of ChatResult/ChatStreamChunk will always be null.
-   * Default: true (reasoning is included).
+   * When false, the `thinking` field of ChatResult/ChatStreamChunk will always be None.
+   * Default: true (false when reasoningEffort is "none").
    */
   includeReasoning?: boolean | undefined;
-  /**
-   * Reasoning effort level. Controls whether the model thinks before answering:
-   * "low"/"none" → thinking disabled, "medium"/"high" → thinking enabled.
-   * Not set → thinking enabled (model thinks naturally).
-   */
-  reasoningEffort?: string | undefined;
   /** When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result */
   reportPerformance?: boolean | undefined;
   /**
@@ -2202,7 +2028,7 @@ export interface ChatStreamChunk {
    * true = reasoning (inside <think>...</think>), false = content (after </think>).
    * Only present on intermediate (non-final) chunks.
    */
-  isReasoning?: boolean;
+  isReasoning?: boolean | undefined;
 }
 
 /** Result from classify_and_rotate: orientation info + corrected image bytes. */
@@ -2333,6 +2159,42 @@ export declare function createPaddleocrVlConfig(): ModelConfig;
 /** Create a default Qianfan-OCR configuration (JS factory function) */
 export declare function createQianfanOcrConfig(): QianfanOcrConfig;
 
+/**
+ * Create a random-init Qwen3.5 model and save it to disk.
+ *
+ * Spawns a dedicated `ModelThread<Qwen35Cmd>` whose init builds a fresh
+ * random-weight `Qwen35Inner` directly, then dispatches `Qwen35Cmd::SaveModel`
+ * on that thread. The thread is dropped at the end of the promise, so the
+ * in-memory model is released once the checkpoint has been written. Used by
+ * TypeScript test fixtures that need an on-disk checkpoint without keeping a
+ * NAPI model instance alive.
+ */
+export declare function createRandomQwen35Checkpoint(config: Qwen35Config, savePath: string): Promise<undefined>;
+
+/**
+ * Create a random-init Qwen3.5 MoE model and save it to disk.
+ *
+ * Spawns a dedicated `ModelThread<Qwen35MoeCmd>` whose init builds a fresh
+ * random-weight `Qwen35MoeInner` directly, then dispatches
+ * `Qwen35MoeCmd::SaveModel` on that thread. The thread is dropped at the end
+ * of the promise, so the in-memory model is released once the checkpoint has
+ * been written. Used by TypeScript test fixtures that need an on-disk
+ * checkpoint without keeping a NAPI model instance alive.
+ */
+export declare function createRandomQwen35MoeCheckpoint(config: Qwen35MoeConfig, savePath: string): Promise<undefined>;
+
+/**
+ * Create a random-init Qwen3 model and save it to disk.
+ *
+ * Spawns a dedicated `ModelThread<Qwen3Cmd>` whose init builds a fresh
+ * random-weight `Qwen3Inner` directly, then dispatches `Qwen3Cmd::SaveModel`
+ * on that thread. The thread is dropped at the end of the promise, so the
+ * in-memory model is released once the checkpoint has been written. Used by
+ * TypeScript test fixtures that need an on-disk checkpoint without keeping a
+ * NAPI model instance alive.
+ */
+export declare function createRandomQwen3Checkpoint(config: Qwen3Config, savePath: string): Promise<undefined>;
+
 /** Document element - either a table or paragraph */
 export interface DocumentElement {
   elementType: ElementType;
@@ -2457,6 +2319,109 @@ export interface FunctionParameters {
   properties?: string;
   /** List of required parameter names */
   required?: Array<string>;
+}
+
+/** Gemma4 generation configuration. */
+export interface Gemma4ChatConfig {
+  maxNewTokens?: number;
+  temperature?: number;
+  topK?: number;
+  topP?: number;
+  minP?: number;
+  /**
+   * Enable thinking mode. `None` = let the template decide,
+   * `Some(false)` = disabled, `Some(true)` = enabled.
+   */
+  enableThinking?: boolean;
+}
+
+/** Gemma4 chat result. */
+export interface Gemma4ChatResult {
+  text: string;
+  numTokens: number;
+  finishReason: string;
+  /** Performance metrics (always present). */
+  performance?: PerformanceMetrics;
+}
+
+/**
+ * Gemma 4 model configuration (dense variant).
+ *
+ * Supports E2B (2.3B), E4B (4.5B), and 31B dense models.
+ * For MoE models (26B-A4B), use `Gemma4MoeConfig` from `gemma4_moe`.
+ */
+export interface Gemma4Config {
+  vocabSize: number;
+  hiddenSize: number;
+  numHiddenLayers: number;
+  numAttentionHeads: number;
+  numKeyValueHeads: number;
+  headDim: number;
+  intermediateSize: number;
+  rmsNormEps: number;
+  tieWordEmbeddings: boolean;
+  maxPositionEmbeddings: number;
+  slidingWindow: number;
+  /**
+   * Explicit per-layer attention type: "sliding_attention" or "full_attention".
+   * Parsed from `text_config.layer_types` in the HuggingFace config.
+   */
+  layerTypes: Array<string>;
+  /** RoPE theta for global (full) attention layers. */
+  ropeTheta: number;
+  /** RoPE theta for sliding (local) attention layers. */
+  ropeLocalBaseFreq: number;
+  /** Fraction of head_dim to rotate for global attention (0.25 = 25%). */
+  partialRotaryFactor: number;
+  /** KV heads for global layers. If None, uses num_key_value_heads. */
+  globalNumKeyValueHeads?: number;
+  /** Head dimension for global layers. If None, uses head_dim. */
+  globalHeadDim?: number;
+  attentionKEqV: boolean;
+  finalLogitSoftcapping?: number;
+  perLayerInputEmbeds: boolean;
+  hiddenSizePerLayerInput?: number;
+  vocabSizePerLayerInput?: number;
+  padTokenId: number;
+  eosTokenIds: Array<number>;
+  bosTokenId: number;
+  attentionBias: boolean;
+  useDoubleWideMlp: boolean;
+  numKvSharedLayers?: number;
+  defaultTemperature?: number;
+  defaultTopK?: number;
+  defaultTopP?: number;
+  enableMoeBlock: boolean;
+  numExperts?: number;
+  topKExperts?: number;
+  moeIntermediateSize?: number;
+  visionConfig?: Gemma4VisionConfig;
+  imageTokenId?: number;
+  boiTokenId?: number;
+  eoiTokenId?: number;
+  visionSoftTokensPerImage?: number;
+}
+
+/**
+ * Vision encoder configuration for Gemma4 multimodal models.
+ *
+ * Parsed from the `vision_config` sub-dict in config.json.
+ */
+export interface Gemma4VisionConfig {
+  hiddenSize: number;
+  intermediateSize: number;
+  numHiddenLayers: number;
+  numAttentionHeads: number;
+  numKeyValueHeads: number;
+  headDim: number;
+  rmsNormEps: number;
+  patchSize: number;
+  positionEmbeddingSize: number;
+  defaultOutputLength: number;
+  poolingKernelSize: number;
+  useClippedLinears: boolean;
+  ropeTheta: number;
+  standardize: boolean;
 }
 
 /** Result from generate_batch_for_training with all data needed for training */

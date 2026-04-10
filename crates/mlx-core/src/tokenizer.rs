@@ -52,12 +52,10 @@ use tracing::warn;
 
 /// Special token IDs for Qwen3 models
 const ENDOFTEXT_TOKEN_ID: u32 = 151643;
-#[allow(dead_code)] // Reserved for future use (e.g., get_im_start_token_id())
-const IM_START_TOKEN_ID: u32 = 151644;
 const IM_END_TOKEN_ID: u32 = 151645;
 
 /// Valid roles for ChatML format (prevents role injection attacks)
-const VALID_CHATML_ROLES: &[&str] = &["system", "user", "assistant", "tool"];
+const VALID_CHATML_ROLES: &[&str] = &["system", "user", "assistant", "tool", "developer"];
 
 /// Tool call made by an assistant
 #[napi(object)]
@@ -192,11 +190,18 @@ impl Qwen3Tokenizer {
 
                 let (think_end_id, think_end_str) = Self::detect_think_end(&tokenizer);
 
+                // Read special token IDs from tokenizer_config.json if available.
+                // Falls back to Qwen defaults (pad=151643, eos=151645, bos=None)
+                // for backward compatibility with Qwen3/3.5 models.
+                let tokenizer_path_ref = Path::new(&tokenizer_path);
+                let (pad_token_id, eos_token_id, bos_token_id) =
+                    Self::resolve_special_tokens(&tokenizer, tokenizer_path_ref);
+
                 Ok(Self {
                     tokenizer: Arc::new(tokenizer),
-                    pad_token_id: ENDOFTEXT_TOKEN_ID,
-                    eos_token_id: IM_END_TOKEN_ID,
-                    bos_token_id: None, // Qwen3 doesn't use BOS by default
+                    pad_token_id,
+                    eos_token_id,
+                    bos_token_id,
                     chat_template,
                     think_end_id,
                     think_end_str,
@@ -236,29 +241,39 @@ impl Qwen3Tokenizer {
     /// The chat template string if found and valid, `None` otherwise.
     fn load_chat_template(tokenizer_path: &str) -> Option<String> {
         let path = Path::new(tokenizer_path);
-        let config_path = path.parent()?.join("tokenizer_config.json");
+        let dir = path.parent()?;
 
-        if !config_path.exists() {
-            return None;
+        // First: try tokenizer_config.json (embedded template)
+        let config_path = dir.join("tokenizer_config.json");
+        if config_path.exists()
+            && let Ok(config_content) = std::fs::read_to_string(&config_path)
+            && let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_content)
+            && let Some(template) = config.get("chat_template").and_then(|v| v.as_str())
+        {
+            // Basic template safety validation
+            if let Err(warning) = Self::validate_template_safety(template) {
+                // Log warning but don't fail - the template may still work
+                #[cfg(debug_assertions)]
+                eprintln!("Warning: {}", warning);
+                let _ = warning; // Suppress unused warning in release builds
+            }
+            return Some(template.to_string());
         }
 
-        let config_content = std::fs::read_to_string(&config_path).ok()?;
-        let config: serde_json::Value = serde_json::from_str(&config_content).ok()?;
-
-        let template = config
-            .get("chat_template")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())?;
-
-        // Basic template safety validation
-        if let Err(warning) = Self::validate_template_safety(&template) {
-            // Log warning but don't fail - the template may still work
-            #[cfg(debug_assertions)]
-            eprintln!("Warning: {}", warning);
-            let _ = warning; // Suppress unused warning in release builds
+        // Second: try standalone chat_template.jinja file (used by Gemma4 HF snapshots)
+        let jinja_path = dir.join("chat_template.jinja");
+        if jinja_path.exists()
+            && let Ok(template) = std::fs::read_to_string(&jinja_path)
+        {
+            if let Err(warning) = Self::validate_template_safety(&template) {
+                #[cfg(debug_assertions)]
+                eprintln!("Warning: {}", warning);
+                let _ = warning;
+            }
+            return Some(template);
         }
 
-        Some(template)
+        None
     }
 
     /// Load tokenizer from file synchronously (for internal use)
@@ -277,15 +292,53 @@ impl Qwen3Tokenizer {
 
         let (think_end_id, think_end_str) = Self::detect_think_end(&tokenizer);
 
+        // Read special token IDs from tokenizer_config.json if available.
+        // Falls back to Qwen defaults (pad=151643, eos=151645, bos=None)
+        // for backward compatibility with Qwen3/3.5 models.
+        let (pad_token_id, eos_token_id, bos_token_id) =
+            Self::resolve_special_tokens(&tokenizer, tokenizer_path);
+
         Ok(Self {
             tokenizer: Arc::new(tokenizer),
-            pad_token_id: ENDOFTEXT_TOKEN_ID,
-            eos_token_id: IM_END_TOKEN_ID,
-            bos_token_id: None,
+            pad_token_id,
+            eos_token_id,
+            bos_token_id,
             chat_template,
             think_end_id,
             think_end_str,
         })
+    }
+
+    /// Resolve special token IDs from tokenizer_config.json.
+    /// Returns (pad_token_id, eos_token_id, bos_token_id).
+    fn resolve_special_tokens(
+        tokenizer: &Tokenizer,
+        tokenizer_path: &Path,
+    ) -> (u32, u32, Option<u32>) {
+        let config_path = tokenizer_path
+            .parent()
+            .map(|p| p.join("tokenizer_config.json"));
+
+        let config: Option<serde_json::Value> = config_path
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str(&s).ok());
+
+        let resolve = |key: &str| -> Option<u32> {
+            config
+                .as_ref()
+                .and_then(|c| c.get(key))
+                .and_then(|v| {
+                    v.as_str()
+                        .or_else(|| v.get("content").and_then(|c| c.as_str()))
+                })
+                .and_then(|token_str| tokenizer.token_to_id(token_str))
+        };
+
+        let pad = resolve("pad_token").unwrap_or(ENDOFTEXT_TOKEN_ID);
+        let eos = resolve("eos_token").unwrap_or(IM_END_TOKEN_ID);
+        let bos = resolve("bos_token");
+
+        (pad, eos, bos)
     }
 
     /// Validates a chat template for suspicious patterns that could indicate
@@ -548,6 +601,14 @@ impl Qwen3Tokenizer {
         let add_prompt = add_generation_prompt.unwrap_or(true);
         let tokenizer = self.tokenizer.clone();
         let chat_template = self.chat_template.clone();
+        let bos_str = self
+            .bos_token_id
+            .and_then(|id| self.tokenizer.id_to_token(id))
+            .unwrap_or_default();
+        let eos_str = self
+            .tokenizer
+            .id_to_token(self.eos_token_id)
+            .unwrap_or_default();
 
         env.spawn_future_with_callback(
             async move {
@@ -563,6 +624,8 @@ impl Qwen3Tokenizer {
                             tools.as_deref(),
                             add_prompt,
                             enable_thinking,
+                            &bos_str,
+                            &eos_str,
                         )
                         .map_err(Error::from_reason)?
                     } else {
@@ -719,6 +782,8 @@ impl Qwen3Tokenizer {
         tools: Option<&[ToolDefinition]>,
         add_generation_prompt: bool,
         enable_thinking: Option<bool>,
+        bos_token: &str,
+        eos_token: &str,
     ) -> std::result::Result<String, String> {
         let mut env = Environment::new();
 
@@ -890,11 +955,21 @@ impl Qwen3Tokenizer {
                             if let Some(id) = &tc.id {
                                 call_obj.insert("id".to_string(), serde_json::json!(id));
                             }
+                            // Flat format (backward compat with some templates)
                             call_obj.insert("name".to_string(), serde_json::json!(tc.name));
+                            // Parse arguments
                             let args_value =
                                 serde_json::from_str::<serde_json::Value>(&tc.arguments)
                                     .unwrap_or_else(|_| serde_json::json!(tc.arguments));
-                            call_obj.insert("arguments".to_string(), args_value);
+                            call_obj.insert("arguments".to_string(), args_value.clone());
+                            // Wrapped format (Gemma4/OpenAI standard: tool_call.function.name)
+                            call_obj.insert(
+                                "function".to_string(),
+                                serde_json::json!({
+                                    "name": tc.name,
+                                    "arguments": args_value,
+                                }),
+                            );
                             serde_json::Value::Object(call_obj)
                         })
                         .collect();
@@ -919,11 +994,14 @@ impl Qwen3Tokenizer {
         // Build context for Jinja2 template
         // Note: enable_thinking defaults to true to allow model to think naturally.
         // Setting to false adds empty <think></think> tags which DISABLES thinking.
+        // bos_token/eos_token: used by Gemma4 and other templates ({{ bos_token }}).
         let ctx = context! {
             messages => messages_value,
             tools => tools_value,
             add_generation_prompt => add_generation_prompt,
             enable_thinking => enable_thinking.unwrap_or(true),
+            bos_token => bos_token,
+            eos_token => eos_token,
         };
 
         tmpl.render(ctx)
@@ -1007,6 +1085,14 @@ impl Qwen3Tokenizer {
         })
     }
 
+    /// Returns true if the tokenizer has a chat template loaded.
+    ///
+    /// Used by models (e.g. Gemma4) to decide whether to use the template or
+    /// fall back to a model-specific manual prompt format.
+    pub(crate) fn has_chat_template(&self) -> bool {
+        self.chat_template.is_some()
+    }
+
     /// Encode text synchronously (for internal use by generate())
     pub(crate) fn encode_sync(
         &self,
@@ -1088,6 +1174,14 @@ impl Qwen3Tokenizer {
         let sanitized: Vec<ChatMessage> = Self::sanitize_messages(messages);
 
         // Use Jinja2 rendering if template exists, fallback to ChatML otherwise
+        let bos_str = self
+            .bos_token_id
+            .and_then(|id| self.tokenizer.id_to_token(id))
+            .unwrap_or_default();
+        let eos_str = self
+            .tokenizer
+            .id_to_token(self.eos_token_id)
+            .unwrap_or_default();
         let formatted = if let Some(chat_template) = &self.chat_template {
             Self::render_chat_template_jinja2(
                 chat_template,
@@ -1095,6 +1189,8 @@ impl Qwen3Tokenizer {
                 tools,
                 add_prompt,
                 enable_thinking,
+                &bos_str,
+                &eos_str,
             )
             .map_err(Error::from_reason)?
         } else {

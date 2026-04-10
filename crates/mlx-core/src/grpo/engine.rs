@@ -32,32 +32,26 @@
 ///   console.log(metrics);
 /// }
 /// ```
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
-use crate::array::{
-    MxArray, get_active_memory, get_peak_memory, heavy_cleanup, reset_peak_memory,
-    synchronize_and_clear_cache,
-};
-use crate::grpo::advantages::compute_advantages;
-use crate::grpo::autograd::compute_loss_and_gradients_autograd;
 use crate::grpo::loss::GRPOLossConfig;
 use crate::grpo::rewards::{
     BuiltinRewardConfig, JsonSchemaReward, LengthReward, RewardRegistry, ToolUseReward,
     XMLFormatReward,
 };
-use crate::models::qwen3::{GenerationConfig, Qwen3Model};
-use crate::models::qwen3_5::model::Qwen3_5Model;
-use crate::models::qwen3_5_moe::model::Qwen3_5MoeModel;
-use crate::optimizers::GradientUtils;
+use crate::models::qwen3::{GenerationConfig, Qwen3Cmd, Qwen3Model};
+use crate::models::qwen3_5::model::{Qwen3_5Model, Qwen35Cmd};
+use crate::models::qwen3_5_moe::model::{Qwen3_5MoeModel, Qwen35MoeCmd};
 use crate::tokenizer::{ChatMessage, ToolDefinition};
 use crate::tools::build_reward_outputs;
-use crate::training_model::{ModelType, TrainableModel, TrainableModelEnum};
+use crate::training_model::{
+    GenerationPlainData, ModelType, TrainStepPlainMetrics, TrainingDispatch,
+};
 
 /// Configuration for the GRPO training engine
 #[napi(object)]
@@ -331,14 +325,16 @@ pub struct TrainStepResultWithOutputs {
     pub completion_lengths: Vec<i32>,
 }
 
-/// Internal training state
+/// Internal training state (NAPI-side only).
+///
+/// Gradient accumulation, optimizer, and NaN tracking now live on the model thread
+/// in `ModelThreadTrainingState`. This struct only tracks epoch-level accumulators
+/// and the emergency save flag.
 struct EngineState {
-    /// Accumulated gradients
-    accumulated_gradients: Option<HashMap<String, MxArray>>,
-    /// Current micro-step within gradient accumulation
-    micro_step: i32,
-    /// Global step counter
+    /// Global step counter (mirrors model thread's step)
     step: i64,
+    /// Current micro-step within gradient accumulation (mirrors model thread)
+    micro_step: i32,
     /// Current epoch
     epoch: i32,
     /// Epoch metrics accumulator
@@ -346,20 +342,28 @@ struct EngineState {
     epoch_reward_sum: f64,
     epoch_steps: i64,
     epoch_tokens: i64,
-    /// Cumulative NaN gradient count across training
+    /// Cumulative NaN gradient count (mirrored from model thread metrics)
     nan_gradient_count: u64,
     /// Consecutive NaN gradient count (for emergency checkpoint detection)
     consecutive_nan_count: u32,
     /// Flag indicating an emergency checkpoint should be saved
     needs_emergency_save: bool,
+    /// Lifecycle generation — bumped by `reset()` so an in-flight
+    /// `train_step*()` can detect that its stale post-await writeback would
+    /// resurrect cleared state and skip the update.
+    generation: u64,
+    /// Terminal invalidation flag — set by `reset()` so this handle can no
+    /// longer drive the model thread's training state. Any subsequent
+    /// dispatch from this engine errors out. A fresh engine must be
+    /// constructed to resume training.
+    invalidated: bool,
 }
 
 impl Default for EngineState {
     fn default() -> Self {
         Self {
-            accumulated_gradients: None,
-            micro_step: 0,
             step: 0,
+            micro_step: 0,
             epoch: 0,
             epoch_loss_sum: 0.0,
             epoch_reward_sum: 0.0,
@@ -368,130 +372,29 @@ impl Default for EngineState {
             nan_gradient_count: 0,
             consecutive_nan_count: 0,
             needs_emergency_save: false,
+            generation: 0,
+            invalidated: false,
         }
     }
 }
 
 /// GRPO Training Engine
 ///
-/// Complete training engine that runs entirely in Rust.
+/// Thin coordinator that routes all MLX operations through the model thread.
+/// No MxArrays or model state live here — only plain data crosses the boundary.
 #[napi]
 pub struct GRPOTrainingEngine {
-    /// The model being trained
-    model: Arc<RwLock<TrainableModelEnum>>,
-    /// Model type (carries config for functional forward pass in autograd)
+    /// Dispatch handle for sending commands to the model thread
+    dispatch: TrainingDispatch,
+    /// Model type (carries config for identifying model family)
     model_type: ModelType,
     /// Engine configuration
     config: GRPOEngineConfig,
     /// Reward registry (built-in rewards)
     reward_registry: RewardRegistry,
-    /// Training state
+    /// Training state (epoch counters and emergency save flag)
     state: Arc<RwLock<EngineState>>,
-    /// AdamW optimizer (used when optimizer_type is "adamw")
-    optimizer: Option<Arc<std::sync::Mutex<crate::optimizers::AdamW>>>,
-}
-
-/// Apply gradients to model using either AdamW or SGD.
-fn apply_optimizer_step(
-    model: &mut TrainableModelEnum,
-    grads: &HashMap<String, MxArray>,
-    params: &HashMap<String, MxArray>,
-    lr: f64,
-    optimizer: &Option<Arc<std::sync::Mutex<crate::optimizers::AdamW>>>,
-    grad_acc_steps: i32,
-) -> Result<()> {
-    if let Some(opt_arc) = optimizer {
-        // AdamW path
-        let mut opt = opt_arc
-            .lock()
-            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire optimizer lock"))?;
-
-        let mut param_names_vec: Vec<String> = Vec::new();
-        let mut param_refs: Vec<&MxArray> = Vec::new();
-        let mut grad_refs: Vec<&MxArray> = Vec::new();
-
-        // When using gradient accumulation, gradients are summed (not averaged).
-        // SGD compensates by dividing lr, but AdamW ignores lr (uses delta trick with 1.0).
-        // So we must average the gradients explicitly before passing to AdamW.
-        let scaled_grads: HashMap<String, MxArray>;
-        let grads_to_use = if grad_acc_steps > 1 {
-            let scale = 1.0 / grad_acc_steps as f32;
-            let scale_arr = MxArray::from_float32(&[scale], &[]).unwrap();
-            scaled_grads = grads
-                .iter()
-                .map(|(name, grad)| (name.clone(), grad.mul(&scale_arr).unwrap()))
-                .collect();
-            &scaled_grads
-        } else {
-            grads
-        };
-
-        for (name, grad) in grads_to_use {
-            if let Some(param) = params.get(name) {
-                param_names_vec.push(name.clone());
-                param_refs.push(param);
-                grad_refs.push(grad);
-            }
-        }
-
-        let updated = opt.update_batch(param_names_vec.clone(), param_refs.clone(), grad_refs)?;
-
-        // Create deltas: delta = param - updated (so param - 1.0 * delta = updated)
-        let deltas: HashMap<String, MxArray> = param_names_vec
-            .iter()
-            .enumerate()
-            .map(|(i, name)| {
-                let delta = param_refs[i].sub(&updated[i]).unwrap();
-                (name.clone(), delta)
-            })
-            .collect();
-
-        let delta_refs: HashMap<String, &MxArray> =
-            deltas.iter().map(|(k, v)| (k.clone(), v)).collect();
-        model.apply_gradients_with_params(delta_refs, 1.0, params)?;
-
-        debug!("Applied AdamW update (step={})", opt.get_step());
-    } else {
-        // SGD path
-        let grads_refs: HashMap<String, &MxArray> =
-            grads.iter().map(|(k, v)| (k.clone(), v)).collect();
-        model.apply_gradients_with_params(grads_refs, lr, params)?;
-
-        debug!("Applied SGD gradients with lr: {}", lr);
-    }
-
-    Ok(())
-}
-
-/// Create an AdamW optimizer from engine config, or None for SGD.
-fn create_optimizer(
-    config: &GRPOEngineConfig,
-) -> Option<Arc<std::sync::Mutex<crate::optimizers::AdamW>>> {
-    let opt_type = config.optimizer_type.as_deref().unwrap_or("adamw");
-    if opt_type == "adamw" {
-        let optimizer = crate::optimizers::AdamW::new(
-            config.learning_rate,
-            config.adamw_beta1,
-            config.adamw_beta2,
-            config.adamw_eps,
-            config.weight_decay,
-            Some(true), // bias correction
-        );
-        info!(
-            "Using AdamW optimizer (lr={}, beta1={}, beta2={}, wd={})",
-            config.learning_rate.unwrap_or(1e-6),
-            config.adamw_beta1.unwrap_or(0.9),
-            config.adamw_beta2.unwrap_or(0.999),
-            config.weight_decay.unwrap_or(0.01),
-        );
-        Some(Arc::new(std::sync::Mutex::new(optimizer)))
-    } else {
-        info!(
-            "Using SGD optimizer (lr={})",
-            config.learning_rate.unwrap_or(1e-6)
-        );
-        None
-    }
+    // No optimizer — lives on model thread in ModelThreadTrainingState
 }
 
 #[napi]
@@ -499,7 +402,7 @@ impl GRPOTrainingEngine {
     /// Create a new training engine from a Qwen3 model
     ///
     /// # Arguments
-    /// * `model` - The Qwen3 model to train (will be cloned internally)
+    /// * `model` - The Qwen3 model (must be loaded via load())
     /// * `config` - Engine configuration
     #[napi(constructor)]
     pub fn new(model: &Qwen3Model, config: GRPOEngineConfig) -> Result<Self> {
@@ -513,24 +416,38 @@ impl GRPOTrainingEngine {
             model_type.pad_token_id()
         );
 
-        let optimizer = create_optimizer(&config);
+        // Extract the cmd_sender from the model's thread
+        let sender = model
+            .thread
+            .cmd_sender()
+            .ok_or_else(|| Error::from_reason("Model thread not running"))?
+            .clone();
+
+        // Send InitTraining to set up optimizer + state on model thread
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sender
+            .send(Qwen3Cmd::InitTraining {
+                config: Box::new(config.clone()),
+                model_type: model_type.clone(),
+                reply: tx,
+            })
+            .map_err(|_| Error::from_reason("Model thread has exited"))?;
+        rx.blocking_recv()
+            .map_err(|_| Error::from_reason("Model thread exited during init"))??;
 
         Ok(Self {
-            model: Arc::new(RwLock::new(TrainableModelEnum::Qwen3(
-                model.clone_for_session()?,
-            ))),
+            dispatch: TrainingDispatch::Qwen3(sender),
             model_type,
             config,
             reward_registry: RewardRegistry::new(),
             state: Arc::new(RwLock::new(EngineState::default())),
-            optimizer,
         })
     }
 
     /// Create a new training engine from a Qwen3.5 dense model
     #[napi(factory)]
     pub fn from_qwen35(model: &Qwen3_5Model, config: GRPOEngineConfig) -> Result<Self> {
-        let model_type = ModelType::Qwen35Dense(model.get_config());
+        let model_type = ModelType::Qwen35Dense(model.config.clone());
 
         info!(
             "Creating training engine (Qwen3.5 Dense): {} layers, {} hidden",
@@ -538,24 +455,36 @@ impl GRPOTrainingEngine {
             model_type.hidden_size()
         );
 
-        let optimizer = create_optimizer(&config);
+        let sender = model
+            .thread
+            .cmd_sender()
+            .ok_or_else(|| Error::from_reason("Model thread not running"))?
+            .clone();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sender
+            .send(Qwen35Cmd::InitTraining {
+                config: Box::new(config.clone()),
+                model_type: model_type.clone(),
+                reply: tx,
+            })
+            .map_err(|_| Error::from_reason("Model thread has exited"))?;
+        rx.blocking_recv()
+            .map_err(|_| Error::from_reason("Model thread exited during init"))??;
 
         Ok(Self {
-            model: Arc::new(RwLock::new(TrainableModelEnum::Qwen35Dense(
-                model.clone_for_training()?,
-            ))),
+            dispatch: TrainingDispatch::Qwen35Dense(sender),
             model_type,
             config,
             reward_registry: RewardRegistry::new(),
             state: Arc::new(RwLock::new(EngineState::default())),
-            optimizer,
         })
     }
 
     /// Create a new training engine from a Qwen3.5 MoE model
     #[napi(factory)]
     pub fn from_qwen35_moe(model: &Qwen3_5MoeModel, config: GRPOEngineConfig) -> Result<Self> {
-        let model_type = ModelType::Qwen35Moe(model.get_config());
+        let model_type = ModelType::Qwen35Moe(model.config.clone());
 
         info!(
             "Creating training engine (Qwen3.5 MoE): {} layers, {} hidden",
@@ -563,17 +492,29 @@ impl GRPOTrainingEngine {
             model_type.hidden_size()
         );
 
-        let optimizer = create_optimizer(&config);
+        let sender = model
+            .thread
+            .cmd_sender()
+            .ok_or_else(|| Error::from_reason("Model thread not running"))?
+            .clone();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sender
+            .send(Qwen35MoeCmd::InitTraining {
+                config: Box::new(config.clone()),
+                model_type: model_type.clone(),
+                reply: tx,
+            })
+            .map_err(|_| Error::from_reason("Model thread has exited"))?;
+        rx.blocking_recv()
+            .map_err(|_| Error::from_reason("Model thread exited during init"))??;
 
         Ok(Self {
-            model: Arc::new(RwLock::new(TrainableModelEnum::Qwen35Moe(
-                model.clone_for_training()?,
-            ))),
+            dispatch: TrainingDispatch::Qwen35Moe(sender),
             model_type,
             config,
             reward_registry: RewardRegistry::new(),
             state: Arc::new(RwLock::new(EngineState::default())),
-            optimizer,
         })
     }
 
@@ -651,8 +592,8 @@ impl GRPOTrainingEngine {
     /// This method performs the complete training cycle:
     /// 1. Generate completions for each prompt (G times per prompt)
     /// 2. Use provided rewards to compute advantages
-    /// 3. Compute GRPO loss and gradients
-    /// 4. Apply gradients (respecting accumulation steps)
+    /// 3. Compute GRPO loss and gradients (on model thread)
+    /// 4. Apply gradients (respecting accumulation steps, on model thread)
     ///
     /// # Arguments
     /// * `prompts` - Array of chat conversations to use as prompts
@@ -684,428 +625,97 @@ impl GRPOTrainingEngine {
         }
 
         let generation_start = std::time::Instant::now();
+        let gen_config = self.build_gen_config();
 
-        // Clone Arcs for the blocking task
-        let model_arc = Arc::clone(&self.model);
-        let state_arc = Arc::clone(&self.state);
-        let optimizer_arc = self.optimizer.clone();
-        let model_type = self.model_type.clone();
-        let config = self.config.clone();
-        let enable_thinking = config.enable_thinking;
-        let tools = config.tools.clone();
+        // Reject dispatch from an invalidated handle and snapshot the
+        // lifecycle generation before any await points so that if `reset()`
+        // runs concurrently, our stale post-await writeback is discarded
+        // and does not resurrect cleared state.
+        let start_generation = self.ensure_valid_snapshot_generation()?;
 
-        // Build generation config - use model's eos_token_id explicitly
-        let gen_config = GenerationConfig {
-            max_new_tokens: config.max_completion_length,
-            temperature: config.temperature,
-            top_p: config.top_p,
-            top_k: config.top_k,
-            min_p: None,
-            repetition_penalty: config.repetition_penalty,
-            repetition_context_size: Some(256),
-            presence_penalty: config.presence_penalty,
-            presence_context_size: None,
-            frequency_penalty: config.frequency_penalty,
-            frequency_context_size: None,
-            max_consecutive_tokens: Some(16),
-            max_ngram_repeats: Some(8),
-            ngram_size: Some(3),
-            eos_token_id: Some(model_type.eos_token_id()),
-            return_logprobs: Some(true),
-            prefill_step_size: None, // Use default (2048)
-            kv_cache_bits: None,     // Default: no quantization
-            kv_cache_group_size: None,
-            num_draft_tokens: None, // Speculative decoding not used in GRPO
-            report_performance: None,
-        };
+        // === Phase 1: Generate completions via model thread (single batched call) ===
+        let gen_data = self
+            .dispatch_generate(
+                &prompts,
+                group_size,
+                gen_config.clone(),
+                self.config.enable_thinking,
+                self.config.tools.clone(),
+            )
+            .await?;
 
-        // Run the entire training step in spawn_blocking
-        let metrics = napi::bindgen_prelude::spawn_blocking(move || {
-            // === Phase 1: Generate completions ===
-            let mut prompt_tokens_all: Vec<MxArray> = Vec::with_capacity(num_prompts);
-            let mut completion_tokens_all: Vec<MxArray> =
-                Vec::with_capacity(num_prompts * group_size);
-            let mut completion_logprobs_all: Vec<MxArray> =
-                Vec::with_capacity(num_prompts * group_size);
-            let mut token_counts_all: Vec<i32> = Vec::with_capacity(num_prompts * group_size);
+        let total_tokens: i32 = gen_data.token_counts.iter().map(|&tc| tc as i32).sum();
 
-            for prompt_messages in prompts {
-                // Tokenize prompt with tools for proper tool calling format
-                let prompt_token_ids = {
-                    let model = model_arc.read().map_err(|_| {
-                        Error::new(Status::GenericFailure, "Failed to acquire model read lock")
-                    })?;
-                    model.apply_chat_template_sync(
-                        &prompt_messages,
-                        Some(true),
-                        tools.as_deref(),
-                        enable_thinking,
-                    )?
-                };
+        let generation_time_ms = generation_start.elapsed().as_secs_f64() * 1000.0;
+        let training_start = std::time::Instant::now();
 
-                let prompt_array =
-                    MxArray::from_uint32(&prompt_token_ids, &[1, prompt_token_ids.len() as i64])?;
-                prompt_tokens_all.push(prompt_array.squeeze(Some(&[0]))?);
+        // === Phase 2: Train via model thread ===
+        // Re-check invalidation after the generate await: a concurrent
+        // `reset()` may have fired during Phase 1, and we must not dispatch
+        // a training step against a newly re-initialized training_state on
+        // behalf of an old handle.
+        self.ensure_valid()?;
+        let loss_config = self.build_loss_config(num_prompts, group_size);
+        let metrics = self
+            .dispatch_train_step(rewards.clone(), group_size as i32, loss_config, None)
+            .await?;
 
-                // Generate G completions
-                for _g in 0..group_size {
-                    let result = {
-                        let model = model_arc.read().map_err(|_| {
-                            Error::new(Status::GenericFailure, "Failed to acquire model read lock")
-                        })?;
-                        model.generate_for_training_sync(&prompt_array, Some(gen_config.clone()))?
-                    };
+        let training_time_ms = training_start.elapsed().as_secs_f64() * 1000.0;
 
-                    completion_tokens_all.push(result.tokens.clone());
-                    completion_logprobs_all.push(result.logprobs.clone());
-                    token_counts_all.push(result.num_tokens as i32);
+        // Compute reward stats (plain data, safe on NAPI thread)
+        let (mean_reward, std_reward) = compute_reward_stats(&rewards);
 
-                    // CRITICAL: Use heavy_cleanup() to clear KV cache, intermediate tensors,
-                    // AND compiler cache after each completion. This prevents Metal context
-                    // accumulation that causes "Context leak detected" warnings.
-                    // The compiler cache holds Metal command buffers that can accumulate.
-                    heavy_cleanup();
-                }
-            }
+        // Update engine state from model thread metrics — gated on generation
+        // so a concurrent reset wins cleanly.
+        {
+            let mut state = self.state.write().map_err(|_| {
+                Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+            })?;
+            if state.generation == start_generation {
+                state.step = metrics.step;
+                state.epoch_steps += 1;
 
-            let generation_time_ms = generation_start.elapsed().as_secs_f64() * 1000.0;
+                // Mirror NaN tracking
+                state.nan_gradient_count = metrics.nan_gradient_count;
 
-            // Heavy cleanup after generation phase to release ALL Metal contexts
-            // This is more aggressive than synchronize_and_clear_cache() and helps
-            // prevent Metal driver context leaks.
-            heavy_cleanup();
-
-            let training_start = std::time::Instant::now();
-            reset_peak_memory(); // Reset peak memory counter for this step
-
-            // === Phase 2: Compute loss and gradients ===
-            let loss_config = GRPOLossConfig {
-                epsilon_low: config.clip_epsilon.unwrap_or(0.2),
-                epsilon_high: None,
-                beta: config.kl_coef.unwrap_or(0.0),
-                loss_type: config
-                    .loss_type
-                    .clone()
-                    .unwrap_or_else(|| "grpo".to_string()),
-                importance_sampling_level: "token".to_string(),
-                max_completion_length: config.max_completion_length.map(|n| n as i64),
-                num_items_in_batch: Some(
-                    (num_prompts * config.group_size.unwrap_or(4) as usize) as f64,
-                ),
-                gradient_accumulation_steps: config.gradient_accumulation_steps.unwrap_or(1) as i64,
-                lm_head_chunk_size: config.lm_head_chunk_size.map(|n| n as i64),
-                forward_chunk_size: config.forward_chunk_size.map(|n| n as i64),
-                vocab_chunk_size: config.vocab_chunk_size.map(|n| n as i64),
-            };
-
-            let params = {
-                let model = model_arc.read().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire model read lock")
-                })?;
-                model.get_parameters()?
-            };
-
-            let prompt_refs: Vec<&MxArray> = prompt_tokens_all.iter().collect();
-            let completion_refs: Vec<&MxArray> = completion_tokens_all.iter().collect();
-            let logprob_refs: Vec<&MxArray> = completion_logprobs_all.iter().collect();
-
-            let (loss_value, gradients) = compute_loss_and_gradients_autograd(
-                &model_type,
-                &params,
-                &prompt_refs,
-                &completion_refs,
-                &logprob_refs,
-                &rewards,
-                config.group_size.unwrap_or(4),
-                loss_config,
-                config.gradient_checkpointing.unwrap_or(true),
-            )?;
-
-            // Check for NaN
-            if loss_value.is_nan() || loss_value.is_infinite() {
-                warn!("Skipping step due to invalid loss: {}", loss_value);
-                synchronize_and_clear_cache();
-
-                let (mean_reward, std_reward) = compute_reward_stats(&rewards);
-                let total_tokens: i32 = token_counts_all.iter().sum();
-
-                let state = state_arc.read().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state read lock")
-                })?;
-
-                return Ok::<EngineStepMetrics, Error>(EngineStepMetrics {
-                    step: state.step,
-                    loss: loss_value,
-                    mean_reward,
-                    std_reward,
-                    mean_advantage: 0.0,
-                    std_advantage: 0.0,
-                    total_tokens,
-                    gradients_applied: false,
-                    generation_time_ms,
-                    training_time_ms: training_start.elapsed().as_secs_f64() * 1000.0,
-                    peak_memory_mb: get_peak_memory() / 1e6,
-                    active_memory_mb: get_active_memory() / 1e6,
-                });
-            }
-
-            // Step 1: Validate ALL gradients first - if ANY has NaN/Inf, skip entire step
-            // This prevents partial gradient application which can degrade model weights
-            // Uses GPU-native has_nan_or_inf() to avoid transferring entire gradient tensors to CPU
-            // (For Qwen3-0.6B: transfers ~4 bytes per gradient instead of ~2.4GB total)
-            let verbose_nan = config.verbose_nan_detection.unwrap_or(false);
-            for (name, grad) in gradients.iter() {
-                grad.eval();
-                // GPU-native check: only transfers a single boolean to CPU
-                let has_invalid = grad.has_nan_or_inf()?;
-                if has_invalid {
-                    // Only do detailed CPU analysis in verbose mode (for debugging)
-                    let invalid_count = if verbose_nan {
-                        let data = grad.to_float32()?;
-                        data.iter()
-                            .filter(|v| v.is_nan() || v.is_infinite())
-                            .count()
-                    } else {
-                        0 // Unknown count in fast mode
-                    };
-
-                    if verbose_nan {
-                        warn!(
-                            "Gradient '{}' contains {} invalid values (NaN/Inf) - SKIPPING ENTIRE STEP to prevent model corruption",
-                            name, invalid_count
-                        );
-                    } else {
-                        warn!(
-                            "Gradient '{}' contains NaN/Inf values - SKIPPING ENTIRE STEP to prevent model corruption (enable verbose_nan_detection for counts)",
-                            name
-                        );
-                    }
-
-                    // Update NaN tracking
-                    let mut state = state_arc.write().map_err(|_| {
-                        Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-                    })?;
-                    state.nan_gradient_count += 1;
+                // Check emergency save threshold
+                if !metrics.gradients_applied && metrics.nan_gradient_count > 0 {
                     state.consecutive_nan_count += 1;
-                    let max_nan = config.max_nan_gradients.unwrap_or(100) as u64;
-                    warn!(
-                        "NaN gradient count: {} / {} (consecutive: {})",
-                        state.nan_gradient_count, max_nan, state.consecutive_nan_count
-                    );
-
-                    // Check if we've exceeded max NaN threshold
-                    if state.nan_gradient_count >= max_nan {
-                        return Err(Error::new(
-                            Status::GenericFailure,
-                            format!(
-                                "Training stopped: exceeded maximum NaN gradient count ({}/{})",
-                                state.nan_gradient_count, max_nan
-                            ),
-                        ));
-                    }
-
-                    // Check emergency save threshold (5 consecutive NaNs)
-                    let emergency_threshold = config.emergency_save_threshold.unwrap_or(5) as u32;
-                    if state.consecutive_nan_count >= emergency_threshold {
+                    let emergency_threshold =
+                        self.config.emergency_save_threshold.unwrap_or(5) as u32;
+                    if state.consecutive_nan_count >= emergency_threshold
+                        && !state.needs_emergency_save
+                    {
                         state.needs_emergency_save = true;
                         warn!(
-                            "Emergency save triggered: {} consecutive NaN gradients",
+                            "Emergency save triggered: {} consecutive steps with NaN/Inf gradients",
                             state.consecutive_nan_count
                         );
                     }
-
-                    let current_step = state.step;
-                    drop(state);
-
-                    // Compute metrics for reporting
-                    let (mean_reward, std_reward) = compute_reward_stats(&rewards);
-                    let total_tokens: i32 = token_counts_all.iter().sum();
-
-                    synchronize_and_clear_cache();
-
-                    // Return early WITHOUT applying any gradients
-                    return Ok::<EngineStepMetrics, Error>(EngineStepMetrics {
-                        step: current_step,
-                        loss: loss_value,
-                        mean_reward,
-                        std_reward,
-                        mean_advantage: 0.0,
-                        std_advantage: 0.0,
-                        total_tokens,
-                        gradients_applied: false,
-                        generation_time_ms,
-                        training_time_ms: training_start.elapsed().as_secs_f64() * 1000.0,
-                        peak_memory_mb: get_peak_memory() / 1e6,
-                        active_memory_mb: get_active_memory() / 1e6,
-                    });
+                } else {
+                    state.consecutive_nan_count = 0;
                 }
-            }
 
-            // Step 2: Clamp gradient values to prevent extreme values
-            // This happens BEFORE norm clipping, as extreme values break norm computation
-            let grad_clip_value = config.gradient_clip_value.unwrap_or(1.0);
-            let mut clamped_gradients: HashMap<String, MxArray> = HashMap::new();
-
-            for (name, grad) in gradients.iter() {
-                // Clamp to reasonable range
-                let clamped = grad.clip(Some(-grad_clip_value), Some(grad_clip_value))?;
-                clamped.eval();
-                clamped_gradients.insert(name.clone(), clamped);
-            }
-
-            // Step 3: Apply gradient norm clipping
-            let gradients = if let Some(max_norm) = config.gradient_clip_norm {
-                let grad_refs: HashMap<String, &MxArray> =
-                    clamped_gradients.iter().map(|(k, v)| (k.clone(), v)).collect();
-                GradientUtils::clip_grad_norm(grad_refs, max_norm)?
-            } else {
-                clamped_gradients
-            };
-
-            // === Phase 3: Accumulate and apply gradients ===
-            let mut state = state_arc.write().map_err(|_| {
-                Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-            })?;
-
-            // Accumulate gradients with NaN/Inf checking
-            let acc_result = accumulate_gradients(&mut state, gradients)?;
-
-            // Handle invalid gradients found during accumulation
-            if acc_result.had_invalid_gradients {
-                state.consecutive_nan_count += 1;
-                state.nan_gradient_count += acc_result.invalid_param_count as u64;
-                warn!(
-                    "Found {} parameters with NaN/Inf during accumulation: {:?} (consecutive: {})",
-                    acc_result.invalid_param_count,
-                    acc_result.invalid_param_names,
-                    state.consecutive_nan_count
-                );
-
-                // Check emergency save threshold
-                let emergency_threshold = config.emergency_save_threshold.unwrap_or(5) as u32;
-                if state.consecutive_nan_count >= emergency_threshold && !state.needs_emergency_save
-                {
-                    state.needs_emergency_save = true;
-                    warn!(
-                        "Emergency save triggered: {} consecutive steps with NaN/Inf gradients",
-                        state.consecutive_nan_count
-                    );
-                }
-            } else {
-                // Reset consecutive NaN count on fully successful accumulation
-                state.consecutive_nan_count = 0;
-            }
-
-            state.micro_step += 1;
-
-            let grad_acc_steps = config.gradient_accumulation_steps.unwrap_or(1);
-            let gradients_applied = if state.micro_step >= grad_acc_steps {
-                let grads = state.accumulated_gradients.take().ok_or_else(|| {
-                    Error::new(Status::GenericFailure, "No accumulated gradients")
-                })?;
-
-                let lr = config.learning_rate.unwrap_or(1e-6) / grad_acc_steps as f64;
-
-                // Release state lock, acquire model lock
-                drop(state);
-
-                let mut model_mut = model_arc.write().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire model write lock")
-                })?;
-
-                apply_optimizer_step(&mut model_mut, &grads, &params, lr, &optimizer_arc, grad_acc_steps)?;
-
-                // Re-acquire state lock
-                let mut state = state_arc.write().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-                })?;
-                state.accumulated_gradients = None;
-                state.micro_step = 0;
-                state.step += 1;
-                state.epoch_steps += 1;
-
-                true
-            } else {
-                state.step += 1;
-                state.epoch_steps += 1;
-                // CRITICAL: Release state lock to prevent deadlock when
-                // re-acquiring for epoch accumulators. The if-branch drops
-                // its lock explicitly, but this else-branch was missing it.
-                drop(state);
-                false
-            };
-
-            // Compute metrics
-            let (mean_reward, std_reward) = compute_reward_stats(&rewards);
-            let total_tokens: i32 = token_counts_all.iter().sum();
-
-            // Update epoch accumulators
-            {
-                let mut state = state_arc.write().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-                })?;
-                state.epoch_loss_sum += loss_value;
+                state.epoch_loss_sum += metrics.loss;
                 state.epoch_reward_sum += mean_reward;
                 state.epoch_tokens += total_tokens as i64;
             }
+        }
 
-            // Compute mean advantage
-            let rewards_f32: Vec<f32> = rewards.iter().map(|&r| r as f32).collect();
-            let rewards_array = MxArray::from_float32(&rewards_f32, &[rewards.len() as i64])?;
-            let advantages = compute_advantages(
-                &rewards_array,
-                config.group_size.unwrap_or(4),
-                "group".to_string(),
-            )?;
-            let adv_data = advantages.to_float32()?;
-            let mean_advantage =
-                adv_data.iter().map(|&a| a as f64).sum::<f64>() / adv_data.len() as f64;
-            let std_advantage = {
-                let variance = adv_data
-                    .iter()
-                    .map(|&a| {
-                        let diff = a as f64 - mean_advantage;
-                        diff * diff
-                    })
-                    .sum::<f64>()
-                    / adv_data.len() as f64;
-                variance.sqrt()
-            };
-
-            // CRITICAL: Always call heavy_cleanup after autograd to clear compiled graph cache.
-            // Without compile_clear_cache(), the C++ side accumulates cached compiled graphs,
-            // causing unbounded memory growth. This was the root cause of OOM issues.
-            heavy_cleanup();
-
-            let step = state_arc
-                .read()
-                .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state lock"))?
-                .step;
-
-            Ok(EngineStepMetrics {
-                step,
-                loss: loss_value,
-                mean_reward,
-                std_reward,
-                mean_advantage,
-                std_advantage,
-                total_tokens,
-                gradients_applied,
-                generation_time_ms,
-                training_time_ms: training_start.elapsed().as_secs_f64() * 1000.0,
-                peak_memory_mb: get_peak_memory() / 1e6,
-                active_memory_mb: get_active_memory() / 1e6,
-            })
+        Ok(EngineStepMetrics {
+            step: metrics.step,
+            loss: metrics.loss,
+            mean_reward,
+            std_reward,
+            mean_advantage: metrics.mean_advantage,
+            std_advantage: metrics.std_advantage,
+            total_tokens: metrics.total_tokens,
+            gradients_applied: metrics.gradients_applied,
+            generation_time_ms,
+            training_time_ms,
+            peak_memory_mb: metrics.peak_memory_mb,
+            active_memory_mb: metrics.active_memory_mb,
         })
-        .await
-        .map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("spawn_blocking error: {}", e),
-            )
-        })??;
-
-        Ok(metrics)
     }
 
     /// Generate completions without training
@@ -1127,166 +737,56 @@ impl GRPOTrainingEngine {
         &self,
         prompts: Vec<Vec<ChatMessage>>,
     ) -> Result<GenerateBatchResult> {
+        self.ensure_valid()?;
         let group_size = self.config.group_size.unwrap_or(4) as usize;
-        let num_prompts = prompts.len();
+        let gen_config = self.build_gen_config();
 
-        let model_arc = Arc::clone(&self.model);
-        let config = self.config.clone();
-        let model_type = self.model_type.clone();
-        let enable_thinking = config.enable_thinking;
-        let tools = config.tools.clone();
-
-        // Build generation config - use model's eos_token_id explicitly
-        let gen_config = GenerationConfig {
-            max_new_tokens: config.max_completion_length,
-            temperature: config.temperature,
-            top_p: config.top_p,
-            top_k: config.top_k,
-            min_p: None,
-            repetition_penalty: config.repetition_penalty,
-            repetition_context_size: Some(256),
-            presence_penalty: config.presence_penalty,
-            presence_context_size: None,
-            frequency_penalty: config.frequency_penalty,
-            frequency_context_size: None,
-            max_consecutive_tokens: Some(16),
-            max_ngram_repeats: Some(8),
-            ngram_size: Some(3),
-            eos_token_id: Some(model_type.eos_token_id()),
-            return_logprobs: Some(true),
-            prefill_step_size: None, // Use default (2048)
-            kv_cache_bits: None,     // Default: no quantization
-            kv_cache_group_size: None,
-            num_draft_tokens: None, // Speculative decoding not used in GRPO
-            report_performance: None,
-        };
-
-        let result = napi::bindgen_prelude::spawn_blocking(move || {
-            let num_completions = num_prompts * group_size;
-            let max_tokens = gen_config.max_new_tokens.unwrap_or(256) as usize;
-
-            // Step 1: Tokenize all prompts first
-            let mut prompt_arrays: Vec<MxArray> = Vec::with_capacity(num_prompts);
-            for prompt_messages in &prompts {
-                let prompt_token_ids = {
-                    let model = model_arc.read().map_err(|_| {
-                        Error::new(Status::GenericFailure, "Failed to acquire model read lock")
-                    })?;
-                    model.apply_chat_template_sync(
-                        prompt_messages,
-                        Some(true),
-                        tools.as_deref(),
-                        enable_thinking,
-                    )?
-                };
-                let prompt_array =
-                    MxArray::from_uint32(&prompt_token_ids, &[1, prompt_token_ids.len() as i64])?;
-                prompt_arrays.push(prompt_array);
-            }
-
-            // Step 2: Batched generation
-            // Use parallel batch generation if enabled (true batch with per-sequence RoPE offsets)
-            // Otherwise use sequential (prefill once per prompt, batch decode G completions)
-            let use_parallel = config.use_parallel_batch_generation.unwrap_or(false);
-            let batch_result = {
-                let model = model_arc.read().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire model read lock")
-                })?;
-                if use_parallel {
-                    // Parallel batch generation is only available for Qwen3 models
-                    match &*model {
-                        TrainableModelEnum::Qwen3(m) => {
-                            m.generate_batch_parallel_sync(&prompt_arrays, group_size, Some(gen_config.clone()))?
-                        }
-                        _ => {
-                            // Fall back to sequential for non-Qwen3 models
-                            model.generate_batch_for_training_sync(&prompt_arrays, group_size, Some(gen_config.clone()))?
-                        }
-                    }
-                } else {
-                    model.generate_batch_for_training_sync(&prompt_arrays, group_size, Some(gen_config.clone()))?
-                }
-            };
-
-            // Step 3: Decode all completions and convert to expected format
-            let mut completion_texts: Vec<String> = Vec::with_capacity(num_completions);
-            let mut all_tokens: Vec<i64> = Vec::with_capacity(num_completions * max_tokens);
-            let mut all_logprobs: Vec<f64> = Vec::with_capacity(num_completions * max_tokens);
-            let mut completion_lengths: Vec<i32> = Vec::with_capacity(num_completions);
-            let mut finish_reasons: Vec<String> = Vec::with_capacity(num_completions);
-
-            // Results are ordered: [prompt0_comp0, prompt0_comp1, ..., prompt1_comp0, ...]
-            for (i, tokens_arr) in batch_result.tokens.iter().enumerate() {
-                // Decode tokens to text
-                let text = {
-                    let model = model_arc.read().map_err(|_| {
-                        Error::new(Status::GenericFailure, "Failed to acquire model read lock")
-                    })?;
-                    model.decode_tokens_sync(tokens_arr)?
-                };
-                completion_texts.push(text);
-
-                // Extract token IDs and logprobs
-                let tokens = tokens_arr.to_int32()?;
-                let logprobs = batch_result.logprobs[i].to_float32()?;
-
-                completion_lengths.push(tokens.len() as i32);
-                all_tokens.extend(tokens.iter().map(|&x| x as i64));
-                all_logprobs.extend(logprobs.iter().map(|&x| x as f64));
-
-                // Get finish reason from batch result
-                // Use batch_result's group_size to ensure consistent indexing
-                let result_group_size = batch_result.group_size as usize;
-                let prompt_idx = i / result_group_size;
-                let group_idx = i % result_group_size;
-
-                // Bounds check with helpful error message
-                let reason = batch_result.finish_reasons
-                    .get(prompt_idx)
-                    .and_then(|reasons: &Vec<String>| reasons.get(group_idx))
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        eprintln!(
-                            "WARN: finish_reasons out of bounds - i={}, prompt_idx={}, group_idx={}, \
-                             finish_reasons.len()={}, result_group_size={}, tokens.len()={}",
-                            i, prompt_idx, group_idx,
-                            batch_result.finish_reasons.len(), result_group_size, batch_result.tokens.len()
-                        );
-                        "unknown".to_string()
-                    });
-                finish_reasons.push(reason);
-            }
-
-            // Heavy cleanup after generation phase to release ALL Metal contexts
-            heavy_cleanup();
-            Ok::<GenerateBatchResult, Error>(GenerateBatchResult {
-                completion_texts,
-                completion_tokens: all_tokens,
-                completion_logprobs: all_logprobs,
-                completion_lengths,
-                finish_reasons,
-            })
-        })
-        .await
-        .map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("spawn_blocking error: {}", e),
+        // Single batched dispatch — the returned GenerationPlainData already
+        // holds all prompts' data in prompt-major order.
+        let gen_data = self
+            .dispatch_generate(
+                &prompts,
+                group_size,
+                gen_config.clone(),
+                self.config.enable_thinking,
+                self.config.tools.clone(),
             )
-        })??;
+            .await?;
 
-        Ok(result)
+        let total_completions = gen_data.completion_texts.len();
+        let mut all_texts = Vec::with_capacity(total_completions);
+        let mut all_tokens = Vec::new();
+        let mut all_logprobs = Vec::new();
+        let mut all_lengths = Vec::with_capacity(total_completions);
+        let mut all_reasons = Vec::with_capacity(total_completions);
+
+        for i in 0..total_completions {
+            all_texts.push(gen_data.completion_texts[i].clone());
+            all_lengths.push(gen_data.completion_tokens[i].len() as i32);
+            all_tokens.extend(gen_data.completion_tokens[i].iter().map(|&t| t as i64));
+            all_logprobs.extend(gen_data.completion_logprobs[i].iter().map(|&l| l as f64));
+            all_reasons.push(gen_data.finish_reasons[i].clone());
+        }
+
+        Ok(GenerateBatchResult {
+            completion_texts: all_texts,
+            completion_tokens: all_tokens,
+            completion_logprobs: all_logprobs,
+            completion_lengths: all_lengths,
+            finish_reasons: all_reasons,
+        })
     }
 
     /// Run a training step with pre-generated completions
     ///
-    /// This method performs training using pre-generated completions,
-    /// eliminating the double-generation issue.
+    /// Uses the cached MxArrays from the most recent generate_batch_for_training
+    /// call on the model thread. The generation_result parameter is used only for
+    /// validation (the actual MxArrays are cached on the model thread).
     ///
     /// # Arguments
     /// * `prompts` - Array of chat conversations to use as prompts
     /// * `rewards` - Reward values for each completion (num_prompts * group_size)
-    /// * `generation_result` - Pre-generated completion data from generate_batch_for_training
+    /// * `generation_result` - Pre-generated completion data (used for validation)
     ///
     /// # Returns
     /// * Training step metrics
@@ -1328,395 +828,72 @@ impl GRPOTrainingEngine {
         }
 
         let training_start = std::time::Instant::now();
-        reset_peak_memory(); // Reset peak memory counter for this step
 
-        // Clone Arcs for the blocking task
-        let model_arc = Arc::clone(&self.model);
-        let state_arc = Arc::clone(&self.state);
-        let optimizer_arc = self.optimizer.clone();
-        let model_type = self.model_type.clone();
-        let config = self.config.clone();
-        let enable_thinking = config.enable_thinking;
-        let tools = config.tools.clone();
+        // Reject dispatch from an invalidated handle and snapshot the
+        // lifecycle generation before the train_step await so any
+        // concurrent reset wins cleanly.
+        let start_generation = self.ensure_valid_snapshot_generation()?;
 
-        // Run the training step in spawn_blocking
-        let metrics = napi::bindgen_prelude::spawn_blocking(move || {
-            // === Phase 1: Tokenize prompts and reconstruct completion arrays ===
-            let mut prompt_tokens_all: Vec<MxArray> = Vec::with_capacity(num_prompts);
+        // Dispatch train step to model thread (uses cached MxArrays from generate phase)
+        let loss_config = self.build_loss_config(num_prompts, group_size);
+        let metrics = self
+            .dispatch_train_step(rewards.clone(), group_size as i32, loss_config, None)
+            .await?;
 
-            for prompt_messages in prompts {
-                // Tokenize prompt with tools for proper tool calling format
-                let prompt_token_ids = {
-                    let model = model_arc.read().map_err(|_| {
-                        Error::new(Status::GenericFailure, "Failed to acquire model read lock")
-                    })?;
-                    model.apply_chat_template_sync(
-                        &prompt_messages,
-                        Some(true),
-                        tools.as_deref(),
-                        enable_thinking,
-                    )?
-                };
+        let training_time_ms = training_start.elapsed().as_secs_f64() * 1000.0;
 
-                let prompt_array =
-                    MxArray::from_uint32(&prompt_token_ids, &[prompt_token_ids.len() as i64])?;
-                prompt_tokens_all.push(prompt_array);
-            }
+        let (mean_reward, std_reward) = compute_reward_stats(&rewards);
+        let total_tokens: i32 = generation_result.completion_lengths.iter().sum();
 
-            // Reconstruct completion token/logprob arrays from flattened data
-            let mut completion_tokens_all: Vec<MxArray> = Vec::with_capacity(expected_rewards);
-            let mut completion_logprobs_all: Vec<MxArray> = Vec::with_capacity(expected_rewards);
-            let mut token_counts_all: Vec<i32> = Vec::with_capacity(expected_rewards);
-
-            let mut offset = 0usize;
-            for &length in &generation_result.completion_lengths {
-                let len = length as usize;
-                let end = offset + len;
-
-                let tokens = &generation_result.completion_tokens[offset..end];
-                let logprobs: Vec<f32> = generation_result.completion_logprobs[offset..end]
-                    .iter()
-                    .map(|&x| x as f32)
-                    .collect();
-
-                let tokens_i32: Vec<i32> = tokens.iter().map(|&x| x as i32).collect();
-                completion_tokens_all.push(MxArray::from_int32(&tokens_i32, &[len as i64])?);
-                completion_logprobs_all.push(MxArray::from_float32(&logprobs, &[len as i64])?);
-                token_counts_all.push(length);
-
-                offset = end;
-            }
-
-            // Sync and clear GPU memory after Phase 1 to reduce fragmentation
-            // This releases intermediate tensors before building training graph
-            synchronize_and_clear_cache();
-
-            // === Phase 2: Compute loss and gradients ===
-            let loss_config = GRPOLossConfig {
-                epsilon_low: config.clip_epsilon.unwrap_or(0.2),
-                epsilon_high: None,
-                beta: config.kl_coef.unwrap_or(0.0),
-                loss_type: config
-                    .loss_type
-                    .clone()
-                    .unwrap_or_else(|| "grpo".to_string()),
-                importance_sampling_level: "token".to_string(),
-                max_completion_length: config.max_completion_length.map(|n| n as i64),
-                num_items_in_batch: Some(expected_rewards as f64),
-                gradient_accumulation_steps: config.gradient_accumulation_steps.unwrap_or(1) as i64,
-                lm_head_chunk_size: config.lm_head_chunk_size.map(|n| n as i64),
-                forward_chunk_size: config.forward_chunk_size.map(|n| n as i64),
-                vocab_chunk_size: config.vocab_chunk_size.map(|n| n as i64),
-            };
-
-            let params = {
-                let model = model_arc.read().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire model read lock")
-                })?;
-                model.get_parameters()?
-            };
-
-            let prompt_refs: Vec<&MxArray> = prompt_tokens_all.iter().collect();
-            let completion_refs: Vec<&MxArray> = completion_tokens_all.iter().collect();
-            let logprob_refs: Vec<&MxArray> = completion_logprobs_all.iter().collect();
-
-            let (loss_value, gradients) = compute_loss_and_gradients_autograd(
-                &model_type,
-                &params,
-                &prompt_refs,
-                &completion_refs,
-                &logprob_refs,
-                &rewards,
-                config.group_size.unwrap_or(4),
-                loss_config,
-                config.gradient_checkpointing.unwrap_or(true),
-            )?;
-
-            // Check for NaN
-            if loss_value.is_nan() || loss_value.is_infinite() {
-                warn!("Skipping step due to invalid loss: {}", loss_value);
-                synchronize_and_clear_cache();
-
-                let (mean_reward, std_reward) = compute_reward_stats(&rewards);
-                let total_tokens: i32 = token_counts_all.iter().sum();
-
-                let state = state_arc.read().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state read lock")
-                })?;
-
-                return Ok::<EngineStepMetrics, Error>(EngineStepMetrics {
-                    step: state.step,
-                    loss: loss_value,
-                    mean_reward,
-                    std_reward,
-                    mean_advantage: 0.0,
-                    std_advantage: 0.0,
-                    total_tokens,
-                    gradients_applied: false,
-                    generation_time_ms: 0.0, // Not measured here, was done separately
-                    training_time_ms: training_start.elapsed().as_secs_f64() * 1000.0,
-                peak_memory_mb: get_peak_memory() / 1e6,
-                active_memory_mb: get_active_memory() / 1e6,
-                });
-            }
-
-            // Step 1: Validate and clamp gradient values to prevent extreme values
-            // This happens BEFORE norm clipping, as Inf values break norm computation
-            let grad_clip_value = config.gradient_clip_value.unwrap_or(1.0);
-            let mut clamped_gradients: HashMap<String, MxArray> = HashMap::new();
-            let mut has_invalid_grad = false;
-            let mut invalid_param_names: Vec<String> = Vec::new();
-
-            for (name, grad) in gradients.iter() {
-                grad.eval();
-
-                // GPU-native check: transfers only ~4 bytes instead of entire gradient tensor
-                if grad.has_nan_or_inf()? {
-                    warn!(
-                        "Gradient '{}' contains NaN/Inf values - will skip step",
-                        name
-                    );
-                    has_invalid_grad = true;
-                    invalid_param_names.push(name.clone());
-                    continue; // Don't insert anything - skip this gradient entirely
-                }
-
-                // Clamp to reasonable range (lazy - let MLX fuse operations)
-                let clamped = grad.clip(Some(-grad_clip_value), Some(grad_clip_value))?;
-                clamped_gradients.insert(name.clone(), clamped);
-            }
-
-            // Log all invalid parameters if any were found
-            if !invalid_param_names.is_empty() {
-                warn!(
-                    "Found {} parameters with NaN/Inf gradients: {:?}",
-                    invalid_param_names.len(),
-                    invalid_param_names
-                );
-            }
-
-            // Step 2: Apply gradient norm clipping
-            let gradients = if !has_invalid_grad {
-                if let Some(max_norm) = config.gradient_clip_norm {
-                    let grad_refs: HashMap<String, &MxArray> =
-                        clamped_gradients.iter().map(|(k, v)| (k.clone(), v)).collect();
-                    GradientUtils::clip_grad_norm(grad_refs, max_norm)?
-                } else {
-                    clamped_gradients
-                }
-            } else {
-                clamped_gradients
-            };
-
-            if has_invalid_grad {
-                synchronize_and_clear_cache();
-
-                let (mean_reward, std_reward) = compute_reward_stats(&rewards);
-                let total_tokens: i32 = token_counts_all.iter().sum();
-
-                let mut state = state_arc.write().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-                })?;
-
-                // Track NaN gradient occurrences (step NOT incremented on NaN skip)
-                state.nan_gradient_count += 1;
-                state.consecutive_nan_count += 1;
-
-                let max_nan = config.max_nan_gradients.unwrap_or(100) as u64;
-                let emergency_threshold = config.emergency_save_threshold.unwrap_or(5) as u32;
-
-                // Check if we should trigger emergency checkpoint
-                if state.consecutive_nan_count >= emergency_threshold && !state.needs_emergency_save {
-                    warn!(
-                        "Consecutive NaN gradients ({}) reached threshold ({}), flagging for emergency checkpoint",
-                        state.consecutive_nan_count, emergency_threshold
-                    );
-                    state.needs_emergency_save = true;
-                }
-
-                // Check if we've exceeded maximum NaN gradient count
-                if state.nan_gradient_count > max_nan {
-                    return Err(Error::new(
-                        Status::GenericFailure,
-                        format!(
-                            "Training stopped: {} NaN gradients exceeded threshold of {}. \
-                            Model weights may be corrupted. Consider using an earlier checkpoint or reducing learning rate.",
-                            state.nan_gradient_count, max_nan
-                        ),
-                    ));
-                }
-
-                warn!(
-                    "NaN gradient count: {} / {} (consecutive: {})",
-                    state.nan_gradient_count, max_nan, state.consecutive_nan_count
-                );
-
-                return Ok::<EngineStepMetrics, Error>(EngineStepMetrics {
-                    step: state.step,
-                    loss: loss_value,
-                    mean_reward,
-                    std_reward,
-                    mean_advantage: 0.0,
-                    std_advantage: 0.0,
-                    total_tokens,
-                    gradients_applied: false,
-                    generation_time_ms: 0.0,
-                    training_time_ms: training_start.elapsed().as_secs_f64() * 1000.0,
-                peak_memory_mb: get_peak_memory() / 1e6,
-                active_memory_mb: get_active_memory() / 1e6,
-                });
-            }
-
-            // === Phase 3: Accumulate and apply gradients ===
-            let mut state = state_arc.write().map_err(|_| {
+        // Update engine state — gated on generation.
+        {
+            let mut state = self.state.write().map_err(|_| {
                 Error::new(Status::GenericFailure, "Failed to acquire state write lock")
             })?;
+            if state.generation == start_generation {
+                state.step = metrics.step;
+                state.epoch_steps += 1;
+                state.nan_gradient_count = metrics.nan_gradient_count;
 
-            // Accumulate gradients with NaN/Inf checking
-            let acc_result = accumulate_gradients(&mut state, gradients)?;
-
-            // Handle invalid gradients found during accumulation
-            if acc_result.had_invalid_gradients {
-                state.consecutive_nan_count += 1;
-                state.nan_gradient_count += acc_result.invalid_param_count as u64;
-                warn!(
-                    "Found {} parameters with NaN/Inf during accumulation: {:?} (consecutive: {})",
-                    acc_result.invalid_param_count,
-                    acc_result.invalid_param_names,
-                    state.consecutive_nan_count
-                );
-
-                // Check emergency save threshold
-                let emergency_threshold = config.emergency_save_threshold.unwrap_or(5) as u32;
-                if state.consecutive_nan_count >= emergency_threshold && !state.needs_emergency_save
-                {
-                    state.needs_emergency_save = true;
-                    warn!(
-                        "Emergency save triggered: {} consecutive steps with NaN/Inf gradients",
-                        state.consecutive_nan_count
-                    );
+                if !metrics.gradients_applied && metrics.nan_gradient_count > 0 {
+                    state.consecutive_nan_count += 1;
+                    let emergency_threshold =
+                        self.config.emergency_save_threshold.unwrap_or(5) as u32;
+                    if state.consecutive_nan_count >= emergency_threshold
+                        && !state.needs_emergency_save
+                    {
+                        state.needs_emergency_save = true;
+                    }
+                } else {
+                    state.consecutive_nan_count = 0;
                 }
-            } else {
-                // Reset consecutive NaN count on fully successful accumulation
-                state.consecutive_nan_count = 0;
-            }
 
-            state.micro_step += 1;
-
-            let grad_acc_steps = config.gradient_accumulation_steps.unwrap_or(1);
-            let gradients_applied = if state.micro_step >= grad_acc_steps {
-                let grads = state.accumulated_gradients.take().ok_or_else(|| {
-                    Error::new(Status::GenericFailure, "No accumulated gradients")
-                })?;
-
-                let lr = config.learning_rate.unwrap_or(1e-6) / grad_acc_steps as f64;
-
-                // Release state lock, acquire model lock
-                drop(state);
-
-                let mut model_mut = model_arc.write().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire model write lock")
-                })?;
-
-                apply_optimizer_step(&mut model_mut, &grads, &params, lr, &optimizer_arc, grad_acc_steps)?;
-
-                // Re-acquire state lock
-                let mut state = state_arc.write().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-                })?;
-                state.accumulated_gradients = None;
-                state.micro_step = 0;
-                state.step += 1;
-                state.epoch_steps += 1;
-
-                true
-            } else {
-                state.step += 1;
-                state.epoch_steps += 1;
-                // CRITICAL: Release state lock to prevent deadlock when
-                // re-acquiring for epoch accumulators. The if-branch drops
-                // its lock explicitly, but this else-branch was missing it.
-                drop(state);
-                false
-            };
-
-            // Compute metrics
-            let (mean_reward, std_reward) = compute_reward_stats(&rewards);
-            let total_tokens: i32 = token_counts_all.iter().sum();
-
-            // Update epoch accumulators
-            {
-                let mut state = state_arc.write().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-                })?;
-                state.epoch_loss_sum += loss_value;
+                state.epoch_loss_sum += metrics.loss;
                 state.epoch_reward_sum += mean_reward;
                 state.epoch_tokens += total_tokens as i64;
             }
+        }
 
-            // Compute mean and std advantage
-            let rewards_f32: Vec<f32> = rewards.iter().map(|&r| r as f32).collect();
-            let rewards_array = MxArray::from_float32(&rewards_f32, &[rewards.len() as i64])?;
-            let advantages = compute_advantages(
-                &rewards_array,
-                config.group_size.unwrap_or(4),
-                "group".to_string(),
-            )?;
-            let adv_data = advantages.to_float32()?;
-            let mean_advantage =
-                adv_data.iter().map(|&a| a as f64).sum::<f64>() / adv_data.len() as f64;
-            let std_advantage = {
-                let variance = adv_data
-                    .iter()
-                    .map(|&a| {
-                        let diff = a as f64 - mean_advantage;
-                        diff * diff
-                    })
-                    .sum::<f64>()
-                    / adv_data.len() as f64;
-                variance.sqrt()
-            };
-
-            // CRITICAL: Always call heavy_cleanup after autograd to clear compiled graph cache.
-            // Without compile_clear_cache(), the C++ side accumulates cached compiled graphs,
-            // causing unbounded memory growth. This was the root cause of OOM issues.
-            heavy_cleanup();
-
-            let step = state_arc
-                .read()
-                .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state lock"))?
-                .step;
-
-            Ok(EngineStepMetrics {
-                step,
-                loss: loss_value,
-                mean_reward,
-                std_reward,
-                mean_advantage,
-                std_advantage,
-                total_tokens,
-                gradients_applied,
-                generation_time_ms: 0.0,
-                training_time_ms: training_start.elapsed().as_secs_f64() * 1000.0,
-                peak_memory_mb: get_peak_memory() / 1e6,
-                active_memory_mb: get_active_memory() / 1e6,
-            })
+        Ok(EngineStepMetrics {
+            step: metrics.step,
+            loss: metrics.loss,
+            mean_reward,
+            std_reward,
+            mean_advantage: metrics.mean_advantage,
+            std_advantage: metrics.std_advantage,
+            total_tokens: metrics.total_tokens,
+            gradients_applied: metrics.gradients_applied,
+            generation_time_ms: 0.0,
+            training_time_ms,
+            peak_memory_mb: metrics.peak_memory_mb,
+            active_memory_mb: metrics.active_memory_mb,
         })
-        .await
-        .map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("spawn_blocking error: {}", e),
-            )
-        })??;
-
-        Ok(metrics)
     }
 
     /// Unified training step with JS reward callback and optional output recording
     ///
-    /// Same as `train_step_auto` but optionally captures the full RewardOutput data
-    /// for persistence to an output store database.
+    /// Generates completions via the model thread, calls the JS reward function
+    /// with plain data, then dispatches the training step to the model thread.
     ///
     /// # Arguments
     /// * `prompts` - Array of chat conversations to use as prompts
@@ -1739,124 +916,51 @@ impl GRPOTrainingEngine {
         let expected_completions = num_prompts * group_size;
 
         let generation_start = std::time::Instant::now();
+        let gen_config = self.build_gen_config();
 
-        // Clone Arcs for the blocking task
-        let model_arc = Arc::clone(&self.model);
-        let model_type = self.model_type.clone();
-        let config = self.config.clone();
-        let enable_thinking = config.enable_thinking;
-        let tools = config.tools.clone();
+        // Reject dispatch from an invalidated handle and snapshot the
+        // lifecycle generation before any await points so that if `reset()`
+        // runs concurrently, our stale post-await writebacks are discarded
+        // and do not resurrect cleared state.
+        let start_generation = self.ensure_valid_snapshot_generation()?;
 
-        // Build generation config
-        let gen_config = GenerationConfig {
-            max_new_tokens: config.max_completion_length,
-            temperature: config.temperature,
-            top_p: config.top_p,
-            top_k: config.top_k,
-            min_p: None,
-            repetition_penalty: config.repetition_penalty,
-            repetition_context_size: Some(256),
-            presence_penalty: config.presence_penalty,
-            presence_context_size: None,
-            frequency_penalty: config.frequency_penalty,
-            frequency_context_size: None,
-            max_consecutive_tokens: Some(16),
-            max_ngram_repeats: Some(8),
-            ngram_size: Some(3),
-            eos_token_id: Some(model_type.eos_token_id()),
-            return_logprobs: Some(true),
-            prefill_step_size: None, // Use default (2048)
-            kv_cache_bits: None,     // Default: no quantization
-            kv_cache_group_size: None,
-            num_draft_tokens: None, // Speculative decoding not used in GRPO
-            report_performance: None,
-        };
-
-        // === Phase 1: Generate completions ===
+        // === Phase 1: Generate completions via model thread ===
         info!(
             "Phase 1: Generating {} completions ({} prompts × {} groups)",
             expected_completions, num_prompts, group_size
         );
-        let gen_result = napi::bindgen_prelude::spawn_blocking(move || {
-            let mut completion_texts: Vec<String> = Vec::with_capacity(expected_completions);
-            let mut prompt_texts: Vec<String> = Vec::with_capacity(num_prompts);
-            let mut prompt_tokens_all: Vec<MxArray> = Vec::with_capacity(num_prompts);
-            let mut completion_tokens_all: Vec<MxArray> = Vec::with_capacity(expected_completions);
-            let mut completion_logprobs_all: Vec<MxArray> =
-                Vec::with_capacity(expected_completions);
-            let mut token_counts_all: Vec<u32> = Vec::with_capacity(expected_completions);
-            let mut finish_reasons_all: Vec<String> = Vec::with_capacity(expected_completions);
 
-            for prompt_messages in prompts.into_iter() {
-                // Tokenize prompt with tools for proper tool calling format
-                let prompt_token_ids = {
-                    let model = model_arc.read().map_err(|_| {
-                        Error::new(Status::GenericFailure, "Failed to acquire model read lock")
-                    })?;
-                    model.apply_chat_template_sync(
-                        &prompt_messages,
-                        Some(true),
-                        tools.as_deref(),
-                        enable_thinking,
-                    )?
-                };
+        let mut all_completion_texts: Vec<String> = Vec::with_capacity(expected_completions);
+        let mut all_prompt_texts: Vec<String> = Vec::with_capacity(num_prompts);
+        let mut all_token_counts: Vec<u32> = Vec::with_capacity(expected_completions);
+        let mut all_finish_reasons: Vec<String> = Vec::with_capacity(expected_completions);
 
-                let prompt_array =
-                    MxArray::from_uint32(&prompt_token_ids, &[prompt_token_ids.len() as i64])?;
-                let prompt_text = {
-                    let model = model_arc.read().map_err(|_| {
-                        Error::new(Status::GenericFailure, "Failed to acquire model read lock")
-                    })?;
-                    model.decode_tokens_sync(&prompt_array)?
-                };
-                prompt_texts.push(prompt_text);
-                prompt_tokens_all.push(prompt_array.clone());
-
-                let prompt_2d =
-                    MxArray::from_uint32(&prompt_token_ids, &[1, prompt_token_ids.len() as i64])?;
-
-                for _g in 0..group_size {
-                    let result = {
-                        let model = model_arc.read().map_err(|_| {
-                            Error::new(Status::GenericFailure, "Failed to acquire model read lock")
-                        })?;
-                        model.generate_for_training_sync(&prompt_2d, Some(gen_config.clone()))?
-                    };
-
-                    let text = {
-                        let model = model_arc.read().map_err(|_| {
-                            Error::new(Status::GenericFailure, "Failed to acquire model read lock")
-                        })?;
-                        model.decode_tokens_sync(&result.tokens)?
-                    };
-                    completion_texts.push(text);
-                    finish_reasons_all.push(result.finish_reason.clone());
-
-                    token_counts_all.push(result.num_tokens as u32);
-                    completion_tokens_all.push(result.tokens.clone());
-                    completion_logprobs_all.push(result.logprobs.clone());
-                }
-            }
-
-            synchronize_and_clear_cache();
-
-            Ok::<_, Error>(IntermediateGenerationResult {
-                completion_texts,
-                prompt_texts,
-                prompt_tokens: prompt_tokens_all,
-                completion_tokens: completion_tokens_all,
-                completion_logprobs: completion_logprobs_all,
-                token_counts: token_counts_all,
-                finish_reasons: finish_reasons_all,
-            })
-        })
-        .await
-        .map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("spawn_blocking error in generation: {}", e),
+        // Single batched dispatch — accumulates completions for all prompts in
+        // prompt-major order on the model thread.
+        let gen_data = self
+            .dispatch_generate(
+                &prompts,
+                group_size,
+                gen_config.clone(),
+                self.config.enable_thinking,
+                self.config.tools.clone(),
             )
-        })??;
+            .await?;
+
+        // Collect one prompt text per prompt (prompt_texts is repeated per
+        // completion in prompt-major order, so stride by group_size).
+        for p in 0..num_prompts {
+            let base = p * group_size;
+            if let Some(pt) = gen_data.prompt_texts.get(base) {
+                all_prompt_texts.push(pt.clone());
+            }
+        }
+
+        for i in 0..gen_data.completion_texts.len() {
+            all_completion_texts.push(gen_data.completion_texts[i].clone());
+            all_token_counts.push(gen_data.token_counts[i]);
+            all_finish_reasons.push(gen_data.finish_reasons[i].clone());
+        }
 
         let generation_time_ms = generation_start.elapsed().as_secs_f64() * 1000.0;
         info!(
@@ -1864,25 +968,13 @@ impl GRPOTrainingEngine {
             generation_time_ms / 1000.0
         );
 
-        let IntermediateGenerationResult {
-            completion_texts,
-            prompt_texts,
-            prompt_tokens,
-            completion_tokens,
-            completion_logprobs,
-            token_counts,
-            finish_reasons,
-        } = gen_result;
-
-        let finish_reasons_for_filter = finish_reasons.clone();
-
         // === Phase 2: Build RewardOutput[] and call JS reward function ===
         info!("Phase 2: Computing rewards via JS callback...");
         let reward_outputs = build_reward_outputs(
-            prompt_texts,
-            completion_texts.clone(),
-            token_counts.clone(),
-            finish_reasons,
+            all_prompt_texts,
+            all_completion_texts.clone(),
+            all_token_counts.clone(),
+            all_finish_reasons.clone(),
             group_size as u32,
         );
 
@@ -1930,21 +1022,45 @@ impl GRPOTrainingEngine {
             ));
         }
 
-        // === DEGENERATE OUTPUT FILTERING ===
+        // === DEGENERATE OUTPUT FILTERING (per-prompt balanced) ===
+        //
+        // The autograd / advantages paths require a rectangular layout:
+        // `valid_indices.len() == num_prompts * effective_group_size`.
+        // We therefore filter per prompt and then truncate every prompt to the
+        // minimum survivor count, so uneven drops across prompts can't break
+        // divisibility downstream.
         let max_tokens_threshold =
             (self.config.max_completion_length.unwrap_or(4096) as f64 * 0.9) as u32;
-        let valid_indices: Vec<usize> = finish_reasons_for_filter
-            .iter()
-            .enumerate()
-            .filter(|(i, reason)| *reason != "length" || token_counts[*i] < max_tokens_threshold)
-            .map(|(i, _)| i)
-            .collect();
+        let (valid_indices, balanced_effective_group_size, per_prompt_survivor_counts) =
+            compute_balanced_valid_indices(
+                &all_finish_reasons,
+                &all_token_counts,
+                num_prompts,
+                group_size,
+                max_tokens_threshold,
+            );
 
         let num_filtered = expected_completions - valid_indices.len();
         if num_filtered > 0 {
+            let min_survivors = per_prompt_survivor_counts
+                .iter()
+                .copied()
+                .min()
+                .unwrap_or(0);
+            let max_survivors = per_prompt_survivor_counts
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0);
             info!(
-                "Filtered {} degenerate completions (finish_reason='length', tokens >= {})",
-                num_filtered, max_tokens_threshold
+                "Filtered {} degenerate completions (finish_reason='length', tokens >= {}); \
+                 per-prompt survivors: min={} max={} counts={:?}, effective_group_size={}",
+                num_filtered,
+                max_tokens_threshold,
+                min_survivors,
+                max_survivors,
+                per_prompt_survivor_counts,
+                balanced_effective_group_size
             );
         }
 
@@ -1954,17 +1070,25 @@ impl GRPOTrainingEngine {
                 expected_completions
             );
 
-            let mut state = self.state.write().map_err(|_| {
-                Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-            })?;
-            state.step += 1;
-            let current_step = state.step;
-            drop(state);
+            // Re-check invalidation after the JS reward callback await —
+            // a concurrent `reset()` may have fired while JS was running.
+            self.ensure_valid()?;
+            // Bump ts.step on the model thread (it's the single source of truth)
+            // and drop stale MxArrays in the same round-trip. Mirror the result
+            // into the engine's read-through cache — gated on generation.
+            let current_step = self.dispatch_bump_skipped_step().await?;
+
+            {
+                let mut state = self.state.write().map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+                })?;
+                if state.generation == start_generation {
+                    state.step = current_step;
+                }
+            }
 
             let (mean_reward, std_reward) = compute_reward_stats(&rewards);
-            let total_tokens: u32 = token_counts.iter().sum();
-
-            heavy_cleanup();
+            let total_tokens: u32 = all_token_counts.iter().sum();
 
             return Ok(TrainStepResultWithOutputs {
                 metrics: EngineStepMetrics {
@@ -1978,22 +1102,25 @@ impl GRPOTrainingEngine {
                     gradients_applied: false,
                     generation_time_ms,
                     training_time_ms: 0.0,
-                    peak_memory_mb: get_peak_memory() / 1e6,
-                    active_memory_mb: get_active_memory() / 1e6,
+                    peak_memory_mb: 0.0,
+                    active_memory_mb: 0.0,
                 },
-                completions: completion_texts,
+                completions: all_completion_texts,
                 rewards,
                 outputs_json: outputs_json_for_return,
-                completion_lengths: token_counts.iter().map(|&x| x as i32).collect(),
+                completion_lengths: all_token_counts.iter().map(|&x| x as i32).collect(),
             });
         }
 
         let filtered_count = valid_indices.len();
-        let effective_group_size = if num_prompts > 0 {
-            filtered_count / num_prompts
-        } else {
-            group_size
-        };
+        // By construction from compute_balanced_valid_indices:
+        // filtered_count == num_prompts * balanced_effective_group_size
+        let effective_group_size = balanced_effective_group_size;
+        debug_assert_eq!(
+            filtered_count,
+            num_prompts * effective_group_size,
+            "balanced filter must produce a rectangular layout"
+        );
 
         if effective_group_size < 1 {
             warn!(
@@ -2001,17 +1128,25 @@ impl GRPOTrainingEngine {
                 filtered_count, num_prompts
             );
 
-            let mut state = self.state.write().map_err(|_| {
-                Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-            })?;
-            state.step += 1;
-            let current_step = state.step;
-            drop(state);
+            // Re-check invalidation after the JS reward callback await —
+            // a concurrent `reset()` may have fired while JS was running.
+            self.ensure_valid()?;
+            // Bump ts.step on the model thread (it's the single source of truth)
+            // and drop stale MxArrays in the same round-trip. Mirror the result
+            // into the engine's read-through cache — gated on generation.
+            let current_step = self.dispatch_bump_skipped_step().await?;
+
+            {
+                let mut state = self.state.write().map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+                })?;
+                if state.generation == start_generation {
+                    state.step = current_step;
+                }
+            }
 
             let (mean_reward, std_reward) = compute_reward_stats(&rewards);
-            let total_tokens: u32 = token_counts.iter().sum();
-
-            heavy_cleanup();
+            let total_tokens: u32 = all_token_counts.iter().sum();
 
             return Ok(TrainStepResultWithOutputs {
                 metrics: EngineStepMetrics {
@@ -2025,364 +1160,116 @@ impl GRPOTrainingEngine {
                     gradients_applied: false,
                     generation_time_ms,
                     training_time_ms: 0.0,
-                    peak_memory_mb: get_peak_memory() / 1e6,
-                    active_memory_mb: get_active_memory() / 1e6,
+                    peak_memory_mb: 0.0,
+                    active_memory_mb: 0.0,
                 },
-                completions: completion_texts,
+                completions: all_completion_texts,
                 rewards,
                 outputs_json: outputs_json_for_return,
-                completion_lengths: token_counts.iter().map(|&x| x as i32).collect(),
+                completion_lengths: all_token_counts.iter().map(|&x| x as i32).collect(),
             });
         }
 
-        let usable_count = num_prompts * effective_group_size;
-        let valid_indices: Vec<usize> = if usable_count < filtered_count {
-            valid_indices.into_iter().take(usable_count).collect()
-        } else {
-            valid_indices
-        };
-
-        let filtered_completion_tokens: Vec<MxArray> = valid_indices
-            .iter()
-            .map(|&i| completion_tokens[i].clone())
-            .collect();
-        let filtered_completion_logprobs: Vec<MxArray> = valid_indices
-            .iter()
-            .map(|&i| completion_logprobs[i].clone())
-            .collect();
-        let filtered_token_counts: Vec<u32> =
-            valid_indices.iter().map(|&i| token_counts[i]).collect();
+        // Filter rewards for the valid completions
         let filtered_rewards: Vec<f64> = valid_indices.iter().map(|&i| rewards[i]).collect();
 
-        synchronize_and_clear_cache();
-
-        // === Phase 3: Train ===
+        // === Phase 3: Train via model thread ===
         info!(
             "Phase 3: Training with {} valid completions (filtered {})",
             valid_indices.len(),
             num_filtered
         );
         let training_start = std::time::Instant::now();
-        reset_peak_memory(); // Reset peak memory counter for this step
 
-        let model_arc = Arc::clone(&self.model);
-        let state_arc = Arc::clone(&self.state);
-        let optimizer_arc = self.optimizer.clone();
-        let model_type = self.model_type.clone();
-        let config = self.config.clone();
-        let rewards_clone = filtered_rewards.clone();
-        let group_size_for_training = effective_group_size as i32;
+        let usable_count = num_prompts * effective_group_size;
+        let loss_config = GRPOLossConfig {
+            epsilon_low: self.config.clip_epsilon.unwrap_or(0.2),
+            epsilon_high: None,
+            beta: self.config.kl_coef.unwrap_or(0.0),
+            loss_type: self
+                .config
+                .loss_type
+                .clone()
+                .unwrap_or_else(|| "grpo".to_string()),
+            importance_sampling_level: "token".to_string(),
+            max_completion_length: self.config.max_completion_length.map(|n| n as i64),
+            num_items_in_batch: Some(usable_count as f64),
+            gradient_accumulation_steps: self.config.gradient_accumulation_steps.unwrap_or(1)
+                as i64,
+            lm_head_chunk_size: self.config.lm_head_chunk_size.map(|n| n as i64),
+            forward_chunk_size: self.config.forward_chunk_size.map(|n| n as i64),
+            vocab_chunk_size: self.config.vocab_chunk_size.map(|n| n as i64),
+        };
 
-        let metrics = napi::bindgen_prelude::spawn_blocking(move || {
-            let loss_config = GRPOLossConfig {
-                epsilon_low: config.clip_epsilon.unwrap_or(0.2),
-                epsilon_high: None,
-                beta: config.kl_coef.unwrap_or(0.0),
-                loss_type: config
-                    .loss_type
-                    .clone()
-                    .unwrap_or_else(|| "grpo".to_string()),
-                importance_sampling_level: "token".to_string(),
-                max_completion_length: config.max_completion_length.map(|n| n as i64),
-                num_items_in_batch: Some(usable_count as f64),
-                gradient_accumulation_steps: config.gradient_accumulation_steps.unwrap_or(1) as i64,
-                lm_head_chunk_size: config.lm_head_chunk_size.map(|n| n as i64),
-                forward_chunk_size: config.forward_chunk_size.map(|n| n as i64),
-                vocab_chunk_size: config.vocab_chunk_size.map(|n| n as i64),
-            };
-
-            let params = {
-                let model = model_arc.read().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire model read lock")
-                })?;
-                model.get_parameters()?
-            };
-
-            let prompt_refs: Vec<&MxArray> = prompt_tokens.iter().collect();
-            let completion_refs: Vec<&MxArray> = filtered_completion_tokens.iter().collect();
-            let logprob_refs: Vec<&MxArray> = filtered_completion_logprobs.iter().collect();
-
-            info!(
-                "Computing loss and gradients ({} prompts, {} completions)",
-                prompt_refs.len(),
-                completion_refs.len()
-            );
-            let grad_start = std::time::Instant::now();
-
-            let (loss_value, gradients) = compute_loss_and_gradients_autograd(
-                &model_type,
-                &params,
-                &prompt_refs,
-                &completion_refs,
-                &logprob_refs,
-                &rewards_clone,
-                group_size_for_training,
+        // Final re-check before the training dispatch: this is the last
+        // await gap where a concurrent `reset()` could have invalidated
+        // this handle between the reward callback and the training step.
+        self.ensure_valid()?;
+        let metrics = self
+            .dispatch_train_step(
+                filtered_rewards.clone(),
+                effective_group_size as i32,
                 loss_config,
-                config.gradient_checkpointing.unwrap_or(true),
-            )?;
+                Some(valid_indices.clone()),
+            )
+            .await?;
 
-            info!(
-                "Loss computed in {:.1}s: {:.4} ({} gradients)",
-                grad_start.elapsed().as_secs_f64(),
-                loss_value,
-                gradients.len()
-            );
+        let training_time_ms = training_start.elapsed().as_secs_f64() * 1000.0;
 
-            if loss_value.is_nan() || loss_value.is_infinite() {
-                warn!("Skipping step due to invalid loss: {}", loss_value);
-                synchronize_and_clear_cache();
+        let (mean_reward, std_reward) = compute_reward_stats(&filtered_rewards);
+        let total_tokens: u32 = all_token_counts.iter().sum();
 
-                let (mean_reward, std_reward) = compute_reward_stats(&rewards_clone);
-                let total_tokens: u32 = filtered_token_counts.iter().sum();
-
-                let state = state_arc.read().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state read lock")
-                })?;
-
-                return Ok::<EngineStepMetrics, Error>(EngineStepMetrics {
-                    step: state.step,
-                    loss: loss_value,
-                    mean_reward,
-                    std_reward,
-                    mean_advantage: 0.0,
-                    std_advantage: 0.0,
-                    total_tokens: total_tokens as i32,
-                    gradients_applied: false,
-                    generation_time_ms,
-                    training_time_ms: training_start.elapsed().as_secs_f64() * 1000.0,
-                    peak_memory_mb: get_peak_memory() / 1e6,
-                    active_memory_mb: get_active_memory() / 1e6,
-                });
-            }
-
-            // Validate gradients using GPU-native check (transfers only ~4 bytes per gradient)
-            info!("Validating {} gradients...", gradients.len());
-            let validate_start = std::time::Instant::now();
-            for (name, grad) in gradients.iter() {
-                grad.eval();
-
-                // GPU-native check: more thorough than sum-based check, catches sparse NaN values
-                if grad.has_nan_or_inf()? {
-                    warn!(
-                        "Gradient '{}' contains NaN/Inf values - SKIPPING STEP",
-                        name
-                    );
-
-                    let mut state = state_arc.write().map_err(|_| {
-                        Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-                    })?;
-                    state.nan_gradient_count += 1;
-                    state.consecutive_nan_count += 1;
-                    let max_nan = config.max_nan_gradients.unwrap_or(100) as u64;
-
-                    if state.nan_gradient_count >= max_nan {
-                        return Err(Error::new(
-                            Status::GenericFailure,
-                            format!(
-                                "Training stopped: exceeded maximum NaN gradient count ({}/{})",
-                                state.nan_gradient_count, max_nan
-                            ),
-                        ));
-                    }
-
-                    let emergency_threshold = config.emergency_save_threshold.unwrap_or(5) as u32;
-                    if state.consecutive_nan_count >= emergency_threshold {
-                        state.needs_emergency_save = true;
-                    }
-
-                    let current_step = state.step;
-                    drop(state);
-
-                    let (mean_reward, std_reward) = compute_reward_stats(&rewards_clone);
-                    let total_tokens: u32 = filtered_token_counts.iter().sum();
-                    synchronize_and_clear_cache();
-
-                    return Ok::<EngineStepMetrics, Error>(EngineStepMetrics {
-                        step: current_step,
-                        loss: loss_value,
-                        mean_reward,
-                        std_reward,
-                        mean_advantage: 0.0,
-                        std_advantage: 0.0,
-                        total_tokens: total_tokens as i32,
-                        gradients_applied: false,
-                        generation_time_ms,
-                        training_time_ms: training_start.elapsed().as_secs_f64() * 1000.0,
-                        peak_memory_mb: get_peak_memory() / 1e6,
-                        active_memory_mb: get_active_memory() / 1e6,
-                    });
-                }
-            }
-            info!(
-                "Gradients validated in {:.1}s",
-                validate_start.elapsed().as_secs_f64()
-            );
-
-            // Clip gradients
-            info!("Clipping and applying gradients...");
-            let apply_start = std::time::Instant::now();
-            let grad_clip_value = config.gradient_clip_value.unwrap_or(1.0);
-            let grad_refs: HashMap<String, &MxArray> =
-                gradients.iter().map(|(k, v)| (k.clone(), v)).collect();
-            let gradients = GradientUtils::clip_grad_value_and_norm(
-                grad_refs,
-                grad_clip_value,
-                config.gradient_clip_norm,
-            )?;
-
-            // Apply gradients
-            let mut state = state_arc.write().map_err(|_| {
+        // Update engine state — gated on generation so a concurrent
+        // reset wins cleanly.
+        {
+            let mut state = self.state.write().map_err(|_| {
                 Error::new(Status::GenericFailure, "Failed to acquire state write lock")
             })?;
+            if state.generation == start_generation {
+                state.step = metrics.step;
+                state.epoch_steps += 1;
+                state.nan_gradient_count = metrics.nan_gradient_count;
 
-            // Accumulate gradients with NaN/Inf checking
-            let acc_result = accumulate_gradients(&mut state, gradients)?;
-
-            // Handle invalid gradients found during accumulation
-            if acc_result.had_invalid_gradients {
-                state.consecutive_nan_count += 1;
-                state.nan_gradient_count += acc_result.invalid_param_count as u64;
-                warn!(
-                    "Found {} parameters with NaN/Inf during accumulation: {:?} (consecutive: {})",
-                    acc_result.invalid_param_count,
-                    acc_result.invalid_param_names,
-                    state.consecutive_nan_count
-                );
-
-                // Check emergency save threshold
-                let emergency_threshold = config.emergency_save_threshold.unwrap_or(5) as u32;
-                if state.consecutive_nan_count >= emergency_threshold && !state.needs_emergency_save
-                {
-                    state.needs_emergency_save = true;
-                    warn!(
-                        "Emergency save triggered: {} consecutive steps with NaN/Inf gradients",
-                        state.consecutive_nan_count
-                    );
+                if !metrics.gradients_applied && metrics.nan_gradient_count > 0 {
+                    state.consecutive_nan_count += 1;
+                    let emergency_threshold =
+                        self.config.emergency_save_threshold.unwrap_or(5) as u32;
+                    if state.consecutive_nan_count >= emergency_threshold
+                        && !state.needs_emergency_save
+                    {
+                        state.needs_emergency_save = true;
+                    }
+                } else {
+                    state.consecutive_nan_count = 0;
                 }
-            } else {
-                // Reset consecutive NaN count on fully successful accumulation
-                state.consecutive_nan_count = 0;
-            }
 
-            state.micro_step += 1;
-
-            let grad_acc_steps = config.gradient_accumulation_steps.unwrap_or(1);
-            let gradients_applied = if state.micro_step >= grad_acc_steps {
-                let grads = state.accumulated_gradients.take().ok_or_else(|| {
-                    Error::new(Status::GenericFailure, "No accumulated gradients")
-                })?;
-
-                let lr = config.learning_rate.unwrap_or(1e-6) / grad_acc_steps as f64;
-                drop(state);
-
-                let mut model_mut = model_arc.write().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire model write lock")
-                })?;
-
-                apply_optimizer_step(
-                    &mut model_mut,
-                    &grads,
-                    &params,
-                    lr,
-                    &optimizer_arc,
-                    grad_acc_steps,
-                )?;
-                drop(model_mut);
-                drop(grads);
-
-                let mut state = state_arc.write().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-                })?;
-                state.accumulated_gradients = None;
-                state.micro_step = 0;
-                state.step += 1;
-                state.epoch_steps += 1;
-                drop(state);
-
-                heavy_cleanup();
-                true
-            } else {
-                state.step += 1;
-                state.epoch_steps += 1;
-                drop(state);
-                heavy_cleanup();
-                false
-            };
-
-            info!(
-                "Gradients applied in {:.1}s (applied={})",
-                apply_start.elapsed().as_secs_f64(),
-                gradients_applied
-            );
-
-            let (mean_reward, std_reward) = compute_reward_stats(&rewards_clone);
-            let total_tokens: u32 = filtered_token_counts.iter().sum();
-
-            {
-                let mut state = state_arc.write().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-                })?;
-                state.epoch_loss_sum += loss_value;
+                state.epoch_loss_sum += metrics.loss;
                 state.epoch_reward_sum += mean_reward;
                 state.epoch_tokens += total_tokens as i64;
             }
+        }
 
-            let rewards_f32: Vec<f32> = rewards_clone.iter().map(|&r| r as f32).collect();
-            let rewards_array = MxArray::from_float32(&rewards_f32, &[rewards_clone.len() as i64])?;
-            let advantages =
-                compute_advantages(&rewards_array, group_size_for_training, "group".to_string())?;
-            let adv_data = advantages.to_float32()?;
-            let mean_advantage =
-                adv_data.iter().map(|&a| a as f64).sum::<f64>() / adv_data.len() as f64;
-            let std_advantage = {
-                let variance = adv_data
-                    .iter()
-                    .map(|&a| {
-                        let diff = a as f64 - mean_advantage;
-                        diff * diff
-                    })
-                    .sum::<f64>()
-                    / adv_data.len() as f64;
-                variance.sqrt()
-            };
-
-            // Note: heavy_cleanup() was already called after gradient application above.
-            // No need for additional cleanup here - the compiled graph cache was already cleared.
-
-            let step = state_arc
-                .read()
-                .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state lock"))?
-                .step;
-
-            Ok(EngineStepMetrics {
-                step,
-                loss: loss_value,
-                mean_reward,
-                std_reward,
-                mean_advantage,
-                std_advantage,
-                total_tokens: total_tokens as i32,
-                gradients_applied,
-                generation_time_ms,
-                training_time_ms: training_start.elapsed().as_secs_f64() * 1000.0,
-                peak_memory_mb: get_peak_memory() / 1e6,
-                active_memory_mb: get_active_memory() / 1e6,
-            })
-        })
-        .await
-        .map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("spawn_blocking error in training: {}", e),
-            )
-        })??;
+        let step_metrics = EngineStepMetrics {
+            step: metrics.step,
+            loss: metrics.loss,
+            mean_reward,
+            std_reward,
+            mean_advantage: metrics.mean_advantage,
+            std_advantage: metrics.std_advantage,
+            total_tokens: metrics.total_tokens,
+            gradients_applied: metrics.gradients_applied,
+            generation_time_ms,
+            training_time_ms,
+            peak_memory_mb: metrics.peak_memory_mb,
+            active_memory_mb: metrics.active_memory_mb,
+        };
 
         Ok(TrainStepResultWithOutputs {
-            metrics,
-            completions: completion_texts,
+            metrics: step_metrics,
+            completions: all_completion_texts,
             rewards,
             outputs_json: outputs_json_for_return,
-            completion_lengths: token_counts.iter().map(|&x| x as i32).collect(),
+            completion_lengths: all_token_counts.iter().map(|&x| x as i32).collect(),
         })
     }
 
@@ -2473,26 +1360,44 @@ impl GRPOTrainingEngine {
         })
     }
 
-    /// Reset the engine for a fresh training run
+    /// Reset the engine for a fresh training run.
+    ///
+    /// This is a TERMINAL operation on this handle. It drops the training
+    /// state (optimizer, step counter) on the model thread so a fresh
+    /// `GRPOTrainingEngine` can be constructed on the same model, and marks
+    /// THIS handle as invalidated. Any subsequent dispatch-requiring method
+    /// on this handle returns an error — callers must construct a new
+    /// engine to continue training.
     #[napi]
     pub fn reset(&self) -> Result<()> {
+        // Short-circuit if already reset — idempotent.
+        {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state lock"))?;
+            if state.invalidated {
+                return Ok(());
+            }
+        }
+
+        // Drop model-thread training state first (optimizer + ts.step).
+        self.dispatch_reset_training_blocking()?;
+
         let mut state = self
             .state
             .write()
             .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state lock"))?;
 
+        // Preserve-and-bump the lifecycle generation so any in-flight
+        // `train_step*()` with a stale `start_generation` skips its
+        // post-await writeback and doesn't resurrect cleared state.
+        let next_generation = state.generation.wrapping_add(1);
         *state = EngineState::default();
+        state.generation = next_generation;
+        state.invalidated = true;
 
-        // Reset optimizer state if present
-        if let Some(ref optimizer) = self.optimizer
-            && let Ok(mut opt) = optimizer.lock()
-        {
-            opt.reset();
-        }
-
-        synchronize_and_clear_cache();
-
-        info!("Training engine reset");
+        info!("Training engine reset (engine handle invalidated)");
         Ok(())
     }
 
@@ -2552,197 +1457,346 @@ impl GRPOTrainingEngine {
 
     /// Save optimizer state (moment tensors + step) to a SafeTensors file.
     ///
-    /// The step counter is stored in the `__metadata__` field.
-    /// Each parameter's first moment (m) and second moment (v) are stored as
-    /// `{param_name}.m` and `{param_name}.v` tensors.
-    ///
-    /// No-op if the engine uses SGD (no optimizer state to save).
+    /// Routes through the model thread so AdamW moments and step counter
+    /// survive across checkpoint/resume. No-op if the engine uses SGD
+    /// (no optimizer to save) or before the first optimizer update has
+    /// populated any moment tensors.
     #[napi]
-    pub fn save_optimizer_state(&self, path: String) -> Result<()> {
-        let opt_arc = match &self.optimizer {
-            Some(opt) => opt,
-            None => return Ok(()), // SGD — no state to save
-        };
-
-        let opt = opt_arc
-            .lock()
-            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire optimizer lock"))?;
-
-        let step = opt.get_step();
-        let keys = opt.get_state_keys();
-
-        if keys.is_empty() {
-            return Ok(()); // No state accumulated yet
-        }
-
-        let mut tensors: HashMap<String, MxArray> = HashMap::new();
-
-        for key in &keys {
-            if let Some(m) = opt.get_first_moment(key.clone()) {
-                tensors.insert(format!("{}.m", key), m);
-            }
-            if let Some(v) = opt.get_second_moment(key.clone()) {
-                tensors.insert(format!("{}.v", key), v);
-            }
-        }
-
-        let metadata = serde_json::json!({
-            "step": step.to_string(),
-            "format": "adamw_optimizer_state",
-        });
-
-        crate::utils::safetensors::save_safetensors(&path, &tensors, Some(metadata))
+    pub async fn save_optimizer_state(&self, path: String) -> Result<()> {
+        self.ensure_valid()?;
+        self.dispatch_save_optimizer_state(path).await
     }
 
     /// Load optimizer state (moment tensors + step) from a SafeTensors file.
     ///
-    /// Restores the step counter from metadata and sets first/second moment
-    /// tensors for each parameter found in the file.
-    ///
-    /// No-op if the engine uses SGD (no optimizer to restore).
+    /// Routes through the model thread. No-op if the engine uses SGD.
     #[napi]
-    pub fn load_optimizer_state(&self, path: String) -> Result<()> {
-        let opt_arc = match &self.optimizer {
-            Some(opt) => opt,
-            None => return Ok(()), // SGD — nothing to restore
-        };
+    pub async fn load_optimizer_state(&self, path: String) -> Result<()> {
+        self.ensure_valid()?;
+        self.dispatch_load_optimizer_state(path).await
+    }
 
-        let mut opt = opt_arc
-            .lock()
-            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire optimizer lock"))?;
-
-        // Load SafeTensors file
-        let st_file = crate::utils::safetensors::SafeTensorsFile::load(&path)?;
-
-        // Restore step from metadata
-        if let Some(metadata) = &st_file.metadata
-            && let Some(step_str) = metadata.get("step").and_then(|v| v.as_str())
-            && let Ok(step) = step_str.parse::<i64>()
-        {
-            opt.set_step(step);
+    /// Returns an error if this engine handle has been invalidated via
+    /// `reset()`. Call at the top of any method that dispatches to the
+    /// model thread.
+    fn ensure_valid(&self) -> Result<()> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state read lock"))?;
+        if state.invalidated {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "GRPOTrainingEngine handle has been invalidated by reset(). \
+                 Construct a new engine to continue training.",
+            ));
         }
-
-        // Load all tensors
-        let tensors = st_file.load_tensors(&path)?;
-
-        // Restore moment tensors: keys are "{param_name}.m" and "{param_name}.v"
-        for (tensor_key, array) in &tensors {
-            if let Some(param_name) = tensor_key.strip_suffix(".m") {
-                opt.set_first_moment(param_name.to_string(), array)?;
-            } else if let Some(param_name) = tensor_key.strip_suffix(".v") {
-                opt.set_second_moment(param_name.to_string(), array)?;
-            }
-        }
-
         Ok(())
+    }
+
+    /// Atomically check that this engine has not been invalidated and
+    /// snapshot the current lifecycle generation. Used by the train_step*()
+    /// methods to gate their post-await writebacks.
+    fn ensure_valid_snapshot_generation(&self) -> Result<u64> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state read lock"))?;
+        if state.invalidated {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "GRPOTrainingEngine handle has been invalidated by reset(). \
+                 Construct a new engine to continue training.",
+            ));
+        }
+        Ok(state.generation)
     }
 }
 
 // =============================================================================
-// Helper types
+// Dispatch helper methods (private, not exposed to NAPI)
 // =============================================================================
 
-/// Internal result from generation phase (not exposed to NAPI)
-/// Keeps MxArray data in Rust memory for efficient training
-struct IntermediateGenerationResult {
-    /// Generated completion texts (for reward function and return value)
-    completion_texts: Vec<String>,
-    /// Formatted prompt texts (for reward function)
-    prompt_texts: Vec<String>,
-    /// Prompt tokens as MxArray (for training)
-    prompt_tokens: Vec<MxArray>,
-    /// Completion tokens as MxArray (for training)
-    completion_tokens: Vec<MxArray>,
-    /// Completion log probabilities as MxArray (for training)
-    completion_logprobs: Vec<MxArray>,
-    /// Token counts for each completion
-    token_counts: Vec<u32>,
-    /// Finish reasons for each completion ("stop", "length", or "repetition")
-    finish_reasons: Vec<String>,
+impl GRPOTrainingEngine {
+    /// Send GenerateForTraining command and await plain data result.
+    async fn dispatch_generate(
+        &self,
+        prompts: &[Vec<ChatMessage>],
+        group_size: usize,
+        gen_config: GenerationConfig,
+        enable_thinking: Option<bool>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Result<GenerationPlainData> {
+        // ChatMessage doesn't implement Clone (contains Uint8Array), so we
+        // reconstruct each message from its serializable fields. Images are
+        // not used during training, so we drop them.
+        let owned_prompts: Vec<Vec<ChatMessage>> = prompts
+            .iter()
+            .map(|prompt_messages| {
+                prompt_messages
+                    .iter()
+                    .map(|m| ChatMessage {
+                        role: m.role.clone(),
+                        content: m.content.clone(),
+                        tool_calls: m.tool_calls.clone(),
+                        tool_call_id: m.tool_call_id.clone(),
+                        reasoning_content: m.reasoning_content.clone(),
+                        images: None, // Images not used in training
+                    })
+                    .collect()
+            })
+            .collect();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match &self.dispatch {
+            TrainingDispatch::Qwen3(sender) => {
+                sender
+                    .send(Qwen3Cmd::GenerateForTraining {
+                        prompts: owned_prompts,
+                        group_size,
+                        gen_config,
+                        enable_thinking,
+                        tools,
+                        reply: tx,
+                    })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Dense(sender) => {
+                sender
+                    .send(Qwen35Cmd::GenerateForTraining {
+                        prompts: owned_prompts,
+                        group_size,
+                        gen_config,
+                        enable_thinking,
+                        tools,
+                        reply: tx,
+                    })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Moe(sender) => {
+                sender
+                    .send(Qwen35MoeCmd::GenerateForTraining {
+                        prompts: owned_prompts,
+                        group_size,
+                        gen_config,
+                        enable_thinking,
+                        tools,
+                        reply: tx,
+                    })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+        }
+        rx.await
+            .map_err(|_| Error::from_reason("Model thread exited"))?
+    }
+
+    /// Send TrainStepGRPO command and await metrics.
+    async fn dispatch_train_step(
+        &self,
+        rewards: Vec<f64>,
+        group_size: i32,
+        loss_config: GRPOLossConfig,
+        valid_indices: Option<Vec<usize>>,
+    ) -> Result<TrainStepPlainMetrics> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match &self.dispatch {
+            TrainingDispatch::Qwen3(sender) => {
+                sender
+                    .send(Qwen3Cmd::TrainStepGRPO {
+                        rewards,
+                        group_size,
+                        loss_config,
+                        valid_indices,
+                        reply: tx,
+                    })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Dense(sender) => {
+                sender
+                    .send(Qwen35Cmd::TrainStepGRPO {
+                        rewards,
+                        group_size,
+                        loss_config,
+                        valid_indices,
+                        reply: tx,
+                    })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Moe(sender) => {
+                sender
+                    .send(Qwen35MoeCmd::TrainStepGRPO {
+                        rewards,
+                        group_size,
+                        loss_config,
+                        valid_indices,
+                        reply: tx,
+                    })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+        }
+        rx.await
+            .map_err(|_| Error::from_reason("Model thread exited"))?
+    }
+
+    /// Send BumpSkippedStep command and await the new step.
+    ///
+    /// Used by `train_step_auto`'s early-return paths (all-filtered and
+    /// no-valid-completions). This both drops stale MxArrays on the model
+    /// thread AND increments the model-thread-owned `ts.step`, returning
+    /// it so the engine's read-through cache can track it.
+    ///
+    /// `ts.step` is the single source of truth for the training step; the
+    /// engine's `EngineState.step` is only ever updated FROM the model
+    /// thread (success path uses `metrics.step`, skip path uses this).
+    async fn dispatch_bump_skipped_step(&self) -> Result<i64> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match &self.dispatch {
+            TrainingDispatch::Qwen3(sender) => {
+                sender
+                    .send(Qwen3Cmd::BumpSkippedStep { reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Dense(sender) => {
+                sender
+                    .send(Qwen35Cmd::BumpSkippedStep { reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Moe(sender) => {
+                sender
+                    .send(Qwen35MoeCmd::BumpSkippedStep { reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+        }
+        rx.await
+            .map_err(|_| Error::from_reason("Model thread exited"))?
+    }
+
+    /// Send ResetTraining command and block until complete.
+    ///
+    /// Drops the training state (optimizer + step counter) on the model
+    /// thread so `InitTraining` can be called again. Blocking because it's
+    /// invoked from the sync `reset()` NAPI method.
+    fn dispatch_reset_training_blocking(&self) -> Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match &self.dispatch {
+            TrainingDispatch::Qwen3(sender) => {
+                sender
+                    .send(Qwen3Cmd::ResetTraining { reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Dense(sender) => {
+                sender
+                    .send(Qwen35Cmd::ResetTraining { reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Moe(sender) => {
+                sender
+                    .send(Qwen35MoeCmd::ResetTraining { reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+        }
+        rx.blocking_recv()
+            .map_err(|_| Error::from_reason("Model thread exited"))?
+    }
+
+    async fn dispatch_save_optimizer_state(&self, path: String) -> Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match &self.dispatch {
+            TrainingDispatch::Qwen3(sender) => {
+                sender
+                    .send(Qwen3Cmd::SaveOptimizerState { path, reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Dense(sender) => {
+                sender
+                    .send(Qwen35Cmd::SaveOptimizerState { path, reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Moe(sender) => {
+                sender
+                    .send(Qwen35MoeCmd::SaveOptimizerState { path, reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+        }
+        rx.await
+            .map_err(|_| Error::from_reason("Model thread exited"))?
+    }
+
+    async fn dispatch_load_optimizer_state(&self, path: String) -> Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match &self.dispatch {
+            TrainingDispatch::Qwen3(sender) => {
+                sender
+                    .send(Qwen3Cmd::LoadOptimizerState { path, reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Dense(sender) => {
+                sender
+                    .send(Qwen35Cmd::LoadOptimizerState { path, reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Moe(sender) => {
+                sender
+                    .send(Qwen35MoeCmd::LoadOptimizerState { path, reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+        }
+        rx.await
+            .map_err(|_| Error::from_reason("Model thread exited"))?
+    }
+
+    /// Build generation config from engine config.
+    fn build_gen_config(&self) -> GenerationConfig {
+        GenerationConfig {
+            max_new_tokens: self.config.max_completion_length,
+            temperature: self.config.temperature,
+            top_p: self.config.top_p,
+            top_k: self.config.top_k,
+            min_p: None,
+            repetition_penalty: self.config.repetition_penalty,
+            repetition_context_size: Some(256),
+            presence_penalty: self.config.presence_penalty,
+            presence_context_size: None,
+            frequency_penalty: self.config.frequency_penalty,
+            frequency_context_size: None,
+            max_consecutive_tokens: Some(16),
+            max_ngram_repeats: Some(8),
+            ngram_size: Some(3),
+            eos_token_id: Some(self.model_type.eos_token_id()),
+            return_logprobs: Some(true),
+            prefill_step_size: None,
+            kv_cache_bits: None,
+            kv_cache_group_size: None,
+            num_draft_tokens: None,
+            report_performance: None,
+        }
+    }
+
+    /// Build loss config from engine config.
+    fn build_loss_config(&self, num_prompts: usize, group_size: usize) -> GRPOLossConfig {
+        GRPOLossConfig {
+            epsilon_low: self.config.clip_epsilon.unwrap_or(0.2),
+            epsilon_high: None,
+            beta: self.config.kl_coef.unwrap_or(0.0),
+            loss_type: self
+                .config
+                .loss_type
+                .clone()
+                .unwrap_or_else(|| "grpo".to_string()),
+            importance_sampling_level: "token".to_string(),
+            max_completion_length: self.config.max_completion_length.map(|n| n as i64),
+            num_items_in_batch: Some((num_prompts * group_size) as f64),
+            gradient_accumulation_steps: self.config.gradient_accumulation_steps.unwrap_or(1)
+                as i64,
+            lm_head_chunk_size: self.config.lm_head_chunk_size.map(|n| n as i64),
+            forward_chunk_size: self.config.forward_chunk_size.map(|n| n as i64),
+            vocab_chunk_size: self.config.vocab_chunk_size.map(|n| n as i64),
+        }
+    }
 }
 
 // =============================================================================
 // Helper functions
 // =============================================================================
-
-/// Result of gradient accumulation
-struct AccumulationResult {
-    /// Whether any gradients contained NaN/Inf values
-    had_invalid_gradients: bool,
-    /// Number of parameters that had invalid gradients
-    invalid_param_count: usize,
-    /// Names of parameters with invalid gradients (for logging)
-    invalid_param_names: Vec<String>,
-}
-
-/// Accumulate gradients into state with finite value checking.
-///
-/// Gradients are checked for NaN/Inf values before accumulating. If a gradient
-/// contains non-finite values, it is skipped to prevent corrupting the accumulated
-/// gradients. The function returns information about any skipped gradients.
-///
-/// We eval() each accumulated gradient to materialize it and allow MLX to free
-/// the computation graph.
-fn accumulate_gradients(
-    state: &mut EngineState,
-    new_grads: HashMap<String, MxArray>,
-) -> Result<AccumulationResult> {
-    let mut invalid_param_names = Vec::new();
-
-    match &mut state.accumulated_gradients {
-        Some(acc) => {
-            for (name, grad) in new_grads {
-                // Check for non-finite values before accumulating
-                // This uses GPU-native isfinite() which is efficient
-                grad.eval();
-                if grad.has_nan_or_inf()? {
-                    warn!(
-                        "Skipping gradient accumulation for '{}' due to NaN/Inf values",
-                        name
-                    );
-                    invalid_param_names.push(name);
-                    // Skip this gradient, keep existing accumulated value
-                    continue;
-                }
-
-                if let Some(existing) = acc.get_mut(&name) {
-                    let summed = existing.add(&grad)?;
-                    // CRITICAL: eval() to materialize the result, allowing MLX to free
-                    // the computation graph from the add operation
-                    summed.eval();
-                    *existing = summed;
-                } else {
-                    // First accumulation for this parameter - just store
-                    acc.insert(name, grad);
-                }
-            }
-        }
-        None => {
-            // First step - filter out invalid gradients and eval valid ones
-            let mut evaluated_grads = HashMap::with_capacity(new_grads.len());
-            for (name, grad) in new_grads {
-                grad.eval();
-                if grad.has_nan_or_inf()? {
-                    warn!(
-                        "Skipping initial gradient for '{}' due to NaN/Inf values",
-                        name
-                    );
-                    invalid_param_names.push(name);
-                    continue;
-                }
-                evaluated_grads.insert(name, grad);
-            }
-            state.accumulated_gradients = Some(evaluated_grads);
-        }
-    }
-
-    let invalid_param_count = invalid_param_names.len();
-    Ok(AccumulationResult {
-        had_invalid_gradients: invalid_param_count > 0,
-        invalid_param_count,
-        invalid_param_names,
-    })
-}
 
 /// Compute reward statistics
 fn compute_reward_stats(rewards: &[f64]) -> (f64, f64) {
@@ -2755,6 +1809,73 @@ fn compute_reward_stats(rewards: &[f64]) -> (f64, f64) {
     let std = variance.sqrt();
 
     (mean, std)
+}
+
+/// Compute per-prompt balanced valid indices for GRPO degenerate-output filtering.
+///
+/// The cache layout is prompt-major: completion index `c` belongs to prompt
+/// `c / group_size`. After filtering "length"-degenerate completions per-prompt,
+/// we take the FIRST `min_survivor_count` survivors from each prompt so that the
+/// result is rectangular (num_prompts * effective_group_size). This keeps the
+/// divisibility invariant required by advantages.rs (`rewards.len() % group_size == 0`)
+/// and autograd.rs (`num_prompts * group_size` completions).
+///
+/// # Arguments
+/// * `all_finish_reasons` - finish reason per completion (length == num_prompts * group_size)
+/// * `all_token_counts`   - token count per completion (length == num_prompts * group_size)
+/// * `num_prompts`        - number of prompts in this batch
+/// * `group_size`         - original completions-per-prompt before filtering
+/// * `max_tokens_threshold` - drop a completion if finish_reason == "length" and tokens >= this
+///
+/// # Returns
+/// `(balanced_valid_indices, effective_group_size, per_prompt_survivor_counts)`
+/// * `balanced_valid_indices` - rectangular, prompt-major list of kept indices
+/// * `effective_group_size` - min survivors across all prompts (0 if any prompt lost all)
+/// * `per_prompt_survivor_counts` - raw per-prompt survivor counts, pre-balancing (for logging)
+pub(crate) fn compute_balanced_valid_indices(
+    all_finish_reasons: &[String],
+    all_token_counts: &[u32],
+    num_prompts: usize,
+    group_size: usize,
+    max_tokens_threshold: u32,
+) -> (Vec<usize>, usize, Vec<usize>) {
+    if num_prompts == 0 || group_size == 0 {
+        return (Vec::new(), 0, Vec::new());
+    }
+
+    // Collect survivors per prompt, preserving prompt-major order.
+    let mut per_prompt: Vec<Vec<usize>> = (0..num_prompts).map(|_| Vec::new()).collect();
+    for (idx, reason) in all_finish_reasons.iter().enumerate() {
+        let token_count = all_token_counts.get(idx).copied().unwrap_or(0);
+        let is_degenerate = reason == "length" && token_count >= max_tokens_threshold;
+        if is_degenerate {
+            continue;
+        }
+        let prompt_idx = idx / group_size;
+        if prompt_idx < num_prompts {
+            per_prompt[prompt_idx].push(idx);
+        }
+    }
+
+    let per_prompt_counts: Vec<usize> = per_prompt.iter().map(|v| v.len()).collect();
+    let effective_group_size = per_prompt_counts.iter().copied().min().unwrap_or(0);
+
+    // Rebuild valid_indices in prompt-major order, taking the first
+    // `effective_group_size` survivors from each prompt. By construction this
+    // guarantees `valid_indices.len() == num_prompts * effective_group_size`.
+    let mut balanced_valid_indices =
+        Vec::with_capacity(num_prompts.saturating_mul(effective_group_size));
+    for prompt_survivors in &per_prompt {
+        for &idx in prompt_survivors.iter().take(effective_group_size) {
+            balanced_valid_indices.push(idx);
+        }
+    }
+
+    (
+        balanced_valid_indices,
+        effective_group_size,
+        per_prompt_counts,
+    )
 }
 
 #[cfg(test)]
@@ -2778,136 +1899,131 @@ mod tests {
         assert_eq!(std, 0.0);
     }
 
-    #[test]
-    fn test_accumulate_gradients_valid() {
-        let mut state = EngineState::default();
-        let mut grads = HashMap::new();
-        grads.insert(
-            "param1".to_string(),
-            MxArray::from_float32(&[1.0, 2.0, 3.0], &[3]).unwrap(),
-        );
-        grads.insert(
-            "param2".to_string(),
-            MxArray::from_float32(&[4.0, 5.0], &[2]).unwrap(),
-        );
-
-        let result = accumulate_gradients(&mut state, grads).unwrap();
-        assert!(!result.had_invalid_gradients);
-        assert_eq!(result.invalid_param_count, 0);
-        assert!(result.invalid_param_names.is_empty());
-        assert!(state.accumulated_gradients.is_some());
-        assert_eq!(state.accumulated_gradients.as_ref().unwrap().len(), 2);
+    fn mk_reasons(len: usize, degenerate_idxs: &[usize]) -> Vec<String> {
+        (0..len)
+            .map(|i| {
+                if degenerate_idxs.contains(&i) {
+                    "length".to_string()
+                } else {
+                    "stop".to_string()
+                }
+            })
+            .collect()
     }
 
     #[test]
-    fn test_accumulate_gradients_with_nan() {
-        let mut state = EngineState::default();
-        let mut grads = HashMap::new();
-        grads.insert(
-            "valid".to_string(),
-            MxArray::from_float32(&[1.0, 2.0, 3.0], &[3]).unwrap(),
-        );
-        grads.insert(
-            "invalid_nan".to_string(),
-            MxArray::from_float32(&[1.0, f32::NAN, 3.0], &[3]).unwrap(),
-        );
-
-        let result = accumulate_gradients(&mut state, grads).unwrap();
-        assert!(result.had_invalid_gradients);
-        assert_eq!(result.invalid_param_count, 1);
-        assert!(
-            result
-                .invalid_param_names
-                .contains(&"invalid_nan".to_string())
-        );
-
-        // Valid gradient should still be accumulated
-        assert!(state.accumulated_gradients.is_some());
-        let acc = state.accumulated_gradients.as_ref().unwrap();
-        assert_eq!(acc.len(), 1);
-        assert!(acc.contains_key("valid"));
+    fn test_balanced_filter_no_filtering() {
+        // 3 prompts * 4 completions = 12, none degenerate
+        let reasons = mk_reasons(12, &[]);
+        let tokens = vec![10u32; 12];
+        let (valid, eff, counts) = compute_balanced_valid_indices(&reasons, &tokens, 3, 4, 100);
+        assert_eq!(eff, 4);
+        assert_eq!(valid.len(), 3 * 4);
+        assert_eq!(valid, (0..12).collect::<Vec<_>>());
+        assert_eq!(counts, vec![4, 4, 4]);
     }
 
     #[test]
-    fn test_accumulate_gradients_with_inf() {
-        let mut state = EngineState::default();
-        let mut grads = HashMap::new();
-        grads.insert(
-            "valid".to_string(),
-            MxArray::from_float32(&[1.0, 2.0], &[2]).unwrap(),
-        );
-        grads.insert(
-            "invalid_inf".to_string(),
-            MxArray::from_float32(&[f32::INFINITY, 2.0], &[2]).unwrap(),
-        );
-        grads.insert(
-            "invalid_neg_inf".to_string(),
-            MxArray::from_float32(&[1.0, f32::NEG_INFINITY], &[2]).unwrap(),
-        );
-
-        let result = accumulate_gradients(&mut state, grads).unwrap();
-        assert!(result.had_invalid_gradients);
-        assert_eq!(result.invalid_param_count, 2);
-
-        // Valid gradient should still be accumulated
-        assert!(state.accumulated_gradients.is_some());
-        let acc = state.accumulated_gradients.as_ref().unwrap();
-        assert_eq!(acc.len(), 1);
-        assert!(acc.contains_key("valid"));
+    fn test_balanced_filter_uniform_drop() {
+        // 3 prompts * 4 = 12, drop 1 from each prompt: indices 0, 4, 8
+        // All those have finish_reason=length AND token_count >= threshold
+        let reasons = mk_reasons(12, &[0, 4, 8]);
+        let mut tokens = vec![10u32; 12];
+        tokens[0] = 200;
+        tokens[4] = 200;
+        tokens[8] = 200;
+        let (valid, eff, counts) = compute_balanced_valid_indices(&reasons, &tokens, 3, 4, 100);
+        assert_eq!(eff, 3);
+        assert_eq!(valid.len(), 3 * 3);
+        // Prompt 0: survivors [1,2,3], prompt 1: [5,6,7], prompt 2: [9,10,11]
+        assert_eq!(valid, vec![1, 2, 3, 5, 6, 7, 9, 10, 11]);
+        assert_eq!(counts, vec![3, 3, 3]);
     }
 
     #[test]
-    fn test_accumulate_gradients_multiple_steps() {
-        let mut state = EngineState::default();
-
-        // First step: valid gradients
-        let mut grads1 = HashMap::new();
-        grads1.insert(
-            "param".to_string(),
-            MxArray::from_float32(&[1.0, 1.0, 1.0], &[3]).unwrap(),
-        );
-        let result1 = accumulate_gradients(&mut state, grads1).unwrap();
-        assert!(!result1.had_invalid_gradients);
-
-        // Second step: also valid
-        let mut grads2 = HashMap::new();
-        grads2.insert(
-            "param".to_string(),
-            MxArray::from_float32(&[2.0, 2.0, 2.0], &[3]).unwrap(),
-        );
-        let result2 = accumulate_gradients(&mut state, grads2).unwrap();
-        assert!(!result2.had_invalid_gradients);
-
-        // Check accumulated values (should be sum: [3, 3, 3])
-        let acc = state.accumulated_gradients.as_ref().unwrap();
-        let values = acc.get("param").unwrap().to_float32().unwrap();
-        assert_eq!(values.as_ref(), &[3.0f32, 3.0, 3.0]);
+    fn test_balanced_filter_uneven_drop() {
+        // 3 prompts * 4 = 12
+        // Prompt 0 loses 1 (idx 0), prompt 1 loses 3 (idxs 4,5,6), prompt 2 loses 0
+        let reasons = mk_reasons(12, &[0, 4, 5, 6]);
+        let mut tokens = vec![10u32; 12];
+        for &i in &[0usize, 4, 5, 6] {
+            tokens[i] = 200;
+        }
+        let (valid, eff, counts) = compute_balanced_valid_indices(&reasons, &tokens, 3, 4, 100);
+        // min survivors = 1 (prompt 1 kept only idx 7)
+        assert_eq!(eff, 1);
+        assert_eq!(counts, vec![3, 1, 4]);
+        assert_eq!(valid.len(), 3);
+        // prompt 0 first survivor = 1, prompt 1 = 7, prompt 2 = 8
+        assert_eq!(valid, vec![1, 7, 8]);
     }
 
     #[test]
-    fn test_accumulate_gradients_skips_nan_preserves_existing() {
-        let mut state = EngineState::default();
+    fn test_balanced_filter_all_from_one_prompt() {
+        // 3 prompts * 4 = 12; prompt 1 loses ALL 4 completions (idxs 4-7)
+        let reasons = mk_reasons(12, &[4, 5, 6, 7]);
+        let mut tokens = vec![10u32; 12];
+        for t in tokens.iter_mut().skip(4).take(4) {
+            *t = 200;
+        }
+        let (valid, eff, counts) = compute_balanced_valid_indices(&reasons, &tokens, 3, 4, 100);
+        assert_eq!(eff, 0);
+        assert_eq!(valid.len(), 0);
+        assert_eq!(counts, vec![4, 0, 4]);
+    }
 
-        // First step: valid gradient
-        let mut grads1 = HashMap::new();
-        grads1.insert(
-            "param".to_string(),
-            MxArray::from_float32(&[1.0, 1.0, 1.0], &[3]).unwrap(),
-        );
-        let _ = accumulate_gradients(&mut state, grads1).unwrap();
+    #[test]
+    fn test_balanced_filter_asymmetric_whole_loss() {
+        // 2 prompts * 3 = 6; prompt 0 keeps all, prompt 1 loses all
+        let reasons = mk_reasons(6, &[3, 4, 5]);
+        let mut tokens = vec![10u32; 6];
+        for t in tokens.iter_mut().skip(3).take(3) {
+            *t = 200;
+        }
+        let (valid, eff, counts) = compute_balanced_valid_indices(&reasons, &tokens, 2, 3, 100);
+        assert_eq!(eff, 0);
+        assert_eq!(valid.len(), 0);
+        assert_eq!(counts, vec![3, 0]);
+    }
 
-        // Second step: NaN gradient (should be skipped, preserving [1, 1, 1])
-        let mut grads2 = HashMap::new();
-        grads2.insert(
-            "param".to_string(),
-            MxArray::from_float32(&[f32::NAN, 2.0, 2.0], &[3]).unwrap(),
-        );
-        let result2 = accumulate_gradients(&mut state, grads2).unwrap();
-        assert!(result2.had_invalid_gradients);
+    #[test]
+    fn test_balanced_filter_rectangular_invariant() {
+        // Random-ish but deterministic: 4 prompts * 5 = 20
+        // prompt 0 loses 0, prompt 1 loses 2 (idxs 6, 8), prompt 2 loses 1 (idx 11), prompt 3 loses 4 (15,16,17,18)
+        let degenerate = vec![6usize, 8, 11, 15, 16, 17, 18];
+        let reasons = mk_reasons(20, &degenerate);
+        let mut tokens = vec![10u32; 20];
+        for &i in &degenerate {
+            tokens[i] = 200;
+        }
+        let (valid, eff, counts) = compute_balanced_valid_indices(&reasons, &tokens, 4, 5, 100);
+        // Survivor counts: [5, 3, 4, 1] → min = 1
+        assert_eq!(counts, vec![5, 3, 4, 1]);
+        assert_eq!(eff, 1);
+        // Rectangular: 4 * 1 = 4
+        assert_eq!(valid.len(), 4);
+        // First survivor of each prompt: 0 (p0), 5 (p1 first non-degen), 10 (p2 first non-degen), 19 (p3 only survivor)
+        assert_eq!(valid, vec![0, 5, 10, 19]);
+        // Verify divisibility
+        assert_eq!(valid.len() % 4, 0);
+    }
 
-        // Accumulated values should still be [1, 1, 1] (NaN gradient was skipped)
-        let acc = state.accumulated_gradients.as_ref().unwrap();
-        let values = acc.get("param").unwrap().to_float32().unwrap();
-        assert_eq!(values.as_ref(), &[1.0f32, 1.0, 1.0]);
+    #[test]
+    fn test_balanced_filter_length_but_under_threshold() {
+        // finish_reason == "length" but token_count < threshold → NOT degenerate
+        let reasons = mk_reasons(6, &[0, 1, 2, 3, 4, 5]);
+        let tokens = vec![50u32; 6]; // below threshold 100
+        let (valid, eff, counts) = compute_balanced_valid_indices(&reasons, &tokens, 2, 3, 100);
+        assert_eq!(eff, 3);
+        assert_eq!(valid.len(), 6);
+        assert_eq!(counts, vec![3, 3]);
+    }
+
+    #[test]
+    fn test_balanced_filter_empty_inputs() {
+        let (valid, eff, counts) = compute_balanced_valid_indices(&[], &[], 0, 4, 100);
+        assert_eq!(eff, 0);
+        assert!(valid.is_empty());
+        assert!(counts.is_empty());
     }
 }

@@ -4,8 +4,6 @@
 //! across both model variants: config extraction, penalty application,
 //! performance metrics, result finalization, and cache management.
 
-use std::sync::{Arc, RwLock};
-
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
@@ -331,8 +329,11 @@ pub(crate) fn finalize_chat_result(
     })
 }
 
-/// Save or clear cache state after generation.
-pub(crate) fn save_cache_state(
+/// Direct-ownership version of `save_cache_state` for dedicated-thread models.
+///
+/// Takes `&mut` refs instead of `Arc<RwLock<>>`. Used by Qwen3.5 Dense on
+/// its dedicated model thread.
+pub(crate) fn save_cache_state_direct(
     reuse_cache: bool,
     has_images: bool,
     generated_tokens: &[u32],
@@ -340,92 +341,74 @@ pub(crate) fn save_cache_state(
     tokens: &[u32],
     expanded_tokens: Option<&[u32]>,
     image_cache_key: u64,
-    cached_token_history_arc: &Arc<RwLock<Vec<u32>>>,
-    cached_image_key_arc: &Arc<RwLock<Option<u64>>>,
-    cached_rope_deltas_arc: &Arc<RwLock<Option<i32>>>,
-    caches_arc: &Arc<RwLock<Option<Vec<Qwen3_5LayerCache>>>>,
-) -> Result<()> {
+    cached_token_history: &mut Vec<u32>,
+    cached_image_key: &mut Option<u64>,
+    cached_rope_deltas: &mut Option<i32>,
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+) {
     if reuse_cache {
         let mut full_history = if has_images {
             expanded_tokens.unwrap_or(tokens).to_vec()
         } else {
             tokens.to_vec()
         };
-        // Only include tokens that were actually forwarded through the model.
-        // When stopped at max_tokens ("length"), the last token was never forwarded
-        // (the pipelined loop skips forward on the final step).
         let history_tokens = if finish_reason == "length" && !generated_tokens.is_empty() {
             &generated_tokens[..generated_tokens.len() - 1]
         } else {
             generated_tokens
         };
         full_history.extend_from_slice(history_tokens);
-        if let Ok(mut th) = cached_token_history_arc.write() {
-            *th = full_history;
-        }
-        if let Ok(mut ik) = cached_image_key_arc.write() {
-            *ik = if has_images {
-                Some(image_cache_key)
-            } else {
-                None
-            };
-        }
+        *cached_token_history = full_history;
+        *cached_image_key = if has_images {
+            Some(image_cache_key)
+        } else {
+            None
+        };
     } else {
-        // reuseCache: false — clear all cache state to free GPU memory
-        if let Ok(mut cg) = caches_arc.write() {
-            *cg = None;
-        }
-        if let Ok(mut th) = cached_token_history_arc.write() {
-            th.clear();
-        }
-        if let Ok(mut ik) = cached_image_key_arc.write() {
-            *ik = None;
-        }
-        if let Ok(mut rd) = cached_rope_deltas_arc.write() {
-            *rd = None;
-        }
+        *caches = None;
+        cached_token_history.clear();
+        *cached_image_key = None;
+        *cached_rope_deltas = None;
     }
-    Ok(())
 }
 
-/// Verify cache prefix match for reuse. Returns the number of cached tokens
-/// that match the current input (0 if no match).
-pub(crate) fn verify_cache_prefix(
+/// Direct-ownership version of `verify_cache_prefix` for dedicated-thread models.
+///
+/// Takes direct refs instead of `Arc<RwLock<>>`. Used by Qwen3.5 Dense on
+/// its dedicated model thread.
+pub(crate) fn verify_cache_prefix_direct(
     reuse_cache: bool,
     has_images: bool,
     tokens: &[u32],
     tokens_for_matching: &[u32],
     image_cache_key: u64,
     cached_token_history: &[u32],
-    cached_image_key: &Arc<RwLock<Option<u64>>>,
+    cached_image_key: &Option<u64>,
     has_caches: bool,
-) -> Result<usize> {
+) -> usize {
     if !reuse_cache {
-        return Ok(0);
+        return 0;
     }
     let cached = cached_token_history;
     if has_images {
-        let cached_img_key_guard = cached_image_key
-            .read()
-            .map_err(|_| Error::from_reason("Failed to read cached image key"))?;
-        if let Some(cached_key) = *cached_img_key_guard
+        if let Some(cached_key) = *cached_image_key
             && cached_key == image_cache_key
             && !cached.is_empty()
             && tokens_for_matching.len() >= cached.len()
             && tokens_for_matching[..cached.len()] == cached[..]
             && has_caches
         {
-            return Ok(cached.len());
+            return cached.len();
         }
-        Ok(0)
+        0
     } else if !cached.is_empty()
         && tokens.len() >= cached.len()
         && tokens[..cached.len()] == cached[..]
         && has_caches
     {
-        Ok(cached.len())
+        cached.len()
     } else {
-        Ok(0)
+        0
     }
 }
 
