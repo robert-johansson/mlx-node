@@ -192,6 +192,10 @@ Cargo.lock
 *.node
 /docs/superpowers/plans/*.md
 
+# NAPI-RS ESM build artifacts (CJS versions are committed)
+packages/core/index.js
+packages/core/index.d.ts
+
 # TypeScript compiled output in packages (not NAPI-RS generated files)
 packages/*/src/**/*.js
 src/**/*.js
