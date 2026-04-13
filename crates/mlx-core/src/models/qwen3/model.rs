@@ -249,6 +249,15 @@ pub(crate) enum Qwen3Cmd {
     ResetCache {
         reply: ResponseTx<()>,
     },
+    Forward {
+        input_ids: MxArray,
+        reply: ResponseTx<MxArray>,
+    },
+    ForwardWithCache {
+        input_ids: MxArray,
+        use_cache: bool,
+        reply: ResponseTx<MxArray>,
+    },
     ForwardPaged {
         input_ids: MxArray,
         slot_mapping: MxArray,
@@ -443,6 +452,16 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
         }
         Qwen3Cmd::ResetCache { reply } => {
             let _ = reply.send(inner.reset_cache_sync());
+        }
+        Qwen3Cmd::Forward { input_ids, reply } => {
+            let _ = reply.send(inner.forward_sync(&input_ids));
+        }
+        Qwen3Cmd::ForwardWithCache {
+            input_ids,
+            use_cache,
+            reply,
+        } => {
+            let _ = reply.send(inner.forward_with_cache_sync(&input_ids, use_cache));
         }
         Qwen3Cmd::ForwardPaged {
             input_ids,
@@ -716,6 +735,117 @@ impl Qwen3Inner {
         self.cached_token_history.clear();
         self.cached_image_key = None;
         Ok(())
+    }
+
+    /// Uncached forward pass. Creates temporary caches, runs through all
+    /// transformer layers, and discards the caches. Does NOT touch the
+    /// persistent kv_caches.
+    fn forward_sync(&self, input_ids: &MxArray) -> Result<MxArray> {
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            let num_layers = self.layers.len();
+            let mut temp_caches: Vec<KVCache> = (0..num_layers).map(|_| KVCache::new()).collect();
+
+            let mut hidden_states = self.embedding.forward(input_ids)?;
+            for (layer, cache) in self.layers.iter().zip(temp_caches.iter_mut()) {
+                hidden_states = layer.forward(&hidden_states, None, Some(cache))?;
+            }
+            hidden_states = self.final_norm.forward(&hidden_states)?;
+
+            if self.config.tie_word_embeddings {
+                let embedding_weight = self.embedding.get_weight();
+                hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
+            } else {
+                self.lm_head.forward(&hidden_states)?
+            }
+        };
+        logits.eval();
+        Ok(logits)
+    }
+
+    /// Cached forward pass using the persistent kv_caches.
+    /// When `use_cache` is true, uses and updates the persistent caches.
+    /// When `use_cache` is false, behaves like `forward_sync` (temporary caches).
+    ///
+    /// Mirrors the chat pipeline's split prefill/decode approach:
+    /// - Multi-token (prefill): processes tokens [0:N-1] through body only
+    ///   (no lm_head), then runs last token through full forward for logits.
+    /// - Single-token (decode step): runs through full forward directly.
+    ///
+    /// Returns logits shape [1, 1, vocab_size] (last position only).
+    /// Input must be pre-evaluated (done by the NAPI method). Logits are
+    /// evaluated on the model thread before returning so the caller can
+    /// use them from any thread.
+    fn forward_with_cache_sync(&mut self, input_ids: &MxArray, use_cache: bool) -> Result<MxArray> {
+        if !use_cache {
+            return self.forward_sync(input_ids);
+        }
+        let caches = self.kv_caches.as_mut().ok_or_else(|| {
+            napi::Error::from_reason(
+                "KV caches not initialized. Call initKvCaches() before forwardWithCache().",
+            )
+        })?;
+
+        let seq_len = input_ids.shape_at(1)?;
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+
+            if seq_len > 1 {
+                // Prefill path: process all-but-last token through body only (no lm_head),
+                // then run last token through full forward to get logits.
+                let prefill_ids = input_ids.slice_axis(1, 0, seq_len - 1)?;
+                let mut hidden_states = self.embedding.forward(&prefill_ids)?;
+                for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+                    hidden_states = layer.forward(&hidden_states, None, Some(cache))?;
+                }
+                // Don't need hidden_states from prefill — just populated caches.
+                // Eval caches so they're materialized before the decode step.
+                for cache in caches.iter() {
+                    if let Some(k) = cache.keys_ref() {
+                        k.eval();
+                    }
+                    if let Some(v) = cache.values_ref() {
+                        v.eval();
+                    }
+                }
+
+                // Last token -> logits
+                let last_token = input_ids.slice_axis(1, seq_len - 1, seq_len)?;
+                let mut hidden_states = self.embedding.forward(&last_token)?;
+                for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+                    hidden_states = layer.forward(&hidden_states, None, Some(cache))?;
+                }
+                hidden_states = self.final_norm.forward(&hidden_states)?;
+                if self.config.tie_word_embeddings {
+                    let embedding_weight = self.embedding.get_weight();
+                    hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
+                } else {
+                    self.lm_head.forward(&hidden_states)?
+                }
+            } else {
+                // Decode step: single token, run full forward directly.
+                let mut hidden_states = self.embedding.forward(input_ids)?;
+                for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+                    hidden_states = layer.forward(&hidden_states, None, Some(cache))?;
+                }
+                hidden_states = self.final_norm.forward(&hidden_states)?;
+                if self.config.tie_word_embeddings {
+                    let embedding_weight = self.embedding.get_weight();
+                    hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
+                } else {
+                    self.lm_head.forward(&hidden_states)?
+                }
+            }
+        };
+
+        // Evaluate logits on the model thread. This implicitly materializes
+        // cache mutations through the lazy dependency graph, and ensures the
+        // returned array is concrete (usable from any thread).
+        logits.eval();
+        Ok(logits)
     }
 
     fn paged_cache_stats_sync(&self) -> Option<PagedCacheStats> {
@@ -5056,6 +5186,55 @@ impl Qwen3Model {
     #[napi]
     pub fn reset_kv_caches(&self) -> Result<()> {
         send_and_block(&self.thread, |reply| Qwen3Cmd::ResetKvCaches { reply })
+    }
+
+    /// Uncached forward pass. Returns logits for all positions.
+    ///
+    /// Creates temporary KV caches internally and discards them after the call.
+    /// Does NOT touch the persistent KV caches used by `forwardWithCache`.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs, shape: `[1, seq_len]`
+    ///
+    /// # Returns
+    /// * Logits, shape: `[1, seq_len, vocab_size]`
+    #[napi]
+    pub fn forward(&self, input_ids: &MxArray) -> Result<MxArray> {
+        // Materialize input on the NAPI thread before sending to the model
+        // thread. MLX default streams are thread-local, so lazy arrays from
+        // the caller's thread cannot be evaluated on the model thread.
+        input_ids.eval();
+        send_and_block(&self.thread, |reply| Qwen3Cmd::Forward {
+            input_ids: input_ids.clone(),
+            reply,
+        })
+    }
+
+    /// Cached forward pass. Returns logits for the last position only.
+    ///
+    /// When `use_cache` is true, uses and updates the persistent KV caches
+    /// (must call `initKvCaches()` first). Supports both prefill (multi-token)
+    /// and step (single-token) modes.
+    ///
+    /// When `use_cache` is false, behaves like `forward()` (temporary caches).
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs, shape: `[1, seq_len]`
+    /// * `use_cache` - Whether to use persistent KV caches
+    ///
+    /// # Returns
+    /// * Logits, shape: `[1, 1, vocab_size]` (last position only)
+    #[napi]
+    pub fn forward_with_cache(&self, input_ids: &MxArray, use_cache: bool) -> Result<MxArray> {
+        // Materialize input on the NAPI thread before sending to the model
+        // thread. MLX default streams are thread-local, so lazy arrays from
+        // the caller's thread cannot be evaluated on the model thread.
+        input_ids.eval();
+        send_and_block(&self.thread, |reply| Qwen3Cmd::ForwardWithCache {
+            input_ids: input_ids.clone(),
+            use_cache,
+            reply,
+        })
     }
 
     /// Get paged attention memory statistics (if enabled)
