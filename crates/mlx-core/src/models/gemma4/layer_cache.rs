@@ -42,6 +42,15 @@ impl Gemma4LayerCache {
         }
     }
 
+    /// Reset the cache, clearing all stored keys and values.
+    pub fn reset(&mut self) {
+        match &mut self.inner {
+            CacheType::Global(c) => c.reset(),
+            CacheType::Sliding(c) => c.reset(),
+        }
+        self.stashed_kv = None;
+    }
+
     /// Get the current offset (number of tokens cached).
     pub fn get_offset(&self) -> i32 {
         match &self.inner {

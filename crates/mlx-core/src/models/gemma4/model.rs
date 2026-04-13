@@ -8,7 +8,7 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 
 use crate::array::{DType, MxArray};
-use crate::model_thread::{ResponseTx, StreamTx};
+use crate::model_thread::{ResponseTx, StreamTx, send_and_block};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
@@ -154,6 +154,10 @@ pub(crate) struct Gemma4Inner {
     /// session is text-only.
     pub(crate) cached_image_key: Option<u64>,
     pub(crate) model_id: u64,
+    /// Persistent KV caches for incremental generation via forward/forwardWithCache.
+    /// Initialized by `init_kv_caches_sync`, cleared by `reset_kv_caches_sync`.
+    /// Separate from the per-call caches created in `chat_sync`.
+    pub(crate) kv_caches: Option<Vec<Gemma4LayerCache>>,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
@@ -233,6 +237,21 @@ pub(crate) enum Gemma4Cmd {
     /// and session-management code can start from a known clean state
     /// between turns.
     ResetCaches { reply: ResponseTx<()> },
+    Forward {
+        input_ids: MxArray,
+        reply: ResponseTx<MxArray>,
+    },
+    ForwardWithCache {
+        input_ids: MxArray,
+        use_cache: bool,
+        reply: ResponseTx<MxArray>,
+    },
+    InitKvCaches {
+        reply: ResponseTx<()>,
+    },
+    ResetKvCaches {
+        reply: ResponseTx<()>,
+    },
 }
 
 /// Gemma 4 dense language model.
@@ -346,6 +365,7 @@ impl Gemma4Inner {
             cached_token_history: Vec::new(),
             cached_image_key: None,
             model_id,
+            kv_caches: None,
         })
     }
 
@@ -404,32 +424,106 @@ impl Gemma4Inner {
         self.tokenizer = Some(tokenizer);
     }
 
+    /// Initialize persistent KV caches for incremental generation.
+    /// Creates one cache per layer (global or sliding based on config).
+    fn init_kv_caches_sync(&mut self) -> Result<()> {
+        self.kv_caches = Some(init_caches_for_config(&self.config));
+        Ok(())
+    }
+
+    /// Reset all persistent KV caches, clearing stored keys and values.
+    fn reset_kv_caches_sync(&mut self) -> Result<()> {
+        if let Some(caches) = self.kv_caches.as_mut() {
+            for cache in caches.iter_mut() {
+                cache.reset();
+            }
+        }
+        Ok(())
+    }
+
+    /// Uncached forward pass. Creates temporary caches, runs forward_inner,
+    /// and discards the caches. Does NOT touch the persistent kv_caches.
+    fn forward_sync(&self, input_ids: &MxArray) -> Result<MxArray> {
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            let mut temp_caches = init_caches_for_config(&self.config);
+            forward_inner(
+                input_ids,
+                &self.embed_tokens,
+                &self.layers,
+                &mut temp_caches,
+                &self.final_norm,
+                &self.lm_head,
+                self.embed_weight_t.as_ref(),
+                self.ple.as_ref(),
+                &self.config,
+            )?
+        };
+        logits.eval();
+        Ok(logits)
+    }
+
+    /// Cached forward pass using the persistent kv_caches.
+    fn forward_with_cache_sync(&mut self, input_ids: &MxArray, use_cache: bool) -> Result<MxArray> {
+        if !use_cache {
+            return self.forward_sync(input_ids);
+        }
+        let caches = self.kv_caches.as_mut().ok_or_else(|| {
+            napi::Error::from_reason(
+                "KV caches not initialized. Call initKvCaches() before forwardWithCache().",
+            )
+        })?;
+
+        let seq_len = input_ids.shape_at(1)?;
+
+        let logits = if seq_len > 1 {
+            prefill_body_gemma4(
+                input_ids,
+                &self.embed_tokens,
+                &self.layers,
+                caches,
+                &self.final_norm,
+                self.ple.as_ref(),
+                &self.config,
+            )?;
+
+            let last_token = input_ids.slice_axis(1, seq_len - 1, seq_len)?;
+            forward_inner(
+                &last_token,
+                &self.embed_tokens,
+                &self.layers,
+                caches,
+                &self.final_norm,
+                &self.lm_head,
+                self.embed_weight_t.as_ref(),
+                self.ple.as_ref(),
+                &self.config,
+            )?
+        } else {
+            forward_inner(
+                input_ids,
+                &self.embed_tokens,
+                &self.layers,
+                caches,
+                &self.final_norm,
+                &self.lm_head,
+                self.embed_weight_t.as_ref(),
+                self.ple.as_ref(),
+                &self.config,
+            )?
+        };
+
+        logits.eval();
+        Ok(logits)
+    }
+
     /// Core Gemma4 chat implementation with optional EOS override.
     ///
     /// Shared between the non-streaming and streaming session paths. All
     /// image decode + resize + patching happens here on the model thread
     /// (off the NAPI thread) using `ChatMessage.images` which is `Send`
     /// via napi-rs's `unsafe impl`.
-    ///
-    /// ## Field support
-    ///
-    /// **Supported**: `max_new_tokens`, `temperature`, `top_k`, `top_p`,
-    /// `min_p`, `tools`, `reasoning_effort` (mapped to the template's
-    /// `enable_thinking` kwarg via `chat_common::resolve_enable_thinking`),
-    /// `report_performance`, `reuse_cache`.
-    ///
-    /// **Silent no-ops** (Gemma4 decode loop has no code path that reads
-    /// them): `repetition_penalty`, `repetition_context_size`,
-    /// `presence_penalty`, `presence_context_size`, `frequency_penalty`,
-    /// `frequency_context_size`, `max_consecutive_tokens`,
-    /// `max_ngram_repeats`, `ngram_size`, `thinking_token_budget`,
-    /// `include_reasoning`.
-    ///
-    /// `eos_token_id` is the caller-supplied stop-on token id. The decode
-    /// loop stops on this id OR any of `config.eos_token_ids`, so the
-    /// cached history ends on a caller-controlled boundary (typically a
-    /// turn-terminator token). Used by the session-start path to leave
-    /// the cache on a clean Gemma4 `<turn|>` boundary.
     pub(crate) fn chat_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
@@ -2412,6 +2506,52 @@ pub(crate) fn handle_gemma4_cmd(inner: &mut Gemma4Inner, cmd: Gemma4Cmd) {
             let result = inner.reset_caches_sync();
             let _ = reply.send(result);
         }
+        Gemma4Cmd::Forward { input_ids, reply } => {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                inner.forward_sync(&input_ids)
+            }));
+            let _ = reply.send(match result {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = if let Some(s) = e.downcast_ref::<String>() {
+                        s.clone()
+                    } else if let Some(s) = e.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else {
+                        "Unknown panic in forward_sync".to_string()
+                    };
+                    Err(napi::Error::from_reason(format!("forward panicked: {}", msg)))
+                }
+            });
+        }
+        Gemma4Cmd::ForwardWithCache {
+            input_ids,
+            use_cache,
+            reply,
+        } => {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                inner.forward_with_cache_sync(&input_ids, use_cache)
+            }));
+            let _ = reply.send(match result {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = if let Some(s) = e.downcast_ref::<String>() {
+                        s.clone()
+                    } else if let Some(s) = e.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else {
+                        "Unknown panic in forward_with_cache_sync".to_string()
+                    };
+                    Err(napi::Error::from_reason(format!("forward_with_cache panicked: {}", msg)))
+                }
+            });
+        }
+        Gemma4Cmd::InitKvCaches { reply } => {
+            let _ = reply.send(inner.init_kv_caches_sync());
+        }
+        Gemma4Cmd::ResetKvCaches { reply } => {
+            let _ = reply.send(inner.reset_kv_caches_sync());
+        }
     }
 }
 
@@ -2687,6 +2827,79 @@ impl Gemma4Model {
         });
 
         Ok(ChatStreamHandle { cancelled })
+    }
+
+    /// Uncached forward pass. Returns logits.
+    ///
+    /// Creates temporary KV caches for the pass and discards them.
+    /// Does NOT touch the persistent KV caches (used by forwardWithCache).
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs, shape: `[1, seq_len]`
+    ///
+    /// # Returns
+    /// * Logits, shape: `[1, seq_len, vocab_size]`
+    #[napi]
+    pub fn forward(&self, input_ids: &MxArray) -> Result<MxArray> {
+        // Materialize input on the NAPI thread (see forward_with_cache comment).
+        input_ids.eval();
+        send_and_block(&self.thread, |reply| Gemma4Cmd::Forward {
+            input_ids: input_ids.clone(),
+            reply,
+        })
+    }
+
+    /// Cached forward pass. Returns logits for the last position only.
+    ///
+    /// When `use_cache` is true, uses and updates the persistent KV caches
+    /// (must call `initKvCaches()` first). Supports both prefill (multi-token)
+    /// and step (single-token) modes.
+    ///
+    /// For multi-token input (prefill): processes tokens [0:N-1] through the
+    /// transformer body (no lm_head) to populate caches, then runs the last
+    /// token through the full forward (with lm_head) to produce logits.
+    /// This matches the chat pipeline's split prefill/decode approach.
+    ///
+    /// When `use_cache` is false, behaves like `forward()` (temporary caches).
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs, shape: `[1, seq_len]`
+    /// * `use_cache` - Whether to use persistent KV caches
+    ///
+    /// # Returns
+    /// * Logits, shape: `[1, 1, vocab_size]` (last position only)
+    #[napi]
+    pub fn forward_with_cache(&self, input_ids: &MxArray, use_cache: bool) -> Result<MxArray> {
+        // Materialize input on the NAPI thread before sending to the model
+        // thread. MLX default streams are thread-local, so lazy arrays from
+        // the caller's thread cannot be evaluated on the model thread (the
+        // stream they reference doesn't exist in the model thread's TLS).
+        // Evaluating here makes the array concrete so downstream ops on the
+        // model thread don't depend on the caller's stream.
+        input_ids.eval();
+        send_and_block(&self.thread, |reply| Gemma4Cmd::ForwardWithCache {
+            input_ids: input_ids.clone(),
+            use_cache,
+            reply,
+        })
+    }
+
+    /// Initialize KV caches for incremental generation.
+    ///
+    /// Creates one cache per transformer layer (global or sliding based on config).
+    /// Call this before starting a `forwardWithCache` sequence.
+    #[napi]
+    pub fn init_kv_caches(&self) -> Result<()> {
+        send_and_block(&self.thread, |reply| Gemma4Cmd::InitKvCaches { reply })
+    }
+
+    /// Reset all KV caches.
+    ///
+    /// Clears cached key-value states. Call this between different generation
+    /// sequences to start fresh.
+    #[napi]
+    pub fn reset_kv_caches(&self) -> Result<()> {
+        send_and_block(&self.thread, |reply| Gemma4Cmd::ResetKvCaches { reply })
     }
 }
 
