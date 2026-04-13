@@ -407,12 +407,6 @@ impl MxArray {
     // --- Special functions ---
 
     #[napi]
-    pub fn erf(&self) -> Result<MxArray> {
-        let handle = unsafe { sys::mlx_array_erf(self.handle.0) };
-        MxArray::from_handle(handle, "erf")
-    }
-
-    #[napi]
     pub fn erfinv(&self) -> Result<MxArray> {
         let handle = unsafe { sys::mlx_array_erfinv(self.handle.0) };
         MxArray::from_handle(handle, "erfinv")

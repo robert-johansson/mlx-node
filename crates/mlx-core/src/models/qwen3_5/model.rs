@@ -250,6 +250,21 @@ pub(crate) enum Qwen35Cmd {
         path: String,
         reply: ResponseTx<()>,
     },
+    // --- VLM commands ---
+    ProcessImage {
+        image_data: Vec<u8>,
+        reply: ResponseTx<VlmProcessedImage>,
+    },
+    ComputeImageTokenCount {
+        grid_thw: MxArray,
+        reply: ResponseTx<i32>,
+    },
+    VlmPrefillStep {
+        input_ids: MxArray,
+        pixel_values: MxArray,
+        image_grid_thw: MxArray,
+        reply: ResponseTx<MxArray>,
+    },
 }
 
 /// Command handler for the dedicated model thread.
@@ -432,6 +447,21 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         }
         Qwen35Cmd::LoadOptimizerState { path, reply } => {
             let _ = reply.send(inner.load_optimizer_state_sync(path));
+        }
+        // --- VLM commands ---
+        Qwen35Cmd::ProcessImage { image_data, reply } => {
+            let _ = reply.send(inner.process_image_sync(&image_data));
+        }
+        Qwen35Cmd::ComputeImageTokenCount { grid_thw, reply } => {
+            let _ = reply.send(inner.compute_image_token_count_sync(&grid_thw));
+        }
+        Qwen35Cmd::VlmPrefillStep {
+            input_ids,
+            pixel_values,
+            image_grid_thw,
+            reply,
+        } => {
+            let _ = reply.send(inner.vlm_prefill_step_sync(&input_ids, &pixel_values, &image_grid_thw));
         }
     }
 }
@@ -830,6 +860,78 @@ impl Qwen35Inner {
     /// Set spatial merge size.
     pub(crate) fn set_spatial_merge_size(&mut self, size: i32) {
         self.spatial_merge_size = Some(size);
+    }
+
+    /// VLM: preprocess image bytes (runs on model thread).
+    fn process_image_sync(&self, image_data: &[u8]) -> Result<VlmProcessedImage> {
+        let processor = self
+            .image_processor
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Image processor not loaded (not a VLM model)"))?;
+        let processed = processor.process_bytes(image_data)?;
+        let aggregated = crate::models::paddleocr_vl::processing::aggregate_processed_images(
+            vec![processed],
+        )?;
+        Ok(VlmProcessedImage {
+            pixel_values: aggregated.pixel_values(),
+            grid_thw: aggregated.grid_thw(),
+        })
+    }
+
+    /// VLM: compute image token count from grid dimensions (runs on model thread).
+    fn compute_image_token_count_sync(&self, grid_thw: &MxArray) -> Result<i32> {
+        let sms = self.spatial_merge_size.unwrap_or(2);
+        let count = compute_num_image_tokens(grid_thw, sms)?;
+        Ok(count as i32)
+    }
+
+    /// VLM: prefill step — process vision features and run the first forward pass (runs on model thread).
+    fn vlm_prefill_step_sync(
+        &mut self,
+        input_ids: &MxArray,
+        pixel_values: &MxArray,
+        image_grid_thw: &MxArray,
+    ) -> Result<MxArray> {
+        let vision_encoder = self
+            .vision_encoder
+            .clone()
+            .ok_or_else(|| Error::from_reason("Vision encoder not loaded"))?;
+
+        let sms = self.spatial_merge_size.unwrap_or(2);
+
+        // Initialize caches if needed
+        if self.caches.is_none() {
+            self.init_caches_sync()?;
+        }
+
+        // Build ProcessedImages from the provided tensors
+        let processed = ProcessedImages::new(pixel_values.clone(), image_grid_thw.clone());
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        // Use vlm_prefill free function for the full prefill (handles compiled + fallback)
+        let (last_logits, rope_deltas, _compiled) = vlm_prefill(
+            input_ids,
+            0, // No cache key for single-step prefill
+            &processed,
+            &vision_encoder,
+            sms,
+            &self.embedding.get_weight(),
+            &mut self.layers,
+            &mut self.caches,
+            &self.final_norm,
+            &self.lm_head,
+            &self.config,
+            256, // default max_new_tokens for cache sizing
+            generation_stream,
+            &self.vision_cache,
+            self.model_id,
+        )?;
+
+        // Save rope deltas for subsequent forwardWithCache calls
+        self.cached_rope_deltas = Some(rope_deltas as i32);
+
+        Ok(last_logits)
     }
 
     /// Initialize M-RoPE on all full attention layers (VLM mode).
@@ -4570,18 +4672,9 @@ impl Qwen3_5Model {
     /// Object with `pixelValues` [num_patches, 3, 16, 16] and `gridThw` [1, 3]
     #[napi]
     pub fn process_image(&self, image_data: Buffer) -> Result<VlmProcessedImage> {
-        let processor = self
-            .image_processor
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Image processor not loaded (not a VLM model)"))?;
-        let processed = processor.process_bytes(&image_data)?;
-        // Aggregate single image into ProcessedImages to get MxArray grid_thw
-        let aggregated = crate::models::paddleocr_vl::processing::aggregate_processed_images(
-            vec![processed],
-        )?;
-        Ok(VlmProcessedImage {
-            pixel_values: aggregated.pixel_values(),
-            grid_thw: aggregated.grid_thw(),
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::ProcessImage {
+            image_data: image_data.to_vec(),
+            reply,
         })
     }
 
@@ -4590,9 +4683,12 @@ impl Qwen3_5Model {
     /// Use this to know how many `<|image_pad|>` tokens to inject into the prompt.
     #[napi]
     pub fn compute_image_token_count(&self, grid_thw: &MxArray) -> Result<i32> {
-        let sms = self.spatial_merge_size.unwrap_or(2);
-        let count = compute_num_image_tokens(grid_thw, sms)?;
-        Ok(count as i32)
+        crate::model_thread::send_and_block(&self.thread, |reply| {
+            Qwen35Cmd::ComputeImageTokenCount {
+                grid_thw: grid_thw.clone(),
+                reply,
+            }
+        })
     }
 
     /// VLM prefill: process an image and run the first forward pass.
@@ -4614,67 +4710,12 @@ impl Qwen3_5Model {
         pixel_values: &MxArray,
         image_grid_thw: &MxArray,
     ) -> Result<MxArray> {
-        let vision_encoder = self
-            .vision_encoder
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Vision encoder not loaded"))?;
-
-        let sms = self
-            .spatial_merge_size
-            .unwrap_or(2);
-
-        // Initialize caches if needed
-        {
-            let caches_guard = self
-                .caches
-                .read()
-                .map_err(|_| Error::from_reason("Failed to acquire caches read lock"))?;
-            if caches_guard.is_none() {
-                drop(caches_guard);
-                self.init_caches()?;
-            }
-        }
-
-        // Build ProcessedImages from the provided tensors
-        let processed = crate::models::paddleocr_vl::processing::ProcessedImages::new(
-            pixel_values.clone(),
-            image_grid_thw.clone(),
-        );
-
-        // Get text model embedding weight for merging
-        let embedding_weight = self.embedding.get_weight();
-
-        // Prepare vision features (vision encoder + merge with text embeddings)
-        let generation_stream = Stream::new(DeviceType::Gpu);
-        let (inputs_embeds, position_ids, rope_deltas) = vlm_prepare_vision_features(
-            input_ids,
-            0, // No cache key for single-step prefill
-            &processed,
-            vision_encoder,
-            sms,
-            &embedding_weight,
-            generation_stream,
-            &self.vision_cache,
-        )?;
-
-        // Save rope deltas for subsequent forwardWithCache calls
-        if let Ok(mut rd) = self.cached_rope_deltas.write() {
-            *rd = Some(rope_deltas as i32);
-        }
-
-        // Forward pass through the text model with position IDs
-        {
-            let caches_guard = self
-                .caches
-                .read()
-                .map_err(|_| Error::from_reason("Failed to acquire caches read lock"))?;
-            if caches_guard.is_none() {
-                drop(caches_guard);
-                self.init_caches()?;
-            }
-        }
-
-        self.forward_from_embeddings_with_positions(&inputs_embeds, Some(&position_ids))
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::VlmPrefillStep {
+            input_ids: input_ids.clone(),
+            pixel_values: pixel_values.clone(),
+            image_grid_thw: image_grid_thw.clone(),
+            reply,
+        })
     }
 
     /// Load a pretrained model from a directory.

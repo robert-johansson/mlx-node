@@ -578,7 +578,6 @@ unsafe extern "C-unwind" {
     pub fn mlx_logit_softcap(x: *mut mlx_array, softcap: *mut mlx_array) -> *mut mlx_array;
 
     // GenMLX consolidation: special functions
-    pub fn mlx_array_erf(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_erfinv(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_lgamma(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_digamma(handle: *mut mlx_array) -> *mut mlx_array;
