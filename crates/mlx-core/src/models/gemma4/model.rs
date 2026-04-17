@@ -2507,44 +2507,14 @@ pub(crate) fn handle_gemma4_cmd(inner: &mut Gemma4Inner, cmd: Gemma4Cmd) {
             let _ = reply.send(result);
         }
         Gemma4Cmd::Forward { input_ids, reply } => {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                inner.forward_sync(&input_ids)
-            }));
-            let _ = reply.send(match result {
-                Ok(r) => r,
-                Err(e) => {
-                    let msg = if let Some(s) = e.downcast_ref::<String>() {
-                        s.clone()
-                    } else if let Some(s) = e.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else {
-                        "Unknown panic in forward_sync".to_string()
-                    };
-                    Err(napi::Error::from_reason(format!("forward panicked: {}", msg)))
-                }
-            });
+            let _ = reply.send(inner.forward_sync(&input_ids));
         }
         Gemma4Cmd::ForwardWithCache {
             input_ids,
             use_cache,
             reply,
         } => {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                inner.forward_with_cache_sync(&input_ids, use_cache)
-            }));
-            let _ = reply.send(match result {
-                Ok(r) => r,
-                Err(e) => {
-                    let msg = if let Some(s) = e.downcast_ref::<String>() {
-                        s.clone()
-                    } else if let Some(s) = e.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else {
-                        "Unknown panic in forward_with_cache_sync".to_string()
-                    };
-                    Err(napi::Error::from_reason(format!("forward_with_cache panicked: {}", msg)))
-                }
-            });
+            let _ = reply.send(inner.forward_with_cache_sync(&input_ids, use_cache));
         }
         Gemma4Cmd::InitKvCaches { reply } => {
             let _ = reply.send(inner.init_kv_caches_sync());
