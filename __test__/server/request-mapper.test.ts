@@ -379,6 +379,139 @@ describe('mapRequest', () => {
 
     expect(messages).toEqual([{ role: 'user', content: 'No explicit type' }]);
   });
+
+  describe('assistant message + function_call coalescing (Finding 3)', () => {
+    it('coalesces assistant message followed by function_call into a single assistant turn', () => {
+      // A single assistant turn that produced both text and tool calls is serialised by
+      // the OpenAI Responses API as `[message(assistant, text), function_call, ...]`.
+      // The mapper must coalesce that run into ONE `assistant` ChatMessage carrying
+      // both text and `toolCalls`, matching the hot-path `ChatSession` shape exactly.
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'user', content: 'What is the weather?' },
+          { type: 'message', role: 'assistant', content: 'Let me check.' },
+          {
+            type: 'function_call',
+            id: 'fc-1',
+            call_id: 'call_abc',
+            name: 'get_weather',
+            arguments: '{"city":"SF"}',
+          },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'user', content: 'What is the weather?' },
+        {
+          role: 'assistant',
+          content: 'Let me check.',
+          toolCalls: [{ name: 'get_weather', arguments: '{"city":"SF"}', id: 'call_abc' }],
+        },
+      ]);
+    });
+
+    it('coalesces assistant message followed by multiple function_calls into one turn', () => {
+      // A fan-out shape: one assistant message then several
+      // parallel function_calls. All siblings end up on the SAME
+      // assistant turn.
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'assistant', content: 'Fetching two cities.' },
+          {
+            type: 'function_call',
+            id: 'fc-1',
+            call_id: 'call_a',
+            name: 'get_weather',
+            arguments: '{"city":"SF"}',
+          },
+          {
+            type: 'function_call',
+            id: 'fc-2',
+            call_id: 'call_b',
+            name: 'get_weather',
+            arguments: '{"city":"NYC"}',
+          },
+        ],
+      });
+
+      expect(messages).toEqual([
+        {
+          role: 'assistant',
+          content: 'Fetching two cities.',
+          toolCalls: [
+            { name: 'get_weather', arguments: '{"city":"SF"}', id: 'call_a' },
+            { name: 'get_weather', arguments: '{"city":"NYC"}', id: 'call_b' },
+          ],
+        },
+      ]);
+    });
+
+    it('does not coalesce a function_call onto a preceding user message', () => {
+      // A function_call after a user message is not a valid
+      // fan-out head — the coalesce predicate is gated on the
+      // previous message being an assistant. The mapper opens a
+      // fresh assistant turn instead.
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'user', content: 'Hello' },
+          {
+            type: 'function_call',
+            id: 'fc-1',
+            call_id: 'call_x',
+            name: 'do_thing',
+            arguments: '{}',
+          },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'user', content: 'Hello' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ name: 'do_thing', arguments: '{}', id: 'call_x' }],
+        },
+      ]);
+    });
+
+    it('does not absorb an assistant message that follows function_call into the same turn', () => {
+      // Only a message BEFORE a function_call run is coalesced.
+      // A message AFTER a function_call starts a fresh turn —
+      // that shape is a subsequent user/system/assistant turn,
+      // not a continuation of the fan-out.
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          {
+            type: 'function_call',
+            id: 'fc-1',
+            call_id: 'call_a',
+            name: 'lookup',
+            arguments: '{}',
+          },
+          {
+            type: 'function_call_output',
+            call_id: 'call_a',
+            output: 'done',
+          },
+          { type: 'message', role: 'assistant', content: 'All done.' },
+        ],
+      });
+
+      expect(messages).toEqual([
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ name: 'lookup', arguments: '{}', id: 'call_a' }],
+        },
+        { role: 'tool', content: 'done', toolCallId: 'call_a' },
+        { role: 'assistant', content: 'All done.' },
+      ]);
+    });
+  });
 });
 
 describe('reconstructMessagesFromChain', () => {
@@ -490,22 +623,154 @@ describe('reconstructMessagesFromChain', () => {
     expect(messages).toEqual([]);
   });
 
-  it('skips assistant message when output has no text and no tool calls', () => {
+  it('preserves assistant turn when empty text accompanies reasoning', () => {
+    // An empty assistant `message` item alongside a non-empty `reasoning` item must
+    // still reconstruct the assistant turn, otherwise cold replay after TTL expiry
+    // silently rebuilds a different conversation than the live session saw.
     const chain = [
       {
         inputJson: JSON.stringify([{ role: 'user', content: 'Hello' }]),
         outputJson: JSON.stringify([
           {
             type: 'reasoning',
-            summary: [{ text: 'thinking...' }],
+            summary: [{ text: 'let me think about this...' }],
           },
-          // No message item, no function_call items
+          {
+            type: 'message',
+            content: [{ text: '' }],
+          },
         ]),
       },
     ];
 
     const messages = reconstructMessagesFromChain(chain);
-    // Only user message, no assistant since content is empty and no tool calls
+    expect(messages).toEqual([
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: '', reasoningContent: 'let me think about this...' },
+    ]);
+  });
+
+  it('preserves assistant turn with reasoning even when no message item is present', () => {
+    // Some stored records carry ONLY a `reasoning` item (no `message`); reconstruction
+    // must still re-emit the assistant turn, carrying the reasoning summary through.
+    const chain = [
+      {
+        inputJson: JSON.stringify([{ role: 'user', content: 'Tell me a secret' }]),
+        outputJson: JSON.stringify([
+          {
+            type: 'reasoning',
+            summary: [{ text: 'I reasoned silently and produced nothing.' }],
+          },
+        ]),
+      },
+    ];
+
+    const messages = reconstructMessagesFromChain(chain);
+    expect(messages).toEqual([
+      { role: 'user', content: 'Tell me a secret' },
+      {
+        role: 'assistant',
+        content: '',
+        reasoningContent: 'I reasoned silently and produced nothing.',
+      },
+    ]);
+  });
+
+  it('skips assistant message when output has no text, no reasoning, and no tool calls', () => {
+    // A stored record with NO assistant-facing items at all (no message, no reasoning,
+    // no function_call) must produce no assistant turn on reconstruction — otherwise
+    // legitimate no-op turns clutter the replayed history with an empty assistant.
+    const chain = [
+      {
+        inputJson: JSON.stringify([{ role: 'user', content: 'Hello' }]),
+        outputJson: JSON.stringify([]),
+      },
+    ];
+
+    const messages = reconstructMessagesFromChain(chain);
+    // Only user message, no assistant since ALL output items were absent.
     expect(messages).toEqual([{ role: 'user', content: 'Hello' }]);
+  });
+
+  it('preserves assistant turn driven purely by tool calls', () => {
+    // Tool-call-only assistant turns must remain reconstructible after the predicate
+    // was widened to also accept reasoning-only / empty-text turns.
+    const chain = [
+      {
+        inputJson: JSON.stringify([{ role: 'user', content: 'Get weather' }]),
+        outputJson: JSON.stringify([
+          {
+            type: 'function_call',
+            name: 'get_weather',
+            arguments: '{"city":"NYC"}',
+            call_id: 'call_nyc',
+          },
+        ]),
+      },
+    ];
+
+    const messages = reconstructMessagesFromChain(chain);
+    expect(messages).toHaveLength(2);
+    expect(messages[1]).toEqual({
+      role: 'assistant',
+      content: '',
+      toolCalls: [{ name: 'get_weather', arguments: '{"city":"NYC"}', id: 'call_nyc' }],
+    });
+  });
+
+  it('preserves assistant turn when only an empty-text message item is present', () => {
+    // The server deliberately emits a `message` item with empty text when a turn
+    // completes with no tool calls and no output (e.g. a tool-result continuation
+    // where the model acknowledged and produced nothing). `ChatSession` hot-path
+    // history always appends an assistant message for every completed turn — the
+    // reconstruction predicate keys on item PRESENCE, not accumulated content.
+    const chain = [
+      {
+        inputJson: JSON.stringify([{ role: 'user', content: 'thanks' }]),
+        outputJson: JSON.stringify([
+          {
+            type: 'message',
+            content: [{ text: '' }],
+          },
+        ]),
+      },
+    ];
+
+    const messages = reconstructMessagesFromChain(chain);
+    expect(messages).toEqual([
+      { role: 'user', content: 'thanks' },
+      { role: 'assistant', content: '' },
+    ]);
+  });
+
+  it('preserves assistant turn when an empty message item accompanies an empty reasoning item', () => {
+    // A stored record carrying BOTH a `message` item with empty text and a `reasoning`
+    // item with empty summary must reconstruct the assistant turn with empty content
+    // and NO reasoningContent field — we omit empty reasoning so the reconstructed
+    // shape matches a plain blank successful turn byte-for-byte.
+    const chain = [
+      {
+        inputJson: JSON.stringify([{ role: 'user', content: 'thanks' }]),
+        outputJson: JSON.stringify([
+          {
+            type: 'reasoning',
+            summary: [{ text: '' }],
+          },
+          {
+            type: 'message',
+            content: [{ text: '' }],
+          },
+        ]),
+      },
+    ];
+
+    const messages = reconstructMessagesFromChain(chain);
+    expect(messages).toEqual([
+      { role: 'user', content: 'thanks' },
+      { role: 'assistant', content: '' },
+    ]);
+    // Pin that `reasoningContent` is absent, not present-but-empty — some downstream
+    // paths distinguish `undefined` from `''` when deciding whether to emit <think>.
+    expect(messages[1]).not.toHaveProperty('reasoningContent');
   });
 });

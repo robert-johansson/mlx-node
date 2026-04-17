@@ -14,11 +14,12 @@
  */
 
 // Model classes (for inference)
-export { Qwen3Model, Qwen3Tokenizer } from '@mlx-node/core';
+export { Qwen3Tokenizer } from '@mlx-node/core';
+export { Qwen3Model } from './stream.js';
 
 // Gemma4 models
 export { Gemma4Model, Gemma4Model as Gemma4_Model } from './stream.js';
-export type { Gemma4Config, Gemma4ChatConfig } from '@mlx-node/core';
+export type { Gemma4Config } from '@mlx-node/core';
 
 // Embedding models
 export { HarrierModel } from '@mlx-node/core';
@@ -48,8 +49,18 @@ export type { ChatConfig, ChatResult, ChatMessage, ToolCallResult, PerformanceMe
 export type { ChatStreamDelta, ChatStreamFinal, ChatStreamEvent } from './stream.js';
 export type { ChatStreamChunk, ChatStreamHandle } from '@mlx-node/core';
 // Internal: exported for testing the callback-to-AsyncGenerator bridge
-// Not part of the public API — may change without notice
-export { _createChatStream } from './stream.js';
+// Not part of the public API — may change without notice.
+// `_runChatStream` is the generic adapter used by every model wrapper
+// (and the VLM package's QianfanOCR wrapper) to turn a callback-based
+// native stream into an `AsyncGenerator<ChatStreamEvent>`.
+export { _runChatStream } from './stream.js';
+// Cross-model chat session wrapper (see chat-session.ts for design notes).
+// `SessionCapableModel` is the structural interface matched by every
+// generative model wrapper and used as the upper-bound for
+// `ChatSession<M>`; exported so the VLM wrapper can pin a compile-time
+// conformance assertion.
+export { ChatSession } from './chat-session.js';
+export type { ChatSessionOptions, SendOptions, SessionCapableModel } from './chat-session.js';
 
 // Model utilities (TypeScript-only)
 export {
@@ -61,7 +72,7 @@ export {
 } from './models/qwen3-configs.js';
 
 // Model loading
-export { loadModel, detectModelType, type ModelType } from './models/model-loader.js';
+export { loadModel, loadSession, detectModelType, type ModelType } from './models/model-loader.js';
 
 // Interfaces
 export type { TrainableModel, LoadableModel, EmbeddingModel } from './interfaces.js';

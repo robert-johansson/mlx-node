@@ -677,6 +677,14 @@ impl Qwen3Tokenizer {
             .collect()
     }
 
+    /// `pub(crate)` wrapper around [`Self::sanitize_messages`] so other
+    /// modules (notably the Qwen3.5 session-continue path) can subject
+    /// user-supplied strings to the same role/content injection guard used
+    /// by the jinja rendering path.
+    pub(crate) fn sanitize_messages_public(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        Self::sanitize_messages(messages)
+    }
+
     /// Format messages using simple ChatML format (fallback when no template).
     /// Expects pre-sanitized messages (call sanitize_messages first).
     fn format_chatml_presanitized(messages: &[ChatMessage], add_generation_prompt: bool) -> String {
@@ -1239,6 +1247,19 @@ impl Qwen3Tokenizer {
     /// Get the think-end string (e.g., `"</think>"` or `"</longcat_think>"`).
     pub fn think_end_str(&self) -> Option<&str> {
         self.think_end_str.as_deref()
+    }
+
+    /// Get the `<|im_end|>` token ID, if the tokenizer has it in its vocab.
+    ///
+    /// This is the "turn end" sentinel for ChatML-style templates. It's
+    /// preferable to `config.json:eos_token_id` for session-based chat
+    /// because it yields clean cache boundaries: cached history ends at
+    /// `<|im_end|>`, and the next turn's delta starts with
+    /// `\n<|im_start|>user\n...`. Using the raw `eos_token_id` from
+    /// `config.json` (which may be `<|endoftext|>` for Qwen3.5) wastes
+    /// decode tokens and makes clean template continuation impossible.
+    pub fn im_end_id(&self) -> Option<u32> {
+        self.tokenizer.token_to_id("<|im_end|>")
     }
 }
 

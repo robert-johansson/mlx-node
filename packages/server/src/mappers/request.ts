@@ -1,15 +1,9 @@
-/**
- * Maps OpenAI Responses API request to internal ChatMessage[] + ChatConfig.
- */
+/** OpenAI Responses API request → internal `ChatMessage[]` + `ChatConfig`. */
 
 import type { ChatConfig, ChatMessage, ToolDefinition } from '@mlx-node/core';
 
 import type { ContentPart, ResponsesAPIRequest, ResponsesToolDefinition } from '../types.js';
 
-/**
- * Resolve the text content of a message, which can be either a plain string
- * or an array of content parts.
- */
 function resolveContent(content: string | ContentPart[]): string {
   if (typeof content === 'string') return content;
   const parts: string[] = [];
@@ -23,12 +17,7 @@ function resolveContent(content: string | ContentPart[]): string {
   return parts.join('');
 }
 
-/**
- * Map a Responses API tool definition to the internal ToolDefinition format.
- *
- * The NAPI layer requires `parameters.properties` to be a JSON string,
- * so we stringify the properties object here.
- */
+/** NAPI `ToolDefinition` requires `parameters.properties` to be a JSON string. */
 function mapTool(tool: ResponsesToolDefinition): ToolDefinition {
   if (tool.type !== 'function') {
     throw new Error(`Unsupported tool type: "${tool.type as string}"`);
@@ -55,26 +44,28 @@ export interface MappedRequest {
   config: ChatConfig;
 }
 
-/**
- * Convert the Responses API request into internal ChatMessage[] + ChatConfig.
- */
 export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage[]): MappedRequest {
   const messages: ChatMessage[] = [];
 
-  // System instructions go first (before any history)
   if (req.instructions) {
     messages.push({ role: 'system', content: req.instructions });
   }
 
-  // Prepend any prior conversation messages (from previous_response_id chain)
   if (priorMessages) {
     messages.push(...priorMessages);
   }
 
-  // Map input
+  // Coalesce a `message + function_call+` run (or a pure `function_call+` run)
+  // into ONE assistant `ChatMessage` carrying both `content` and `toolCalls`.
+  // `ChatSession.sendStream()` appends exactly one assistant message per turn,
+  // and `validateAndCanonicalizeHistoryToolOrder` requires each fan-out's
+  // `toolCalls` to pair 1:1 with the trailing tool block — splitting would
+  // reshape the conversation and make the walker reject the turn as orphaned.
+  // A `message` item immediately after a `function_call` starts a new turn.
   if (typeof req.input === 'string') {
     messages.push({ role: 'user', content: req.input });
   } else {
+    let prevItemType: string | null = null;
     for (const item of req.input) {
       if (item == null || typeof item !== 'object') {
         throw new Error('Each input item must be a non-null object');
@@ -83,7 +74,7 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
 
       if (itemType === 'message') {
         const msg = item as { role: string; content: string | ContentPart[] };
-        // Map "developer" role to "system" (OpenAI convention)
+        // OpenAI "developer" maps to our "system".
         const role = msg.role === 'developer' ? 'system' : msg.role;
         if (role !== 'user' && role !== 'assistant' && role !== 'system') {
           throw new Error(`Unsupported message role: "${msg.role}"`);
@@ -93,15 +84,26 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
           content: resolveContent(msg.content),
         });
       } else if (itemType === 'function_call') {
-        // Reconstruct an assistant message with a tool call
+        // Coalesce onto the preceding assistant turn — see the loop header.
         const fc = item as { name: string; arguments: string; call_id: string };
-        messages.push({
-          role: 'assistant',
-          content: '',
-          toolCalls: [{ name: fc.name, arguments: fc.arguments, id: fc.call_id }],
-        });
+        const last = messages[messages.length - 1];
+        const canCoalesce =
+          (prevItemType === 'function_call' || prevItemType === 'message') &&
+          last !== undefined &&
+          last.role === 'assistant';
+        if (canCoalesce) {
+          if (last!.toolCalls === undefined) {
+            last!.toolCalls = [];
+          }
+          last!.toolCalls!.push({ name: fc.name, arguments: fc.arguments, id: fc.call_id });
+        } else {
+          messages.push({
+            role: 'assistant',
+            content: '',
+            toolCalls: [{ name: fc.name, arguments: fc.arguments, id: fc.call_id }],
+          });
+        }
       } else if (itemType === 'function_call_output') {
-        // Tool result message
         const fco = item as { call_id: string; output: string };
         messages.push({
           role: 'tool',
@@ -111,10 +113,11 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
       } else {
         throw new Error(`Unsupported input item type: "${itemType as string}"`);
       }
+
+      prevItemType = itemType;
     }
   }
 
-  // Build ChatConfig
   const config: ChatConfig = {
     reportPerformance: true,
   };
@@ -133,16 +136,14 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
   }
   if (req.tools && req.tools.length > 0) {
     if (req.tool_choice === 'none') {
-      // Don't pass any tools — user explicitly disabled tool use
+      // Caller disabled tool use.
     } else if (typeof req.tool_choice === 'object' && req.tool_choice?.type === 'function') {
-      // Only pass the specifically named tool
       const targetName = req.tool_choice.name;
       const matched = req.tools.filter((t) => t.name === targetName);
       if (matched.length > 0) {
         config.tools = matched.map(mapTool);
       }
     } else {
-      // 'auto', 'required', or unspecified — pass all tools
       config.tools = req.tools.map(mapTool);
     }
   }
@@ -154,21 +155,17 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
 }
 
 /**
- * Reconstruct ChatMessage[] from a stored response chain.
- *
- * Each StoredResponseRecord contains `inputJson` (the messages sent)
- * and `outputJson` (the output items produced). We reconstruct the
- * conversation by interleaving input and output messages.
+ * Reconstruct `ChatMessage[]` from a stored response chain. Each record
+ * stores `inputJson` (messages sent) and `outputJson` (output items); we
+ * interleave them.
  */
 export function reconstructMessagesFromChain(chain: { inputJson: string; outputJson: string }[]): ChatMessage[] {
   const messages: ChatMessage[] = [];
 
   for (const record of chain) {
-    // Add the original input messages
     const inputMessages = JSON.parse(record.inputJson) as ChatMessage[];
     messages.push(...inputMessages);
 
-    // Reconstruct assistant message from output items
     const outputItems = JSON.parse(record.outputJson) as Array<{
       type: string;
       content?: Array<{ text: string }>;
@@ -180,13 +177,25 @@ export function reconstructMessagesFromChain(chain: { inputJson: string; outputJ
 
     let assistantText = '';
     let thinkingText = '';
+    // Track presence vs. content separately: an empty-text `message` item
+    // still represents a real successful turn (the hot-path `ChatSession`
+    // always appends an assistant message per turn), so cold replay must
+    // preserve it or `primeHistory` will reshape the conversation.
+    let hadMessageItem = false;
+    let hadReasoningItem = false;
     const toolCalls: { name: string; arguments: string; id?: string }[] = [];
 
     for (const item of outputItems) {
-      if (item.type === 'message' && item.content) {
-        assistantText += item.content.map((c) => c.text).join('');
-      } else if (item.type === 'reasoning' && item.summary) {
-        thinkingText += item.summary.map((s) => s.text).join('');
+      if (item.type === 'message') {
+        hadMessageItem = true;
+        if (item.content) {
+          assistantText += item.content.map((c) => c.text).join('');
+        }
+      } else if (item.type === 'reasoning') {
+        hadReasoningItem = true;
+        if (item.summary) {
+          thinkingText += item.summary.map((s) => s.text).join('');
+        }
       } else if (item.type === 'function_call') {
         toolCalls.push({
           name: item.name!,
@@ -196,7 +205,13 @@ export function reconstructMessagesFromChain(chain: { inputJson: string; outputJ
       }
     }
 
-    if (assistantText || toolCalls.length > 0) {
+    // Preserve the assistant turn whenever the record carried any assistant-facing
+    // item — message (even empty), reasoning, or function_call — because the hot-path
+    // `ChatSession` always appends one assistant message per completed turn.
+    // Keying on accumulated content would silently drop blank successful turns and
+    // reshape the replayed conversation. Records with no assistant items (input-only)
+    // are still skipped so we don't fabricate turns the live session never generated.
+    if (hadMessageItem || hadReasoningItem || toolCalls.length > 0) {
       const assistantMsg: ChatMessage = {
         role: 'assistant',
         content: assistantText,

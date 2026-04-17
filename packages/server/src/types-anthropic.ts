@@ -1,13 +1,4 @@
-/**
- * Anthropic Messages API type definitions
- *
- * Covers the request/response shapes for POST /v1/messages
- * and the SSE streaming event protocol.
- */
-
-// ---------------------------------------------------------------------------
-// Content blocks (input)
-// ---------------------------------------------------------------------------
+/** Anthropic Messages API types: request/response shapes and SSE streaming events for POST /v1/messages. */
 
 export interface AnthropicTextContentBlock {
   type: 'text';
@@ -26,7 +17,8 @@ export interface AnthropicImageContentBlock {
 export interface AnthropicToolResultContentBlock {
   type: 'tool_result';
   tool_use_id: string;
-  content?: string | AnthropicTextContentBlock[];
+  /** May be a string, text-block array, or mix of text and image blocks. Image-mixed shapes are rejected by the mapper; see `resolveToolResultContent`. */
+  content?: string | (AnthropicTextContentBlock | AnthropicImageContentBlock)[];
   is_error?: boolean;
 }
 
