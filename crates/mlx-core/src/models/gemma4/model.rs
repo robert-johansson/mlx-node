@@ -4633,9 +4633,11 @@ impl Gemma4Model {
     /// * Logits, shape: `[1, seq_len, vocab_size]`
     #[napi]
     pub fn forward(&self, input_ids: &MxArray) -> Result<MxArray> {
-        // Materialize input on the NAPI thread (see forward_with_cache comment).
+        let Some(thread) = self.thread.as_ref() else {
+            return Err(napi::Error::from_reason("Model not loaded. Call load() first."));
+        };
         input_ids.eval();
-        send_and_block(&self.thread, |reply| Gemma4Cmd::Forward {
+        send_and_block(thread, |reply| Gemma4Cmd::Forward {
             input_ids: input_ids.clone(),
             reply,
         })
@@ -4662,14 +4664,11 @@ impl Gemma4Model {
     /// * Logits, shape: `[1, 1, vocab_size]` (last position only)
     #[napi]
     pub fn forward_with_cache(&self, input_ids: &MxArray, use_cache: bool) -> Result<MxArray> {
-        // Materialize input on the NAPI thread before sending to the model
-        // thread. MLX default streams are thread-local, so lazy arrays from
-        // the caller's thread cannot be evaluated on the model thread (the
-        // stream they reference doesn't exist in the model thread's TLS).
-        // Evaluating here makes the array concrete so downstream ops on the
-        // model thread don't depend on the caller's stream.
+        let Some(thread) = self.thread.as_ref() else {
+            return Err(napi::Error::from_reason("Model not loaded. Call load() first."));
+        };
         input_ids.eval();
-        send_and_block(&self.thread, |reply| Gemma4Cmd::ForwardWithCache {
+        send_and_block(thread, |reply| Gemma4Cmd::ForwardWithCache {
             input_ids: input_ids.clone(),
             use_cache,
             reply,
@@ -4682,7 +4681,10 @@ impl Gemma4Model {
     /// Call this before starting a `forwardWithCache` sequence.
     #[napi]
     pub fn init_kv_caches(&self) -> Result<()> {
-        send_and_block(&self.thread, |reply| Gemma4Cmd::InitKvCaches { reply })
+        let Some(thread) = self.thread.as_ref() else {
+            return Err(napi::Error::from_reason("Model not loaded. Call load() first."));
+        };
+        send_and_block(thread, |reply| Gemma4Cmd::InitKvCaches { reply })
     }
 
     /// Reset all KV caches.
@@ -4691,7 +4693,10 @@ impl Gemma4Model {
     /// sequences to start fresh.
     #[napi]
     pub fn reset_kv_caches(&self) -> Result<()> {
-        send_and_block(&self.thread, |reply| Gemma4Cmd::ResetKvCaches { reply })
+        let Some(thread) = self.thread.as_ref() else {
+            return Err(napi::Error::from_reason("Model not loaded. Call load() first."));
+        };
+        send_and_block(thread, |reply| Gemma4Cmd::ResetKvCaches { reply })
     }
 }
 
