@@ -52,6 +52,7 @@ impl TransformerBlock {
         rope_theta: Option<f64>,
         use_qk_norm: Option<bool>,
         head_dim: Option<u32>,
+        attention_bias: Option<bool>,
     ) -> Result<Self> {
         let head_dim_val = head_dim.unwrap_or(hidden_size / num_heads);
         let rope_theta_val = rope_theta.unwrap_or(10000.0);
@@ -65,6 +66,7 @@ impl TransformerBlock {
             Some(rope_theta_val),
             Some(use_qk_norm_val),
             Some(rms_norm_eps),
+            attention_bias,
         )?;
 
         let mlp = MLP::new(hidden_size, intermediate_size)?;

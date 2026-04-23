@@ -18,6 +18,7 @@ pub struct Qwen3Config {
     pub max_position_embeddings: i32,
     pub head_dim: i32, // Dimension per attention head (e.g., 128 for Qwen3-0.6B)
     pub use_qk_norm: bool,
+    pub attention_bias: bool,
     pub tie_word_embeddings: bool,
     pub pad_token_id: i32,
     pub eos_token_id: i32,

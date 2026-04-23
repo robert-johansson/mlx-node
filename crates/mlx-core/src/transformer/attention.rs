@@ -1,4 +1,4 @@
-use crate::array::{MxArray, scaled_dot_product_attention};
+use crate::array::{MxArray, scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::nn::{Linear, RMSNorm, RoPE};
 use crate::transformer::kv_cache::KVCache;
 use mlx_sys as sys;
@@ -48,16 +48,17 @@ impl Attention {
         rope_theta: Option<f64>,
         use_qk_norm: Option<bool>,
         qk_norm_eps: Option<f64>,
+        attention_bias: Option<bool>,
     ) -> Result<Self> {
         let head_dim = head_dim.unwrap_or(hidden_size / num_heads);
         let rope_theta = rope_theta.unwrap_or(10000.0);
         let use_qk_norm = use_qk_norm.unwrap_or(false);
         let qk_norm_eps = qk_norm_eps.unwrap_or(1e-6);
+        let qkv_bias = attention_bias.unwrap_or(false);
 
-        // Create projections (no bias)
-        let q_proj = Linear::new(hidden_size, num_heads * head_dim, Some(false))?;
-        let k_proj = Linear::new(hidden_size, num_kv_heads * head_dim, Some(false))?;
-        let v_proj = Linear::new(hidden_size, num_kv_heads * head_dim, Some(false))?;
+        let q_proj = Linear::new(hidden_size, num_heads * head_dim, Some(qkv_bias))?;
+        let k_proj = Linear::new(hidden_size, num_kv_heads * head_dim, Some(qkv_bias))?;
+        let v_proj = Linear::new(hidden_size, num_kv_heads * head_dim, Some(qkv_bias))?;
         let o_proj = Linear::new(num_heads * head_dim, hidden_size, Some(false))?;
 
         // Optional QK normalization
@@ -110,6 +111,11 @@ impl Attention {
         mask: Option<&MxArray>,
         cache: Option<&mut KVCache>,
     ) -> Result<MxArray> {
+        let has_qkv_bias = self.q_proj.get_bias().is_some();
+        if has_qkv_bias {
+            return self.forward_with_bias(x, mask, cache);
+        }
+
         // Use fused C++ implementation for better performance
         // This reduces ~15 FFI calls to 3 (qkv + cache + output)
         let seq_len = x.shape_at(1)?;
@@ -205,6 +211,61 @@ impl Attention {
         }
 
         MxArray::from_handle(handle, "fused_attention_output")
+    }
+
+    /// Non-fused forward path for models with QKV bias (e.g. Qwen2).
+    /// Uses Linear::forward which correctly applies bias terms.
+    fn forward_with_bias(
+        &self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<MxArray> {
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+
+        let queries = self.q_proj.forward(x)?;
+        let keys = self.k_proj.forward(x)?;
+        let values = self.v_proj.forward(x)?;
+
+        let mut queries =
+            queries.reshape(&[batch, seq_len, self.n_heads as i64, self.head_dim as i64])?;
+        let mut keys =
+            keys.reshape(&[batch, seq_len, self.n_kv_heads as i64, self.head_dim as i64])?;
+        let values =
+            values.reshape(&[batch, seq_len, self.n_kv_heads as i64, self.head_dim as i64])?;
+
+        if let Some(ref q_norm) = self.q_norm {
+            queries = q_norm.forward(&queries)?;
+        }
+        if let Some(ref k_norm) = self.k_norm {
+            keys = k_norm.forward(&keys)?;
+        }
+
+        let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
+        let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
+        let values = values.transpose(Some(&[0, 2, 1, 3]))?;
+
+        let offset = cache.as_ref().map(|c| c.get_offset()).unwrap_or(0);
+        let queries = self.rope.forward(&queries, Some(offset))?;
+        let keys = self.rope.forward(&keys, Some(offset))?;
+
+        let (keys, values) = if let Some(cache) = cache {
+            cache.update_and_fetch(&keys, &values)?
+        } else {
+            (keys, values)
+        };
+
+        let kv_len = keys.shape_at(2)?;
+        let use_causal = mask.is_none() && seq_len > 1 && seq_len == kv_len;
+        let output = if use_causal {
+            scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale)?
+        } else {
+            scaled_dot_product_attention(&queries, &keys, &values, self.scale, mask)?
+        };
+        let output = output.transpose(Some(&[0, 2, 1, 3]))?;
+        let output = output.reshape(&[batch, seq_len, (self.n_heads * self.head_dim) as i64])?;
+        self.o_proj.forward(&output)
     }
 
     /// Forward pass with pre-computed Q/K/V tensors.
@@ -357,6 +418,18 @@ impl Attention {
         Ok(())
     }
 
+    pub fn set_q_proj_bias(&mut self, bias: &MxArray) -> Result<()> {
+        self.q_proj.set_bias(Some(bias))
+    }
+
+    pub fn set_k_proj_bias(&mut self, bias: &MxArray) -> Result<()> {
+        self.k_proj.set_bias(Some(bias))
+    }
+
+    pub fn set_v_proj_bias(&mut self, bias: &MxArray) -> Result<()> {
+        self.v_proj.set_bias(Some(bias))
+    }
+
     pub fn set_q_norm_weight(&mut self, weight: &MxArray) -> Result<()> {
         if let Some(ref mut norm) = self.q_norm {
             norm.set_weight(weight)?;
@@ -395,6 +468,18 @@ impl Attention {
 
     pub fn get_o_proj_weight(&self) -> MxArray {
         self.o_proj.get_weight()
+    }
+
+    pub fn get_q_proj_bias(&self) -> Option<MxArray> {
+        self.q_proj.get_bias()
+    }
+
+    pub fn get_k_proj_bias(&self) -> Option<MxArray> {
+        self.k_proj.get_bias()
+    }
+
+    pub fn get_v_proj_bias(&self) -> Option<MxArray> {
+        self.v_proj.get_bias()
     }
 
     pub fn get_q_norm_weight(&self) -> Option<MxArray> {

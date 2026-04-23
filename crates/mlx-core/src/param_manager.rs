@@ -134,6 +134,12 @@ pub fn validate_param_names(param_names: &[String], config: &Qwen3Config) -> Res
         expected_names.push(format!("{}.self_attn.v_proj.weight", prefix));
         expected_names.push(format!("{}.self_attn.o_proj.weight", prefix));
 
+        if config.attention_bias {
+            expected_names.push(format!("{}.self_attn.q_proj.bias", prefix));
+            expected_names.push(format!("{}.self_attn.k_proj.bias", prefix));
+            expected_names.push(format!("{}.self_attn.v_proj.bias", prefix));
+        }
+
         if config.use_qk_norm {
             expected_names.push(format!("{}.self_attn.q_norm.weight", prefix));
             expected_names.push(format!("{}.self_attn.k_norm.weight", prefix));

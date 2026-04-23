@@ -668,6 +668,7 @@ impl Qwen3Inner {
                     Some(config.rope_theta),
                     Some(config.use_qk_norm),
                     Some(config.head_dim as u32),
+                    Some(config.attention_bias),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -5366,7 +5367,18 @@ impl Qwen3Inner {
                 attn.get_o_proj_weight(),
             );
 
-            // QK norm parameters (if enabled)
+            if self.config.attention_bias {
+                if let Some(b) = attn.get_q_proj_bias() {
+                    params.insert(format!("{}.self_attn.q_proj.bias", prefix), b);
+                }
+                if let Some(b) = attn.get_k_proj_bias() {
+                    params.insert(format!("{}.self_attn.k_proj.bias", prefix), b);
+                }
+                if let Some(b) = attn.get_v_proj_bias() {
+                    params.insert(format!("{}.self_attn.v_proj.bias", prefix), b);
+                }
+            }
+
             if self.config.use_qk_norm {
                 if let Some(q_norm_weight) = attn.get_q_norm_weight() {
                     params.insert(format!("{}.self_attn.q_norm.weight", prefix), q_norm_weight);
