@@ -357,7 +357,10 @@ fn parse_config(raw_config: &Value) -> Result<Qwen3Config> {
         use_qk_norm: raw_config["use_qk_norm"]
             .as_bool()
             .or_else(|| raw_config["useQkNorm"].as_bool())
-            .unwrap_or(true),
+            .unwrap_or_else(|| {
+                let model_type = raw_config["model_type"].as_str().unwrap_or("qwen3");
+                model_type != "qwen2"
+            }),
         tie_word_embeddings: raw_config["tie_word_embeddings"]
             .as_bool()
             .or_else(|| raw_config["tieWordEmbeddings"].as_bool())

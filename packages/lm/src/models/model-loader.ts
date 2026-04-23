@@ -14,6 +14,7 @@ import type { LoadableModel, TrainableModel } from '../interfaces.js';
 import { Gemma4Model, Lfm2Model, Qwen3Model, Qwen35Model, Qwen35MoeModel } from '../stream.js';
 
 export type ModelType =
+  | 'qwen2'
   | 'qwen3'
   | 'qwen3_5'
   | 'qwen3_5_moe'
@@ -24,6 +25,7 @@ export type ModelType =
   | 'lfm2';
 
 const SUPPORTED_MODEL_TYPES = new Set<ModelType>([
+  'qwen2',
   'qwen3',
   'qwen3_5',
   'qwen3_5_moe',
@@ -48,6 +50,7 @@ export async function loadModel(modelPath: string): Promise<LoadableModel> {
       return Qwen35MoeModel.load(modelPath) as unknown as Promise<TrainableModel>;
     case 'qwen3_5':
       return Qwen35Model.load(modelPath) as unknown as Promise<TrainableModel>;
+    case 'qwen2':
     case 'qwen3':
       return Qwen3Model.load(modelPath) as unknown as Promise<TrainableModel>;
     case 'harrier':
