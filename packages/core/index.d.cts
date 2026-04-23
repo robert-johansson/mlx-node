@@ -3992,6 +3992,7 @@ export interface Qwen3Config {
   maxPositionEmbeddings: number
   headDim: number
   useQkNorm: boolean
+  attentionBias: boolean
   tieWordEmbeddings: boolean
   padTokenId: number
   eosTokenId: number

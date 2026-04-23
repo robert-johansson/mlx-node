@@ -70,6 +70,7 @@ impl InternVLLanguageModel {
                 Some(config.rope_theta),
                 Some(config.use_qk_norm),
                 Some(head_dim),
+                None,
             )?;
 
             // Load attention weights

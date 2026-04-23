@@ -49,6 +49,7 @@ impl HarrierModel {
                     Some(config.rope_theta),
                     Some(use_qk_norm),
                     Some(config.head_dim as u32),
+                    None,
                 )
             })
             .collect::<Result<Vec<_>>>()?;

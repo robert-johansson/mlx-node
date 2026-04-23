@@ -1734,6 +1734,7 @@ mod forward_pass_equivalence_tests {
             max_position_embeddings: 128,
             head_dim: 8, // 32 / 4 = 8
             use_qk_norm: true,
+            attention_bias: false,
             tie_word_embeddings: false,
             pad_token_id: 0,
             eos_token_id: 1,
@@ -2163,6 +2164,7 @@ mod chunked_forward_tests {
             max_position_embeddings: 128,
             head_dim: 8, // 32 / 4 = 8
             use_qk_norm: true,
+            attention_bias: false,
             tie_word_embeddings: false,
             pad_token_id: 0,
             eos_token_id: 1,
