@@ -77,6 +77,21 @@ fn validate_loaded_parameters(
             vec![hidden_size, num_heads * head_dim],
         ));
 
+        if config.attention_bias {
+            required_params.push((
+                format!("{}.self_attn.q_proj.bias", prefix),
+                vec![num_heads * head_dim],
+            ));
+            required_params.push((
+                format!("{}.self_attn.k_proj.bias", prefix),
+                vec![num_kv_heads * head_dim],
+            ));
+            required_params.push((
+                format!("{}.self_attn.v_proj.bias", prefix),
+                vec![num_kv_heads * head_dim],
+            ));
+        }
+
         // MLP weights
         required_params.push((
             format!("{}.mlp.gate_proj.weight", prefix),
@@ -361,6 +376,13 @@ fn parse_config(raw_config: &Value) -> Result<Qwen3Config> {
                 let model_type = raw_config["model_type"].as_str().unwrap_or("qwen3");
                 model_type != "qwen2"
             }),
+        attention_bias: raw_config["attention_bias"]
+            .as_bool()
+            .or_else(|| raw_config["attentionBias"].as_bool())
+            .unwrap_or_else(|| {
+                let model_type = raw_config["model_type"].as_str().unwrap_or("qwen3");
+                model_type == "qwen2"
+            }),
         tie_word_embeddings: raw_config["tie_word_embeddings"]
             .as_bool()
             .or_else(|| raw_config["tieWordEmbeddings"].as_bool())
@@ -557,6 +579,23 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                             mapped_params.get(&format!("{}.self_attn.o_proj.weight", prefix))
                         {
                             layer.self_attn.set_o_proj_weight(w)?;
+                        }
+                        if config.attention_bias {
+                            if let Some(b) =
+                                mapped_params.get(&format!("{}.self_attn.q_proj.bias", prefix))
+                            {
+                                layer.self_attn.set_q_proj_bias(b)?;
+                            }
+                            if let Some(b) =
+                                mapped_params.get(&format!("{}.self_attn.k_proj.bias", prefix))
+                            {
+                                layer.self_attn.set_k_proj_bias(b)?;
+                            }
+                            if let Some(b) =
+                                mapped_params.get(&format!("{}.self_attn.v_proj.bias", prefix))
+                            {
+                                layer.self_attn.set_v_proj_bias(b)?;
+                            }
                         }
                         if config.use_qk_norm {
                             if let Some(w) =
