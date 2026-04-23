@@ -902,8 +902,8 @@ impl Qwen35Inner {
     /// VLM: compute image token count from grid dimensions (runs on model thread).
     fn compute_image_token_count_sync(&self, grid_thw: &MxArray) -> Result<i32> {
         let sms = self.spatial_merge_size.unwrap_or(2);
-        let count = compute_num_image_tokens(grid_thw, sms)?;
-        Ok(count as i32)
+        let counts = compute_image_token_counts_per_image(grid_thw, sms)?;
+        Ok(counts.iter().sum::<usize>() as i32)
     }
 
     /// VLM: prefill step — process vision features and run the first forward pass (runs on model thread).
