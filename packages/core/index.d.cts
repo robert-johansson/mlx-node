@@ -1143,6 +1143,22 @@ export declare class Qwen35Model {
   /** Reset all caches. */
   resetCaches(): void
   /**
+   * Run a forward pass without persistent caching.
+   *
+   * Creates temporary KV caches internally. Does NOT touch persistent caches.
+   * Returns logits for all positions, shape `[1, seq_len, vocab_size]`.
+   */
+  forward(inputIds: MxArray): MxArray
+  /**
+   * Run a cached forward pass. Must call `initCaches()` first.
+   *
+   * Multi-token input (prefill): processes all tokens, populates cache,
+   * returns last-position logits shape `[1, 1, vocab_size]`.
+   * Single-token input (decode step): uses cached state, returns next logits
+   * shape `[1, 1, vocab_size]`.
+   */
+  forwardWithCache(inputIds: MxArray, useCache: boolean): MxArray
+  /**
    * Take the KV cache from the model, returning a `PromptCache` handle.
    *
    * The cache is moved out of the model — calling `takeCache()` twice
@@ -1322,6 +1338,22 @@ export declare class Qwen35MoeModel {
   initCaches(): void
   /** Reset all caches. */
   resetCaches(): void
+  /**
+   * Run a forward pass without persistent caching.
+   *
+   * Creates temporary KV caches internally. Does NOT touch persistent caches.
+   * Returns logits for all positions, shape `[1, seq_len, vocab_size]`.
+   */
+  forward(inputIds: MxArray): MxArray
+  /**
+   * Run a cached forward pass. Must call `initCaches()` first.
+   *
+   * Multi-token input (prefill): processes all tokens, populates cache,
+   * returns last-position logits shape `[1, 1, vocab_size]`.
+   * Single-token input (decode step): uses cached state, returns next logits
+   * shape `[1, 1, vocab_size]`.
+   */
+  forwardWithCache(inputIds: MxArray, useCache: boolean): MxArray
   /** Take the KV cache from the model, returning a `PromptCache` handle. */
   takeCache(): PromptCache | null
   /** Restore a previously taken `PromptCache` into the model. */
@@ -1459,6 +1491,8 @@ export declare class Qwen3Model {
    * Clears cached key-value states. Call this between different generation sequences.
    */
   resetKvCaches(): void
+  /** Alias for `initKvCaches` — matches the Qwen3.5 naming convention. */
+  initCaches(): void
   /**
    * Uncached forward pass. Returns logits for all positions.
    *
