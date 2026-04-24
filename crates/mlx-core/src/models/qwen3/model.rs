@@ -6768,6 +6768,12 @@ impl Qwen3Model {
         send_and_block(&self.thread, |reply| Qwen3Cmd::ResetKvCaches { reply })
     }
 
+    /// Alias for `initKvCaches` — matches the Qwen3.5 naming convention.
+    #[napi]
+    pub fn init_caches(&self) -> Result<()> {
+        send_and_block(&self.thread, |reply| Qwen3Cmd::InitKvCaches { reply })
+    }
+
     /// Uncached forward pass. Returns logits for all positions.
     ///
     /// Creates temporary KV caches internally and discards them after the call.

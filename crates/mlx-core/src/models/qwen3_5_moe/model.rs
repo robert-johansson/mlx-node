@@ -235,6 +235,16 @@ pub(crate) enum Qwen35MoeCmd {
         path: String,
         reply: ResponseTx<()>,
     },
+    // --- Forward pass commands ---
+    Forward {
+        input_ids: MxArray,
+        reply: ResponseTx<MxArray>,
+    },
+    ForwardWithCache {
+        input_ids: MxArray,
+        use_cache: bool,
+        reply: ResponseTx<MxArray>,
+    },
 }
 
 /// Command handler for the dedicated model thread.
@@ -415,6 +425,16 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
         }
         Qwen35MoeCmd::LoadOptimizerState { path, reply } => {
             let _ = reply.send(inner.load_optimizer_state_sync(path));
+        }
+        Qwen35MoeCmd::Forward { input_ids, reply } => {
+            let _ = reply.send(inner.forward_sync(&input_ids));
+        }
+        Qwen35MoeCmd::ForwardWithCache {
+            input_ids,
+            use_cache,
+            reply,
+        } => {
+            let _ = reply.send(inner.forward_with_cache_sync(&input_ids, use_cache));
         }
     }
 }
@@ -616,6 +636,102 @@ impl Qwen35MoeInner {
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_rope_deltas = None;
+    }
+
+    /// Uncached forward pass with temporary caches.
+    fn forward_sync(&mut self, input_ids: &MxArray) -> Result<MxArray> {
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let embedding_weight = self.embedding.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let fa_idx = self.fa_idx;
+
+        let mut temp_caches: Option<Vec<Qwen3_5LayerCache>> = Some(
+            (0..self.config.num_layers as usize)
+                .map(|i| {
+                    if self.config.is_linear_layer(i) {
+                        Qwen3_5LayerCache::new_linear()
+                    } else {
+                        Qwen3_5LayerCache::new_full_attention()
+                    }
+                })
+                .collect(),
+        );
+
+        let logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            forward_inner(
+                input_ids,
+                &embedding_weight,
+                &mut self.layers,
+                &mut temp_caches,
+                &self.final_norm,
+                &self.lm_head,
+                fa_idx,
+                Some(&embedding_weight_t),
+            )?
+        };
+        logits.eval();
+        Ok(logits)
+    }
+
+    /// Cached forward pass using persistent caches.
+    ///
+    /// Returns logits shape `[1, 1, vocab_size]` (last position only),
+    /// matching the Qwen3 `forward_with_cache_sync` contract.
+    fn forward_with_cache_sync(
+        &mut self,
+        input_ids: &MxArray,
+        use_cache: bool,
+    ) -> Result<MxArray> {
+        if !use_cache {
+            return self.forward_sync(input_ids);
+        }
+        if self.caches.is_none() {
+            return Err(napi::Error::from_reason(
+                "KV caches not initialized. Call initCaches() before forwardWithCache().",
+            ));
+        }
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let embedding_weight = self.embedding.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let fa_idx = self.fa_idx;
+        let seq_len = input_ids.shape_at(1)?;
+
+        let logits = if seq_len > 1 {
+            // Prefill: chunked for memory-bounded long prompts.
+            // chunked_prefill returns [1, last_chunk_len, vocab_size].
+            // Extract last position to get [1, 1, vocab_size].
+            let all_logits = chunked_prefill(
+                input_ids,
+                &embedding_weight,
+                &mut self.layers,
+                &mut self.caches,
+                &self.final_norm,
+                &self.lm_head,
+                fa_idx,
+                Some(&embedding_weight_t),
+                generation_stream,
+            )?;
+            let sl = all_logits.shape_at(1)?;
+            all_logits.slice_axis(1, sl - 1, sl)?
+        } else {
+            // Single-token decode step: forward_inner returns [1, 1, vocab_size].
+            let _stream_ctx = StreamContext::new(generation_stream);
+            forward_inner(
+                input_ids,
+                &embedding_weight,
+                &mut self.layers,
+                &mut self.caches,
+                &self.final_norm,
+                &self.lm_head,
+                fa_idx,
+                Some(&embedding_weight_t),
+            )?
+        };
+
+        logits.eval();
+        Ok(logits)
     }
 
     /// Take the KV cache from the model, returning a `PromptCache` handle.
@@ -5841,6 +5957,37 @@ impl Qwen3_5MoeModel {
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
+    }
+
+    /// Run a forward pass without persistent caching.
+    ///
+    /// Creates temporary KV caches internally. Does NOT touch persistent caches.
+    /// Returns logits for all positions, shape `[1, seq_len, vocab_size]`.
+    #[napi]
+    pub fn forward(&self, input_ids: &MxArray) -> Result<MxArray> {
+        input_ids.eval();
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35MoeCmd::Forward {
+            input_ids: input_ids.clone(),
+            reply,
+        })
+    }
+
+    /// Run a cached forward pass. Must call `initCaches()` first.
+    ///
+    /// Multi-token input (prefill): processes all tokens, populates cache,
+    /// returns last-position logits shape `[1, 1, vocab_size]`.
+    /// Single-token input (decode step): uses cached state, returns next logits
+    /// shape `[1, 1, vocab_size]`.
+    #[napi]
+    pub fn forward_with_cache(&self, input_ids: &MxArray, use_cache: bool) -> Result<MxArray> {
+        input_ids.eval();
+        crate::model_thread::send_and_block(&self.thread, |reply| {
+            Qwen35MoeCmd::ForwardWithCache {
+                input_ids: input_ids.clone(),
+                use_cache,
+                reply,
+            }
+        })
     }
 
     /// Take the KV cache from the model, returning a `PromptCache` handle.
