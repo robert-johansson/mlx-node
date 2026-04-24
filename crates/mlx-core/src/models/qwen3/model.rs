@@ -178,6 +178,9 @@ pub(crate) enum Qwen3Cmd {
     ResetCaches {
         reply: ResponseTx<()>,
     },
+    InitKvCaches {
+        reply: ResponseTx<()>,
+    },
     Forward {
         input_ids: MxArray,
         reply: ResponseTx<MxArray>,
@@ -338,6 +341,9 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
         }
         Qwen3Cmd::ResetCaches { reply } => {
             let _ = reply.send(inner.reset_kv_caches_sync());
+        }
+        Qwen3Cmd::InitKvCaches { reply } => {
+            let _ = reply.send(inner.init_kv_caches_sync());
         }
         Qwen3Cmd::Forward { input_ids, reply } => {
             let _ = reply.send(inner.forward_sync(&input_ids));
@@ -615,6 +621,13 @@ impl Qwen3Inner {
 
     pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
         self.tokenizer = Some(tokenizer);
+    }
+
+    fn init_kv_caches_sync(&mut self) -> Result<()> {
+        let num_layers = self.layers.len();
+        let caches: Vec<KVCache> = (0..num_layers).map(|_| KVCache::new()).collect();
+        self.kv_caches = Some(caches);
+        Ok(())
     }
 
     fn reset_kv_caches_sync(&mut self) -> Result<()> {
@@ -6138,6 +6151,20 @@ impl Qwen3Model {
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
         crate::model_thread::send_and_block(&self.thread, |reply| Qwen3Cmd::ResetCaches { reply })
+    }
+
+    /// Initialize the persistent KV caches. Must be called before
+    /// `forwardWithCache(useCache = true)`.
+    #[napi]
+    pub fn init_kv_caches(&self) -> Result<()> {
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen3Cmd::InitKvCaches { reply })
+    }
+
+    /// Alias for `initKvCaches` — matches the Qwen3.5 naming convention so
+    /// all language models share the same `initCaches`/`resetCaches` surface.
+    #[napi]
+    pub fn init_caches(&self) -> Result<()> {
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen3Cmd::InitKvCaches { reply })
     }
 
     /// Uncached forward pass. Returns logits for all positions.
