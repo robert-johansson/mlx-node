@@ -775,6 +775,7 @@ unsafe extern "C-unwind" {
     pub fn mlx_metal_is_available() -> bool;
     pub fn mlx_metal_device_info() -> *const std::os::raw::c_char;
     pub fn mlx_set_wired_limit(limit: u64, out_old_limit: *mut u64) -> i32;
+    pub fn mlx_get_wired_limit(out_value: *mut u64) -> i32;
     pub fn mlx_get_peak_memory(out_value: *mut u64) -> i32;
     pub fn mlx_get_active_memory(out_value: *mut u64) -> i32;
     pub fn mlx_get_cache_memory(out_value: *mut u64) -> i32;
