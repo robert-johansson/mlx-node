@@ -54,17 +54,21 @@ pub fn get_memory_limit() -> f64 {
 
 #[napi(js_name = "setCacheLimit")]
 pub fn set_cache_limit(limit: f64) -> f64 {
-    crate::array::memory::set_cache_limit(limit)
+    crate::array::memory::set_cache_limit(limit).unwrap_or(0.0)
 }
 
 #[napi(js_name = "setWiredLimit")]
 pub fn set_wired_limit(limit: f64) -> f64 {
-    unsafe { sys::mlx_set_wired_limit(limit as usize) as f64 }
+    let mut prev: u64 = 0;
+    let rc = unsafe { sys::mlx_set_wired_limit(limit as u64, &mut prev) };
+    if rc != 0 { 0.0 } else { prev as f64 }
 }
 
 #[napi(js_name = "getWiredLimit")]
 pub fn get_wired_limit() -> f64 {
-    unsafe { sys::mlx_get_wired_limit() as f64 }
+    let mut v: u64 = 0;
+    let rc = unsafe { sys::mlx_get_wired_limit(&mut v) };
+    if rc != 0 { 0.0 } else { v as f64 }
 }
 
 #[napi(js_name = "compileClearCache")]

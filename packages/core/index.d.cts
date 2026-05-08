@@ -153,6 +153,20 @@ export declare class Gemma4Model {
   constructor(config: Gemma4Config)
   /** Returns true if weights have been loaded via `load()`. */
   get isInitialized(): boolean
+  /**
+   * Whether the block-paged KV cache adapter is active on this model
+   * instance.
+   *
+   * `true` iff `Gemma4Inner::paged_adapter` was successfully
+   * constructed at load time (driven by
+   * `Gemma4Config::use_block_paged_cache`, default-ON since the
+   * `gemma4_paged_vs_flat_parity` integration test verified greedy
+   * byte-equal at BF16 against real Gemma-4-E2B-IT weights — see
+   * CLAUDE.md). Stubs constructed via `new(config)` always return
+   * `false`. Surfaced through this NAPI method so server endpoints
+   * can branch on it without a model-thread roundtrip.
+   */
+  hasBlockPagedCache(): boolean
   modelId(): number
   /** Load a Gemma4 model from a directory. */
   static load(modelPath: string): Promise<Gemma4Model>
@@ -528,6 +542,23 @@ export declare class Lfm2Model {
    * state between turns.
    */
   resetCaches(): void
+  /**
+   * Whether the block-paged KV cache adapter is active on this model
+   * instance.
+   *
+   * `true` iff `Lfm2Inner::paged_adapter` was successfully constructed
+   * at load time (driven by `Lfm2Config::use_block_paged_cache`,
+   * defaulting to `true` after paged-vs-flat parity verification).
+   * LFM2 is hybrid (10 conv + 6 full-attention layers); only the
+   * full-attention layers route through the adapter, conv layers stay
+   * on flat `Lfm2LayerCache::Conv` regardless. When `true`, the native
+   * cache reuses SYS blocks across `chatSessionStart` calls via
+   * content-addressing, so the JS-side warm slot in
+   * `SessionRegistry.getOrCreateWarmAny` is redundant and the
+   * `/v1/messages` server endpoint allocates a fresh `ChatSession` per
+   * request.
+   */
+  hasBlockPagedCache(): boolean
   /**
    * Start a new chat session.
    *
@@ -1052,8 +1083,13 @@ export declare class QianfanOCRModel {
    * Create a new QianfanOCRModel from config (uninitialized, no weights).
    *
    * This constructor path does not spawn a model thread — the returned
-   * instance is only useful for config inspection. Call
-   * [`QianfanOCRModel::load`] to actually run inference.
+   * instance is only useful for `is_initialized` queries until
+   * [`QianfanOCRModel::load`] is called to actually run inference. The
+   * `config` argument is accepted to preserve the `new
+   * QianfanOCRModel(config)` JS surface; the value is discarded because
+   * nothing on the uninitialized path consults it (any future config
+   * getter would forward to the inner thread state populated by
+   * `load()`).
    */
   constructor(config: QianfanOcrConfig)
   /** Returns true if weights have been loaded via `load()`. */
@@ -1142,6 +1178,21 @@ export declare class Qwen35Model {
   initCaches(): void
   /** Reset all caches. */
   resetCaches(): void
+  /**
+   * Whether the block-paged KV cache adapter is active on this model
+   * instance.
+   *
+   * `true` iff `Qwen35Inner::paged_adapter` was successfully
+   * constructed at load time (driven by
+   * `Qwen3_5Config::use_block_paged_cache`, currently default-OFF
+   * because parity is pending real-weights validation). On VLM
+   * checkpoints the adapter can still be active for text-only
+   * inference; image-bearing chat turns are rejected at runtime by
+   * the chat-entry sites. Surfaced through this NAPI method so
+   * server endpoints can branch on it without round-tripping through
+   * the model thread.
+   */
+  hasBlockPagedCache(): boolean
   /**
    * Run a forward pass without persistent caching.
    *
@@ -1339,6 +1390,21 @@ export declare class Qwen35MoeModel {
   /** Reset all caches. */
   resetCaches(): void
   /**
+   * Whether the block-paged KV cache adapter is active on this model
+   * instance.
+   *
+   * `true` iff `Qwen35MoeInner::paged_adapter` was successfully
+   * constructed at load time (driven by
+   * `Qwen3_5MoeConfig::use_block_paged_cache`, currently default-OFF
+   * because parity is pending real-weights validation). On VLM
+   * checkpoints the adapter can still be active for text-only
+   * inference; image-bearing chat turns are rejected at runtime by
+   * the chat-entry sites. Surfaced through this NAPI method so
+   * server endpoints can branch on it without round-tripping through
+   * the model thread.
+   */
+  hasBlockPagedCache(): boolean
+  /**
    * Run a forward pass without persistent caching.
    *
    * Creates temporary KV caches internally. Does NOT touch persistent caches.
@@ -1479,6 +1545,22 @@ export declare class Qwen3Model {
    * Call this when starting a new conversation to ensure a full prefill.
    */
   resetCache(): void
+  /**
+   * Whether the block-paged KV cache adapter is active on this model
+   * instance.
+   *
+   * `true` iff `Qwen3Inner::paged_adapter` was successfully constructed
+   * at load time (driven by `Qwen3Config::use_block_paged_cache`,
+   * defaulting to `true` for Qwen3 since paged-vs-flat parity has been
+   * verified). When `true`, the native cache reuses SYS blocks across
+   * `chatSessionStart` calls via content-addressing in
+   * `BlockAllocator`'s prefix-hash table — the JS-side warm slot in
+   * `SessionRegistry.getOrCreateWarmAny` becomes redundant and the
+   * `/v1/messages` server endpoint allocates a fresh `ChatSession` per
+   * request. See `packages/server/src/endpoints/messages.ts` for the
+   * runtime-routing decision.
+   */
+  hasBlockPagedCache(): boolean
   /**
    * Initialize KV caches for incremental generation
    *
@@ -3032,6 +3114,37 @@ export interface Gemma4Config {
   boiTokenId?: number
   eoiTokenId?: number
   visionSoftTokensPerImage?: number
+  /**
+   * GPU memory budget for paged KV cache in megabytes.
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 2048 (2GB).
+   */
+  pagedCacheMemoryMb?: number | undefined
+  /**
+   * Block size for paged attention (tokens per block).
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 16.
+   */
+  pagedBlockSize?: number | undefined
+  /**
+   * Use the new block-paged KV cache adapter (`PagedKVCacheAdapter`).
+   *
+   * When `Some(true)` or unset (the default), `Gemma4Inner` allocates
+   * a `BlockAllocator` + `LayerKVPool` pair and constructs a
+   * `PagedKVCacheAdapter`. Sliding-window layers stay on the existing
+   * flat `RotatingKVCache` path (window-trimmed semantics don't map
+   * onto the paged pool), while full_attention (global) layers route
+   * through the adapter — including `KV-shared` layers whose anchor
+   * is global (read via `read_kv_range`) and KV-shared layers whose
+   * anchor is sliding (pull from the flat anchor's stash).
+   *
+   * Default: `true` (paged adapter on; opt-out via
+   * `use_block_paged_cache: false` in `config.json` to fall back to
+   * the legacy all-flat `Gemma4LayerCache` path). Parity is verified
+   * by `crates/mlx-core/tests/gemma4_paged_vs_flat_parity.rs` against
+   * real Gemma-4-E2B weights.
+   */
+  useBlockPagedCache?: boolean | undefined
 }
 
 /**
@@ -3212,6 +3325,9 @@ export declare function getExpectedWeightKeys(): Array<string>
 
 export declare function getMemoryLimit(): number
 
+/** Sample MLX's GPU memory counters. See [`GpuMemorySnapshot`]. */
+export declare function getMemorySnapshot(): GpuMemorySnapshot
+
 export declare function getPeakMemory(): number
 
 /** Retrieve all collected profiling data as a `ProfilingSession`. */
@@ -3272,6 +3388,33 @@ export declare function gpuArchitectureGen(): number
 export interface GpuInfo {
   /** GPU architecture generation (M1=13, M2=14, M3=15, M4=16, M5=17). */
   architectureGen: number
+}
+
+/**
+ * Snapshot of MLX's GPU memory counters at this instant. All values
+ * are in bytes. On Apple Silicon, GPU and CPU share unified memory,
+ * so these are NOT a separate "VRAM" pool — they reflect MLX's own
+ * tracking of `StorageModePrivate` Metal buffers (model weights,
+ * `LayerKVPool`, transient intermediate tensors) attributed to the
+ * MLX runtime in this process.
+ *
+ * Useful for live observability during long-running sessions:
+ *
+ * ```js
+ * const { getMemorySnapshot } = require('@mlx-node/core');
+ * setInterval(() => {
+ *   const m = getMemorySnapshot();
+ *   console.log(`active=${(m.activeBytes/1e9).toFixed(2)}GB peak=${(m.peakBytes/1e9).toFixed(2)}GB cache=${(m.cacheBytes/1e9).toFixed(2)}GB`);
+ * }, 1000);
+ * ```
+ */
+export interface GpuMemorySnapshot {
+  /** Current actively-used GPU buffer bytes (excludes cache pool). */
+  activeBytes: number
+  /** Peak GPU buffer bytes since the last `resetPeakMemory()` call. */
+  peakBytes: number
+  /** Bytes held in MLX's caching allocator (released by `clearCache`). */
+  cacheBytes: number
 }
 
 export declare function greater(a: MxArray | number, b: MxArray | number): MxArray
@@ -3575,6 +3718,37 @@ export interface Lfm2Config {
   eosTokenId: number
   bosTokenId: number
   padTokenId: number
+  /**
+   * GPU memory budget for paged KV cache in megabytes.
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 2048 (2GB).
+   */
+  pagedCacheMemoryMb?: number | undefined
+  /**
+   * Block size for paged attention (tokens per block).
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 16.
+   */
+  pagedBlockSize?: number | undefined
+  /**
+   * Use the new block-paged KV cache adapter (`PagedKVCacheAdapter`).
+   *
+   * **OPT-IN — experimental and currently a no-op for chat dispatch.**
+   * When `Some(true)`, `Lfm2Inner` allocates a `BlockAllocator` +
+   * `LayerKVPool` pair sized for the model's full_attention layers
+   * only and constructs a `PagedKVCacheAdapter` field. The chat-session
+   * forward dispatch is NOT yet wired through this adapter — LFM2's
+   * hybrid conv + attention architecture means only attention layers
+   * can use the block-paged path; conv layers continue to use the
+   * existing `Lfm2LayerCache::Conv(ArraysCache)` storage. A bespoke
+   * per-layer dispatch on `Lfm2DecoderLayer` (mirroring the Qwen3
+   * `forward_paged_adapter` pattern) plus a hybrid cache wrapper that
+   * indexes the adapter by attention-layer ordinal (not absolute
+   * layer index) is required before forward wiring can land.
+   *
+   * Default: false (use the existing `Lfm2LayerCache` path).
+   */
+  useBlockPagedCache?: boolean | undefined
 }
 
 export declare function lgamma(a: MxArray | number): MxArray
@@ -3940,6 +4114,49 @@ export interface Qwen35Config {
   fullAttentionInterval: number
   partialRotaryFactor: number
   ropeTheta: number
+  /**
+   * GPU memory budget for paged KV cache in megabytes.
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 2048 (2GB).
+   */
+  pagedCacheMemoryMb?: number | undefined
+  /**
+   * Block size for paged attention (tokens per block).
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 16.
+   */
+  pagedBlockSize?: number | undefined
+  /**
+   * Use the block-paged KV cache adapter (`PagedKVCacheAdapter`) for
+   * full-attention layers.
+   *
+   * **OPT-IN — experimental.** When `Some(true)`, `Qwen35Inner`
+   * allocates a `BlockAllocator` + `LayerKVPool` pair sized for the
+   * model's full-attention layer count and constructs a
+   * `PagedKVCacheAdapter`. The chat-session forward dispatch routes
+   * full-attention layers through this adapter while linear-attention
+   * (GatedDeltaNet / GDN) layers continue to use the existing
+   * `Qwen3_5LayerCache::Linear(ArraysCache)` path with no
+   * cross-request prefix reuse — vLLM's `MambaManager`-style "no
+   * prefix reuse for recurrent layers" stance.
+   *
+   * **Compile lockout**: when this flag is `Some(true)` the dispatch
+   * path skips the `mlx_qwen35_compiled_*` lifecycle entirely (no
+   * mutex acquisition, no `compiled_init_from_prefill`, no compiled
+   * decode). The compiled C++ forward path is incompatible with the
+   * per-layer paged dispatch; flipping this flag at runtime trades
+   * the compiled fast path for cross-request prefix reuse.
+   *
+   * **VLM is rejected**: when both `vision_encoder.is_some()` and
+   * this flag is `Some(true)`, `Qwen35Inner::new_with_paged` returns
+   * a descriptive error. Paged dispatch through M-RoPE / vision
+   * features is deferred.
+   *
+   * Default: `None` / `false` (use the existing flat path with the
+   * compiled C++ forward when available). Default-flip pending real-
+   * weights parity verification.
+   */
+  useBlockPagedCache?: boolean | undefined
 }
 
 /** Generation configuration for Qwen3.5 */
@@ -3994,6 +4211,35 @@ export interface Qwen35MoeConfig {
   moeIntermediateSize?: number | undefined
   normTopkProb: boolean
   mlpOnlyLayers?: number[] | undefined
+  /**
+   * GPU memory budget for paged KV cache in megabytes.
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 2048 (2GB).
+   */
+  pagedCacheMemoryMb?: number | undefined
+  /**
+   * Block size for paged attention (tokens per block).
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 16.
+   */
+  pagedBlockSize?: number | undefined
+  /**
+   * Use the block-paged KV cache adapter for full-attention layers.
+   *
+   * **OPT-IN — experimental.** Same semantics as the dense
+   * `Qwen3_5Config::use_block_paged_cache` field. Routes full-
+   * attention layers through `PagedKVCacheAdapter`; GDN linear-
+   * attention layers stay on `Qwen3_5LayerCache::Linear`. When
+   * enabled, the compiled MoE C++ forward path
+   * (`mlx_qwen35_moe_compiled_*`) is skipped — the paged adapter is
+   * incompatible with the in-graph compile cache.
+   *
+   * VLM (vision encoder present) is rejected with an error in
+   * `Qwen35MoeInner::new`.
+   *
+   * Default: `None` / `false`.
+   */
+  useBlockPagedCache?: boolean | undefined
 }
 
 /** Generation configuration for Qwen3.5 MoE */
@@ -4054,6 +4300,22 @@ export interface Qwen3Config {
    * Default: false
    */
   useFp8Cache?: boolean | undefined
+  /**
+   * Use the new block-paged KV cache adapter (`PagedKVCacheAdapter`).
+   *
+   * **OPT-IN — experimental.** When `Some(true)`, `Qwen3Inner` allocates a
+   * `BlockAllocator` + `LayerKVPool` pair and constructs a
+   * `PagedKVCacheAdapter` for cross-request KV prefix reuse (vLLM-style
+   * block-paged storage with refcounted prefix caching). This flag is
+   * independent of `use_paged_attention`, which drives the legacy
+   * `PagedKVCache` + `ContinuousBatchingScheduler` path. The adapter is
+   * wired through `chat_sync_core` separately; defaulting to `false`
+   * keeps the existing flat `Vec<KVCache>` path entirely unchanged until
+   * the integration is proven on real weights.
+   *
+   * Default: false (use the existing flat KVCache path).
+   */
+  useBlockPagedCache?: boolean | undefined
 }
 
 /** Qwen3 language model configuration */
@@ -4091,6 +4353,14 @@ export interface RecResult {
 export declare function remainder(a: MxArray | number, b: MxArray | number): MxArray
 
 export declare function repeat(a: MxArray, repeats: number, axis: number): MxArray
+
+/**
+ * Reset MLX's peak-memory counter to the current active level.
+ * Useful for measuring per-request peak memory in a long-running
+ * process — call before a request, sample
+ * `getMemorySnapshot().peakBytes` after.
+ */
+export declare function resetPeakMemory(): void
 
 export declare function resetPeakMemory(): void
 
