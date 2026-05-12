@@ -93,6 +93,12 @@ export interface AnthropicMessagesRequest {
   stream?: boolean;
   stop_sequences?: string[];
   metadata?: { user_id?: string };
+  output_config?: {
+    format?: {
+      type?: string;
+      schema?: unknown;
+    };
+  };
   // NOTE: `prompt_cache_key` is intentionally NOT advertised on this
   // endpoint. KV-cache reuse on `/v1/messages` is delivered via the
   // server-side `getOrCreateWarmAny` warm-slot mechanism keyed on the
@@ -103,6 +109,14 @@ export interface AnthropicMessagesRequest {
   // would be a no-op that silently misleads clients. The equivalent
   // field on `/v1/responses` is still honoured for that endpoint's
   // tier-2 lookup.
+}
+
+export type AnthropicCountTokensRequest = Omit<AnthropicMessagesRequest, 'max_tokens'> & {
+  max_tokens?: number;
+};
+
+export interface AnthropicCountTokensResponse {
+  input_tokens: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -157,17 +171,21 @@ export type AnthropicResponseContent =
  *     that did not request explicit caching should never see a
  *     non-zero creation count.
  *
- * The `time_to_first_token_ms`, `prefill_tokens_per_second`, and
- * `decode_tokens_per_second` fields are NON-Anthropic extension
- * fields surfaced for the launcher's verbose log
- * (`requests.ndjson`) so per-turn decode-rate / TTFT / prefill-rate
- * telemetry rides the same response envelope. They are emitted only
- * when the underlying native dispatch produced a finite, positive
- * value — missing or non-finite metrics are elided rather than
- * surfaced as zero / null. Anthropic-compatible clients (Claude
- * Code, official Anthropic SDKs) ignore unknown fields, so the
- * extension is wire-safe — it parallels how `cache_read_input_tokens`
- * is treated above.
+ * The timing fields below are NON-Anthropic extension fields surfaced
+ * for the launcher's verbose log (`requests.ndjson`) so per-turn
+ * decode-rate / TTFT / prefill-rate telemetry rides the same response
+ * envelope. They describe native/server inference timing, not the
+ * HTTP logger's outer `elapsedMs` envelope. They are emitted only when
+ * the underlying native dispatch produced a finite, positive value —
+ * missing or non-finite metrics are elided rather than surfaced as
+ * zero / null. Anthropic-compatible clients (Claude Code, official
+ * Anthropic SDKs) ignore unknown fields, so the extension is wire-safe
+ * — it parallels how `cache_read_input_tokens` is treated above.
+ *
+ * `prefill_input_tokens` and `cached_prefix_tokens` provide the
+ * denominator/context for `prefill_tokens_per_second`: on cached-prefix
+ * turns the prefill rate is for the uncached suffix, not the full
+ * logical prompt.
  */
 export interface AnthropicUsage {
   input_tokens: number;
@@ -180,6 +198,32 @@ export interface AnthropicUsage {
   prefill_tokens_per_second?: number;
   /** Server-extension: generated-token throughput during decode. */
   decode_tokens_per_second?: number;
+  /** Server-extension: native/server inference elapsed, excluding HTTP transport and logging overhead. */
+  server_inference_elapsed_ms?: number;
+  /** Server-extension alias for disambiguating native TTFT from request/HTTP elapsed time. */
+  server_time_to_first_token_ms?: number;
+  /** Server-extension: handler-start to first native token, including model resolve/load and queue wait. */
+  server_total_time_to_first_token_ms?: number;
+  /** Server-extension alias for native prefill throughput. */
+  server_prefill_tokens_per_second?: number;
+  /** Server-extension alias for native decode throughput. */
+  server_decode_tokens_per_second?: number;
+  /** Server-extension: prompt tokens actually prefetched this turn after cached-prefix reuse. */
+  prefill_input_tokens?: number;
+  /** Server-extension: prompt tokens skipped because a cached prefix was reused. */
+  cached_prefix_tokens?: number;
+  /** Server-extension: time spent resolving/loading/aliasing the requested model before registry lookup. */
+  server_model_resolve_ms?: number;
+  /** Server-extension: time spent waiting behind the per-model execution mutex. */
+  server_queue_ms?: number;
+  /** Server-extension: handler time before native inference begins, including resolve and queue wait. */
+  server_pre_inference_ms?: number;
+  /** Server-extension: effective process-level paged-prefill chunk size. */
+  server_paged_prefill_chunk_size?: number;
+  /** Server-extension: effective process-level paged-prefill eval/clear cadence. */
+  server_paged_prefill_eval_interval?: number;
+  /** Server-extension: effective process-level paged-decode cache-clear cadence. */
+  server_paged_decode_cache_clear_interval?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -257,8 +301,7 @@ export interface AnthropicMessageDeltaEvent {
    * prefix, and `cache_read_input_tokens` is emitted only on a true
    * reuse turn.
    *
-   * `time_to_first_token_ms`, `prefill_tokens_per_second`, and
-   * `decode_tokens_per_second` are server-extension fields (not in
+   * Timing/accounting fields are server extensions (not in
    * Anthropic's spec) surfaced for the launcher's verbose log; see
    * the docstring on `AnthropicUsage`. Clients that do not recognize
    * them ignore them.
@@ -274,6 +317,32 @@ export interface AnthropicMessageDeltaEvent {
     prefill_tokens_per_second?: number;
     /** Server-extension: generated-token throughput during decode. */
     decode_tokens_per_second?: number;
+    /** Server-extension: native/server inference elapsed, excluding HTTP transport and logging overhead. */
+    server_inference_elapsed_ms?: number;
+    /** Server-extension alias for disambiguating native TTFT from request/HTTP elapsed time. */
+    server_time_to_first_token_ms?: number;
+    /** Server-extension: handler-start to first native token, including model resolve/load and queue wait. */
+    server_total_time_to_first_token_ms?: number;
+    /** Server-extension alias for native prefill throughput. */
+    server_prefill_tokens_per_second?: number;
+    /** Server-extension alias for native decode throughput. */
+    server_decode_tokens_per_second?: number;
+    /** Server-extension: prompt tokens actually prefetched this turn after cached-prefix reuse. */
+    prefill_input_tokens?: number;
+    /** Server-extension: prompt tokens skipped because a cached prefix was reused. */
+    cached_prefix_tokens?: number;
+    /** Server-extension: time spent resolving/loading/aliasing the requested model before registry lookup. */
+    server_model_resolve_ms?: number;
+    /** Server-extension: time spent waiting behind the per-model execution mutex. */
+    server_queue_ms?: number;
+    /** Server-extension: handler time before native inference begins, including resolve and queue wait. */
+    server_pre_inference_ms?: number;
+    /** Server-extension: effective process-level paged-prefill chunk size. */
+    server_paged_prefill_chunk_size?: number;
+    /** Server-extension: effective process-level paged-prefill eval/clear cadence. */
+    server_paged_prefill_eval_interval?: number;
+    /** Server-extension: effective process-level paged-decode cache-clear cadence. */
+    server_paged_decode_cache_clear_interval?: number;
   };
 }
 

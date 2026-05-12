@@ -1,12 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use tracing::{info, warn};
 
+use crate::inference_trace::{
+    elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
+};
 use crate::model_thread::{ResponseTx, StreamTx};
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 use crate::models::qwen3_5::model::{
@@ -36,6 +39,222 @@ use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+
+fn fresh_moe_layer_caches(config: &Qwen3_5MoeConfig) -> Vec<Qwen3_5LayerCache> {
+    (0..config.num_layers as usize)
+        .map(|i| {
+            if config.is_linear_layer(i) {
+                Qwen3_5LayerCache::new_linear()
+            } else {
+                Qwen3_5LayerCache::new_full_attention()
+            }
+        })
+        .collect()
+}
+
+const MOE_GDN_PREFIX_CHECKPOINT_LIMIT: usize = 8;
+
+struct MoeGdnPrefixCheckpoint {
+    prefix_len: u32,
+    block_size: u32,
+    final_block_hash: u64,
+    tokens: Vec<u32>,
+    caches: Vec<Qwen3_5LayerCache>,
+}
+
+struct MoeGdnHistoryCheckpoint {
+    tokens: Vec<u32>,
+    caches: Vec<Qwen3_5LayerCache>,
+}
+
+struct MoeGdnPrefixPreparation {
+    state: &'static str,
+    already_primed: bool,
+}
+
+#[derive(Default)]
+struct MoeGdnCheckpointStoreTrace {
+    stored: bool,
+    hash_ms: f64,
+    eval_ms: f64,
+    clone_ms: f64,
+    token_clone_ms: f64,
+    update_ms: f64,
+    total_ms: f64,
+}
+
+impl MoeGdnCheckpointStoreTrace {
+    fn finish(mut self, start: Option<std::time::Instant>) -> Self {
+        self.total_ms = start.map(elapsed_ms).unwrap_or(0.0);
+        self
+    }
+}
+
+fn moe_gdn_store_replayed_prefix_checkpoint_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crate::inference_trace::env_flag_enabled("MLX_MOE_GDN_REPLAY_PREFIX_CHECKPOINT")
+    })
+}
+
+#[derive(Clone, Copy)]
+struct TokenPrefixMismatchTrace {
+    index: i64,
+    prompt_token: i64,
+    cached_token: i64,
+}
+
+impl Default for TokenPrefixMismatchTrace {
+    fn default() -> Self {
+        Self {
+            index: -1,
+            prompt_token: -1,
+            cached_token: -1,
+        }
+    }
+}
+
+fn token_prefix_mismatch_trace(prompt: &[u32], cached: &[u32]) -> TokenPrefixMismatchTrace {
+    let common_len = prompt.len().min(cached.len());
+    for i in 0..common_len {
+        if prompt[i] != cached[i] {
+            return TokenPrefixMismatchTrace {
+                index: i as i64,
+                prompt_token: prompt[i] as i64,
+                cached_token: cached[i] as i64,
+            };
+        }
+    }
+
+    TokenPrefixMismatchTrace {
+        index: common_len as i64,
+        prompt_token: prompt.get(common_len).map_or(-1, |token| *token as i64),
+        cached_token: cached.get(common_len).map_or(-1, |token| *token as i64),
+    }
+}
+
+fn moe_paged_linear_caches_ready(
+    config: &Qwen3_5MoeConfig,
+    caches: Option<&[Qwen3_5LayerCache]>,
+) -> bool {
+    let Some(caches) = caches else {
+        return false;
+    };
+    if caches.len() != config.num_layers as usize {
+        return false;
+    }
+    for (i, cache) in caches.iter().enumerate() {
+        if !config.is_linear_layer(i) {
+            continue;
+        }
+        let Qwen3_5LayerCache::Linear(arrays) = cache else {
+            return false;
+        };
+        if arrays.get(0).is_none() || arrays.get(1).is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+fn clone_moe_linear_layer_caches(
+    config: &Qwen3_5MoeConfig,
+    caches: &[Qwen3_5LayerCache],
+) -> Option<Vec<Qwen3_5LayerCache>> {
+    if !moe_paged_linear_caches_ready(config, Some(caches)) {
+        return None;
+    }
+
+    let mut cloned = fresh_moe_layer_caches(config);
+    for i in 0..config.num_layers as usize {
+        if !config.is_linear_layer(i) {
+            continue;
+        }
+        let Qwen3_5LayerCache::Linear(arrays) = &caches[i] else {
+            return None;
+        };
+        cloned[i] = Qwen3_5LayerCache::Linear(arrays.clone());
+    }
+    Some(cloned)
+}
+
+fn compute_paged_prefix_block_hash(
+    tokens: &[u32],
+    prefix_len: u32,
+    block_size: u32,
+    extra_keys_per_block: &[Vec<u64>],
+    cache_salt: u64,
+) -> Option<u64> {
+    if prefix_len == 0 || block_size == 0 || !prefix_len.is_multiple_of(block_size) {
+        return None;
+    }
+
+    let prefix_len = prefix_len as usize;
+    let block_size = block_size as usize;
+    if prefix_len > tokens.len() {
+        return None;
+    }
+
+    let num_blocks = prefix_len / block_size;
+    let mut parent_hash = 0;
+    for block_idx in 0..num_blocks {
+        let extra_keys = extra_keys_per_block.get(block_idx)?;
+        let start = block_idx * block_size;
+        let end = start + block_size;
+        parent_hash = if block_idx == 0 && cache_salt != 0 {
+            let mut salted_keys = Vec::with_capacity(extra_keys.len() + 1);
+            salted_keys.extend_from_slice(extra_keys);
+            salted_keys.push(cache_salt);
+            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, &salted_keys)
+        } else {
+            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, extra_keys)
+        };
+    }
+
+    Some(parent_hash)
+}
+
+fn export_paged_moe_linear_caches(
+    config: &Qwen3_5MoeConfig,
+) -> Result<Option<Vec<Qwen3_5LayerCache>>> {
+    let num_layers = config.num_layers as usize;
+    let expected = num_layers
+        .checked_mul(2)
+        .ok_or_else(|| Error::from_reason("paged MoE cache export size overflow"))?;
+    let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); expected];
+    let exported = unsafe {
+        mlx_sys::mlx_qwen35_moe_export_paged_linear_caches(
+            export_ptrs.as_mut_ptr(),
+            expected as i32,
+        )
+    };
+    if exported == 0 {
+        return Ok(None);
+    }
+    if exported != expected as i32 {
+        return Err(Error::from_reason(format!(
+            "paged MoE linear cache export returned {exported} arrays; expected {expected}"
+        )));
+    }
+
+    let cache_offset = unsafe { mlx_sys::mlx_qwen35_moe_get_paged_cache_offset() };
+    let mut new_caches = fresh_moe_layer_caches(config);
+    for i in 0..num_layers {
+        if !config.is_linear_layer(i) {
+            continue;
+        }
+        let p0 = export_ptrs[i * 2];
+        let p1 = export_ptrs[i * 2 + 1];
+        if p0.is_null() || p1.is_null() {
+            return Err(Error::from_reason(format!(
+                "paged MoE linear cache export missing layer {i}"
+            )));
+        }
+        new_caches[i].import_ptrs(p0, p1, cache_offset);
+    }
+
+    Ok(Some(new_caches))
+}
 
 // Import the shared model ID counter from the dense module — dense and MoE
 // share the same C++ weight map, so IDs must be globally unique.
@@ -83,6 +302,8 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) cached_image_key: Option<u64>,
     pub(crate) cached_rope_deltas: Option<i32>,
     pub(crate) model_id: u64,
+    gdn_prefix_checkpoints: VecDeque<MoeGdnPrefixCheckpoint>,
+    gdn_last_history_checkpoint: Option<MoeGdnHistoryCheckpoint>,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache) for
     /// full-attention layers — same semantics as the dense model.
     /// **Opt-in via `Qwen3_5MoeConfig::use_block_paged_cache`.**
@@ -578,6 +799,8 @@ impl Qwen35MoeInner {
             cached_image_key: None,
             cached_rope_deltas: None,
             model_id,
+            gdn_prefix_checkpoints: VecDeque::new(),
+            gdn_last_history_checkpoint: None,
             paged_adapter,
             training_state: None,
         })
@@ -616,6 +839,8 @@ impl Qwen35MoeInner {
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_rope_deltas = None;
+        self.gdn_prefix_checkpoints.clear();
+        self.gdn_last_history_checkpoint = None;
     }
 
     /// Take the KV cache from the model, returning a `PromptCache` handle.
@@ -626,6 +851,8 @@ impl Qwen35MoeInner {
             return None;
         }
         let caches = self.caches.take()?;
+        self.gdn_prefix_checkpoints.clear();
+        self.gdn_last_history_checkpoint = None;
         Some(crate::models::qwen3_5::prompt_cache::PromptCache::new(
             caches,
             self.cached_token_history.clone(),
@@ -649,7 +876,344 @@ impl Qwen35MoeInner {
         self.cached_token_history = cache.token_history().to_vec();
         self.cached_image_key = cache.image_cache_key();
         self.cached_rope_deltas = cache.rope_deltas();
+        self.gdn_prefix_checkpoints.clear();
+        self.gdn_last_history_checkpoint = None;
         Ok(())
+    }
+
+    fn find_moe_gdn_history_checkpoint(
+        &self,
+        tokens: &[u32],
+        prefix_len: u32,
+    ) -> Option<Vec<Qwen3_5LayerCache>> {
+        let prefix_tokens = tokens.get(..prefix_len as usize)?;
+        let checkpoint = self.gdn_last_history_checkpoint.as_ref()?;
+        if checkpoint.tokens.as_slice() != prefix_tokens {
+            return None;
+        }
+        clone_moe_linear_layer_caches(&self.config, &checkpoint.caches)
+    }
+
+    fn remember_moe_gdn_history_checkpoint(&mut self) -> Result<MoeGdnCheckpointStoreTrace> {
+        let trace_enabled = inference_trace_enabled();
+        let total_start = trace_enabled.then(std::time::Instant::now);
+        let mut trace = MoeGdnCheckpointStoreTrace::default();
+        if self.cached_token_history.is_empty() {
+            self.gdn_last_history_checkpoint = None;
+            return Ok(trace.finish(total_start));
+        }
+
+        let eval_start = trace_enabled.then(std::time::Instant::now);
+        eval_layer_caches(&self.caches)?;
+        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
+        let clone_start = trace_enabled.then(std::time::Instant::now);
+        let Some(caches) = self
+            .caches
+            .as_ref()
+            .and_then(|caches| clone_moe_linear_layer_caches(&self.config, caches))
+        else {
+            self.gdn_last_history_checkpoint = None;
+            trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
+            return Ok(trace.finish(total_start));
+        };
+        trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
+        let token_clone_start = trace_enabled.then(std::time::Instant::now);
+        let tokens = self.cached_token_history.clone();
+        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
+
+        let update_start = trace_enabled.then(std::time::Instant::now);
+        self.gdn_last_history_checkpoint = Some(MoeGdnHistoryCheckpoint { tokens, caches });
+        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
+        trace.stored = true;
+        Ok(trace.finish(total_start))
+    }
+
+    fn find_moe_gdn_prefix_checkpoint(
+        &self,
+        tokens: &[u32],
+        prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+    ) -> Option<Vec<Qwen3_5LayerCache>> {
+        let final_block_hash = compute_paged_prefix_block_hash(
+            tokens,
+            prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+        )?;
+        let prefix_len_usize = prefix_len as usize;
+        let prefix_tokens = tokens.get(..prefix_len_usize)?;
+
+        self.gdn_prefix_checkpoints
+            .iter()
+            .rev()
+            .find(|checkpoint| {
+                checkpoint.prefix_len == prefix_len
+                    && checkpoint.block_size == block_size
+                    && checkpoint.final_block_hash == final_block_hash
+                    && checkpoint.tokens.as_slice() == prefix_tokens
+                    && moe_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches))
+            })
+            .and_then(|checkpoint| clone_moe_linear_layer_caches(&self.config, &checkpoint.caches))
+    }
+
+    fn remember_moe_gdn_prefix_checkpoint(
+        &mut self,
+        tokens: &[u32],
+        prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+    ) -> Result<MoeGdnCheckpointStoreTrace> {
+        let trace_enabled = inference_trace_enabled();
+        let total_start = trace_enabled.then(std::time::Instant::now);
+        let mut trace = MoeGdnCheckpointStoreTrace::default();
+        let hash_start = trace_enabled.then(std::time::Instant::now);
+        let Some(final_block_hash) = compute_paged_prefix_block_hash(
+            tokens,
+            prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+        ) else {
+            trace.hash_ms = hash_start.map(elapsed_ms).unwrap_or(0.0);
+            return Ok(trace.finish(total_start));
+        };
+        trace.hash_ms = hash_start.map(elapsed_ms).unwrap_or(0.0);
+        let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
+            return Ok(trace.finish(total_start));
+        };
+
+        let eval_start = trace_enabled.then(std::time::Instant::now);
+        eval_layer_caches(&self.caches)?;
+        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
+        let clone_start = trace_enabled.then(std::time::Instant::now);
+        let Some(caches) = self
+            .caches
+            .as_ref()
+            .and_then(|caches| clone_moe_linear_layer_caches(&self.config, caches))
+        else {
+            trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
+            return Ok(trace.finish(total_start));
+        };
+        trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
+        let token_clone_start = trace_enabled.then(std::time::Instant::now);
+        let prefix_tokens = prefix_tokens.to_vec();
+        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
+
+        let update_start = trace_enabled.then(std::time::Instant::now);
+        self.gdn_prefix_checkpoints.retain(|checkpoint| {
+            !(checkpoint.prefix_len == prefix_len
+                && checkpoint.block_size == block_size
+                && checkpoint.final_block_hash == final_block_hash
+                && checkpoint.tokens == prefix_tokens)
+        });
+        self.gdn_prefix_checkpoints
+            .push_back(MoeGdnPrefixCheckpoint {
+                prefix_len,
+                block_size,
+                final_block_hash,
+                tokens: prefix_tokens,
+                caches,
+            });
+        while self.gdn_prefix_checkpoints.len() > MOE_GDN_PREFIX_CHECKPOINT_LIMIT {
+            self.gdn_prefix_checkpoints.pop_front();
+        }
+        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
+        trace.stored = true;
+
+        Ok(trace.finish(total_start))
+    }
+
+    fn prepare_moe_gdn_prefix_state(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+        continued_live_prefix: bool,
+    ) -> Result<MoeGdnPrefixPreparation> {
+        let trace_enabled = inference_trace_enabled();
+        let prepare_trace_start = trace_enabled.then(std::time::Instant::now);
+        let gdn_caches_ready = moe_paged_linear_caches_ready(&self.config, self.caches.as_deref());
+        if gdn_caches_ready && continued_live_prefix {
+            if let Some(start) = prepare_trace_start {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=live \
+                     cached_prefix_tokens={} elapsed_ms={:.1}",
+                    cached_prefix_len,
+                    elapsed_ms(start)
+                ));
+            }
+            return Ok(MoeGdnPrefixPreparation {
+                state: "live",
+                already_primed: true,
+            });
+        }
+
+        let gdn_prefix_from_history = cached_prefix_len > 0
+            && self.cached_token_history.len() == cached_prefix_len as usize
+            && tokens.starts_with(&self.cached_token_history);
+        if gdn_caches_ready && gdn_prefix_from_history {
+            if let Some(start) = prepare_trace_start {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=last_history \
+                     cached_prefix_tokens={} elapsed_ms={:.1}",
+                    cached_prefix_len,
+                    elapsed_ms(start)
+                ));
+            }
+            return Ok(MoeGdnPrefixPreparation {
+                state: "last_history",
+                already_primed: true,
+            });
+        }
+        if cached_prefix_len > 0 {
+            let history_lookup_start = trace_enabled.then(std::time::Instant::now);
+            let history_checkpoint =
+                self.find_moe_gdn_history_checkpoint(tokens, cached_prefix_len);
+            let history_lookup_ms = history_lookup_start.map(elapsed_ms);
+            if let Some(checkpoint) = history_checkpoint {
+                self.caches = Some(checkpoint);
+                if let Some(start) = prepare_trace_start {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=last_history_checkpoint \
+                         cached_prefix_tokens={} history_lookup_ms={:.1} elapsed_ms={:.1}",
+                        cached_prefix_len,
+                        history_lookup_ms.unwrap_or(0.0),
+                        elapsed_ms(start)
+                    ));
+                }
+                return Ok(MoeGdnPrefixPreparation {
+                    state: "last_history_checkpoint",
+                    already_primed: true,
+                });
+            } else if trace_enabled {
+                let history_checkpoint_len = self
+                    .gdn_last_history_checkpoint
+                    .as_ref()
+                    .map_or(0, |checkpoint| checkpoint.tokens.len());
+                let history_mismatch =
+                    token_prefix_mismatch_trace(tokens, &self.cached_token_history);
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-moe gdn_history_checkpoint_miss \
+                     cached_prefix_tokens={} history_len={} checkpoint_len={} \
+                     history_match={} history_mismatch_at={} prompt_token={} \
+                     history_token={} history_lookup_ms={:.1}",
+                    cached_prefix_len,
+                    self.cached_token_history.len(),
+                    history_checkpoint_len,
+                    gdn_prefix_from_history,
+                    history_mismatch.index,
+                    history_mismatch.prompt_token,
+                    history_mismatch.cached_token,
+                    history_lookup_ms.unwrap_or(0.0)
+                ));
+            }
+        }
+
+        let prefix_lookup_start = trace_enabled.then(std::time::Instant::now);
+        let prefix_checkpoint = self.find_moe_gdn_prefix_checkpoint(
+            tokens,
+            cached_prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+        );
+        let prefix_lookup_ms = prefix_lookup_start.map(elapsed_ms);
+        if let Some(checkpoint) = prefix_checkpoint {
+            self.caches = Some(checkpoint);
+            if let Some(start) = prepare_trace_start {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=checkpoint \
+                     cached_prefix_tokens={} prefix_lookup_ms={:.1} elapsed_ms={:.1}",
+                    cached_prefix_len,
+                    prefix_lookup_ms.unwrap_or(0.0),
+                    elapsed_ms(start)
+                ));
+            }
+            return Ok(MoeGdnPrefixPreparation {
+                state: "checkpoint",
+                already_primed: true,
+            });
+        }
+
+        self.caches = Some(fresh_moe_layer_caches(&self.config));
+        if cached_prefix_len == 0 {
+            if let Some(start) = prepare_trace_start {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=replay \
+                     cached_prefix_tokens=0 prefix_lookup_ms={:.1} elapsed_ms={:.1}",
+                    prefix_lookup_ms.unwrap_or(0.0),
+                    elapsed_ms(start)
+                ));
+            }
+            return Ok(MoeGdnPrefixPreparation {
+                state: "replay",
+                already_primed: false,
+            });
+        }
+
+        let cached_prefix_len_usize = cached_prefix_len as usize;
+        let prefix = tokens.get(..cached_prefix_len_usize).ok_or_else(|| {
+            Error::from_reason("MoE paged GDN prefix replay length exceeds prompt length")
+        })?;
+        let embed = self.embedding.clone();
+        let caches_ref = self
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("MoE paged GDN prefix caches not initialized"))?;
+        let replay_trace_start = trace_enabled.then(std::time::Instant::now);
+        super::paged_forward::run_gdn_only_prefill(prefix, &embed, &mut self.layers, caches_ref)?;
+        let replay_ms = replay_trace_start.map(elapsed_ms);
+        let store_trace = if moe_gdn_store_replayed_prefix_checkpoint_enabled() {
+            self.remember_moe_gdn_prefix_checkpoint(
+                tokens,
+                cached_prefix_len,
+                block_size,
+                extra_keys_per_block,
+                cache_salt,
+            )?
+        } else {
+            MoeGdnCheckpointStoreTrace::default()
+        };
+        if let Some(start) = prepare_trace_start {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state={} \
+                 cached_prefix_tokens={} prefix_lookup_ms={:.1} replay_ms={:.1} stored={} \
+                 store_hash_ms={:.1} store_eval_ms={:.1} store_clone_ms={:.1} \
+                 store_token_clone_ms={:.1} store_update_ms={:.1} store_ms={:.1} \
+                 elapsed_ms={:.1}",
+                if store_trace.stored {
+                    "replay_store"
+                } else {
+                    "replay"
+                },
+                cached_prefix_len,
+                prefix_lookup_ms.unwrap_or(0.0),
+                replay_ms.unwrap_or(0.0),
+                store_trace.stored,
+                store_trace.hash_ms,
+                store_trace.eval_ms,
+                store_trace.clone_ms,
+                store_trace.token_clone_ms,
+                store_trace.update_ms,
+                store_trace.total_ms,
+                elapsed_ms(start)
+            ));
+        }
+
+        Ok(MoeGdnPrefixPreparation {
+            state: if store_trace.stored {
+                "replay_store"
+            } else {
+                "replay"
+            },
+            already_primed: true,
+        })
     }
 
     /// Set the tokenizer.
@@ -1152,7 +1716,7 @@ impl Qwen35MoeInner {
                     // compile init would feed stale handles to the GPU —
                     // triggering Metal page-faults / innocent-victim hangs
                     // on the first forward of the next turn.
-                    eval_layer_caches(&self.caches);
+                    eval_layer_caches(&self.caches)?;
                 }
             }
             // _moe_guard dropped here, calling mlx_qwen35_moe_reset()
@@ -1269,6 +1833,7 @@ impl Qwen35MoeInner {
         }
 
         let prompt_token_count = tokens.len() as u32;
+        let trace_enabled = inference_trace_enabled();
         let sampling_config = p.sampling_config;
 
         let think_end_id = tokenizer.think_end_id();
@@ -1335,28 +1900,44 @@ impl Qwen35MoeInner {
             adapter.block_size()
         };
         let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
-        let cached_prefix_len = {
+        let cache_salt = 0;
+        let live_ready;
+        let live_prefix_match;
+        let live_tokens_len;
+        let mut live_mismatch = TokenPrefixMismatchTrace::default();
+        let (cached_prefix_len, continued_live_prefix) = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("MoE chat_sync_core_paged: paged_adapter is None")
             })?;
-            let can_continue =
-                adapter.is_live_for_continue() && tokens.starts_with(adapter.request_tokens());
+            live_ready = adapter.is_live_for_continue();
+            let live_tokens = adapter.request_tokens();
+            live_tokens_len = live_tokens.len();
+            live_prefix_match = tokens.starts_with(live_tokens);
+            if trace_enabled && live_ready && !live_prefix_match {
+                live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
+            }
+            let can_continue = live_ready && live_prefix_match;
             if can_continue {
                 match adapter.continue_turn(&tokens, total_budget) {
-                    Ok((prior, _)) => prior,
+                    Ok((prior, _)) => (prior, true),
                     Err(_) => {
                         let _ = adapter.release_request();
                         adapter
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0, false)
+                            .find_cached_prefix_per_block(
+                                &tokens,
+                                &lookup_extra_keys,
+                                cache_salt,
+                                false,
+                            )
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
                             .allocate_suffix_blocks(total_budget)
                             .map_err(Error::from_reason)?;
-                        cached
+                        (cached, false)
                     }
                 }
             } else {
@@ -1367,27 +1948,41 @@ impl Qwen35MoeInner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0, false)
+                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, cache_salt, false)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
                     .allocate_suffix_blocks(total_budget)
                     .map_err(Error::from_reason)?;
-                cached
+                (cached, false)
             }
         };
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-moe paged_prefix_lookup prompt_tokens={} \
+                 cached_prefix_tokens={} continued_live_prefix={} live_ready={} \
+                 live_match={} live_tokens={} live_mismatch_at={} prompt_token={} live_token={}",
+                tokens.len(),
+                cached_prefix_len,
+                continued_live_prefix,
+                live_ready,
+                live_prefix_match,
+                live_tokens_len,
+                live_mismatch.index,
+                live_mismatch.prompt_token,
+                live_mismatch.cached_token
+            ));
+        }
 
-        self.caches = Some(
-            (0..self.config.num_layers as usize)
-                .map(|i| {
-                    if self.config.is_linear_layer(i) {
-                        Qwen3_5LayerCache::new_linear()
-                    } else {
-                        Qwen3_5LayerCache::new_full_attention()
-                    }
-                })
-                .collect(),
-        );
+        let gdn_prefix_preparation = self.prepare_moe_gdn_prefix_state(
+            &tokens,
+            cached_prefix_len,
+            block_size,
+            &lookup_extra_keys,
+            cache_salt,
+            continued_live_prefix,
+        )?;
+        let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_rope_deltas = None;
@@ -1411,6 +2006,7 @@ impl Qwen35MoeInner {
             report_perf,
             &mut first_token_instant,
             use_cpp_paged,
+            gdn_prefix_already_primed,
         );
 
         let (generated_tokens, finish_reason) = match forward_result {
@@ -1442,6 +2038,20 @@ impl Qwen35MoeInner {
             full_history.extend_from_slice(&generated_tokens[..upto]);
         }
         self.cached_token_history = full_history;
+        let gdn_history_checkpoint_store = self.remember_moe_gdn_history_checkpoint()?;
+        if inference_trace_enabled() {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-moe gdn_history_checkpoint stored={} tokens={} \
+                 eval_ms={:.1} clone_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
+                gdn_history_checkpoint_store.stored,
+                self.cached_token_history.len(),
+                gdn_history_checkpoint_store.eval_ms,
+                gdn_history_checkpoint_store.clone_ms,
+                gdn_history_checkpoint_store.token_clone_ms,
+                gdn_history_checkpoint_store.update_ms,
+                gdn_history_checkpoint_store.total_ms
+            ));
+        }
 
         let performance = if report_perf {
             compute_performance_metrics(
@@ -1483,6 +2093,7 @@ impl Qwen35MoeInner {
         report_perf: bool,
         first_token_instant: &mut Option<std::time::Instant>,
         use_cpp_paged: bool,
+        gdn_prefix_already_primed: bool,
     ) -> Result<(Vec<u32>, String)> {
         if suffix_len == 0 {
             return Err(Error::from_reason(
@@ -1514,6 +2125,7 @@ impl Qwen35MoeInner {
                 tokens,
                 suffix,
                 cached_prefix_len,
+                gdn_prefix_already_primed,
                 &embed,
                 &mut self.layers,
                 caches_ref,
@@ -1605,12 +2217,12 @@ impl Qwen35MoeInner {
         // during this turn. After a successful compiled step the C++
         // side has advanced its per-layer GDN linear-cache globals
         // (conv_state / recurrent_state) but those updates are never
-        // imported back into `self.caches`. Falling back to pure-Rust
-        // decode after that point would run from stale pre-step GDN
-        // state while `paged_adapter` and `token_history` have already
-        // advanced — silently corrupting the rest of the request. The
-        // mid-turn fallback below is therefore only safe BEFORE the
-        // first successful compiled step.
+        // imported back into `self.caches` until the loop finishes.
+        // Falling back to pure-Rust decode after that point would run
+        // from stale pre-step GDN state while `paged_adapter` and
+        // `token_history` have already advanced — silently corrupting
+        // the rest of the request. The mid-turn fallback below is
+        // therefore only safe BEFORE the first successful compiled step.
         let mut cpp_compiled_step_completed = false;
 
         let max_new_tokens = p.max_new_tokens;
@@ -1781,6 +2393,25 @@ impl Qwen35MoeInner {
             crate::array::maybe_clear_cache_for_paged_step(step);
         }
 
+        if cpp_compiled_step_completed {
+            match export_paged_moe_linear_caches(&self.config) {
+                Ok(Some(new_caches)) => {
+                    self.caches = Some(new_caches);
+                    eval_layer_caches(&self.caches)?;
+                }
+                Ok(None) => {
+                    self.caches = None;
+                }
+                Err(err) => {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-moe paged_linear_cache_export_error error={}",
+                        err
+                    ));
+                    self.caches = None;
+                }
+            }
+        }
+
         Ok((generated_tokens, finish_reason))
     }
 
@@ -1804,6 +2435,8 @@ impl Qwen35MoeInner {
         }
 
         let prompt_token_count = tokens.len() as u32;
+        let trace_enabled = inference_trace_enabled();
+        let request_trace_start = trace_enabled.then(std::time::Instant::now);
         let sampling_config = p.sampling_config;
         let include_reasoning = p.include_reasoning;
 
@@ -1861,28 +2494,44 @@ impl Qwen35MoeInner {
             adapter.block_size()
         };
         let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
-        let cached_prefix_len = {
+        let cache_salt = 0;
+        let live_ready;
+        let live_prefix_match;
+        let live_tokens_len;
+        let mut live_mismatch = TokenPrefixMismatchTrace::default();
+        let (cached_prefix_len, continued_live_prefix) = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("MoE chat_stream_sync_core_paged: paged_adapter is None")
             })?;
-            let can_continue =
-                adapter.is_live_for_continue() && tokens.starts_with(adapter.request_tokens());
+            live_ready = adapter.is_live_for_continue();
+            let live_tokens = adapter.request_tokens();
+            live_tokens_len = live_tokens.len();
+            live_prefix_match = tokens.starts_with(live_tokens);
+            if trace_enabled && live_ready && !live_prefix_match {
+                live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
+            }
+            let can_continue = live_ready && live_prefix_match;
             if can_continue {
                 match adapter.continue_turn(&tokens, total_budget) {
-                    Ok((prior, _)) => prior,
+                    Ok((prior, _)) => (prior, true),
                     Err(_) => {
                         let _ = adapter.release_request();
                         adapter
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0, false)
+                            .find_cached_prefix_per_block(
+                                &tokens,
+                                &lookup_extra_keys,
+                                cache_salt,
+                                false,
+                            )
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
                             .allocate_suffix_blocks(total_budget)
                             .map_err(Error::from_reason)?;
-                        cached
+                        (cached, false)
                     }
                 }
             } else {
@@ -1893,27 +2542,43 @@ impl Qwen35MoeInner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0, false)
+                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, cache_salt, false)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
                     .allocate_suffix_blocks(total_budget)
                     .map_err(Error::from_reason)?;
-                cached
+                (cached, false)
             }
         };
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-moe paged_prefix_lookup prompt_tokens={} \
+                 cached_prefix_tokens={} continued_live_prefix={} live_ready={} \
+                 live_match={} live_tokens={} live_mismatch_at={} prompt_token={} live_token={}",
+                tokens.len(),
+                cached_prefix_len,
+                continued_live_prefix,
+                live_ready,
+                live_prefix_match,
+                live_tokens_len,
+                live_mismatch.index,
+                live_mismatch.prompt_token,
+                live_mismatch.cached_token
+            ));
+        }
 
-        self.caches = Some(
-            (0..self.config.num_layers as usize)
-                .map(|i| {
-                    if self.config.is_linear_layer(i) {
-                        Qwen3_5LayerCache::new_linear()
-                    } else {
-                        Qwen3_5LayerCache::new_full_attention()
-                    }
-                })
-                .collect(),
-        );
+        let prefill_trace_start = trace_enabled.then(std::time::Instant::now);
+        let gdn_prefix_preparation = self.prepare_moe_gdn_prefix_state(
+            &tokens,
+            cached_prefix_len,
+            block_size,
+            &lookup_extra_keys,
+            cache_salt,
+            continued_live_prefix,
+        )?;
+        let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
+        let gdn_prefix_state = gdn_prefix_preparation.state;
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_rope_deltas = None;
@@ -1925,6 +2590,24 @@ impl Qwen35MoeInner {
                     "MoE chat_stream_sync_core_paged: cached_prefix_len > total_prompt_tokens",
                 )
             })?;
+
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-moe stream_paged_start prompt_tokens={} \
+                 cached_prefix_tokens={} suffix_tokens={} block_size={} \
+                 prefill_chunk_size={} prefill_eval_interval={} decode_clear_interval={} \
+                 cpp_paged_candidate={} gdn_prefix_state={}",
+                prompt_token_count,
+                cached_prefix_len,
+                suffix_len,
+                block_size,
+                crate::array::paged_prefill_chunk_size(),
+                crate::array::paged_prefill_eval_interval(),
+                crate::array::paged_decode_cache_clear_interval(),
+                use_cpp_paged,
+                gdn_prefix_state
+            ));
+        }
 
         let result = self.chat_stream_sync_core_paged_inner(
             &tokens,
@@ -1943,7 +2626,30 @@ impl Qwen35MoeInner {
             cb,
             cancelled,
             use_cpp_paged,
+            gdn_prefix_already_primed,
+            prefill_trace_start,
         );
+
+        if let Some(start) = request_trace_start {
+            match &result {
+                Ok((generated_tokens, finish_reason)) => {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-moe stream_paged_done generated_tokens={} \
+                         finish_reason={} elapsed_ms={:.1}",
+                        generated_tokens.len(),
+                        finish_reason,
+                        elapsed_ms(start)
+                    ));
+                }
+                Err(err) => {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-moe stream_paged_error elapsed_ms={:.1} error={}",
+                        elapsed_ms(start),
+                        err
+                    ));
+                }
+            }
+        }
 
         let (generated_tokens, finish_reason) = match result {
             Ok(t) => {
@@ -1974,6 +2680,20 @@ impl Qwen35MoeInner {
             full_history.extend_from_slice(&generated_tokens[..upto]);
         }
         self.cached_token_history = full_history;
+        let gdn_history_checkpoint_store = self.remember_moe_gdn_history_checkpoint()?;
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-moe gdn_history_checkpoint stored={} tokens={} \
+                 eval_ms={:.1} clone_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
+                gdn_history_checkpoint_store.stored,
+                self.cached_token_history.len(),
+                gdn_history_checkpoint_store.eval_ms,
+                gdn_history_checkpoint_store.clone_ms,
+                gdn_history_checkpoint_store.token_clone_ms,
+                gdn_history_checkpoint_store.update_ms,
+                gdn_history_checkpoint_store.total_ms
+            ));
+        }
 
         let full_text = tokenizer
             .decode_sync(&generated_tokens, true)
@@ -2076,6 +2796,8 @@ impl Qwen35MoeInner {
         cb: &StreamSender,
         cancelled: &Arc<AtomicBool>,
         use_cpp_paged: bool,
+        gdn_prefix_already_primed: bool,
+        prefill_trace_start: Option<std::time::Instant>,
     ) -> Result<(Vec<u32>, String)> {
         if suffix_len == 0 {
             return Err(Error::from_reason(
@@ -2083,6 +2805,7 @@ impl Qwen35MoeInner {
             ));
         }
 
+        let trace_enabled = inference_trace_enabled();
         let suffix = &tokens[(cached_prefix_len as usize)..];
         let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
             self.config.num_layers as usize,
@@ -2105,6 +2828,7 @@ impl Qwen35MoeInner {
                 tokens,
                 suffix,
                 cached_prefix_len,
+                gdn_prefix_already_primed,
                 &embed,
                 &mut self.layers,
                 caches_ref,
@@ -2125,6 +2849,17 @@ impl Qwen35MoeInner {
         // starts allocating (see chat_sync_core_paged_inner for rationale).
         crate::array::synchronize_and_clear_cache();
 
+        if let Some(start) = prefill_trace_start {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-moe paged_first_token_ready prompt_tokens={} \
+                 cached_prefix_tokens={} suffix_tokens={} prefill_to_first_token_ms={:.1}",
+                tokens.len(),
+                cached_prefix_len,
+                suffix_len,
+                elapsed_ms(start)
+            ));
+        }
+
         if report_perf {
             *first_token_instant = Some(std::time::Instant::now());
         }
@@ -2132,6 +2867,7 @@ impl Qwen35MoeInner {
         // C++ compiled paged decode setup (see sync twin for full
         // explanation). Mirrors the sync path so streaming and sync
         // dispatchers behave identically when both paths are available.
+        let decode_setup_trace_start = trace_enabled.then(std::time::Instant::now);
         let mut cpp_session_ready = if use_cpp_paged {
             let caches_ref = self.caches.as_ref().ok_or_else(|| {
                 Error::from_reason(
@@ -2165,6 +2901,22 @@ impl Qwen35MoeInner {
         } else {
             false
         };
+        if let Some(start) = decode_setup_trace_start {
+            let adapter_block_size = self
+                .paged_adapter
+                .as_ref()
+                .map(|adapter| adapter.block_size())
+                .unwrap_or(0);
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-moe paged_decode_setup cpp_requested={} cpp_ready={} \
+                 block_size={} compiled_required_block_size={} setup_ms={:.1}",
+                use_cpp_paged,
+                cpp_session_ready,
+                adapter_block_size,
+                CPP_PAGED_REQUIRED_BLOCK_SIZE,
+                elapsed_ms(start)
+            ));
+        }
 
         // Even if a later forward fails and we flip
         // `cpp_session_ready=false`, the guard still runs at scope exit.
@@ -2173,16 +2925,29 @@ impl Qwen35MoeInner {
         // Tracks whether ANY compiled C++ paged step has succeeded
         // during this turn. After a successful compiled step the C++
         // GDN linear-cache globals (conv_state / recurrent_state) have
-        // advanced but are never imported back into `self.caches`, so a
-        // pure-Rust fallback would read stale pre-step state. The
-        // mid-turn fallback below is therefore only safe BEFORE the
-        // first successful compiled step. See sync sibling
+        // advanced but are not imported back into `self.caches` until
+        // the loop finishes, so a pure-Rust fallback would read stale
+        // pre-step state. The mid-turn fallback below is therefore only
+        // safe BEFORE the first successful compiled step. See sync sibling
         // `chat_sync_core_paged_inner` for the full rationale.
         let mut cpp_compiled_step_completed = false;
 
         let max_new_tokens = p.max_new_tokens;
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
         let mut finish_reason = String::from("length");
+        let decode_trace_start = trace_enabled.then(std::time::Instant::now);
+        let decode_progress_interval = if trace_enabled {
+            crate::array::paged_decode_cache_clear_interval().max(1) as usize
+        } else {
+            usize::MAX
+        };
+        let mut decode_progress_last = decode_trace_start.unwrap_or_else(std::time::Instant::now);
+        let mut decode_progress_last_count = 0usize;
+        let mut decode_build_inputs_ms = 0.0;
+        let mut decode_forward_ms = 0.0;
+        let mut decode_sample_build_ms = 0.0;
+        let mut decode_token_eval_ms = 0.0;
+        let mut decode_cache_clear_ms = 0.0;
 
         let max_blocks_per_seq: u32 = {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
@@ -2263,11 +3028,20 @@ impl Qwen35MoeInner {
                 adapter
                     .record_tokens(&[token_id])
                     .map_err(Error::from_reason)?;
+                let build_inputs_trace_start = trace_enabled.then(std::time::Instant::now);
                 let inputs = adapter
                     .build_paged_attention_inputs(1, 1, max_blocks_per_seq)
                     .map_err(Error::from_reason)?;
+                if let Some(start) = build_inputs_trace_start {
+                    decode_build_inputs_ms += elapsed_ms(start);
+                }
                 let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
-                match forward_moe_cpp_paged(&input_ids, &embedding_weight, &inputs) {
+                let forward_trace_start = trace_enabled.then(std::time::Instant::now);
+                let forward_result = forward_moe_cpp_paged(&input_ids, &embedding_weight, &inputs);
+                if let Some(start) = forward_trace_start {
+                    decode_forward_ms += elapsed_ms(start);
+                }
+                match forward_result {
                     Ok(logits) => {
                         cpp_compiled_step_completed = true;
                         logits
@@ -2310,6 +3084,7 @@ impl Qwen35MoeInner {
                                 "MoE chat_stream_sync_core_paged_inner: paged_adapter dropped during cpp fallback",
                             )
                         })?;
+                        let fallback_trace_start = trace_enabled.then(std::time::Instant::now);
                         let logits = super::paged_forward::run_paged_decode_step(
                             token_id,
                             &embed,
@@ -2321,6 +3096,9 @@ impl Qwen35MoeInner {
                             &layer_kinds,
                             adapter_mut,
                         )?;
+                        if let Some(start) = fallback_trace_start {
+                            decode_forward_ms += elapsed_ms(start);
+                        }
                         logits.squeeze(Some(&[1]))?
                     }
                 }
@@ -2337,6 +3115,7 @@ impl Qwen35MoeInner {
                         "MoE chat_stream_sync_core_paged_inner: paged_adapter dropped mid-decode",
                     )
                 })?;
+                let forward_trace_start = trace_enabled.then(std::time::Instant::now);
                 let logits = super::paged_forward::run_paged_decode_step(
                     token_id,
                     &embed,
@@ -2348,6 +3127,9 @@ impl Qwen35MoeInner {
                     &layer_kinds,
                     adapter,
                 )?;
+                if let Some(start) = forward_trace_start {
+                    decode_forward_ms += elapsed_ms(start);
+                }
                 logits.squeeze(Some(&[1]))?
             };
 
@@ -2360,10 +3142,110 @@ impl Qwen35MoeInner {
                 apply_all_penalties(next_logits, &token_history, p)?
             };
 
+            let sample_trace_start = trace_enabled.then(std::time::Instant::now);
             y = sample(&next_logits, sampling_config)?;
+            if let Some(start) = sample_trace_start {
+                decode_sample_build_ms += elapsed_ms(start);
+            }
+            let token_eval_trace_start = trace_enabled.then(std::time::Instant::now);
             y.eval();
+            if let Some(start) = token_eval_trace_start {
+                decode_token_eval_ms += elapsed_ms(start);
+            }
 
+            let cache_clear_trace_start = trace_enabled.then(std::time::Instant::now);
             crate::array::maybe_clear_cache_for_paged_step(step);
+            if let Some(start) = cache_clear_trace_start {
+                decode_cache_clear_ms += elapsed_ms(start);
+            }
+            if trace_enabled
+                && generated_tokens
+                    .len()
+                    .is_multiple_of(decode_progress_interval)
+            {
+                let window_ms = elapsed_ms(decode_progress_last);
+                let window_tokens = generated_tokens
+                    .len()
+                    .saturating_sub(decode_progress_last_count);
+                let window_tok_s = if window_ms > 0.0 {
+                    window_tokens as f64 / (window_ms / 1000.0)
+                } else {
+                    0.0
+                };
+                let elapsed_decode_ms = decode_trace_start.map(elapsed_ms).unwrap_or(0.0);
+                let active_mib = crate::array::get_active_memory() / (1024.0 * 1024.0);
+                let cache_mib = crate::array::get_cache_memory() / (1024.0 * 1024.0);
+                let peak_mib = crate::array::get_peak_memory() / (1024.0 * 1024.0);
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-moe paged_decode_progress generated_tokens={} \
+                     context_tokens={} window_tokens={} window_ms={:.1} window_tok_s={:.2} \
+                     elapsed_ms={:.1} cpp_ready={} build_inputs_ms={:.1} forward_ms={:.1} \
+                     sample_ms={:.1} sample_build_ms={:.1} token_eval_ms={:.1} \
+                     cache_clear_ms={:.1} active_mib={:.1} cache_mib={:.1} peak_mib={:.1}",
+                    generated_tokens.len(),
+                    token_history.len(),
+                    window_tokens,
+                    window_ms,
+                    window_tok_s,
+                    elapsed_decode_ms,
+                    cpp_session_ready,
+                    decode_build_inputs_ms,
+                    decode_forward_ms,
+                    decode_sample_build_ms + decode_token_eval_ms,
+                    decode_sample_build_ms,
+                    decode_token_eval_ms,
+                    decode_cache_clear_ms,
+                    active_mib,
+                    cache_mib,
+                    peak_mib
+                ));
+                decode_progress_last = std::time::Instant::now();
+                decode_progress_last_count = generated_tokens.len();
+            }
+        }
+
+        if let Some(start) = decode_trace_start {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-moe paged_decode_done generated_tokens={} finish_reason={} \
+                 decode_loop_ms={:.1} cpp_compiled_step_completed={} build_inputs_ms={:.1} \
+                 forward_ms={:.1} sample_ms={:.1} sample_build_ms={:.1} \
+                 token_eval_ms={:.1} cache_clear_ms={:.1}",
+                generated_tokens.len(),
+                finish_reason,
+                elapsed_ms(start),
+                cpp_compiled_step_completed,
+                decode_build_inputs_ms,
+                decode_forward_ms,
+                decode_sample_build_ms + decode_token_eval_ms,
+                decode_sample_build_ms,
+                decode_token_eval_ms,
+                decode_cache_clear_ms
+            ));
+        }
+
+        if cpp_compiled_step_completed {
+            match export_paged_moe_linear_caches(&self.config) {
+                Ok(Some(new_caches)) => {
+                    self.caches = Some(new_caches);
+                    eval_layer_caches(&self.caches)?;
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-moe paged_linear_cache_export ok=true"
+                    ));
+                }
+                Ok(None) => {
+                    self.caches = None;
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-moe paged_linear_cache_export ok=false reason=not_initialized"
+                    ));
+                }
+                Err(err) => {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-moe paged_linear_cache_export ok=false error={}",
+                        err
+                    ));
+                    self.caches = None;
+                }
+            }
         }
 
         Ok((generated_tokens, finish_reason))
@@ -2815,7 +3697,7 @@ impl Qwen35MoeInner {
                     // See the chat path for rationale: force-eval the
                     // exported lazy handles before `MoeResetGuard` clears
                     // `g_compiled_caches_moe` at end of scope.
-                    eval_layer_caches(&self.caches);
+                    eval_layer_caches(&self.caches)?;
                 }
             }
             // _moe_guard dropped here
@@ -3336,7 +4218,7 @@ impl Qwen35MoeInner {
                     // See the chat path for rationale: force-eval the
                     // exported lazy handles before `MoeResetGuard` clears
                     // `g_compiled_caches_moe` at end of scope.
-                    eval_layer_caches(&self.caches);
+                    eval_layer_caches(&self.caches)?;
                 }
             }
             // _moe_guard dropped here, calling mlx_qwen35_moe_reset()
@@ -3996,7 +4878,7 @@ impl Qwen35MoeInner {
                     // See the chat path for rationale: force-eval the
                     // exported lazy handles before `MoeResetGuard` clears
                     // `g_compiled_caches_moe` at end of scope.
-                    eval_layer_caches(&self.caches);
+                    eval_layer_caches(&self.caches)?;
                 }
             }
             // _moe_guard dropped here
@@ -6591,7 +7473,7 @@ fn chunked_prefill_with_size(
         }
         // Materialize all cache arrays on GPU so the next chunk doesn't
         // extend a giant lazy graph rooted at the prior chunk's inputs.
-        eval_layer_caches(caches);
+        eval_layer_caches(caches)?;
         crate::array::clear_cache();
         offset += chunk_size;
     }
@@ -7244,6 +8126,77 @@ mod paged_construction_tests {
         let inner = Qwen35MoeInner::new(cfg)
             .expect("Qwen35MoeInner::new must succeed without paged adapter");
         assert!(inner.paged_adapter.is_none());
+    }
+
+    #[test]
+    fn test_fresh_moe_layer_caches_are_not_gdn_reuse_ready() {
+        let cfg = tiny_moe_cfg(true);
+        let caches = fresh_moe_layer_caches(&cfg);
+        assert_eq!(caches.len(), cfg.num_layers as usize);
+        assert!(
+            !moe_paged_linear_caches_ready(&cfg, Some(&caches)),
+            "fresh linear caches have empty conv/recurrent slots, so a live continuation must replay GDN"
+        );
+        assert!(matches!(caches[0], Qwen3_5LayerCache::Linear(_)));
+        assert!(matches!(caches[3], Qwen3_5LayerCache::FullAttention(_)));
+    }
+
+    #[test]
+    fn test_paged_moe_linear_cache_export_uninitialized_returns_none() {
+        unsafe {
+            mlx_sys::mlx_qwen35_moe_reset();
+        }
+        let cfg = tiny_moe_cfg(true);
+        let exported = export_paged_moe_linear_caches(&cfg)
+            .expect("uninitialized paged export should not fail");
+        assert!(exported.is_none());
+    }
+
+    #[test]
+    fn test_paged_prefix_block_hash_matches_allocator_chain() {
+        let tokens: Vec<u32> = (1..=12).collect();
+        let per_block = vec![vec![11], vec![], vec![33, 44]];
+
+        let h0 = mlx_paged_attn::hash_tokens(&tokens[0..4], 0, &per_block[0]);
+        let h1 = mlx_paged_attn::hash_tokens(&tokens[4..8], h0, &per_block[1]);
+        let h2 = mlx_paged_attn::hash_tokens(&tokens[8..12], h1, &per_block[2]);
+
+        assert_eq!(
+            compute_paged_prefix_block_hash(&tokens, 12, 4, &per_block, 0),
+            Some(h2)
+        );
+    }
+
+    #[test]
+    fn test_paged_prefix_block_hash_applies_salt_to_first_block_only() {
+        let tokens: Vec<u32> = (1..=8).collect();
+        let per_block = vec![vec![11], vec![22]];
+        let salt = 99;
+
+        let mut first_block_keys = per_block[0].clone();
+        first_block_keys.push(salt);
+        let h0 = mlx_paged_attn::hash_tokens(&tokens[0..4], 0, &first_block_keys);
+        let h1 = mlx_paged_attn::hash_tokens(&tokens[4..8], h0, &per_block[1]);
+
+        assert_eq!(
+            compute_paged_prefix_block_hash(&tokens, 8, 4, &per_block, salt),
+            Some(h1)
+        );
+    }
+
+    #[test]
+    fn test_paged_prefix_block_hash_rejects_non_full_or_unkeyed_prefix() {
+        let tokens: Vec<u32> = (1..=8).collect();
+        let per_block = vec![vec![]];
+
+        assert_eq!(
+            compute_paged_prefix_block_hash(&tokens, 6, 4, &per_block, 0),
+            None
+        );
+        assert_eq!(
+            compute_paged_prefix_block_hash(&tokens, 8, 4, &per_block, 0),
+            None
+        );
     }
 
     #[test]

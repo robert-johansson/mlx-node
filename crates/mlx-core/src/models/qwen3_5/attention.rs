@@ -1,6 +1,12 @@
+use std::sync::OnceLock;
+use std::time::Instant;
+
 use crate::array::MxArray;
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::array::mask::create_causal_mask;
+use crate::inference_trace::{
+    elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
+};
 use crate::models::paddleocr_vl::language::{MultimodalRoPE, apply_multimodal_rotary_pos_emb};
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
@@ -33,6 +39,26 @@ pub struct Qwen3_5Attention {
     num_kv_heads: i32,
     head_dim: i32,
     scale: f32,
+}
+
+fn paged_prefill_paged_attention_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crate::inference_trace::env_flag_enabled_or_default(
+            "MLX_PAGED_PREFILL_PAGED_ATTENTION",
+            true,
+        )
+    })
+}
+
+fn native_kv_write_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MLX_QWEN35_NATIVE_KV_WRITE")
+            .or_else(|_| std::env::var("MLX_NATIVE_KV_WRITE"))
+            .map(|value| crate::inference_trace::env_flag_value_enabled(&value))
+            .unwrap_or(true)
+    })
 }
 
 impl Qwen3_5Attention {
@@ -312,14 +338,57 @@ impl Qwen3_5Attention {
             self.head_dim as i64,
         ])?;
 
-        adapter
-            .update_keys_values(
+        let trace_enabled = inference_trace_enabled();
+        let write_trace_start = trace_enabled.then(Instant::now);
+        let write_path = if native_kv_write_enabled() {
+            match adapter.update_keys_values_native(
                 attn_layer_idx,
                 &keys_paged,
                 &values_paged,
                 first_logical_position,
-            )
-            .map_err(napi::Error::from_reason)?;
+            ) {
+                Ok(()) => "native",
+                Err(err) => {
+                    if trace_enabled {
+                        write_inference_trace(format_args!(
+                            "[MLX_TRACE] qwen3.5-attn paged_kv_write_fallback \
+                             layer={} first_position={} seq_len={} error={}",
+                            attn_layer_idx, first_logical_position, seq_len, err
+                        ));
+                    }
+                    adapter
+                        .update_keys_values(
+                            attn_layer_idx,
+                            &keys_paged,
+                            &values_paged,
+                            first_logical_position,
+                        )
+                        .map_err(napi::Error::from_reason)?;
+                    "legacy"
+                }
+            }
+        } else {
+            adapter
+                .update_keys_values(
+                    attn_layer_idx,
+                    &keys_paged,
+                    &values_paged,
+                    first_logical_position,
+                )
+                .map_err(napi::Error::from_reason)?;
+            "legacy"
+        };
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-attn paged_kv_write_done \
+                 layer={} first_position={} seq_len={} path={} elapsed_ms={:.1}",
+                attn_layer_idx,
+                first_logical_position,
+                seq_len,
+                write_path,
+                write_trace_start.map(elapsed_ms).unwrap_or(0.0)
+            ));
+        }
 
         // Compute attention output.
         let attn_bhtd = if is_prefill {
@@ -344,46 +413,151 @@ impl Qwen3_5Attention {
                 }
             } else {
                 // Cache-hit prefill: read full [0, total_ctx) K/V back
-                // from the pool. The suffix was just written above.
+                // from the pool. The suffix was just written above. When
+                // explicitly enabled, try the MLX paged-attention bridge first
+                // so the suffix attends directly against the pool without
+                // host-side K/V materialization.
                 let total_ctx = cached_prefix_len + (seq_len as u32);
-                let (k_full, v_full) = adapter
-                    .read_kv_range(attn_layer_idx, 0, total_ctx)
-                    .map_err(napi::Error::from_reason)?;
-                let mask =
-                    create_causal_mask(seq_len as i32, Some(cached_prefix_len as i32), None)?;
-                scaled_dot_product_attention(
-                    &queries_bhtd,
-                    &k_full,
-                    &v_full,
-                    self.scale as f64,
-                    Some(&mask),
-                )?
+                let maybe_paged_attn = if batch == 1 && paged_prefill_paged_attention_enabled() {
+                    let paged_trace_start = trace_enabled.then(Instant::now);
+                    let queries_paged =
+                        queries.reshape(&[seq_len, self.num_heads as i64, self.head_dim as i64])?;
+                    match adapter.gather_kv_for_prefill_chunk(
+                        attn_layer_idx,
+                        &queries_paged,
+                        cached_prefix_len,
+                        self.scale,
+                    ) {
+                        Ok(attn_t_h_d) => {
+                            let target_dtype = x.dtype()?;
+                            let attn_t_h_d = attn_t_h_d.astype(target_dtype)?;
+                            let attn = attn_t_h_d.reshape(&[
+                                batch,
+                                seq_len,
+                                self.num_heads as i64,
+                                self.head_dim as i64,
+                            ])?;
+                            let attn = attn.transpose(Some(&[0, 2, 1, 3]))?;
+                            if trace_enabled {
+                                write_inference_trace(format_args!(
+                                    "[MLX_TRACE] qwen3.5-attn cache_hit_prefill \
+                                     layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
+                                     path=paged_attention bridge_ms={:.1} read_kv_range_ms=0.0 \
+                                     mask_ms=0.0 sdpa_mode=none sdpa_graph_ms=0.0",
+                                    attn_layer_idx,
+                                    seq_len,
+                                    cached_prefix_len,
+                                    total_ctx,
+                                    paged_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                                ));
+                            }
+                            Some(attn)
+                        }
+                        Err(err) => {
+                            if trace_enabled {
+                                write_inference_trace(format_args!(
+                                    "[MLX_TRACE] qwen3.5-attn cache_hit_prefill_paged_fallback \
+                                     layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
+                                     error={}",
+                                    attn_layer_idx, seq_len, cached_prefix_len, total_ctx, err
+                                ));
+                            }
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                match maybe_paged_attn {
+                    Some(attn) => attn,
+                    None => {
+                        let read_trace_start = trace_enabled.then(Instant::now);
+                        let (k_full, v_full) = adapter
+                            .read_kv_range(attn_layer_idx, 0, total_ctx)
+                            .map_err(napi::Error::from_reason)?;
+                        let read_kv_range_ms = read_trace_start.map(elapsed_ms);
+                        let mask_trace_start = trace_enabled.then(Instant::now);
+                        let mask = create_causal_mask(
+                            seq_len as i32,
+                            Some(cached_prefix_len as i32),
+                            None,
+                        )?;
+                        let mask_ms = mask_trace_start.map(elapsed_ms);
+                        let sdpa_trace_start = trace_enabled.then(Instant::now);
+                        let attn = scaled_dot_product_attention(
+                            &queries_bhtd,
+                            &k_full,
+                            &v_full,
+                            self.scale as f64,
+                            Some(&mask),
+                        )?;
+                        if trace_enabled {
+                            write_inference_trace(format_args!(
+                                "[MLX_TRACE] qwen3.5-attn cache_hit_prefill \
+                                 layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
+                                 path=read_kv_range read_kv_range_ms={:.1} mask_ms={:.1} \
+                                 sdpa_mode=explicit_mask sdpa_graph_ms={:.1}",
+                                attn_layer_idx,
+                                seq_len,
+                                cached_prefix_len,
+                                total_ctx,
+                                read_kv_range_ms.unwrap_or(0.0),
+                                mask_ms.unwrap_or(0.0),
+                                sdpa_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                            ));
+                        }
+                        attn
+                    }
+                }
             }
         } else {
-            // Decode: dispatch `gather_kv_for_decode` Metal kernel
-            // directly against the on-GPU paged buffers. Avoids the
-            // per-step host roundtrip (~57 MB per layer per K/V on long
-            // contexts) that `read_kv_range` performs and that was
-            // driving a ~40 GB memory regression in long-context decode
-            // (see Fix #2 spec). Mirrors Qwen3 / Gemma4 / LFM2 paged decode.
-            //
-            // `gather_kv_for_decode` expects `[1, num_query_heads,
-            // head_size]` queries (3-D); squeeze T=1 from `queries_bhtd`
-            // and reshape. Returns `[1, n_heads, head_dim]` which we cast
-            // to x's dtype and reshape to the standard `[B, H, T, D]` tail.
+            // Decode: prefer graph-native paged attention so native K/V
+            // writes and attention reads remain in one MLX dependency graph.
             let queries_3d = queries_bhtd.squeeze(Some(&[2]))?.reshape(&[
                 1,
                 self.num_heads as i64,
                 self.head_dim as i64,
             ])?;
-            let attn_3d = adapter
-                .gather_kv_for_decode(
-                    attn_layer_idx,
-                    &queries_3d,
-                    self.scale,
-                    /* softcap */ 1.0,
-                )
-                .map_err(napi::Error::from_reason)?;
+            let gather_trace_start = trace_enabled.then(Instant::now);
+            let attn_3d = match adapter.gather_kv_for_decode_graph(
+                attn_layer_idx,
+                &queries_3d,
+                self.scale,
+                /* softcap */ 1.0,
+            ) {
+                Ok(attn_3d) => {
+                    if trace_enabled {
+                        write_inference_trace(format_args!(
+                            "[MLX_TRACE] qwen3.5-attn decode_gather_done \
+                             layer={} path=graph total_ctx={} elapsed_ms={:.1}",
+                            attn_layer_idx,
+                            adapter.current_token_count(),
+                            gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                        ));
+                    }
+                    attn_3d
+                }
+                Err(err) => {
+                    if trace_enabled {
+                        write_inference_trace(format_args!(
+                            "[MLX_TRACE] qwen3.5-attn decode_gather_fallback \
+                             layer={} path=raw total_ctx={} error={}",
+                            attn_layer_idx,
+                            adapter.current_token_count(),
+                            err
+                        ));
+                    }
+                    adapter
+                        .gather_kv_for_decode(
+                            attn_layer_idx,
+                            &queries_3d,
+                            self.scale,
+                            /* softcap */ 1.0,
+                        )
+                        .map_err(napi::Error::from_reason)?
+                }
+            };
             let target_dtype = x.dtype()?;
             let attn_3d = attn_3d.astype(target_dtype)?;
             attn_3d.reshape(&[1, self.num_heads as i64, 1, self.head_dim as i64])?

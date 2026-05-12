@@ -45,12 +45,34 @@ Options:
   --                 Everything after this separator is forwarded to the
                      spawned \`claude\` binary verbatim.
 
-Environment variables:
-  MLX_PAGED_PREFILL_CHUNK_SIZE  Tokens per paged-prefill chunk. Defaults to
-                                4096 under \`mlx launch claude\` to bound
-                                cold-prefill memory peaks; set to 0 to
-                                disable chunking, or to a smaller value
-                                (e.g. 1024 / 512) if 4096 still peaks.
+  Environment variables:
+    MLX_PAGED_PREFILL_CHUNK_SIZE  Tokens per paged-prefill chunk. Defaults to
+                                  2048 under \`mlx launch claude\` to bound
+                                  cold-prefill memory peaks; set to 0 to
+                                  disable chunking, or tune explicitly for
+                                  your workload.
+    MLX_PAGED_PREFILL_EVAL_INTERVAL
+                                  Layer cadence for eval+clear during paged
+                                  prefill. Defaults to 8.
+    MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL
+                                  Token cadence for paged decode cache clear.
+                                  Defaults to 64.
+    MLX_PAGED_CACHE_MEMORY_MB      Paged KV cache memory budget override for
+                                  paged-aware Qwen3.5 launch.
+    MLX_GEMMA4_NATIVE_KV_WRITE    Set to 0/false/off to disable graph-native
+                                  Gemma4 global KV writes.
+    MLX_GEMMA4_MAX_SLIDING_RESTORE_TOKENS
+                                  Optional emergency cap on cached Gemma4
+                                  prefix tokens replayed for sliding-cache
+                                  restore. Unset by default.
+    MLX_GEMMA4_SLIDING_CHECKPOINT_LIMIT
+                                  Override retained Gemma4 sliding-cache
+                                  checkpoints. Defaults dynamically from the
+                                  sliding window and paged block size.
+    MLX_INFERENCE_TRACE           Set to 1/true/on to write native inference
+                                  phase traces to a file.
+    MLX_INFERENCE_TRACE_FILE      Override the native trace file path.
+                                  Defaults to <log-dir>/inference-trace.log.
 
 Examples:
   mlx launch claude
@@ -96,6 +118,19 @@ function findClaudeOnPath(): string | null {
   return null;
 }
 
+function envFlagEnabled(value: string | undefined): boolean {
+  if (value == null) return false;
+  switch (value.trim().toLowerCase()) {
+    case '1':
+    case 'true':
+    case 'yes':
+    case 'on':
+      return true;
+    default:
+      return false;
+  }
+}
+
 export async function run(argv: string[]): Promise<void> {
   const parsed = parseArgs({
     args: argv,
@@ -118,19 +153,16 @@ export async function run(argv: string[]): Promise<void> {
     return;
   }
 
-  // Bound paged-prefill memory peak by chunking the prompt: default of
-  // 4096 tokens/chunk caps per-chunk SDPA + MoE intermediates to
-  // chunk-sized tiles instead of full-prompt tiles. Empirically 4096
-  // keeps Qwen3.6-35b-a3b 28-43K-token cold prefills at ~50 GB wired
-  // memory with zero swap (vs. the unchunked 117 GB / 39 GB swap), and
-  // halves the per-chunk synchronize_and_clear_cache + host-roundtrip
-  // K/V replay overhead vs. 1024. Respect any user-provided value (set
-  // in shell) so power users can tune down (e.g. 1024 / 512) if a
-  // larger context still peaks. The MLX env var is read via OnceLock on
-  // first paged-prefill call, so setting `process.env` here — before any
-  // model loads — is sufficient to apply the default.
+  // Bound paged-prefill memory peak by chunking the prompt. Keep this as a
+  // launcher default, not a Rust default: the shared native env var still uses
+  // 0 as "disable chunking", and non-Claude callers may want single-shot
+  // behavior. 2048 matches the mlx-lm / mlx-vlm default and reduces per-chunk
+  // overhead versus the previous 1024 default for long Qwen dense contexts.
+  // Respect any user-provided value (set in shell). The MLX env var is read via
+  // OnceLock on first paged-prefill call, so setting `process.env` here before
+  // model load is sufficient.
   if (process.env.MLX_PAGED_PREFILL_CHUNK_SIZE == null) {
-    process.env.MLX_PAGED_PREFILL_CHUNK_SIZE = '4096';
+    process.env.MLX_PAGED_PREFILL_CHUNK_SIZE = '2048';
   }
 
   const modelsDir = resolveModelsDir(args['models-dir']);
@@ -189,44 +221,22 @@ export async function run(argv: string[]): Promise<void> {
   // Verbose logging: attach AFTER `createServer` so we wrap every
   // incoming request (including `GET /v1/models` which claude fires
   // on startup). `--log-dir` implies `--verbose`.
-  const verbose = args.verbose || args['log-dir'] != null || process.env.MLX_LOG_DIR != null;
+  const traceRequested = envFlagEnabled(process.env.MLX_INFERENCE_TRACE);
+  const verbose = args.verbose || args['log-dir'] != null || process.env.MLX_LOG_DIR != null || traceRequested;
   let logger: Logger | null = null;
   if (verbose) {
     const logDir = resolveLogDir(args['log-dir'], resolveMlxNodeHome());
+    if (
+      traceRequested &&
+      (process.env.MLX_INFERENCE_TRACE_FILE == null || process.env.MLX_INFERENCE_TRACE_FILE.trim() === '')
+    ) {
+      process.env.MLX_INFERENCE_TRACE_FILE = join(logDir, 'inference-trace.log');
+    }
     logger = attachLogger(server.server, logDir);
   }
 
   console.log(
     `[mlx] models dir: ${modelsDir} | listening on http://${host}:${port} | discovered ${discovered.length} model(s) | default: ${boundModel.name}`,
-  );
-  // Mirror the Rust-side parser in crates/mlx-core/src/array/memory.rs::
-  // paged_prefill_chunk_size: trim whitespace, parse i32, reject negative
-  // and unparseable; fall back to 0 (disabled). Logging the EFFECTIVE value
-  // — not the raw env string — prevents misleading "abc tokens" output when
-  // the user typo'd a non-numeric value (which the parser silently maps to
-  // 0/disabled).
-  const rawChunkSize = process.env.MLX_PAGED_PREFILL_CHUNK_SIZE;
-  let effectiveChunkSize = 0;
-  if (rawChunkSize != null) {
-    const trimmed = rawChunkSize.trim();
-    // Mirror Rust's `s.trim().parse::<i32>()`: integer-only, signed,
-    // i32 range [-2^31, 2^31). The TS parser must reject anything Rust
-    // would, otherwise the log shows "N tokens" while chunking is
-    // actually disabled.
-    const I32_MAX = 0x7fff_ffff;
-    // Rust's parse::<i32>() accepts an optional leading '+' or '-'.
-    const parsed = /^[+-]?\d+$/.test(trimmed) ? Number.parseInt(trimmed, 10) : Number.NaN;
-    if (Number.isSafeInteger(parsed) && parsed >= 0 && parsed <= I32_MAX) {
-      effectiveChunkSize = parsed;
-    } else {
-      console.warn(
-        `[mlx] warning: MLX_PAGED_PREFILL_CHUNK_SIZE=${JSON.stringify(rawChunkSize)} is not a non-negative i32 integer; treating as 0 (disabled)`,
-      );
-    }
-  }
-  const chunkLabel = effectiveChunkSize === 0 ? '0 (disabled)' : String(effectiveChunkSize);
-  console.log(
-    `[mlx] paged-prefill chunk size: ${chunkLabel} tokens (set MLX_PAGED_PREFILL_CHUNK_SIZE=N to override; 0 disables)`,
   );
   if (logger) {
     console.log(`[mlx] verbose logging → ${logger.logDir}`);

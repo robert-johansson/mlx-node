@@ -83,14 +83,25 @@ describe('buildAnthropicResponse', () => {
     const response = buildAnthropicResponse(result, baseReq, 'msg_thinking');
 
     expect(response.content).toHaveLength(2);
-    expect(response.content[0]).toEqual({ type: 'thinking', thinking: 'Let me reason through this.' });
+    expect(response.content[0]).toEqual({
+      type: 'thinking',
+      thinking: 'Let me reason through this.',
+    });
     expect(response.content[1]).toEqual({ type: 'text', text: 'Hello!' });
   });
 
   it('tool use response produces tool_use blocks with parsed input', () => {
     const result = makeChatResult({
       text: '',
-      toolCalls: [{ id: 'toolu_01', name: 'get_weather', arguments: '{"city":"SF"}', status: 'ok', rawContent: '' }],
+      toolCalls: [
+        {
+          id: 'toolu_01',
+          name: 'get_weather',
+          arguments: '{"city":"SF"}',
+          status: 'ok',
+          rawContent: '',
+        },
+      ],
     });
     const response = buildAnthropicResponse(result, baseReq, 'msg_tool');
 
@@ -104,10 +115,48 @@ describe('buildAnthropicResponse', () => {
     expect(response.stop_reason).toBe('tool_use');
   });
 
+  it('suppresses Gemma4 parsed tool-call text without duplicating reasoning when tools are not allowed', () => {
+    const result = makeChatResult({
+      text: '',
+      thinking: 'I should inspect files.',
+      toolCalls: [
+        {
+          id: 'toolu_01',
+          name: 'read_file',
+          arguments: '{"path":"Cargo.toml"}',
+          status: 'ok',
+          rawContent: '',
+        },
+      ],
+      rawText:
+        '<|channel>thought\nI should inspect files.\n<channel|><|tool_call>call:read_file{path:<|"|>Cargo.toml<|"|>}<tool_call|><turn|>',
+    });
+    const response = buildAnthropicResponse(result, baseReq, 'msg_no_tools', undefined, false);
+
+    expect(response.stop_reason).toBe('end_turn');
+    expect(response.content).toHaveLength(2);
+    expect(response.content[0]).toEqual({
+      type: 'thinking',
+      thinking: 'I should inspect files.',
+    });
+    expect(response.content[1]).toEqual({
+      type: 'text',
+      text: '',
+    });
+  });
+
   it('tool use with object arguments uses them directly', () => {
     const result = makeChatResult({
       text: '',
-      toolCalls: [{ id: 'toolu_02', name: 'search', arguments: { query: 'MLX' }, status: 'ok', rawContent: '' }],
+      toolCalls: [
+        {
+          id: 'toolu_02',
+          name: 'search',
+          arguments: { query: 'MLX' },
+          status: 'ok',
+          rawContent: '',
+        },
+      ],
     });
     const response = buildAnthropicResponse(result, baseReq, 'msg_obj_args');
 
@@ -123,7 +172,15 @@ describe('buildAnthropicResponse', () => {
     const result = makeChatResult({
       thinking: 'I should call a tool.',
       text: 'Let me look that up.',
-      toolCalls: [{ id: 'toolu_03', name: 'lookup', arguments: '{"term":"foo"}', status: 'ok', rawContent: '' }],
+      toolCalls: [
+        {
+          id: 'toolu_03',
+          name: 'lookup',
+          arguments: '{"term":"foo"}',
+          status: 'ok',
+          rawContent: '',
+        },
+      ],
     });
     const response = buildAnthropicResponse(result, baseReq, 'msg_mixed');
 
@@ -152,7 +209,11 @@ describe('buildAnthropicResponse', () => {
     // Anthropic spec leaves the cache fields OPTIONAL and other
     // Anthropic-compatible servers omit them on misses — so a wire
     // emitting `cache_read_input_tokens: 0` would diverge.
-    const result = makeChatResult({ promptTokens: 11, numTokens: 4, cachedTokens: 0 });
+    const result = makeChatResult({
+      promptTokens: 11,
+      numTokens: 4,
+      cachedTokens: 0,
+    });
     const response = buildAnthropicResponse(result, baseReq, 'msg_no_cache');
 
     expect(response.usage.input_tokens).toBe(11);
@@ -166,7 +227,11 @@ describe('buildAnthropicResponse', () => {
     // cost on the turn, so on a cache HIT it MUST be the unsuffixed
     // remainder (`promptTokens - cachedTokens`) — billing UIs read
     // these fields directly.
-    const result = makeChatResult({ promptTokens: 20, numTokens: 5, cachedTokens: 7 });
+    const result = makeChatResult({
+      promptTokens: 20,
+      numTokens: 5,
+      cachedTokens: 7,
+    });
     const response = buildAnthropicResponse(result, baseReq, 'msg_cache_hit');
 
     expect(response.usage.cache_read_input_tokens).toBe(7);
@@ -192,6 +257,51 @@ describe('buildAnthropicResponse', () => {
     expect(response.usage.time_to_first_token_ms).toBe(1234);
     expect(response.usage.prefill_tokens_per_second).toBe(800);
     expect(response.usage.decode_tokens_per_second).toBe(73.5);
+    expect(response.usage.server_time_to_first_token_ms).toBe(1234);
+    expect(response.usage.server_prefill_tokens_per_second).toBe(800);
+    expect(response.usage.server_decode_tokens_per_second).toBe(73.5);
+    expect(response.usage.prefill_input_tokens).toBe(5);
+    expect(response.usage).not.toHaveProperty('cached_prefix_tokens');
+  });
+
+  it('adds cached-prefix context for perf fields on cache hits', () => {
+    const result = makeChatResult({
+      promptTokens: 20,
+      numTokens: 5,
+      cachedTokens: 15,
+    });
+    const response = buildAnthropicResponse(
+      result,
+      baseReq,
+      'msg_cache_perf',
+      {
+        ttftMs: 250,
+        prefillTokensPerSecond: 20,
+        decodeTokensPerSecond: 40,
+      },
+      true,
+      {
+        server_model_resolve_ms: 57,
+        server_queue_ms: 5,
+        server_pre_inference_ms: 62,
+        server_paged_prefill_chunk_size: 4096,
+        server_paged_prefill_eval_interval: 8,
+        server_paged_decode_cache_clear_interval: 64,
+      },
+    );
+
+    expect(response.usage.input_tokens).toBe(5);
+    expect(response.usage.cache_read_input_tokens).toBe(15);
+    expect(response.usage.prefill_input_tokens).toBe(5);
+    expect(response.usage.cached_prefix_tokens).toBe(15);
+    expect(response.usage.server_inference_elapsed_ms).toBe(350);
+    expect(response.usage.server_total_time_to_first_token_ms).toBe(312);
+    expect(response.usage.server_model_resolve_ms).toBe(57);
+    expect(response.usage.server_queue_ms).toBe(5);
+    expect(response.usage.server_pre_inference_ms).toBe(62);
+    expect(response.usage.server_paged_prefill_chunk_size).toBe(4096);
+    expect(response.usage.server_paged_prefill_eval_interval).toBe(8);
+    expect(response.usage.server_paged_decode_cache_clear_interval).toBe(64);
   });
 
   it('elides perf fields when performance is undefined', () => {
@@ -223,7 +333,15 @@ describe('buildAnthropicResponse', () => {
   it('empty text with tool calls produces no text block, only tool_use blocks', () => {
     const result = makeChatResult({
       text: '',
-      toolCalls: [{ id: 'toolu_04', name: 'fn', arguments: '{}', status: 'ok', rawContent: '' }],
+      toolCalls: [
+        {
+          id: 'toolu_04',
+          name: 'fn',
+          arguments: '{}',
+          status: 'ok',
+          rawContent: '',
+        },
+      ],
     });
     const response = buildAnthropicResponse(result, baseReq, 'msg_no_text');
 
@@ -235,7 +353,15 @@ describe('buildAnthropicResponse', () => {
   it('skips tool calls with status !== "ok"', () => {
     const result = makeChatResult({
       text: 'Done.',
-      toolCalls: [{ id: 'toolu_err', name: 'broken', arguments: '{}', status: 'error', rawContent: '' }],
+      toolCalls: [
+        {
+          id: 'toolu_err',
+          name: 'broken',
+          arguments: '{}',
+          status: 'error',
+          rawContent: '',
+        },
+      ],
     });
     const response = buildAnthropicResponse(result, baseReq, 'msg_err_tool');
 
@@ -246,7 +372,15 @@ describe('buildAnthropicResponse', () => {
   it('generates a toolu_ prefixed id when tool call id is missing', () => {
     const result = makeChatResult({
       text: '',
-      toolCalls: [{ id: undefined as unknown as string, name: 'fn', arguments: '{}', status: 'ok', rawContent: '' }],
+      toolCalls: [
+        {
+          id: undefined as unknown as string,
+          name: 'fn',
+          arguments: '{}',
+          status: 'ok',
+          rawContent: '',
+        },
+      ],
     });
     const response = buildAnthropicResponse(result, baseReq, 'msg_gen_id');
 
@@ -385,6 +519,44 @@ describe('buildMessageDelta', () => {
     expect(event.usage.time_to_first_token_ms).toBe(1234);
     expect(event.usage.prefill_tokens_per_second).toBe(800);
     expect(event.usage.decode_tokens_per_second).toBe(73.5);
+    expect(event.usage.server_time_to_first_token_ms).toBe(1234);
+    expect(event.usage.server_prefill_tokens_per_second).toBe(800);
+    expect(event.usage.server_decode_tokens_per_second).toBe(73.5);
+  });
+
+  it('adds cached-prefix context to streaming perf usage', () => {
+    const event = buildMessageDelta(
+      'end_turn',
+      5,
+      20,
+      15,
+      {
+        ttftMs: 250,
+        prefillTokensPerSecond: 20,
+        decodeTokensPerSecond: 40,
+      },
+      {
+        server_model_resolve_ms: 57,
+        server_queue_ms: 5,
+        server_pre_inference_ms: 62,
+        server_paged_prefill_chunk_size: 4096,
+        server_paged_prefill_eval_interval: 8,
+        server_paged_decode_cache_clear_interval: 64,
+      },
+    );
+
+    expect(event.usage.input_tokens).toBe(5);
+    expect(event.usage.cache_read_input_tokens).toBe(15);
+    expect(event.usage.prefill_input_tokens).toBe(5);
+    expect(event.usage.cached_prefix_tokens).toBe(15);
+    expect(event.usage.server_inference_elapsed_ms).toBe(350);
+    expect(event.usage.server_total_time_to_first_token_ms).toBe(312);
+    expect(event.usage.server_model_resolve_ms).toBe(57);
+    expect(event.usage.server_queue_ms).toBe(5);
+    expect(event.usage.server_pre_inference_ms).toBe(62);
+    expect(event.usage.server_paged_prefill_chunk_size).toBe(4096);
+    expect(event.usage.server_paged_prefill_eval_interval).toBe(8);
+    expect(event.usage.server_paged_decode_cache_clear_interval).toBe(64);
   });
 
   it('elides perf fields when performance is undefined', () => {

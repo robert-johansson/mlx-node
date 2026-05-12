@@ -4,6 +4,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ResponseStore } from '@mlx-node/core';
 
+import { handleCountMessageTokens } from './endpoints/messages-count-tokens.js';
 import { handleCreateMessage } from './endpoints/messages.js';
 import { handleListModels } from './endpoints/models.js';
 import { handleCreateResponse } from './endpoints/responses.js';
@@ -16,8 +17,9 @@ import {
 } from './errors.js';
 import type { PublicModelEntry } from './handler.js';
 import type { IdleSweeper } from './idle-sweeper.js';
+import type { ModelWorkCoordinator } from './model-work-coordinator.js';
 import type { ModelRegistry } from './registry.js';
-import type { AnthropicMessagesRequest } from './types-anthropic.js';
+import type { AnthropicCountTokensRequest, AnthropicMessagesRequest } from './types-anthropic.js';
 import type { ResponsesAPIRequest } from './types.js';
 
 /** Max request body size (10 MB). */
@@ -50,6 +52,7 @@ export async function routeRequest(
   idleSweeper?: IdleSweeper | null,
   resolveModel?: (name: string) => Promise<void>,
   listModels?: () => PublicModelEntry[],
+  modelWorkCoordinator?: ModelWorkCoordinator,
 ): Promise<void> {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const path = url.pathname;
@@ -80,7 +83,37 @@ export async function routeRequest(
       return;
     }
 
-    await handleCreateResponse(res, body, registry, store, req, responseRetentionSec, idleSweeper);
+    await handleCreateResponse(
+      res,
+      body,
+      registry,
+      store,
+      req,
+      responseRetentionSec,
+      idleSweeper,
+      modelWorkCoordinator,
+    );
+    return;
+  }
+
+  if (path === '/v1/messages/count_tokens') {
+    if (req.method !== 'POST') {
+      sendAnthropicMethodNotAllowed(res, 'POST');
+      return;
+    }
+
+    let body: AnthropicCountTokensRequest;
+    try {
+      const raw = await readBody(req);
+      body = JSON.parse(raw) as AnthropicCountTokensRequest;
+    } catch (err) {
+      const msg =
+        err instanceof Error && err.message === 'Request body too large' ? err.message : 'Invalid JSON in request body';
+      sendAnthropicBadRequest(res, msg);
+      return;
+    }
+
+    await handleCountMessageTokens(res, body, registry, idleSweeper, resolveModel, modelWorkCoordinator);
     return;
   }
 
@@ -101,7 +134,7 @@ export async function routeRequest(
       return;
     }
 
-    await handleCreateMessage(res, body, registry, req, idleSweeper, resolveModel);
+    await handleCreateMessage(res, body, registry, req, idleSweeper, resolveModel, modelWorkCoordinator);
     return;
   }
 

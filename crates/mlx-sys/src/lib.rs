@@ -345,7 +345,7 @@ unsafe extern "C-unwind" {
     ) -> *mut mlx_array;
     pub fn mlx_array_eval(handle: *mut mlx_array);
     pub fn mlx_async_eval(handles: *mut *mut mlx_array, count: usize);
-    pub fn mlx_eval(handles: *mut *mut mlx_array, count: usize);
+    pub fn mlx_eval(handles: *mut *mut mlx_array, count: usize) -> bool;
     pub fn mlx_array_size(handle: *mut mlx_array) -> usize;
     pub fn mlx_array_ndim(handle: *mut mlx_array) -> usize;
     pub fn mlx_array_shape(handle: *mut mlx_array, out: *mut i64);
@@ -700,9 +700,9 @@ unsafe extern "C-unwind" {
 
     // Wrap an existing MTL::Buffer (`void*` MTLBuffer pointer — the same
     // shape `mlx_array_get_metal_buffer` returns) as an MLX `array` view.
-    // Zero-copy: the deleter is a no-op so dropping the resulting array
-    // does NOT free the buffer. Caller (typically LayerKVPool) retains
-    // ownership and must keep the buffer alive for the array's lifetime.
+    // Zero-copy: the returned array retains the underlying MTL::Buffer and
+    // releases that retain when the array is dropped, so the view survives the
+    // original Rust buffer holder.
     //
     // - `metal_buffer_ptr`: MTL::Buffer* as `void*`
     // - `dims`/`ndim`: view shape (caller validates element-count vs
@@ -870,6 +870,49 @@ unsafe extern "C-unwind" {
 // ================================================================================
 
 unsafe extern "C-unwind" {
+    /// Emit the MLX C++ `paged_attention(...)` Custom primitive and return the
+    /// lazy on-device output array. Returns null for bridge/factory validation
+    /// errors so callers can fall back to a conservative attention path. GPU
+    /// dispatch errors still occur later when MLX evaluates the returned array.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_paged_attention_forward(
+        q: *mut mlx_array,
+        k_pool: *mut mlx_array,
+        v_pool: *mut mlx_array,
+        block_table: *mut mlx_array,
+        seq_lens: *mut mlx_array,
+        k_scale: *mut mlx_array,
+        v_scale: *mut mlx_array,
+        scale: f32,
+        softcap: f32,
+        sliding_window: i32,
+        block_size: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_size: i32,
+        kv_dtype: u8,
+    ) -> *mut mlx_array;
+
+    /// Emit the MLX C++ `paged_kv_write(...)` Custom primitive and return the
+    /// lazy K/V pool output arrays through `out_k_pool` / `out_v_pool`.
+    /// Returns false for bridge/factory validation errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_paged_kv_write_forward(
+        k_pool: *mut mlx_array,
+        v_pool: *mut mlx_array,
+        new_k: *mut mlx_array,
+        new_v: *mut mlx_array,
+        slot_mapping: *mut mlx_array,
+        k_scale: *mut mlx_array,
+        v_scale: *mut mlx_array,
+        block_size: i32,
+        num_kv_heads: i32,
+        head_size: i32,
+        kv_dtype: u8,
+        out_k_pool: *mut *mut mlx_array,
+        out_v_pool: *mut *mut mlx_array,
+    ) -> bool;
+
     /// Compare two `PagedKVWrite` primitives via `is_equivalent`.
     /// Returns `true` iff both are equivalent (same scalar state).
     pub fn mlx_paged_kv_write_is_equivalent(
@@ -1191,6 +1234,18 @@ unsafe extern "C-unwind" {
     /// seq_lens sliced as `seq_lens[1:]` (nonzero offset) must be
     /// rejected by the `paged_attention` factory.
     pub fn mlx_paged_attention_factory_rejects_non_contiguous_seq_lens() -> i32;
+
+    /// Production FFI bridge must reject non-contiguous metadata instead
+    /// of hiding it behind lazy `contiguous(...)` metadata copies.
+    pub fn mlx_paged_attention_forward_rejects_non_contiguous_metadata() -> i32;
+
+    /// Production FFI bridge must accept already-materialized metadata and
+    /// evaluate the returned lazy paged-attention output successfully.
+    pub fn mlx_paged_attention_forward_eval_accepts_materialized_metadata() -> i32;
+
+    /// Production FFI bridge must emit and evaluate lazy paged-kv-write pool
+    /// outputs without forcing Rust-side Metal buffer extraction.
+    pub fn mlx_paged_kv_write_forward_eval_smoke() -> i32;
 
     // =============================================================================
     // Phase 1 review-round-9 finding: PagedKVWrite::eval_gpu and
@@ -1576,6 +1631,21 @@ unsafe extern "C-unwind" {
     /// Get current compiled cache offset (tokens processed).
     pub fn mlx_qwen35_get_cache_offset() -> i32;
 
+    /// Export paged dense linear-attention caches for live-session continuation.
+    /// Full-attention K/V stays in the Rust paged adapter pools; this returns
+    /// the paged graph's per-layer `(conv_state, recurrent_state)` slots so
+    /// Rust can seed the next turn without replaying the cached prefix through
+    /// GDN. Returns number of arrays exported, or 0 if paged state is not
+    /// initialized.
+    pub fn mlx_qwen35_export_paged_linear_caches(
+        out_ptrs: *mut *mut mlx_array,
+        max_count: i32,
+    ) -> i32;
+
+    /// Get current paged dense cache offset (tokens processed by the compiled
+    /// paged decode graph).
+    pub fn mlx_qwen35_get_paged_cache_offset() -> i32;
+
     // ============================================
     // Phase 5 piece 1: paged Dense forward (coexists with the flat
     // compiled path). The Rust dispatcher decides per-turn which graph
@@ -1735,6 +1805,21 @@ unsafe extern "C-unwind" {
     /// Copies cache arrays to caller-provided output pointers.
     /// Returns number of arrays exported, or 0 if not initialized.
     pub fn mlx_qwen35_moe_export_caches(out_ptrs: *mut *mut mlx_array, max_count: i32) -> i32;
+
+    /// Export paged MoE linear-attention caches for live-session continuation.
+    /// Full-attention K/V stays in the Rust paged adapter pools; this returns
+    /// the paged graph's per-layer `(conv_state, recurrent_state)` slots so
+    /// Rust can seed the next turn without replaying the cached prefix through
+    /// GDN. Returns number of arrays exported, or 0 if paged state is not
+    /// initialized.
+    pub fn mlx_qwen35_moe_export_paged_linear_caches(
+        out_ptrs: *mut *mut mlx_array,
+        max_count: i32,
+    ) -> i32;
+
+    /// Get current paged MoE cache offset (tokens processed by the compiled
+    /// paged decode graph).
+    pub fn mlx_qwen35_moe_get_paged_cache_offset() -> i32;
 
     /// Get current MoE cache offset (tokens processed).
     pub fn mlx_qwen35_moe_get_cache_offset() -> i32;

@@ -259,7 +259,11 @@ describe('handleCreateMessage', () => {
 
       await handleCreateMessage(
         res,
-        { model: 'test', messages: [{ role: 'user', content: 'hi' }], max_tokens: 0 } as any,
+        {
+          model: 'test',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 0,
+        } as any,
         registry,
       );
 
@@ -286,7 +290,11 @@ describe('handleCreateMessage', () => {
 
       await handleCreateMessage(
         res,
-        { model: 'nonexistent', messages: [{ role: 'user', content: 'hi' }], max_tokens: 100 },
+        {
+          model: 'nonexistent',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
         registry,
       );
 
@@ -596,6 +604,50 @@ describe('handleCreateMessage', () => {
       expect(parsed.usage.output_tokens).toBe(10);
     });
 
+    it('clamps max_tokens to the registered output cap before dispatch', async () => {
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      registry.register('test-model', mockModel, { maxOutputTokens: 16 });
+      const { res, getStatus } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'Hello' }],
+          max_tokens: 128000,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      const config = startSpy.mock.calls[0]?.[1] as { maxNewTokens?: number };
+      expect(config.maxNewTokens).toBe(16);
+    });
+
+    it('leaves max_tokens unchanged when no registered output cap exists', async () => {
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      registry.register('test-model', mockModel);
+      const { res, getStatus } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'Hello' }],
+          max_tokens: 128000,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      const config = startSpy.mock.calls[0]?.[1] as { maxNewTokens?: number };
+      expect(config.maxNewTokens).toBe(128000);
+    });
+
     it('returns thinking + text content blocks', async () => {
       const registry = new ModelRegistry();
       const mockModel = createMockModel(
@@ -632,6 +684,65 @@ describe('handleCreateMessage', () => {
       expect(parsed.content[1].text).toBe('The answer is 42.');
     });
 
+    it('streaming suppresses Gemma4 parsed tool-call markup when tools are absent', async () => {
+      const rawText =
+        '<|channel>thought\nI should inspect files.\n<channel|><|tool_call>call:read_file{path:<|"|>Cargo.toml<|"|>}<tool_call|><turn|>';
+      const registry = new ModelRegistry();
+      registry.register(
+        'test-model',
+        createMockStreamModel([
+          { text: 'I should inspect files.', done: false, isReasoning: true },
+          {
+            text: '',
+            done: true,
+            finishReason: 'tool_calls',
+            toolCalls: [
+              {
+                status: 'ok',
+                id: 'toolu_abc123',
+                name: 'read_file',
+                arguments: '{"path":"Cargo.toml"}',
+              } as ToolCallResult,
+            ],
+            thinking: 'I should inspect files.',
+            numTokens: 20,
+            promptTokens: 10,
+            reasoningTokens: 0,
+            rawText,
+          },
+        ]),
+      );
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'summarize Cargo.toml' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const text = events
+        .filter((e) => e.event === 'content_block_delta')
+        .map((e) => e.data['delta'] as { type?: string; text?: string })
+        .filter((delta) => delta.type === 'text_delta')
+        .map((delta) => delta.text ?? '')
+        .join('');
+
+      expect(text).toBe('');
+      expect(text).not.toContain('<|channel>');
+      expect(text).not.toContain('<channel|>');
+      expect(text).not.toContain('<|tool_call>');
+      expect(text).not.toContain('<tool_call|>');
+
+      const stop = events.find((e) => e.event === 'message_delta')?.data['delta'] as { stop_reason?: string };
+      expect(stop.stop_reason).toBe('end_turn');
+    });
+
     it('returns tool_use content blocks', async () => {
       const registry = new ModelRegistry();
       const mockModel = createMockModel(
@@ -661,7 +772,12 @@ describe('handleCreateMessage', () => {
           model: 'test-model',
           messages: [{ role: 'user', content: 'What is the weather?' }],
           max_tokens: 100,
-          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+          tools: [
+            {
+              name: 'get_weather',
+              input_schema: { type: 'object', properties: {} },
+            },
+          ],
         },
         registry,
       );
@@ -674,6 +790,54 @@ describe('handleCreateMessage', () => {
       expect(toolBlock).toBeDefined();
       expect(toolBlock.name).toBe('get_weather');
       expect(toolBlock.input).toEqual({ location: 'San Francisco' });
+    });
+
+    it('does not emit tool_use blocks or parsed tool markup when request has no tools', async () => {
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: '',
+          toolCalls: [
+            {
+              status: 'ok',
+              id: 'toolu_no_tools',
+              name: 'get_weather',
+              arguments: '{"location":"San Francisco"}',
+              rawContent: '{"name":"get_weather","arguments":{"location":"San Francisco"}}',
+            } as ToolCallResult,
+          ],
+          numTokens: 20,
+          promptTokens: 10,
+          reasoningTokens: 0,
+          finishReason: 'stop',
+          rawText: '<tool_call>{"name":"get_weather","arguments":{"location":"San Francisco"}}</tool_call>',
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const noToolsSessionReg = registry.getSessionRegistry('test-model')!;
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'What is the weather?' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.stop_reason).toBe('end_turn');
+      expect(parsed.content.some((b: any) => b.type === 'tool_use')).toBe(false);
+      expect(parsed.content).toEqual([
+        {
+          type: 'text',
+          text: '',
+        },
+      ]);
+      expect(noToolsSessionReg.size).toBe(0);
     });
 
     it('drops the warm slot when chatSessionStart resolves with finishReason="error"', async () => {
@@ -800,6 +964,119 @@ describe('handleCreateMessage', () => {
       expect(msgStop).toBeDefined();
     });
 
+    it('clamps max_tokens to the registered output cap before streaming dispatch', async () => {
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'Hello', done: false, isReasoning: false },
+        {
+          text: 'Hello',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 1,
+          reasoningTokens: 0,
+          rawText: 'Hello',
+        },
+      ];
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('test-model', mockModel, { maxOutputTokens: 16 });
+      const { res, getStatus } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'Hi' }],
+          max_tokens: 128000,
+          stream: true,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const streamSpy = mockModel.chatStreamSessionStart as unknown as ReturnType<typeof vi.fn>;
+      const config = streamSpy.mock.calls[0]?.[1] as { maxNewTokens?: number };
+      expect(config.maxNewTokens).toBe(16);
+    });
+
+    it('uses a short non-thinking config for Claude Code title generation requests', async () => {
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: '{', done: false, isReasoning: true },
+        { text: '{"title": "Analyze codebase architecture"}', done: false, isReasoning: false },
+        {
+          text: '{"title": "Analyze codebase architecture"}',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 8,
+          promptTokens: 32,
+          reasoningTokens: 0,
+          rawText: '{"title": "Analyze codebase architecture"}',
+        },
+      ];
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('test-model', mockModel, { maxOutputTokens: 81920 });
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'Deepresearch the whole codebase, describe the architecture' }],
+          system: [
+            { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.138; cch=d2ad0;' },
+            { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },
+            {
+              type: 'text',
+              text:
+                'Generate a concise, sentence-case title (3-7 words) that captures the main topic. ' +
+                'Return JSON with a single "title" field.',
+            },
+          ],
+          tools: [],
+          max_tokens: 64000,
+          output_config: {
+            format: {
+              type: 'json_schema',
+              schema: {
+                type: 'object',
+                properties: { title: { type: 'string' } },
+                required: ['title'],
+                additionalProperties: false,
+              },
+            },
+          },
+          stream: true,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const streamSpy = mockModel.chatStreamSessionStart as unknown as ReturnType<typeof vi.fn>;
+      const config = streamSpy.mock.calls[0]?.[1] as {
+        maxNewTokens?: number;
+        reasoningEffort?: string;
+        thinkingTokenBudget?: number;
+        includeReasoning?: boolean;
+      };
+      expect(config.maxNewTokens).toBe(128);
+      expect(config.reasoningEffort).toBe('none');
+      expect(config.thinkingTokenBudget).toBe(0);
+      expect(config.includeReasoning).toBe(false);
+
+      const events = parseSSE(getBody());
+      const thinkingStart = events.find(
+        (event) =>
+          event.event === 'content_block_start' &&
+          (event.data['content_block'] as Record<string, unknown> | undefined)?.['type'] === 'thinking',
+      );
+      expect(thinkingStart).toBeUndefined();
+    });
+
     it('emits thinking + text with correct content block indices', async () => {
       const registry = new ModelRegistry();
       const streamEvents = [
@@ -907,6 +1184,12 @@ describe('handleCreateMessage', () => {
           messages: [{ role: 'user', content: 'Weather?' }],
           max_tokens: 100,
           stream: true,
+          tools: [
+            {
+              name: 'get_weather',
+              input_schema: { type: 'object', properties: {} },
+            },
+          ],
         },
         registry,
       );
@@ -972,6 +1255,12 @@ describe('handleCreateMessage', () => {
           messages: [{ role: 'user', content: 'Search' }],
           max_tokens: 100,
           stream: true,
+          tools: [
+            {
+              name: 'search',
+              input_schema: { type: 'object', properties: {} },
+            },
+          ],
         },
         registry,
       );
@@ -989,6 +1278,72 @@ describe('handleCreateMessage', () => {
         (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'tool_use',
       );
       expect(toolStarts).toHaveLength(1);
+    });
+
+    it('suppresses parsed tool_call markup when request has no tools', async () => {
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: '<tool_call>', done: false, isReasoning: false },
+        { text: '{"name":"search"}', done: false, isReasoning: false },
+        {
+          text: '',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [
+            {
+              status: 'ok',
+              id: 'toolu_no_tools',
+              name: 'search',
+              arguments: '{"query":"test"}',
+            },
+          ],
+          thinking: null,
+          numTokens: 8,
+          promptTokens: 4,
+          reasoningTokens: 0,
+          rawText: '<tool_call>{"name":"search"}</tool_call>',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const noToolsStreamSessionReg = registry.getSessionRegistry('test-model')!;
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'Search' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textStarts = events.filter(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'text',
+      );
+      expect(textStarts).toHaveLength(0);
+
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const combined = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(combined).toBe('');
+
+      const toolStarts = events.filter(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'tool_use',
+      );
+      expect(toolStarts).toHaveLength(0);
+
+      const jsonDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'input_json_delta',
+      );
+      expect(jsonDeltas).toHaveLength(0);
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('end_turn');
+      expect(noToolsStreamSessionReg.size).toBe(0);
     });
 
     it('recovers suppressed text after false-alarm tool_call tag when text was already emitted', async () => {
@@ -1069,7 +1424,11 @@ describe('handleCreateMessage', () => {
         // this advances emittedTextLength to 2 BEFORE suppression triggers.
         { text: '\n\n', done: false, isReasoning: false },
         // Unclosed tool_call — tagBuffer suppresses everything from here on.
-        { text: '<tool_call>\n<function=Agent>{"q":"x"}', done: false, isReasoning: false },
+        {
+          text: '<tool_call>\n<function=Agent>{"q":"x"}',
+          done: false,
+          isReasoning: false,
+        },
         {
           // Native side trims the leading "\n\n" (split_at_think_end), so
           // finalText starts with "<tool_call>" — NOT "\n\n<tool_call>".
@@ -1154,7 +1513,14 @@ describe('handleCreateMessage', () => {
           done: true,
           finishReason: 'stop',
           // Non-ok tool call — okToolCalls filter returns [].
-          toolCalls: [{ id: 'tool_1', name: 'lookup', arguments: '', status: 'invalid_json' }],
+          toolCalls: [
+            {
+              id: 'tool_1',
+              name: 'lookup',
+              arguments: '',
+              status: 'invalid_json',
+            },
+          ],
           thinking: null,
           numTokens: 25,
           promptTokens: 5,
@@ -1173,6 +1539,12 @@ describe('handleCreateMessage', () => {
           messages: [{ role: 'user', content: 'use a tool' }],
           max_tokens: 30,
           stream: true,
+          tools: [
+            {
+              name: 'lookup',
+              input_schema: { type: 'object', properties: {} },
+            },
+          ],
         },
         registry,
       );
@@ -1202,7 +1574,11 @@ describe('handleCreateMessage', () => {
       const registry = new ModelRegistry();
       const streamEvents = [
         { text: longWhitespace, done: false, isReasoning: false },
-        { text: '<tool_call>\n<function=Agent>{"q":"x"}', done: false, isReasoning: false },
+        {
+          text: '<tool_call>\n<function=Agent>{"q":"x"}',
+          done: false,
+          isReasoning: false,
+        },
         {
           // Native split_at_think_end trims the leading whitespace → finalText
           // starts with "<tool_call>" (length ~38, less than emittedText's 80
@@ -1269,7 +1645,14 @@ describe('handleCreateMessage', () => {
           text: 'Let me check.',
           done: true,
           finishReason: 'tool_calls',
-          toolCalls: [{ id: 'tool_1', name: 'lookup', arguments: { q: 'x' }, status: 'ok' }],
+          toolCalls: [
+            {
+              id: 'tool_1',
+              name: 'lookup',
+              arguments: { q: 'x' },
+              status: 'ok',
+            },
+          ],
           thinking: null,
           numTokens: 20,
           promptTokens: 5,
@@ -1288,6 +1671,12 @@ describe('handleCreateMessage', () => {
           messages: [{ role: 'user', content: 'use a tool' }],
           max_tokens: 30,
           stream: true,
+          tools: [
+            {
+              name: 'lookup',
+              input_schema: { type: 'object', properties: {} },
+            },
+          ],
         },
         registry,
       );
@@ -1471,7 +1860,10 @@ describe('handleCreateMessage', () => {
       // message on the envelope.
       const errorEvents = events.filter((e) => e.event === 'error');
       expect(errorEvents).toHaveLength(1);
-      const errorBody = errorEvents[0].data['error'] as { type: string; message: string };
+      const errorBody = errorEvents[0].data['error'] as {
+        type: string;
+        message: string;
+      };
       expect(errorBody.type).toBe('api_error');
       expect(errorBody.message).toContain('native decode crashed mid-flight');
 
@@ -1568,7 +1960,10 @@ describe('handleCreateMessage', () => {
       // Exactly one `error` event, citing the client disconnect.
       const errorEvents = events.filter((e) => e.event === 'error');
       expect(errorEvents).toHaveLength(1);
-      const errorBody = errorEvents[0].data['error'] as { type: string; message: string };
+      const errorBody = errorEvents[0].data['error'] as {
+        type: string;
+        message: string;
+      };
       expect(errorBody.type).toBe('api_error');
       expect(errorBody.message).toMatch(/client disconnected/i);
 
@@ -1793,7 +2188,10 @@ describe('handleCreateMessage', () => {
       const errorEvent = events.find((e) => e.event === 'error');
       expect(errorEvent).toBeDefined();
       expect(errorEvent!.data['type']).toBe('error');
-      const errorBody = errorEvent!.data['error'] as { type: string; message: string };
+      const errorBody = errorEvent!.data['error'] as {
+        type: string;
+        message: string;
+      };
       expect(errorBody.type).toBe('api_error');
       expect(errorBody.message).toMatch(/finishReason=error|did not commit/i);
 
@@ -1832,7 +2230,10 @@ describe('handleCreateMessage', () => {
       const errorEvents = events.filter((e) => e.event === 'error');
       expect(errorEvents).toHaveLength(1);
       expect(errorEvents[0].data['type']).toBe('error');
-      const errorBody = errorEvents[0].data['error'] as { type: string; message: string };
+      const errorBody = errorEvents[0].data['error'] as {
+        type: string;
+        message: string;
+      };
       expect(errorBody.type).toBe('api_error');
       expect(errorBody.message).toMatch(/without a done event|stream ended/i);
 
@@ -1916,8 +2317,18 @@ describe('handleCreateMessage', () => {
             {
               role: 'assistant',
               content: [
-                { type: 'tool_use', id: 'call_a', name: 'get_weather', input: { city: 'SF' } },
-                { type: 'tool_use', id: 'call_b', name: 'get_news', input: { q: 'tech' } },
+                {
+                  type: 'tool_use',
+                  id: 'call_a',
+                  name: 'get_weather',
+                  input: { city: 'SF' },
+                },
+                {
+                  type: 'tool_use',
+                  id: 'call_b',
+                  name: 'get_news',
+                  input: { q: 'tech' },
+                },
               ],
             },
             {
@@ -1925,8 +2336,16 @@ describe('handleCreateMessage', () => {
               content: [
                 // Intentionally reversed order — the handler must
                 // canonicalize to [call_a, call_b] before dispatch.
-                { type: 'tool_result', tool_use_id: 'call_b', content: '{"headlines":[]}' },
-                { type: 'tool_result', tool_use_id: 'call_a', content: '{"temp":68}' },
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_b',
+                  content: '{"headlines":[]}',
+                },
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_a',
+                  content: '{"temp":68}',
+                },
               ],
             },
           ],
@@ -1977,31 +2396,67 @@ describe('handleCreateMessage', () => {
             {
               role: 'assistant',
               content: [
-                { type: 'tool_use', id: 'call_1', name: 'get_a', input: { k: 'a' } },
-                { type: 'tool_use', id: 'call_2', name: 'get_b', input: { k: 'b' } },
+                {
+                  type: 'tool_use',
+                  id: 'call_1',
+                  name: 'get_a',
+                  input: { k: 'a' },
+                },
+                {
+                  type: 'tool_use',
+                  id: 'call_2',
+                  name: 'get_b',
+                  input: { k: 'b' },
+                },
               ],
             },
             {
               role: 'user',
               content: [
                 // First fan-out's tool_result blocks reversed.
-                { type: 'tool_result', tool_use_id: 'call_2', content: '{"v":"b-result"}' },
-                { type: 'tool_result', tool_use_id: 'call_1', content: '{"v":"a-result"}' },
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_2',
+                  content: '{"v":"b-result"}',
+                },
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_1',
+                  content: '{"v":"a-result"}',
+                },
               ],
             },
             {
               role: 'assistant',
               content: [
-                { type: 'tool_use', id: 'call_3', name: 'get_c', input: { k: 'c' } },
-                { type: 'tool_use', id: 'call_4', name: 'get_d', input: { k: 'd' } },
+                {
+                  type: 'tool_use',
+                  id: 'call_3',
+                  name: 'get_c',
+                  input: { k: 'c' },
+                },
+                {
+                  type: 'tool_use',
+                  id: 'call_4',
+                  name: 'get_d',
+                  input: { k: 'd' },
+                },
               ],
             },
             {
               role: 'user',
               content: [
                 // Second fan-out already canonical.
-                { type: 'tool_result', tool_use_id: 'call_3', content: '{"v":"c-result"}' },
-                { type: 'tool_result', tool_use_id: 'call_4', content: '{"v":"d-result"}' },
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_3',
+                  content: '{"v":"c-result"}',
+                },
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_4',
+                  content: '{"v":"d-result"}',
+                },
               ],
             },
           ],
@@ -2053,15 +2508,33 @@ describe('handleCreateMessage', () => {
             {
               role: 'assistant',
               content: [
-                { type: 'tool_use', id: 'call_a', name: 'get_weather', input: { city: 'SF' } },
-                { type: 'tool_use', id: 'call_b', name: 'get_news', input: { q: 'tech' } },
+                {
+                  type: 'tool_use',
+                  id: 'call_a',
+                  name: 'get_weather',
+                  input: { city: 'SF' },
+                },
+                {
+                  type: 'tool_use',
+                  id: 'call_b',
+                  name: 'get_news',
+                  input: { q: 'tech' },
+                },
               ],
             },
             {
               role: 'user',
               content: [
-                { type: 'tool_result', tool_use_id: 'call_a', content: '{"temp":68}' },
-                { type: 'tool_result', tool_use_id: 'call_b', content: '{"headlines":[]}' },
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_a',
+                  content: '{"temp":68}',
+                },
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_b',
+                  content: '{"headlines":[]}',
+                },
               ],
             },
           ],
@@ -2105,15 +2578,29 @@ describe('handleCreateMessage', () => {
             {
               role: 'assistant',
               content: [
-                { type: 'tool_use', id: 'call_a', name: 'get_weather', input: { city: 'SF' } },
-                { type: 'tool_use', id: 'call_b', name: 'get_news', input: { q: 'tech' } },
+                {
+                  type: 'tool_use',
+                  id: 'call_a',
+                  name: 'get_weather',
+                  input: { city: 'SF' },
+                },
+                {
+                  type: 'tool_use',
+                  id: 'call_b',
+                  name: 'get_news',
+                  input: { q: 'tech' },
+                },
               ],
             },
             {
               role: 'user',
               content: [
                 // Only call_a is resolved — call_b is missing.
-                { type: 'tool_result', tool_use_id: 'call_a', content: '{"temp":68}' },
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_a',
+                  content: '{"temp":68}',
+                },
               ],
             },
             {
@@ -2156,11 +2643,24 @@ describe('handleCreateMessage', () => {
             { role: 'user', content: 'get weather' },
             {
               role: 'assistant',
-              content: [{ type: 'tool_use', id: 'call_a', name: 'get_weather', input: { city: 'SF' } }],
+              content: [
+                {
+                  type: 'tool_use',
+                  id: 'call_a',
+                  name: 'get_weather',
+                  input: { city: 'SF' },
+                },
+              ],
             },
             {
               role: 'user',
-              content: [{ type: 'tool_result', tool_use_id: 'call_ghost', content: '{"temp":68}' }],
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_ghost',
+                  content: '{"temp":68}',
+                },
+              ],
             },
           ],
           max_tokens: 100,
@@ -2194,16 +2694,34 @@ describe('handleCreateMessage', () => {
             {
               role: 'assistant',
               content: [
-                { type: 'tool_use', id: 'call_a', name: 'get_weather', input: { city: 'SF' } },
-                { type: 'tool_use', id: 'call_b', name: 'get_news', input: { q: 'tech' } },
+                {
+                  type: 'tool_use',
+                  id: 'call_a',
+                  name: 'get_weather',
+                  input: { city: 'SF' },
+                },
+                {
+                  type: 'tool_use',
+                  id: 'call_b',
+                  name: 'get_news',
+                  input: { q: 'tech' },
+                },
               ],
             },
             {
               role: 'user',
               content: [
                 { type: 'text', text: 'here are outputs' },
-                { type: 'tool_result', tool_use_id: 'call_b', content: '{"v":"b"}' },
-                { type: 'tool_result', tool_use_id: 'call_a', content: '{"v":"a"}' },
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_b',
+                  content: '{"v":"b"}',
+                },
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_a',
+                  content: '{"v":"a"}',
+                },
               ],
             },
           ],
@@ -2244,16 +2762,34 @@ describe('handleCreateMessage', () => {
             {
               role: 'assistant',
               content: [
-                { type: 'tool_use', id: 'call_a', name: 'get_weather', input: { city: 'SF' } },
-                { type: 'tool_use', id: 'call_b', name: 'get_news', input: { q: 'tech' } },
+                {
+                  type: 'tool_use',
+                  id: 'call_a',
+                  name: 'get_weather',
+                  input: { city: 'SF' },
+                },
+                {
+                  type: 'tool_use',
+                  id: 'call_b',
+                  name: 'get_news',
+                  input: { q: 'tech' },
+                },
               ],
             },
             {
               role: 'user',
               content: [
                 // Reversed — canonicalization will reorder to [call_a, call_b].
-                { type: 'tool_result', tool_use_id: 'call_b', content: '{"v":"b"}' },
-                { type: 'tool_result', tool_use_id: 'call_a', content: '{"v":"a"}' },
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_b',
+                  content: '{"v":"b"}',
+                },
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_a',
+                  content: '{"v":"a"}',
+                },
               ],
             },
             { role: 'user', content: 'here are outputs' },
@@ -2271,7 +2807,12 @@ describe('handleCreateMessage', () => {
       const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
       expect(startSpy).toHaveBeenCalledTimes(1);
       const [primedMessages] = startSpy.mock.calls[0] as [
-        Array<{ role: string; content: string; toolCallId?: string; toolCalls?: Array<{ id: string }> }>,
+        Array<{
+          role: string;
+          content: string;
+          toolCallId?: string;
+          toolCalls?: Array<{ id: string }>;
+        }>,
       ];
 
       const assistantIdx = primedMessages.findIndex((m) => m.role === 'assistant');
@@ -2309,7 +2850,14 @@ describe('handleCreateMessage', () => {
             { role: 'user', content: 'call the tool' },
             {
               role: 'assistant',
-              content: [{ type: 'tool_use', id: 'call_fail', name: 'get_weather', input: { city: 'SF' } }],
+              content: [
+                {
+                  type: 'tool_use',
+                  id: 'call_fail',
+                  name: 'get_weather',
+                  input: { city: 'SF' },
+                },
+              ],
             },
             {
               role: 'user',
@@ -2340,7 +2888,10 @@ describe('handleCreateMessage', () => {
       expect(toolMsg).toBeDefined();
       expect(toolMsg!.content).toBe(JSON.stringify({ is_error: true, content: 'boom: connection refused' }));
       // Envelope content is valid JSON and round-trips cleanly.
-      const parsed = JSON.parse(toolMsg!.content) as { is_error: boolean; content: string };
+      const parsed = JSON.parse(toolMsg!.content) as {
+        is_error: boolean;
+        content: string;
+      };
       expect(parsed.is_error).toBe(true);
       expect(parsed.content).toBe('boom: connection refused');
     });
@@ -3079,8 +3630,18 @@ describe('handleCreateMessage', () => {
       // like the simpler three-turn test above — but with a rotating
       // billing block prepended.
       const startResults = [
-        makeChatResult({ text: 'A1', cachedTokens: 0, promptTokens: 5, numTokens: 3 }),
-        makeChatResult({ text: 'A2', cachedTokens: 12, promptTokens: 20, numTokens: 5 }),
+        makeChatResult({
+          text: 'A1',
+          cachedTokens: 0,
+          promptTokens: 5,
+          numTokens: 3,
+        }),
+        makeChatResult({
+          text: 'A2',
+          cachedTokens: 12,
+          promptTokens: 20,
+          numTokens: 5,
+        }),
       ];
       const chatSessionStart = vi.fn().mockResolvedValueOnce(startResults[0]).mockResolvedValueOnce(startResults[1]);
       const resetCaches = vi.fn();
@@ -3104,7 +3665,10 @@ describe('handleCreateMessage', () => {
         {
           model: 'test-model',
           system: [
-            { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.119.806; cch=AAAA;' },
+            {
+              type: 'text',
+              text: 'x-anthropic-billing-header: cc_version=2.1.119.806; cch=AAAA;',
+            },
             { type: 'text', text: 'You are Claude.' },
           ],
           messages: [{ role: 'user', content: 'A' }],
@@ -3127,7 +3691,10 @@ describe('handleCreateMessage', () => {
           system: [
             // cch= rotated. Without the strip this whole request would
             // miss the warm slot at the gate level.
-            { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.119.806; cch=BBBB;' },
+            {
+              type: 'text',
+              text: 'x-anthropic-billing-header: cc_version=2.1.119.806; cch=BBBB;',
+            },
             { type: 'text', text: 'You are Claude.' },
           ],
           messages: [
@@ -3145,7 +3712,9 @@ describe('handleCreateMessage', () => {
       expect(r2.getStatus()).toBe(200);
       expect(r2.getHeaders()['x-session-cache']).toBe('prefix_hit');
       expect(r2.getHeaders()['x-cached-tokens']).toBe('12');
-      const t2Body = JSON.parse(r2.getBody()) as { usage: Record<string, number> };
+      const t2Body = JSON.parse(r2.getBody()) as {
+        usage: Record<string, number>;
+      };
       expect(t2Body.usage.cache_read_input_tokens).toBe(12);
       expect(t2Body.usage.input_tokens).toBe(8); // 20 - 12
       expect(sessionReg.size).toBe(1);
@@ -3159,8 +3728,14 @@ describe('handleCreateMessage', () => {
       expect(chatSessionStart).toHaveBeenCalledTimes(2);
       const turn1Messages = chatSessionStart.mock.calls[0]![0] as ChatMessage[];
       const turn2Messages = chatSessionStart.mock.calls[1]![0] as ChatMessage[];
-      expect(turn1Messages[0]).toEqual({ role: 'system', content: 'You are Claude.' });
-      expect(turn2Messages[0]).toEqual({ role: 'system', content: 'You are Claude.' });
+      expect(turn1Messages[0]).toEqual({
+        role: 'system',
+        content: 'You are Claude.',
+      });
+      expect(turn2Messages[0]).toEqual({
+        role: 'system',
+        content: 'You are Claude.',
+      });
     });
 
     it('three-turn streaming replay reuses the warm slot (header reports streaming)', async () => {
@@ -3615,6 +4190,12 @@ describe('handleCreateMessage', () => {
             messages: [{ role: 'user', content: 'hi' }],
             max_tokens: 100,
             stream: true,
+            tools: [
+              {
+                name: 'do_thing',
+                input_schema: { type: 'object', properties: {} },
+              },
+            ],
           },
           registry,
         );
@@ -3854,8 +4435,22 @@ describe('handleCreateMessage', () => {
       //     existing classification.
       const chatSessionStart = vi
         .fn()
-        .mockResolvedValueOnce(makeChatResult({ text: 'A1', numTokens: 3, promptTokens: 5, cachedTokens: 0 }))
-        .mockResolvedValueOnce(makeChatResult({ text: 'A2', numTokens: 5, promptTokens: 20, cachedTokens: 7 }));
+        .mockResolvedValueOnce(
+          makeChatResult({
+            text: 'A1',
+            numTokens: 3,
+            promptTokens: 5,
+            cachedTokens: 0,
+          }),
+        )
+        .mockResolvedValueOnce(
+          makeChatResult({
+            text: 'A2',
+            numTokens: 5,
+            promptTokens: 20,
+            cachedTokens: 7,
+          }),
+        );
       const mockModel = {
         chatSessionStart,
         chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
@@ -3881,7 +4476,9 @@ describe('handleCreateMessage', () => {
         registry,
       );
       expect(r1.getStatus()).toBe(200);
-      const t1Body = JSON.parse(r1.getBody()) as { usage: Record<string, number> };
+      const t1Body = JSON.parse(r1.getBody()) as {
+        usage: Record<string, number>;
+      };
       expect(t1Body.usage.input_tokens).toBe(5);
       expect(t1Body.usage.output_tokens).toBe(3);
       expect(t1Body.usage).not.toHaveProperty('cache_read_input_tokens');
@@ -3909,7 +4506,9 @@ describe('handleCreateMessage', () => {
         registry,
       );
       expect(r2.getStatus()).toBe(200);
-      const t2Body = JSON.parse(r2.getBody()) as { usage: Record<string, number> };
+      const t2Body = JSON.parse(r2.getBody()) as {
+        usage: Record<string, number>;
+      };
       expect(t2Body.usage.cache_read_input_tokens).toBe(7);
       expect(t2Body.usage.input_tokens).toBe(13);
       expect(t2Body.usage.output_tokens).toBe(5);
@@ -4046,13 +4645,27 @@ describe('handleCreateMessage', () => {
       // `'prefix_hit'`.
       const chatSessionStart = vi
         .fn()
-        .mockResolvedValueOnce(makeChatResult({ text: 'first', numTokens: 4, promptTokens: 6, cachedTokens: 0 }))
+        .mockResolvedValueOnce(
+          makeChatResult({
+            text: 'first',
+            numTokens: 4,
+            promptTokens: 6,
+            cachedTokens: 0,
+          }),
+        )
         // Second turn: instructions match (same `system: 'S'`) so
         // `getOrCreateWarmAny` returns a hit, BUT the mocked native
         // result reports `cachedTokens === 0` — exactly what
         // `verify_cache_prefix_direct` returns when the prefix
         // mismatched after a hidden change (images, tools, template).
-        .mockResolvedValueOnce(makeChatResult({ text: 'second', numTokens: 6, promptTokens: 11, cachedTokens: 0 }));
+        .mockResolvedValueOnce(
+          makeChatResult({
+            text: 'second',
+            numTokens: 6,
+            promptTokens: 11,
+            cachedTokens: 0,
+          }),
+        );
       const resetCaches = vi.fn();
       const mockModel = {
         chatSessionStart,
@@ -4125,7 +4738,9 @@ describe('handleCreateMessage', () => {
 
         // Body cache fields stay OFF the wire — no
         // `cache_read_input_tokens`, no `cache_creation_input_tokens`.
-        const t2Body = JSON.parse(r2.getBody()) as { usage: Record<string, number> };
+        const t2Body = JSON.parse(r2.getBody()) as {
+          usage: Record<string, number>;
+        };
         expect(t2Body.usage).not.toHaveProperty('cache_read_input_tokens');
         expect(t2Body.usage).not.toHaveProperty('cache_creation_input_tokens');
         expect(t2Body.usage.input_tokens).toBe(11);
