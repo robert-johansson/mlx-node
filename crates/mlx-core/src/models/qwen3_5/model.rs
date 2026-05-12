@@ -388,16 +388,6 @@ pub(crate) enum Qwen35Cmd {
         config: Qwen3_5GenerationConfig,
         reply: ResponseTx<Qwen3_5GenerationResult>,
     },
-    TakeCache {
-        reply: ResponseTx<Option<crate::models::qwen3_5::prompt_cache::PromptCache>>,
-    },
-    SetCache {
-        cache: crate::models::qwen3_5::prompt_cache::PromptCache,
-        reply: ResponseTx<()>,
-    },
-    InitCaches {
-        reply: ResponseTx<()>,
-    },
     ResetCaches {
         reply: ResponseTx<()>,
     },
@@ -539,15 +529,6 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         } => {
             let _ = reply.send(inner.generate_sync(prompt_tokens, config));
         }
-        Qwen35Cmd::TakeCache { reply } => {
-            let _ = reply.send(Ok(inner.take_cache_sync()));
-        }
-        Qwen35Cmd::SetCache { cache, reply } => {
-            let _ = reply.send(inner.set_cache_sync(cache));
-        }
-        Qwen35Cmd::InitCaches { reply } => {
-            let _ = reply.send(inner.init_caches_sync());
-        }
         Qwen35Cmd::ResetCaches { reply } => {
             let _ = reply.send(inner.reset_caches_sync());
         }
@@ -648,7 +629,7 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
 ///
 /// Packs every value the shared post-prefill pipeline needs into a single
 /// named struct so callers don't have to thread 20+ positional arguments.
-/// Constructed by the prefill-side of [`Qwen35Inner::chat_sync`] and
+/// Constructed by the prefill-side of [`Qwen35Inner::chat_sync_core`] and
 /// [`Qwen35Inner::chat_tokens_delta_sync`].
 ///
 /// The caller is responsible for:
@@ -706,7 +687,7 @@ pub(crate) struct ChatDecodeInputs {
     pub think_end_id: Option<u32>,
     pub think_end_str: Option<String>,
     pub enable_thinking: Option<bool>,
-    /// End-of-sequence token id for the decode loop. For `chat_sync` this
+    /// End-of-sequence token id for the decode loop. For `chat_sync_core` this
     /// is `config.eos_token_id`; for the session delta path it's
     /// `<|im_end|>` so cache boundaries stay clean.
     pub eos_id: u32,
@@ -892,44 +873,6 @@ impl Qwen35Inner {
         self.cached_rope_deltas = None;
         self.gdn_prefix_checkpoints.clear();
         self.gdn_last_history_checkpoint = None;
-    }
-
-    /// Take the KV cache from the model, returning a `PromptCache` handle.
-    pub(crate) fn take_cache_sync(
-        &mut self,
-    ) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
-        if self.cached_token_history.is_empty() {
-            return None;
-        }
-        let caches = self.caches.take()?;
-        self.gdn_prefix_checkpoints.clear();
-        self.gdn_last_history_checkpoint = None;
-        Some(crate::models::qwen3_5::prompt_cache::PromptCache::new(
-            caches,
-            self.cached_token_history.clone(),
-            "qwen3_5",
-            self.config.num_layers as usize,
-            self.cached_image_key,
-            self.cached_rope_deltas,
-            self.model_id,
-        ))
-    }
-
-    /// Restore a previously taken `PromptCache` into the model.
-    pub(crate) fn set_cache_sync(
-        &mut self,
-        mut cache: crate::models::qwen3_5::prompt_cache::PromptCache,
-    ) -> Result<()> {
-        let restored_caches = cache.take_caches().ok_or_else(|| {
-            Error::from_reason("PromptCache is empty (already consumed or disposed)")
-        })?;
-        self.caches = Some(restored_caches);
-        self.cached_token_history = cache.token_history().to_vec();
-        self.cached_image_key = cache.image_cache_key();
-        self.cached_rope_deltas = cache.rope_deltas();
-        self.gdn_prefix_checkpoints.clear();
-        self.gdn_last_history_checkpoint = None;
-        Ok(())
     }
 
     fn find_dense_gdn_history_checkpoint(
@@ -2024,7 +1967,7 @@ impl Qwen35Inner {
             );
         }
 
-        // Check compiled path availability (same contract as chat_sync).
+        // Check compiled path availability (same contract as chat_sync_core).
         let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
         let _compiled_lock = if use_compiled {
             Some(
@@ -2168,7 +2111,7 @@ impl Qwen35Inner {
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
             .clone();
 
-        // Match `chat_sync`'s sanitization so the session path is subject to
+        // Match `chat_sync_core`'s sanitization so the session path is subject to
         // the same role/content injection protection as the legacy path.
         // The delta is text-only — images are stripped here anyway because
         // they are never valid on the session continue path.
@@ -2226,9 +2169,9 @@ impl Qwen35Inner {
     /// Shared post-prefill pipeline: penalty → sample → compiled init (if needed)
     /// → decode loop → cache export → save cache state → finalize result.
     ///
-    /// Extracted from `chat_sync` so it can also be driven by the text-only
+    /// Extracted from `chat_sync_core` so it can also be driven by the text-only
     /// session path (`chat_tokens_delta_sync`). Preserves the exact semantics
-    /// of `chat_sync` for the existing caller — `token_history_init` is the
+    /// of `chat_sync_core` for the existing caller — `token_history_init` is the
     /// full pre-decode token sequence (used for penalty context and the decode
     /// loop's running history), and the decode loop mutates it in place.
     ///
@@ -2653,6 +2596,11 @@ impl Qwen35Inner {
         };
         let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
         let cache_salt = 0;
+        // vLLM exact-prefix cap — see qwen3/model.rs:chat_sync_core_paged.
+        // Ensures every paged turn has at least one suffix token to prefill,
+        // even when the live cache (or a prior request's residue) already
+        // covers the entire new prompt.
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let live_ready;
         let live_prefix_match;
         let live_tokens_len;
@@ -2672,7 +2620,8 @@ impl Qwen35Inner {
             if trace_enabled && live_ready && !live_prefix_match {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
-            let can_continue = live_ready && live_prefix_match;
+            let can_continue =
+                live_ready && live_prefix_match && live_tokens_len <= max_cache_hit_tokens as usize;
 
             if can_continue {
                 match adapter.continue_turn(&tokens, total_budget) {
@@ -2683,11 +2632,12 @@ impl Qwen35Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix_per_block(
+                            .find_cached_prefix_per_block_with_max_tokens(
                                 &tokens,
                                 &lookup_extra_keys,
                                 cache_salt,
                                 false,
+                                max_cache_hit_tokens,
                             )
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
@@ -2705,7 +2655,13 @@ impl Qwen35Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, cache_salt, false)
+                    .find_cached_prefix_per_block_with_max_tokens(
+                        &tokens,
+                        &lookup_extra_keys,
+                        cache_salt,
+                        false,
+                        max_cache_hit_tokens,
+                    )
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -2872,12 +2828,11 @@ impl Qwen35Inner {
         use_cpp_paged: bool,
         gdn_prefix_already_primed: bool,
     ) -> Result<(Vec<u32>, String)> {
-        if suffix_len == 0 {
-            return Err(Error::from_reason(
-                "chat_sync_core_paged: zero-delta prompt (every token cached) is not yet \
-                 supported on the block-paged path; flat path required for this corner case",
-            ));
-        }
+        // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
+        debug_assert!(
+            suffix_len > 0,
+            "chat_sync_core_paged_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
+        );
 
         let suffix = &tokens[(cached_prefix_len as usize)..];
         let layer_kinds =
@@ -3065,7 +3020,9 @@ impl Qwen35Inner {
                         logits
                     }
                     Err(e) => {
-                        if should_propagate_compiled_paged_error(cpp_compiled_step_completed) {
+                        if chat_common::should_propagate_compiled_paged_error(
+                            cpp_compiled_step_completed,
+                        ) {
                             eprintln!(
                                 "[MLX] Qwen3.5 Dense: C++ compiled paged forward failed \
                                  mid-decode (step={step}) AFTER an earlier compiled step \
@@ -3272,6 +3229,8 @@ impl Qwen35Inner {
         };
         let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
         let cache_salt = 0;
+        // See `chat_sync_core_paged` for the vLLM exact-prefix cap rationale.
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let live_ready;
         let live_prefix_match;
         let live_tokens_len;
@@ -3291,7 +3250,8 @@ impl Qwen35Inner {
             if trace_enabled && live_ready && !live_prefix_match {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
-            let can_continue = live_ready && live_prefix_match;
+            let can_continue =
+                live_ready && live_prefix_match && live_tokens_len <= max_cache_hit_tokens as usize;
 
             if can_continue {
                 match adapter.continue_turn(&tokens, total_budget) {
@@ -3302,11 +3262,12 @@ impl Qwen35Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix_per_block(
+                            .find_cached_prefix_per_block_with_max_tokens(
                                 &tokens,
                                 &lookup_extra_keys,
                                 cache_salt,
                                 false,
+                                max_cache_hit_tokens,
                             )
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
@@ -3324,7 +3285,13 @@ impl Qwen35Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, cache_salt, false)
+                    .find_cached_prefix_per_block_with_max_tokens(
+                        &tokens,
+                        &lookup_extra_keys,
+                        cache_salt,
+                        false,
+                        max_cache_hit_tokens,
+                    )
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -3568,12 +3535,11 @@ impl Qwen35Inner {
         use_cpp_paged: bool,
         gdn_prefix_already_primed: bool,
     ) -> Result<(Vec<u32>, String)> {
-        if suffix_len == 0 {
-            return Err(Error::from_reason(
-                "chat_stream_sync_core_paged: zero-delta prompt (every token cached) is not yet \
-                 supported on the block-paged path; flat path required for this corner case",
-            ));
-        }
+        // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
+        debug_assert!(
+            suffix_len > 0,
+            "chat_stream_sync_core_paged_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
+        );
 
         let suffix = &tokens[(cached_prefix_len as usize)..];
         let layer_kinds =
@@ -3763,7 +3729,9 @@ impl Qwen35Inner {
                         logits
                     }
                     Err(e) => {
-                        if should_propagate_compiled_paged_error(cpp_compiled_step_completed) {
+                        if chat_common::should_propagate_compiled_paged_error(
+                            cpp_compiled_step_completed,
+                        ) {
                             eprintln!(
                                 "[MLX] Qwen3.5 Dense (stream): C++ compiled paged forward \
                                  failed mid-decode (step={step}) AFTER an earlier compiled \
@@ -4010,7 +3978,7 @@ impl Qwen35Inner {
             Err(e) => {
                 // Forward the tokenizer error as an mpsc send — this path
                 // signals generic errors via an error-result send rather
-                // than an error chunk, matching the `chat_stream_sync`
+                // than an error chunk, matching the `chat_stream_sync_inner`
                 // final-catch behavior.
                 let _ = stream_tx.send(Err(e));
                 return;
@@ -4119,7 +4087,7 @@ impl Qwen35Inner {
 
         // All guards passed — enter the prefill+decode helper. Any error
         // returned from here propagates as an mpsc error, same as
-        // `chat_stream_sync`.
+        // `chat_stream_sync_inner`.
         let cb = StreamSender(stream_tx.clone());
         let result =
             self.chat_stream_tokens_delta_sync_inner(delta_tokens, config, &cb, &cancelled);
@@ -6669,7 +6637,6 @@ pub struct Qwen3_5Model {
     pub(crate) thread: crate::model_thread::ModelThread<Qwen35Cmd>,
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5Config,
-    pub(crate) model_id: u64,
     /// Snapshot of `Qwen35Inner::paged_adapter.is_some()` captured at
     /// construction time. Currently default-OFF on Qwen3.5 (parity-pending
     /// — see CLAUDE.md and `Qwen3_5Config::use_block_paged_cache`).
@@ -6686,12 +6653,6 @@ pub struct Qwen3_5Model {
 
 #[napi]
 impl Qwen3_5Model {
-    /// Initialize caches for incremental generation.
-    #[napi]
-    pub fn init_caches(&self) -> Result<()> {
-        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::InitCaches { reply })
-    }
-
     /// Reset all caches.
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
@@ -6713,65 +6674,6 @@ impl Qwen3_5Model {
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
-    }
-
-    /// Take the KV cache from the model, returning a `PromptCache` handle.
-    ///
-    /// The cache is moved out of the model — calling `takeCache()` twice
-    /// returns `null` the second time. Pass the cache back via `setCache()`
-    /// before the next `chatSessionStart` / `chatSessionContinue` call for
-    /// incremental prefill.
-    #[napi]
-    pub fn take_cache(&self) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
-        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::TakeCache { reply })
-            .ok()?
-    }
-
-    /// Restore a previously taken `PromptCache` into the model.
-    ///
-    /// On the next `chatSessionStart` / `chatSessionContinue` call with
-    /// `reuseCache: true`, the model will prefix-match the new tokens against
-    /// the cache and only prefill the delta.
-    #[napi]
-    pub fn set_cache(
-        &self,
-        cache: &mut crate::models::qwen3_5::prompt_cache::PromptCache,
-    ) -> Result<()> {
-        // Validate before sending (these checks don't need model-thread state)
-        if cache.model_type() != "qwen3_5" {
-            return Err(Error::from_reason(format!(
-                "Cache type '{}' doesn't match model type 'qwen3_5'",
-                cache.model_type()
-            )));
-        }
-        if cache.num_layers() != self.config.num_layers as usize {
-            return Err(Error::from_reason(format!(
-                "Cache has {} layers but model has {} layers",
-                cache.num_layers(),
-                self.config.num_layers
-            )));
-        }
-        if cache.model_id() != self.model_id {
-            return Err(Error::from_reason(
-                "Cache was created by a different model instance (different checkpoint or config)",
-            ));
-        }
-        // Extract the cache data to send to model thread
-        let owned_cache = crate::models::qwen3_5::prompt_cache::PromptCache::new(
-            cache.take_caches().ok_or_else(|| {
-                Error::from_reason("PromptCache is empty (already consumed or disposed)")
-            })?,
-            cache.token_history().to_vec(),
-            "qwen3_5",
-            cache.num_layers(),
-            cache.image_cache_key(),
-            cache.rope_deltas(),
-            cache.model_id(),
-        );
-        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::SetCache {
-            cache: owned_cache,
-            reply,
-        })
     }
 
     /// Load a pretrained model from a directory.
@@ -7694,63 +7596,6 @@ fn forward_dense_cpp_paged(
     }
 
     MxArray::from_handle(output_ptr, "dense_paged_forward_logits")
-}
-
-/// Policy decision for the C++ compiled paged forward fallback.
-///
-/// Inputs:
-/// * `compiled_step_completed` — whether ANY compiled C++ paged step
-///   has succeeded earlier in this turn.
-///
-/// Output:
-/// * `true` — propagate the forward error as fatal. Returned when a
-///   compiled step has previously succeeded; the C++ side has advanced
-///   its per-layer GDN linear-cache globals (conv_state /
-///   recurrent_state) but those updates are never imported back into
-///   `self.caches`. Falling back to the pure-Rust paged decode after
-///   that point would read stale pre-step state and silently corrupt
-///   the response.
-/// * `false` — safe to fall back to the pure-Rust paged decode.
-///   Returned when no compiled step has succeeded yet; the only failure
-///   mode at that point is an init/configuration mismatch caught at
-///   first dispatch, which leaves `self.caches` consistent with
-///   `paged_adapter` after a `rollback_last_tokens(1)`.
-///
-/// This mirrors the policy applied identically in the dense and MoE
-/// sync + streaming decode loops; extracting it as a stand-alone helper
-/// keeps the tests in lockstep.
-#[inline]
-fn should_propagate_compiled_paged_error(compiled_step_completed: bool) -> bool {
-    compiled_step_completed
-}
-
-#[cfg(test)]
-mod compiled_paged_fallback_policy_tests {
-    use super::should_propagate_compiled_paged_error;
-
-    /// Regression test for review Finding 1 (HIGH): mid-turn fallback
-    /// after a successful compiled step would corrupt the GDN linear
-    /// cache state. The policy must propagate the error as fatal once
-    /// any compiled step has completed; only the first-step failure is
-    /// safe to fall back to pure-Rust decode.
-    #[test]
-    fn no_compiled_step_yet_allows_fallback() {
-        assert!(
-            !should_propagate_compiled_paged_error(false),
-            "first-step compiled forward failure must allow fallback to pure-Rust paged decode \
-             (self.caches is still consistent with paged_adapter pre-rollback)"
-        );
-    }
-
-    #[test]
-    fn after_successful_compiled_step_propagates_as_fatal() {
-        assert!(
-            should_propagate_compiled_paged_error(true),
-            "compiled forward failure AFTER a successful compiled step must propagate as fatal: \
-             the C++ GDN linear-cache globals advanced but self.caches is stale, so a pure-Rust \
-             fallback would silently corrupt the response"
-        );
-    }
 }
 
 // ============================================================================
