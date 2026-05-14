@@ -95,8 +95,12 @@ function makeMockModel() {
       makeChatResult('continue-reply'),
   );
   const chatSessionContinueTool = vi.fn(
-    async (_toolCallId: string, _content: string, _config?: ChatConfig | null): Promise<ChatResult> =>
-      makeChatResult('tool-reply'),
+    async (
+      _toolCallId: string,
+      _content: string,
+      _config?: ChatConfig | null,
+      _isError?: boolean | null,
+    ): Promise<ChatResult> => makeChatResult('tool-reply'),
   );
   const chatStreamSessionStart = vi.fn(async function* (
     _messages: ChatMessage[],
@@ -118,6 +122,8 @@ function makeMockModel() {
     _toolCallId: string,
     _content: string,
     _config?: ChatConfig | null,
+    _signal?: AbortSignal,
+    _isError?: boolean | null,
   ): AsyncGenerator<ChatStreamEvent> {
     yield { text: 'tool', done: false };
     yield finalChunk('tool-reply');
@@ -676,10 +682,132 @@ describe('ChatSession', () => {
       expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
       expect(chatSessionContinueTool.mock.calls[0][0]).toBe('call-42');
       expect(chatSessionContinueTool.mock.calls[0][1]).toBe('{"status":"ok"}');
+      // The third native arg is the merged `config` (config precedes
+      // `isError` at the NAPI boundary so the trailing-optional shape
+      // accepts pre-feature 3-arg callers without InvalidArg).
       expect(chatSessionContinueTool.mock.calls[0][2]?.reuseCache).toBe(true);
+      // The fourth arg is the structured `isError` signal — defaults to
+      // `null` when the caller omits it (we coerce `undefined` to `null`
+      // at the wrapper boundary so the NAPI binding sees a stable
+      // shape).
+      expect(chatSessionContinueTool.mock.calls[0][3]).toBeNull();
       expect(session.turns).toBe(2);
       // Tool-reply has no further outstanding calls.
       expect(session.pendingUnresolvedToolCallCount).toBeNull();
+    });
+
+    it('forwards isError=true through to the native binding', async () => {
+      // Pin the structured tool-error plumbing: when the caller passes
+      // `isError: true`, the wrapper MUST forward it as the fourth
+      // positional argument to the native `chatSessionContinueTool`
+      // call so the renderer can inject the wire-format
+      // `[tool error]` marker. The history entry MUST also carry the
+      // structured flag so cold-replay (image-change restart,
+      // `startFromHistory*`, server-side `SessionRegistry`
+      // cache-miss rebuild) re-renders the marker consistently. The
+      // assertion is at the native binding boundary so the test
+      // covers BOTH the JS-side argument plumbing and the
+      // history-append shape without needing a loaded model.
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'call-err'));
+      const session = new ChatSession(model);
+
+      await session.send('fire the tool call');
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      await session.sendToolResult('call-err', '{"error":"boom"}', { isError: true });
+      expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
+      expect(chatSessionContinueTool.mock.calls[0][0]).toBe('call-err');
+      expect(chatSessionContinueTool.mock.calls[0][1]).toBe('{"error":"boom"}');
+      // The fourth native arg is the structured `isError` signal — `true`
+      // must pass through verbatim (not coerced to `null` like the omit
+      // case). `config` precedes it at index [2].
+      expect(chatSessionContinueTool.mock.calls[0][3]).toBe(true);
+    });
+
+    it('forwards isError=true through to the streaming native binding', async () => {
+      // Streaming counterpart to the non-streaming `isError=true`
+      // assertion above. Mirrors the wire-format invariant: the fifth
+      // positional arg of `chatStreamSessionContinueTool` must carry
+      // the structured flag so the streaming renderer injects the
+      // same `[tool error]` marker as the non-streaming path. `config`
+      // sits at index [2] and `signal` at [3]; `isError` is the
+      // trailing-optional fifth arg.
+      const { model, chatSessionStart, chatStreamSessionContinueTool } = makeMockModel();
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'call-err'));
+      const session = new ChatSession(model);
+
+      await session.send('fire the tool call');
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      const events: ChatStreamEvent[] = [];
+      for await (const ev of session.sendToolResultStream('call-err', '{"error":"boom"}', { isError: true })) {
+        events.push(ev);
+      }
+      expect(chatStreamSessionContinueTool).toHaveBeenCalledTimes(1);
+      expect(chatStreamSessionContinueTool.mock.calls[0][0]).toBe('call-err');
+      expect(chatStreamSessionContinueTool.mock.calls[0][1]).toBe('{"error":"boom"}');
+      // `signal` (index [3]) precedes `isError` (index [4]) at the
+      // wrapper boundary — mirrors the native NAPI ordering where
+      // the trailing-optional `isError` follows the required callback
+      // so pre-feature 4-arg callers still type-check.
+      expect(chatStreamSessionContinueTool.mock.calls[0][4]).toBe(true);
+      // The stream still terminates normally on the mock — confirms the
+      // history-append commit branch ran (sawFinal === true).
+      expect(events.at(-1)?.done).toBe(true);
+    });
+
+    it('defaults isError to null when the caller omits it', async () => {
+      // Default semantics: `isError` is optional and the wrapper
+      // coerces `undefined` to `null` at the NAPI boundary so the
+      // binding sees a stable shape. This pins the "no marker"
+      // pre-feature behavior against accidental flag-inference drift.
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'call-ok'));
+      const session = new ChatSession(model);
+
+      await session.send('fire the tool call');
+      await session.sendToolResult('call-ok', '{"status":"ok"}');
+      // `isError` omitted → coerced to `null` at index [3], not `undefined`.
+      expect(chatSessionContinueTool.mock.calls[0][3]).toBeNull();
+    });
+
+    it('forwards isError=false unchanged (still no marker, but explicit)', async () => {
+      // `Some(false)` is the same wire output as `None` per the
+      // renderer's contract — but the wrapper must NOT silently fold
+      // `false` into `null` because the structured channel is the
+      // authoritative source-of-truth and callers may legitimately
+      // pass an explicit `false` to disambiguate from "not set".
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'call-ok'));
+      const session = new ChatSession(model);
+
+      await session.send('fire the tool call');
+      await session.sendToolResult('call-ok', '{"status":"ok"}', { isError: false });
+      expect(chatSessionContinueTool.mock.calls[0][3]).toBe(false);
+    });
+
+    it('accepts the opts-bag without isError (backward compat with { config } only)', async () => {
+      // Regression: the additive opts-bag signature must accept callers
+      // that pass only `{ config }` without `isError`. The pre-fix
+      // signature interleaved `isError` as a positional third argument
+      // so any caller using `sendToolResult(id, content, { config })`
+      // landed `{ config }` in the `isError` slot and crashed at the
+      // native NAPI boundary (Option<bool>). This pins the opts-bag
+      // contract: `{ config }` alone is a valid call shape and
+      // `isError` defaults to `null` at the native boundary.
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
+      const session = new ChatSession(model);
+
+      await session.send('fire');
+      await session.sendToolResult('c1', 'out', { config: { reuseCache: false } });
+      expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
+      // The merged config sits at index [2] and still forces reuseCache: true.
+      expect(chatSessionContinueTool.mock.calls[0][2]?.reuseCache).toBe(true);
+      // `isError` was omitted → coerced to `null` at the NAPI boundary,
+      // landing in the trailing-optional [3] slot.
+      expect(chatSessionContinueTool.mock.calls[0][3]).toBeNull();
     });
 
     it('rejects sendToolResult when no outstanding tool call exists', async () => {
@@ -731,6 +859,10 @@ describe('ChatSession', () => {
 
       await session.send('fire'); // establishes outstanding call 'c1'
       await session.sendToolResult('c1', 'out', { config: { reuseCache: false } });
+      // The third positional native arg is the merged `ChatConfig` —
+      // `mergeConfig` always forces `reuseCache: true` regardless of the
+      // caller-supplied value (the session path is a cache-reuse op by
+      // construction).
       expect(chatSessionContinueTool.mock.calls[0][2]?.reuseCache).toBe(true);
     });
 

@@ -54,6 +54,7 @@ fn user_message(content: &str) -> ChatMessage {
         content: content.to_string(),
         tool_calls: None,
         tool_call_id: None,
+        is_error: None,
         reasoning_content: None,
         images: None,
     }
@@ -602,6 +603,7 @@ async fn session_continue_tool_round_trips() {
             "dummy_id".to_string(),
             "result content".to_string(),
             Some(tool_cfg),
+            None,
         )
         .await
         .expect("chat_session_continue_tool failed");
@@ -662,6 +664,7 @@ async fn session_start_accepts_images_for_vlm() {
         content: "Describe this image briefly.".to_string(),
         tool_calls: None,
         tool_call_id: None,
+        is_error: None,
         reasoning_content: None,
         images: Some(vec![image_uint8]),
     };

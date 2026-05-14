@@ -406,7 +406,9 @@ export class Qwen35Model extends Qwen35ModelNative {
    * Builds a ChatML `<tool_response>` delta on top of the live
    * session caches and streams the decoded assistant reply. Requires
    * a live session started via `chatSessionStart` /
-   * `chatStreamSessionStart`.
+   * `chatStreamSessionStart`. `isError` is forwarded to the native
+   * renderer — see `chatSessionContinueTool` for the wire-format
+   * marker semantics.
    */
   // @ts-expect-error — override callback-based native method with AsyncGenerator
   async *chatStreamSessionContinueTool(
@@ -414,9 +416,18 @@ export class Qwen35Model extends Qwen35ModelNative {
     content: string,
     config?: ChatConfig | null,
     signal?: AbortSignal,
+    isError?: boolean | null,
   ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream(
-      (callback) => _nativeDenseChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+      (callback) =>
+        _nativeDenseChatStreamSessionContinueTool.call(
+          this,
+          toolCallId,
+          content,
+          config ?? null,
+          callback,
+          isError ?? null,
+        ),
       signal,
     );
   }
@@ -481,9 +492,18 @@ export class Qwen35MoeModel extends Qwen35MoeModelNative {
     content: string,
     config?: ChatConfig | null,
     signal?: AbortSignal,
+    isError?: boolean | null,
   ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream(
-      (callback) => _nativeMoeChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+      (callback) =>
+        _nativeMoeChatStreamSessionContinueTool.call(
+          this,
+          toolCallId,
+          content,
+          config ?? null,
+          callback,
+          isError ?? null,
+        ),
       signal,
     );
   }
@@ -550,9 +570,18 @@ export class Lfm2Model extends Lfm2ModelNative {
     content: string,
     config?: ChatConfig | null,
     signal?: AbortSignal,
+    isError?: boolean | null,
   ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream(
-      (callback) => _nativeLfm2ChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+      (callback) =>
+        _nativeLfm2ChatStreamSessionContinueTool.call(
+          this,
+          toolCallId,
+          content,
+          config ?? null,
+          callback,
+          isError ?? null,
+        ),
       signal,
     );
   }
@@ -619,10 +648,18 @@ export class Gemma4Model extends Gemma4ModelNative {
     content: string,
     config?: ChatConfig | null,
     signal?: AbortSignal,
+    isError?: boolean | null,
   ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream(
       (callback) =>
-        _nativeGemma4ChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+        _nativeGemma4ChatStreamSessionContinueTool.call(
+          this,
+          toolCallId,
+          content,
+          config ?? null,
+          callback,
+          isError ?? null,
+        ),
       signal,
     );
   }
@@ -680,9 +717,18 @@ export class Qwen3Model extends Qwen3ModelNative {
     content: string,
     config?: ChatConfig | null,
     signal?: AbortSignal,
+    isError?: boolean | null,
   ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream(
-      (callback) => _nativeQwen3ChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+      (callback) =>
+        _nativeQwen3ChatStreamSessionContinueTool.call(
+          this,
+          toolCallId,
+          content,
+          config ?? null,
+          callback,
+          isError ?? null,
+        ),
       signal,
     );
   }

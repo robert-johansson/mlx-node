@@ -56,6 +56,7 @@ fn user_message(content: &str) -> ChatMessage {
         content: content.to_string(),
         tool_calls: None,
         tool_call_id: None,
+        is_error: None,
         reasoning_content: None,
         images: None,
     }
@@ -531,6 +532,7 @@ async fn moe_session_continue_tool_round_trips() {
             "dummy_id".to_string(),
             "result content".to_string(),
             Some(tool_cfg),
+            None,
         )
         .await
         .expect("chat_session_continue_tool failed");
