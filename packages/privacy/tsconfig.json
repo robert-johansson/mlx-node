@@ -5,9 +5,7 @@
     "outDir": "dist",
     "composite": true,
     "noEmit": false,
-    "resolveJsonModule": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts"],
-  "references": [{ "path": "../core" }, { "path": "../lm" }, { "path": "../privacy" }, { "path": "../server" }]
+  "include": ["src/**/*.ts"]
 }

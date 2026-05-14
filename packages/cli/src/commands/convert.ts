@@ -4,6 +4,15 @@ import { parseArgs } from 'node:util';
 
 import { convertModel, convertForeignWeights, convertGgufToSafetensors } from '@mlx-node/core';
 
+// Canonical per-mode defaults for quantization bits/group_size.
+// Mirrors crates/mlx-core/src/convert.rs and crates/mlx-core/src/utils/gguf.rs.
+const QUANT_MODE_DEFAULTS: Record<string, [number, number]> = {
+  affine: [4, 64],
+  mxfp4: [4, 32],
+  mxfp8: [8, 32],
+  nvfp4: [4, 16],
+};
+
 function printHelp() {
   console.log(`
 Convert Model Weights to MLX Format
@@ -19,7 +28,7 @@ Optional Arguments:
   --dtype, -d <type>    Target dtype (default: bfloat16)
                         Options: float32, float16, bfloat16
   --model-type, -m      Model type (auto-detected if not specified)
-                        Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_5, qwen3_5_moe, qianfan-ocr
+                        Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_5, qwen3_5_moe, qianfan-ocr, privacy-filter
   --verbose, -v         Enable verbose logging
   --help, -h            Show this help message
 
@@ -29,9 +38,9 @@ Vision Arguments:
 
 Quantization Arguments:
   --quantize, -q        Enable quantization of converted weights
-  --q-bits <int>        Quantization bits (default: 4 for affine, 8 for mxfp8)
-  --q-group-size <int>  Group size (default: 64 for affine, 32 for mxfp8)
-  --q-mode <string>     Mode: "affine" (default) or "mxfp8"
+  --q-bits <int>        Quantization bits (default per --q-mode: affine=4, mxfp4=4, mxfp8=8, nvfp4=4)
+  --q-group-size <int>  Group size (default per --q-mode: affine=64, mxfp4=32, mxfp8=32, nvfp4=16)
+  --q-mode <string>     Mode: "affine" (default), "mxfp4", "mxfp8", or "nvfp4"
   --q-recipe <string>   Per-layer mixed-bit quantization recipe
                         Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth
                         "unsloth" defaults to 3-bit base (gate/up=3b, down=4b,
@@ -117,8 +126,9 @@ export async function run(argv: string[]) {
   const quantGroupSize = parsePositiveInt('--q-group-size', args['q-group-size']);
   const quantMode = args['q-mode'];
 
-  if (quantMode !== undefined && quantMode !== 'affine' && quantMode !== 'mxfp8') {
-    console.error('Error: --q-mode must be "affine" or "mxfp8"');
+  const validQuantModes = ['affine', 'mxfp4', 'mxfp8', 'nvfp4'];
+  if (quantMode !== undefined && !validQuantModes.includes(quantMode)) {
+    console.error(`Error: --q-mode must be one of ${validQuantModes.join(', ')}`);
     process.exit(1);
   }
 
@@ -129,8 +139,10 @@ export async function run(argv: string[]) {
       console.error('Error: --q-recipe requires --quantize (-q) to be enabled');
       process.exit(1);
     }
-    if (quantMode === 'mxfp8') {
-      console.error('Error: --q-recipe is incompatible with --q-mode mxfp8');
+    if (quantMode !== undefined && quantMode !== 'affine') {
+      console.error(
+        `Error: --q-recipe is incompatible with --q-mode ${quantMode} (recipes only apply to affine quantization)`,
+      );
       process.exit(1);
     }
     if (!validRecipes.includes(quantRecipe)) {
@@ -199,8 +211,9 @@ export async function run(argv: string[]) {
     console.log(`Dtype:      ${dtype}`);
     if (args.quantize) {
       const qMode = quantMode || 'affine';
-      const qBits = effectiveQuantBits || (qMode === 'mxfp8' ? 8 : 4);
-      const qGs = quantGroupSize || (qMode === 'mxfp8' ? 32 : 64);
+      const [defaultBits, defaultGs] = QUANT_MODE_DEFAULTS[qMode] ?? [4, 64];
+      const qBits = effectiveQuantBits || defaultBits;
+      const qGs = quantGroupSize || defaultGs;
       console.log(
         `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}`,
       );
@@ -279,6 +292,9 @@ export async function run(argv: string[]) {
       } else if (config.model_type === 'gemma4' || config.model_type === 'gemma4_text') {
         modelType = 'gemma4';
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
+      } else if (config.model_type === 'openai_privacy_filter') {
+        modelType = 'privacy-filter';
+        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       }
     } catch {
       // config.json not found or invalid
@@ -326,8 +342,9 @@ export async function run(argv: string[]) {
   }
   if (args.quantize) {
     const qMode = quantMode || 'affine';
-    const qBits = effectiveQuantBits || (qMode === 'mxfp8' ? 8 : 4);
-    const qGs = quantGroupSize || (qMode === 'mxfp8' ? 32 : 64);
+    const [defaultBits, defaultGs] = QUANT_MODE_DEFAULTS[qMode] ?? [4, 64];
+    const qBits = effectiveQuantBits || defaultBits;
+    const qGs = quantGroupSize || defaultGs;
     console.log(`Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}`);
   }
   if (imatrixPath) {

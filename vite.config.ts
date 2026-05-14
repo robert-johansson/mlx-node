@@ -55,12 +55,17 @@ export default defineConfig({
     watch: false,
     testTimeout: 120000, // 2 minutes
     maxWorkers: 1,
-    include: ['__test__/**/*.{test,spec}.ts', 'examples/**/*.{test,spec}.ts'],
+    include: [
+      '__test__/**/*.{test,spec}.ts',
+      'examples/**/*.{test,spec}.ts',
+      'packages/*/__test__/**/*.{test,spec}.ts',
+    ],
   },
   resolve: {
     alias: {
       '@mlx-node/core': resolve(__dirname, './packages/core/index.cjs'),
       '@mlx-node/lm': resolve(__dirname, './packages/lm/src/index.ts'),
+      '@mlx-node/privacy': resolve(__dirname, './packages/privacy/src/index.ts'),
       '@mlx-node/trl': resolve(__dirname, './packages/trl/src/index.ts'),
       '@mlx-node/server': resolve(__dirname, './packages/server/src/index.ts'),
     },
