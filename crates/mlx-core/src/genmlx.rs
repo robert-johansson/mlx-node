@@ -107,10 +107,23 @@ pub fn log_softmax(a: Either<&MxArray, f64>, axis: Option<i32>) -> Result<MxArra
 #[napi]
 pub fn clip(
     a: Either<&MxArray, f64>,
-    minimum: Option<f64>,
-    maximum: Option<f64>,
+    minimum: Option<Either<&MxArray, f64>>,
+    maximum: Option<Either<&MxArray, f64>>,
 ) -> Result<MxArray> {
-    to_mx(a)?.clip(minimum, maximum)
+    // Bounds accept MxArray or scalar (Either<&MxArray, f64>), matching the
+    // coercion pattern used by every other genmlx.rs op. Array bounds are
+    // applied via maximum/minimum (clip(a,lo,hi) = min(max(a,lo),hi)); MLX
+    // broadcasting handles scalar bounds, so this also covers the f64 case.
+    let mut arr = to_mx(a)?;
+    if let Some(lo) = minimum {
+        let lo_arr = to_mx(lo)?;
+        arr = arr.maximum(&lo_arr)?;
+    }
+    if let Some(hi) = maximum {
+        let hi_arr = to_mx(hi)?;
+        arr = arr.minimum(&hi_arr)?;
+    }
+    Ok(arr)
 }
 
 #[napi(js_name = "nanToNum")]

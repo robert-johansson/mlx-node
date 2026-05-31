@@ -2637,7 +2637,7 @@ export interface CleanupStats {
 
 export declare function clearCache(): void
 
-export declare function clip(a: MxArray | number, minimum?: number | undefined | null, maximum?: number | undefined | null): MxArray
+export declare function clip(a: MxArray | number, minimum?: MxArray | number | undefined | null, maximum?: MxArray | number | undefined | null): MxArray
 
 export declare function compileClearCache(): boolean
 
