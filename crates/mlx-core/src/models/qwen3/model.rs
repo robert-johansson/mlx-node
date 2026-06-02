@@ -1080,9 +1080,38 @@ impl Qwen3Inner {
 
         // Decode text
         let generated_ids_vec: Vec<u32> = generated_tokens.clone();
-        let raw_text = tokenizer.decode_sync(&generated_ids_vec, true)?;
-
-        let (cleaned_text, tool_calls, thinking) = tools::parse_generation_output(&raw_text);
+        let raw_text_full = tokenizer.decode_sync(&generated_ids_vec, true)?;
+        let include_reasoning = chat_common::resolve_include_reasoning(&config);
+        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str();
+        // Parse with reasoning INCLUDED so the reasoning-token count reflects the
+        // true thinking span, THEN apply the include_reasoning suppression
+        // contract to `thinking` and `raw_text` (matches finalize_chat_result /
+        // the streaming paths).
+        let (cleaned_text, tool_calls, thinking_full) = chat_common::parse_thinking_and_tools(
+            &raw_text_full,
+            &generated_tokens,
+            thinking_enabled,
+            think_end_id,
+            think_end_str,
+            true,
+        );
+        let reasoning_tokens =
+            tools::count_reasoning_tokens(&thinking_full, &generated_tokens, think_end_id);
+        let thinking = if include_reasoning {
+            thinking_full
+        } else {
+            None
+        };
+        let raw_text = chat_common::raw_text_with_reasoning_suppressed(
+            &raw_text_full,
+            &generated_tokens,
+            thinking_enabled,
+            think_end_id,
+            think_end_str,
+            include_reasoning,
+        );
 
         let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
             "tool_calls".to_string()
@@ -1113,9 +1142,6 @@ impl Qwen3Inner {
         } else {
             None
         };
-
-        let reasoning_tokens =
-            tools::count_reasoning_tokens(&thinking, &generated_tokens, tokenizer.think_end_id());
 
         Ok(ChatResult {
             text: cleaned_text,
@@ -1210,7 +1236,6 @@ impl Qwen3Inner {
         let max_ngram_repeats: i32 = gen_config.max_ngram_repeats.unwrap_or(3);
         let ngram_size: i32 = gen_config.ngram_size.unwrap_or(64);
         let return_logprobs = gen_config.return_logprobs.unwrap_or(false);
-        let _ = config; // currently no per-call options consumed beyond gen_config
 
         let sampling_config = SamplingConfig {
             temperature: Some(temperature),
@@ -1429,8 +1454,39 @@ impl Qwen3Inner {
         let gen_elapsed = gen_start.map(|s| s.elapsed());
 
         // Decode text + tool/thinking parsing (mirrors chat_sync_core).
-        let raw_text = tokenizer.decode_sync(&generated_tokens, true)?;
-        let (cleaned_text, tool_calls, thinking) = tools::parse_generation_output(&raw_text);
+        let raw_text_full = tokenizer.decode_sync(&generated_tokens, true)?;
+        let include_reasoning = chat_common::resolve_include_reasoning(&config);
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str();
+        // Parse with reasoning INCLUDED so the reasoning-token count reflects the
+        // true thinking span, THEN apply the include_reasoning suppression
+        // contract to `thinking` and `raw_text` (matches finalize_chat_result /
+        // the streaming paths).
+        let (cleaned_text, tool_calls, thinking_full) = chat_common::parse_thinking_and_tools(
+            &raw_text_full,
+            &generated_tokens,
+            thinking_enabled,
+            think_end_id,
+            think_end_str,
+            true,
+        );
+        let reasoning_tokens =
+            tools::count_reasoning_tokens(&thinking_full, &generated_tokens, think_end_id);
+        let thinking = if include_reasoning {
+            thinking_full
+        } else {
+            None
+        };
+        let raw_text = chat_common::raw_text_with_reasoning_suppressed(
+            &raw_text_full,
+            &generated_tokens,
+            thinking_enabled,
+            think_end_id,
+            think_end_str,
+            include_reasoning,
+        );
         let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
             "tool_calls".to_string()
         } else {
@@ -1461,9 +1517,6 @@ impl Qwen3Inner {
         } else {
             None
         };
-
-        let reasoning_tokens =
-            tools::count_reasoning_tokens(&thinking, &generated_tokens, tokenizer.think_end_id());
 
         // generated_logprobs intentionally dropped here — the flat path
         // (chat_sync_core) also collects them but does not surface them
@@ -2291,23 +2344,27 @@ impl Qwen3Inner {
                 streamed_text_len,
             );
             streamed_text_len += token_text.len();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: token_text,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            // Suppress reasoning deltas when include_reasoning == false.
+            // Detokenize + length-advance above stay OUTSIDE this gate.
+            if p.include_reasoning || !is_reasoning {
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: token_text,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(is_reasoning),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
 
             // EOS check.
             if token_value == eos_token_id {
@@ -2377,23 +2434,27 @@ impl Qwen3Inner {
             });
         if full_text.len() > streamed_text_len {
             let residual = full_text[streamed_text_len..].to_string();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(last_is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            // Suppress residual when it is reasoning text and
+            // include_reasoning == false.
+            if p.include_reasoning || !last_is_reasoning {
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: residual,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(last_is_reasoning),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
         }
 
         let num_tokens = generated_tokens.len() as u32;
@@ -2431,7 +2492,14 @@ impl Qwen3Inner {
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(full_text),
+                raw_text: Some(chat_common::raw_text_with_reasoning_suppressed(
+                    &full_text,
+                    &generated_tokens,
+                    thinking_enabled,
+                    think_end_id,
+                    think_end_str,
+                    p.include_reasoning,
+                )),
                 cached_tokens: Some(cached_prefix_len),
                 performance: perf_metrics,
                 is_reasoning: None,
@@ -2834,23 +2902,27 @@ impl Qwen3Inner {
 
         if text.len() > streamed_text_len {
             let residual = text[streamed_text_len..].to_string();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(last_is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            // Suppress residual when it is reasoning text and
+            // include_reasoning == false.
+            if p.include_reasoning || !last_is_reasoning {
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: residual,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(last_is_reasoning),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
         }
 
         let num_tokens = generated_tokens.len() as u32;
@@ -2888,7 +2960,14 @@ impl Qwen3Inner {
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(text),
+                raw_text: Some(chat_common::raw_text_with_reasoning_suppressed(
+                    &text,
+                    &generated_tokens,
+                    thinking_enabled,
+                    think_end_id,
+                    think_end_str.as_deref(),
+                    p.include_reasoning,
+                )),
                 // Start path: report the matched prefix length from
                 // `verify_cache_prefix`. Zero on a miss, full cached
                 // length on an exact-append hit.
@@ -3866,23 +3945,27 @@ impl Qwen3Inner {
             });
         if full_text.len() > streamed_text_len {
             let residual = full_text[streamed_text_len..].to_string();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(last_is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            // Suppress residual when it is reasoning text and
+            // include_reasoning == false.
+            if p.include_reasoning || !last_is_reasoning {
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: residual,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(last_is_reasoning),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
         }
 
         let num_tokens = generated_tokens.len() as u32;
@@ -3919,7 +4002,14 @@ impl Qwen3Inner {
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(full_text),
+                raw_text: Some(chat_common::raw_text_with_reasoning_suppressed(
+                    &full_text,
+                    &generated_tokens,
+                    thinking_enabled,
+                    think_end_id,
+                    think_end_str.as_deref(),
+                    p.include_reasoning,
+                )),
                 // Delta path reuses the full prior history by construction
                 // — report `prior_cached_len` (captured before the
                 // `self.cached_token_history` extend above) as the

@@ -1810,6 +1810,343 @@ unsafe extern "C-unwind" {
         ),
         ctx: *mut std::os::raw::c_void,
     ) -> i32;
+
+    // ============================================
+    // LFM2.5 MoE Compiled Forward Pass (Phase 0 scaffold — INERT)
+    //
+    // The C++ side (`mlx_lfm2_moe.cpp`) stubs these out: `mlx_lfm2_get_model_id`
+    // returns 0 so the Rust dispatcher's `== model_id` gate is never satisfied
+    // and the native forward always runs. The real compiled graph lands later.
+    // ============================================
+
+    /// Active lfm2 compiled-path model id (0 = no model owns the compiled
+    /// path). The Rust dispatcher takes the compiled path only when this equals
+    /// the model's own `model_id`. Phase 0 stub returns 0.
+    pub fn mlx_lfm2_get_model_id() -> u64;
+
+    /// Number of weights registered into the lfm2 compiled graph. Phase 0 stub
+    /// returns 0.
+    pub fn mlx_lfm2_weight_count() -> usize;
+
+    /// Initialize the compiled lfm2 decode graph from prefill state.
+    ///
+    /// `is_attn` is a `num_layers`-long per-layer dispatch map (1 = full
+    /// attention, 0 = conv), built dynamically from `config.is_attention_layer`.
+    /// It is appended BEFORE `cache_arrays` and the C++ param order
+    /// (`mlx_lfm2_moe_init_from_prefill` in mlx_lfm2_moe.cpp) MUST match this
+    /// byte-for-byte or the ABI is silently miswired.
+    ///
+    /// Cache slot layout (stride 2 by ABSOLUTE layer idx): attn layer i →
+    /// `cache_arrays[i*2]` = kv_keys, `[i*2+1]` = kv_values
+    /// (`[B,num_kv_heads,kv_len,head_dim]`, padded to `max_kv_len` C++-side);
+    /// conv layer i → `cache_arrays[i*2]` = conv_state `[B,l_cache-1,hidden]`,
+    /// `[i*2+1]` = null (the conv branch never reads it).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_lfm2_moe_init_from_prefill(
+        num_layers: i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        norm_eps: f32,
+        conv_l_cache: i32,
+        num_experts: i32,
+        num_experts_per_tok: i32,
+        num_dense_layers: i32,
+        norm_topk_prob: i32,
+        use_expert_bias: i32,
+        tie_embedding: i32,
+        conv_bias: i32,
+        max_kv_len: i32,
+        batch_size: i32,
+        is_attn: *const i32,
+        cache_arrays: *mut *mut mlx_array,
+        prefill_offset: i32,
+    );
+
+    /// Run one compiled lfm2 decode step. Writes a null `*output_logits` when
+    /// the graph is not initialized (or on error) so callers fall back to the
+    /// native forward.
+    pub fn mlx_lfm2_moe_forward(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        output_logits: *mut *mut mlx_array,
+        cache_offset_out: *mut i32,
+    );
+
+    /// Async-eval the freshly-sampled decode token (and, when
+    /// `MLX_EVAL_ALL_CACHES=1`, all live compiled caches). Evaluating the token
+    /// — which depends on the compiled logits — triggers the whole compiled
+    /// graph, materializing the cache arrays via the dependency graph.
+    pub fn mlx_lfm2_moe_eval_token_and_caches(token: *mut mlx_array);
+
+    /// Cumulative count of `mlx_lfm2_moe_forward` calls since process start
+    /// (NOT reset by `mlx_lfm2_moe_reset`). Engagement signal for the e2e test
+    /// to assert the compiled decode path actually ran.
+    pub fn mlx_lfm2_moe_forward_call_count() -> u64;
+
+    /// Cumulative count of `mlx_lfm2_moe_forward` calls that took the TRACED
+    /// `compiled_lfm2_decode()` branch — i.e. NOT the eager `MLX_NO_COMPILE`
+    /// arm (NOT reset by `mlx_lfm2_moe_reset`). Unlike
+    /// `mlx_lfm2_moe_forward_call_count`, this proves the actual compiled
+    /// closure ran, not merely that the forward FFI was entered.
+    pub fn mlx_lfm2_moe_compiled_decode_call_count() -> u64;
+
+    /// Export the live compiled caches (uniform stride 2 by absolute layer
+    /// idx; attn -> kv_keys/kv_values, conv -> conv_state/scalar-placeholder)
+    /// into caller-provided heap pointers for cross-turn reuse. Returns the
+    /// count exported (0 if not initialized). Caller must MATERIALIZE the
+    /// returned lazy handles before `mlx_lfm2_moe_reset` frees the globals.
+    pub fn mlx_lfm2_moe_export_caches(out_ptrs: *mut *mut mlx_array, max_count: i32) -> i32;
+
+    /// Current decode offset (number of cached tokens after the last forward).
+    pub fn mlx_lfm2_moe_get_cache_offset() -> i32;
+
+    /// Whether `mlx_lfm2_moe_init_from_prefill` seeded the decode graph cleanly
+    /// (returns 1) or bailed internally on a null slot / padding exception
+    /// (returns 0). The caller checks this to fall back to the native path
+    /// instead of treating the first null forward as a fatal error.
+    pub fn mlx_lfm2_moe_is_initialized() -> i32;
+
+    /// Tear down the compiled lfm2 graph state (clears caches + offset + the
+    /// inited flag). Does NOT touch the shared model-id atom — that is owned by
+    /// `mlx_clear_weights`.
+    pub fn mlx_lfm2_moe_reset();
+
+    /// Invalidate the cached compiled lfm2 decode closure so the NEXT decode
+    /// recompiles `lfm2_decode_fn`, re-capturing the live weight constants from
+    /// the shared `g_weights()` map. MUST be called by `register_weights_with_cpp`
+    /// (under `COMPILED_WEIGHTS_RWLOCK.write()`, before `mlx_set_model_id`) so a
+    /// freshly-loaded lfm2 model can never reuse a previously-compiled model's
+    /// frozen-constant graph (the A→B same-shape model-swap hazard). Internally
+    /// bumps an atomic epoch; the recompile path acquire-loads it under a dedicated
+    /// mutex, so the closure swap is thread-safe regardless of caller locking.
+    pub fn mlx_lfm2_invalidate_compiled();
+
+    /// TEST-ONLY component probe: run a sequence of `T` lfm2 attention decode
+    /// steps (B=1, `x_seq` is `[T, hidden]`) through the compiled
+    /// `lfm2_attn_pure_fn`, threading the KV cache, and return the LAST step's
+    /// output `[1, num_heads*head_dim]` (caller owns; nullptr on error).
+    /// Registers the passed weights into the shared map, runs, then clears it.
+    /// Weights are natural `[out, in]` / `[head_dim]`. Phase-1 parity gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_lfm2_probe_attn_seq(
+        x_seq: *mut mlx_array,
+        q_w: *mut mlx_array,
+        k_w: *mut mlx_array,
+        v_w: *mut mlx_array,
+        out_w: *mut mlx_array,
+        q_norm_w: *mut mlx_array,
+        k_norm_w: *mut mlx_array,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        norm_eps: f32,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY component probe: run the dense SwiGLU MLP through
+    /// `lfm2_dense_mlp` and return the output array (caller owns; nullptr on
+    /// error). Weights are natural `[out, in]`.
+    pub fn mlx_lfm2_probe_dense_mlp(
+        x: *mut mlx_array,
+        gate_w: *mut mlx_array,
+        up_w: *mut mlx_array,
+        down_w: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY component probe: run a sequence of `T` lfm2 ShortConv decode
+    /// steps (B=1, `x_seq` is `[T, hidden]`) through the compiled
+    /// `lfm2_conv_pure_fn`, threading the conv state, and return the LAST step's
+    /// output `[1, hidden]` (caller owns; nullptr on error). Linear weights are
+    /// natural `[out, in]` (in_proj `[3H,H]`, out_proj `[H,H]`); the depthwise
+    /// conv weight is MLX-layout `[hidden, l_cache, 1]` (NOT transposed). When
+    /// `conv_bias == 0` the three bias pointers are ignored (pass null). Phase-2
+    /// parity gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_lfm2_probe_conv_seq(
+        x_seq: *mut mlx_array,
+        in_proj_w: *mut mlx_array,
+        conv_w: *mut mlx_array,
+        out_proj_w: *mut mlx_array,
+        in_proj_b: *mut mlx_array,
+        conv_b: *mut mlx_array,
+        out_proj_b: *mut mlx_array,
+        l_cache: i32,
+        conv_bias: i32,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY component probe: run a `T`-step lfm2 attention decode sequence
+    /// through the ARRAY-OFFSET compiled variant `lfm2_attn_pure_fn_arr` (fixed
+    /// padded KV cache + per-step static additive mask + array RoPE/slice_update —
+    /// the path the compiled decode loop uses), returning the LAST step's output
+    /// `[1, num_heads*head_dim]` (caller owns; nullptr on error). Same weight
+    /// layout as `mlx_lfm2_probe_attn_seq`. Caller MUST hold
+    /// `COMPILED_WEIGHTS_RWLOCK` (write). Phase-2b-1 parity gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_lfm2_probe_attn_arr_seq(
+        x_seq: *mut mlx_array,
+        q_w: *mut mlx_array,
+        k_w: *mut mlx_array,
+        v_w: *mut mlx_array,
+        out_w: *mut mlx_array,
+        q_norm_w: *mut mlx_array,
+        k_norm_w: *mut mlx_array,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        norm_eps: f32,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY component probe: run a SYNTHETIC small dense lfm2 model through
+    /// the full `lfm2_decode_fn` assembly for `T` decode steps and return the
+    /// LAST step's logits `[1, vocab]` (caller owns; nullptr on error). The 2b-1
+    /// end-to-end-shaped parity gate (per-layer conv/attn dispatch, norm/residual
+    /// order, cache-slot interleaving, tied head) — runs EAGER (un-compiled), gate
+    /// stays OFF. Per-layer weights are arrays-of-pointers indexed by layer; conv
+    /// layers ignore attn pointers and vice versa (read per `is_attn[i]`).
+    /// `is_attn` and `token_ids` have lengths `num_layers` and `T`. The embedding
+    /// table is stored under `embed_tokens.weight` (tied head). Caller MUST hold
+    /// `COMPILED_WEIGHTS_RWLOCK` (write). Arg order is byte-identical to the C++
+    /// definition in mlx_lfm2_moe.cpp — keep them in sync.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_lfm2_probe_decode_seq(
+        embed_w: *mut mlx_array,
+        emb_norm_w: *mut mlx_array,
+        is_attn: *const i32,
+        num_layers: i32,
+        hidden: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        l_cache: i32,
+        rope_theta: f32,
+        norm_eps: f32,
+        token_ids: *const i32,
+        t: i32,
+        op_norm_w: *const *mut mlx_array,
+        ffn_norm_w: *const *mut mlx_array,
+        gate_w: *const *mut mlx_array,
+        up_w: *const *mut mlx_array,
+        down_w: *const *mut mlx_array,
+        q_w: *const *mut mlx_array,
+        k_w: *const *mut mlx_array,
+        v_w: *const *mut mlx_array,
+        out_w: *const *mut mlx_array,
+        qn_w: *const *mut mlx_array,
+        kn_w: *const *mut mlx_array,
+        in_proj_w: *const *mut mlx_array,
+        conv_w: *const *mut mlx_array,
+        out_proj_w: *const *mut mlx_array,
+        conv_bias: i32,
+        in_proj_b_w: *const *mut mlx_array,
+        conv_b_w: *const *mut mlx_array,
+        out_proj_b_w: *const *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY component probe: like `mlx_lfm2_probe_decode_seq` but with the
+    /// sparse-MoE FFN branch. Runs a SYNTHETIC small lfm2_moe model through the
+    /// full `lfm2_decode_fn` assembly for `t` steps and returns the LAST step's
+    /// logits `[1, vocab]`. Phase-3a end-to-end-shaped MoE parity gate: layers
+    /// `>= num_dense_layers` route through `lfm2_moe_ffn` (router softmax +
+    /// selection-only expert_bias + top-k + switch_mlp SwiGLU + weighted sum) via
+    /// the stacked `moe_*` weight arrays ([E,out,in] experts, [E,hidden] router,
+    /// [E] bias); dense layers use the `gate_w/up_w/down_w` arrays. Irrelevant
+    /// arrays are null per layer (read per the is-MoE / is_attn predicate). bf16
+    /// experts only. Runs EAGER (un-compiled); the production gate stays OFF.
+    /// Caller MUST hold `COMPILED_WEIGHTS_RWLOCK` (write). Arg order is
+    /// byte-identical to the C++ definition in mlx_lfm2_moe.cpp — keep in sync.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_lfm2_probe_moe_decode_seq(
+        embed_w: *mut mlx_array,
+        emb_norm_w: *mut mlx_array,
+        is_attn: *const i32,
+        num_layers: i32,
+        hidden: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        l_cache: i32,
+        rope_theta: f32,
+        norm_eps: f32,
+        num_experts: i32,
+        num_experts_per_tok: i32,
+        num_dense_layers: i32,
+        norm_topk_prob: i32,
+        use_expert_bias: i32,
+        use_sigmoid: i32,
+        token_ids: *const i32,
+        t: i32,
+        op_norm_w: *const *mut mlx_array,
+        ffn_norm_w: *const *mut mlx_array,
+        gate_w: *const *mut mlx_array,
+        up_w: *const *mut mlx_array,
+        down_w: *const *mut mlx_array,
+        q_w: *const *mut mlx_array,
+        k_w: *const *mut mlx_array,
+        v_w: *const *mut mlx_array,
+        out_w: *const *mut mlx_array,
+        qn_w: *const *mut mlx_array,
+        kn_w: *const *mut mlx_array,
+        in_proj_w: *const *mut mlx_array,
+        conv_w: *const *mut mlx_array,
+        out_proj_w: *const *mut mlx_array,
+        moe_router_w: *const *mut mlx_array,
+        moe_bias: *const *mut mlx_array,
+        moe_gate_proj: *const *mut mlx_array,
+        moe_up_proj: *const *mut mlx_array,
+        moe_down_proj: *const *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    /// DECISIVE H1/H2 probe (TEST-ONLY): builds a FIXED 3-layer synthetic MoE
+    /// model in C++ and runs the SAME `lfm2_decode_fn` BOTH eager and through the
+    /// process-global `compiled_lfm2_decode()`, writing max-abs(compiled - eager)
+    /// of the last-step logits into `out_maxabs`. The ONLY variable is
+    /// `mlx::core::compile`. `well_separated != 0` => bias-dominated top-k (no
+    /// near-ties); `== 0` => near-tie router (FP-fusion sensitive). Caller MUST
+    /// hold `COMPILED_WEIGHTS_RWLOCK` (write); DESTRUCTIVE on the weight map.
+    /// Returns 0 on success, -1 on error.
+    pub fn mlx_lfm2_probe_moe_compiled_vs_eager(
+        seed: u64,
+        well_separated: i32,
+        out_maxabs: *mut f32,
+    ) -> i32;
+
+    /// TEST-ONLY warm-up probe: builds the SAME fixed synthetic MoE LFM2 as
+    /// `mlx_lfm2_probe_moe_compiled_vs_eager` (well_separated=1), drops any closure
+    /// a prior same-epoch probe left (a same-epoch reset, NOT an epoch bump), then
+    /// runs ONE COMPILED decode so a closure is traced + cached at the CURRENT
+    /// compile epoch against THIS `seed`'s constants, evals the last logits, then
+    /// clears weights WITHOUT bumping the epoch. The same-epoch reset is what makes
+    /// the stale closure left behind DETERMINISTICALLY `seed`'s model (determinism
+    /// comes from the reset, not from luck about what a prior probe cached), so an
+    /// order-dependent regression (e.g. the A->B model-swap test relying on its own
+    /// MODEL-A epoch bump) is exercised independent of test ordering. Returns 0 on
+    /// success, -1 on error. Caller MUST hold the compiled-weights write lock
+    /// (DESTRUCTIVE on the process-global weight map).
+    pub fn mlx_lfm2_probe_warm_compiled_no_bump(seed: u64) -> i32;
+
+    /// A→B model-swap regression probe (TEST-ONLY): builds two DISTINCT
+    /// synthetic MoE models (same fixed topology, different `seed_a`/`seed_b`
+    /// weights) in one process; runs A compiled (caching the graph), then
+    /// re-registers B and bumps the compile epoch (`mlx_lfm2_invalidate_compiled`),
+    /// then runs B both compiled and eager.
+    ///
+    /// `out_b_comp_vs_b_eager` is ~0 with the epoch fix but blows up without it
+    /// (the stale closure replays A's frozen constants). `out_b_comp_vs_a_comp`
+    /// is the A-vs-B gap (proves the models genuinely differ). `out_a_comp_vs_a_eager`
+    /// is the A compile-faithfulness sanity. Caller MUST hold
+    /// `COMPILED_WEIGHTS_RWLOCK` (write); DESTRUCTIVE on the weight map. Returns 0
+    /// on success, -1 on error.
+    pub fn mlx_lfm2_probe_moe_ab_swap(
+        seed_a: u64,
+        seed_b: u64,
+        out_b_comp_vs_b_eager: *mut f32,
+        out_b_comp_vs_a_comp: *mut f32,
+        out_a_comp_vs_a_eager: *mut f32,
+    ) -> i32;
 }
 
 // Gradient computation types

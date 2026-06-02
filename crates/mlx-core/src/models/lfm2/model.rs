@@ -8,10 +8,12 @@ use tracing::{info, warn};
 
 use crate::array::MxArray;
 use crate::model_thread::{ResponseTx, StreamTx};
+use crate::models::qwen3_5::arrays_cache::ArraysCache;
 use crate::models::qwen3_5::chat_common::{
     IMAGE_CHANGE_RESTART_PREFIX, ReasoningTracker, apply_all_penalties,
     build_chatml_continue_delta_text, build_synthetic_user_message, compute_performance_metrics,
-    extract_chat_params, finalize_chat_result, parse_thinking_and_tools, resolve_enable_thinking,
+    default_thinking_budget_for_effort, extract_chat_params, finalize_chat_result,
+    parse_thinking_and_tools, raw_text_with_reasoning_suppressed, resolve_enable_thinking,
     resolve_include_reasoning, send_stream_error,
 };
 use crate::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
@@ -19,6 +21,7 @@ use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::sample;
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+use crate::transformer::KVCache;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::config::Lfm2Config;
@@ -57,6 +60,13 @@ pub(crate) struct Lfm2Inner {
     /// not by absolute layer index. `Lfm2DecoderLayer::forward_paged_or_flat`
     /// performs the per-layer dispatch.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// Unique non-zero id for the compiled C++ forward path.
+    /// Drawn from the shared `QWEN35_MODEL_ID_COUNTER` (see the assignment in
+    /// `Lfm2Inner::new`) so ids are globally unique across every model that
+    /// shares the compiled weight registry. Used by
+    /// [`Lfm2Inner::compiled_path_active`] to gate the (not-yet-enabled)
+    /// compiled path.
+    pub(crate) model_id: u64,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
@@ -351,6 +361,19 @@ impl Lfm2Inner {
             cached_token_history: Vec::new(),
             cached_image_key: None,
             paged_adapter,
+            // HARD INVARIANT (compiled-path gate correctness): the model id MUST
+            // come from the SINGLE shared counter, not a per-family one. The
+            // compiled C++ path keys ownership on one process-global atom
+            // (`g_active_model_id`) shared with qwen3.5 (dense + MoE); if lfm2
+            // drew from its own counter, an lfm2 id could equal a resident
+            // qwen3.5 id and the id-equality gate would false-positive,
+            // decoding the other family's weights → gibberish. Allocating from
+            // qwen3.5's counter makes every live id globally unique, so a
+            // non-match is a clean ownership eviction, never a collision. Any
+            // future compiled model sharing the registry MUST also draw from
+            // this counter.
+            model_id: crate::models::qwen3_5::model::QWEN35_MODEL_ID_COUNTER
+                .fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -358,12 +381,40 @@ impl Lfm2Inner {
         self.tokenizer = Some(tokenizer);
     }
 
+    /// Whether the compiled C++ forward path owns this model's weights and may
+    /// be taken for decode. Active only when the C++ side's active model id
+    /// (`mlx_lfm2_get_model_id()`, which reads the shared `g_active_model_id`
+    /// atom) equals this model's [`Lfm2Inner::model_id`].
+    ///
+    /// The id is published ONLY by `register_weights_with_cpp` (load time), which
+    /// is invoked for a bf16/f16, flat-cache, conv_bias=false checkpoint —
+    /// DENSE or sparse-MoE (Phase 3c lifted the MoE exclusion). The gate is
+    /// structurally false for paged and quantized checkpoints (those never
+    /// register), and false until an lfm2 model has registered its weights into
+    /// the shared map.
+    pub(crate) fn compiled_path_active(&self) -> bool {
+        let active = unsafe { mlx_sys::mlx_lfm2_get_model_id() };
+        active != 0 && active == self.model_id
+    }
+
     /// Forward pass through the full model.
     ///
     /// Follows `lfm2.py:258-279` (Lfm2Model.__call__) + Model.__call__ (tied lm_head).
     ///
     /// Returns logits [B, T, vocab_size].
-    fn forward(&mut self, input_ids: &MxArray) -> Result<MxArray> {
+    ///
+    /// `pub(crate)` so the persistence-module test
+    /// `production_compiled_decode_matches_native_with_conv_bias` can drive this
+    /// pure-native per-step forward as the parity REFERENCE for the production
+    /// compiled conv_bias=true decode path. Crate-internal only — no public/NAPI
+    /// surface change.
+    pub(crate) fn forward(&mut self, input_ids: &MxArray) -> Result<MxArray> {
+        // PREFILL stays native. The compiled C++ decode path is wired ONLY into
+        // the single-token decode loop in `chat_sync_core` (it seeds the
+        // compiled graph from the post-prefill caches this native forward
+        // builds, then drives `mlx_lfm2_moe_forward` per step). `forward()`
+        // never calls the compiled path.
+
         // 1. Token embeddings (no scaling)
         let mut h = self.embed_tokens.forward(input_ids)?;
 
@@ -379,13 +430,15 @@ impl Lfm2Inner {
         // 3. Output norm
         h = self.embedding_norm.forward(&h)?;
 
-        // 4. LM head or tied embeddings
+        // 4. LM head or tied embeddings. The tied path routes through
+        // `Embedding::as_linear`, which handles BOTH a packed-quantized
+        // embedding (`mlx_quantized_matmul` on the packed tensors — no dense
+        // table) AND a dense bf16 embedding (`h @ get_weight()^T`, numerically
+        // identical to the prior matmul).
         let logits = if let Some(ref head) = self.lm_head {
             head.forward(&h)?
         } else {
-            let weight = self.embed_tokens.get_weight();
-            let weight_t = weight.transpose(Some(&[1, 0]))?;
-            h.matmul(&weight_t)?
+            self.embed_tokens.as_linear(&h)?
         };
 
         Ok(logits)
@@ -427,6 +480,83 @@ impl Lfm2Inner {
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
+    }
+
+    /// Export the compiled C++ decode caches back into `self.caches`, then
+    /// MATERIALIZE the imported handles so subsequent native turns (or the
+    /// next compiled seed) read live buffers — NOT lazy graph nodes that the
+    /// `Lfm2CompiledResetGuard`'s `mlx_lfm2_moe_reset()` is about to free.
+    ///
+    /// Caller invariant: this must run BEFORE the reset guard drops, and the
+    /// export → import → eval must complete with no `?`-early-return between
+    /// the import and the eval (we collect every imported cache, install it,
+    /// then eval the whole set in one shot).
+    fn export_compiled_caches(&mut self) -> Result<()> {
+        let num_layers = self.config.num_hidden_layers as usize;
+        let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            vec![std::ptr::null_mut(); num_layers * 2];
+        let exported = unsafe {
+            mlx_sys::mlx_lfm2_moe_export_caches(export_ptrs.as_mut_ptr(), (num_layers * 2) as i32)
+        };
+        if exported <= 0 {
+            // Nothing live to export (e.g. compiled init bailed). Leave the
+            // native caches from prefill in place; native is the source of
+            // truth in that case.
+            return Ok(());
+        }
+
+        let cache_offset = unsafe { mlx_sys::mlx_lfm2_moe_get_cache_offset() };
+
+        let mut new_caches: Vec<Lfm2LayerCache> = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            if self.config.is_attention_layer(i) {
+                let k_ptr = export_ptrs[i * 2];
+                let v_ptr = export_ptrs[i * 2 + 1];
+                if k_ptr.is_null() || v_ptr.is_null() {
+                    return Err(Error::from_reason(
+                        "lfm2 compiled cache export: null attn KV handle",
+                    ));
+                }
+                // `from_handle` wraps the heap-allocated handle (null-checked).
+                let keys = MxArray::from_handle(k_ptr, "lfm2 compiled export keys")?;
+                let values = MxArray::from_handle(v_ptr, "lfm2 compiled export values")?;
+                let mut kv = KVCache::new();
+                kv.set_keys(keys);
+                kv.set_values(values);
+                kv.set_offset(cache_offset);
+                new_caches.push(Lfm2LayerCache::Attention(kv));
+            } else {
+                let s_ptr = export_ptrs[i * 2];
+                if s_ptr.is_null() {
+                    return Err(Error::from_reason(
+                        "lfm2 compiled cache export: null conv state handle",
+                    ));
+                }
+                let state = MxArray::from_handle(s_ptr, "lfm2 compiled export conv state")?;
+                // slot.b (export_ptrs[i*2+1]) is the unused scalar placeholder —
+                // a freshly heap-allocated copy. Wrap + drop to release it so it
+                // doesn't leak (export hands back an owned heap handle).
+                let placeholder = export_ptrs[i * 2 + 1];
+                if !placeholder.is_null() {
+                    let _ =
+                        MxArray::from_handle(placeholder, "lfm2 compiled export conv placeholder");
+                }
+                let mut conv = ArraysCache::new(1);
+                conv.set(0, state);
+                new_caches.push(Lfm2LayerCache::Conv(conv));
+            }
+        }
+
+        // Materialize the freshly-imported handles BEFORE installing them as
+        // `self.caches`. If the eval fails, the `?` returns while
+        // `Lfm2CompiledResetGuard` still drops and frees the compiled globals
+        // — so we must NOT have already replaced `self.caches` with lazy
+        // handles that reference those soon-to-be-freed nodes. Keeping the old
+        // (last-safe-native) caches on failure lets a subsequent native turn
+        // fall back cleanly instead of feeding freed buffers to the GPU.
+        eval_lfm2_caches(&new_caches)?;
+        self.caches = new_caches;
+        Ok(())
     }
 
     /// Check if tokens share a prefix with cached_token_history and return the prefix length.
@@ -544,6 +674,7 @@ impl Lfm2Inner {
                 include_reasoning,
                 p,
                 enable_thinking,
+                config.reasoning_effort.clone(),
                 report_perf,
                 eos_token_id,
             );
@@ -608,9 +739,15 @@ impl Lfm2Inner {
         let prompt_token_count = tokens.len();
 
         // Reasoning tracker
-        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
+        // emits a <think>…</think> block, so reasoning is always tracked AND
+        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
+        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
+        let effective_budget = p
+            .thinking_token_budget
+            .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref()));
         let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
+            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
 
         // Prefill: process prompt tokens through chunked forward pass
         let token_arr: Vec<i32> = prefill_tokens.iter().map(|&t| t as i32).collect();
@@ -637,15 +774,242 @@ impl Lfm2Inner {
             first_token_instant = Some(std::time::Instant::now());
         }
 
-        // Decode loop — double-buffered lazy eval pattern
+        // ===== Compiled C++ decode-path dispatch =====
+        // Serialize the compiled lifecycle across model instances on the SHARED
+        // cross-family mutex (the same instance qwen3.5 locks), then re-validate
+        // ownership under the weight RwLock read guard, held for the whole
+        // decode loop. Poison-recover both locks (a panicked prior holder must
+        // not wedge inference forever — banned `.unwrap()` on these paths).
+        //
+        // LOCK CONTRACT (compiled-closure lifecycle, mirrors the qwen3.5 dense
+        // path): registration is the WRITER — `register_weights_with_cpp` holds
+        // `COMPILED_WEIGHTS_RWLOCK.write()` and, in one critical section, clears
+        // + re-stores weights, bumps the compile epoch
+        // (`mlx_lfm2_invalidate_compiled`), then publishes the model id
+        // (`mlx_set_model_id`). Decode is the READER — the `_weight_guard`
+        // (`.read()`, poison-recovered) below spans BOTH the
+        // `mlx_lfm2_get_model_id()` re-check AND every subsequent
+        // `mlx_lfm2_moe_*` / `compiled_lfm2_decode()` invocation in this function
+        // (it is kept alive until end-of-scope, after the decode loop and the
+        // post-loop cache export). So the (epoch, id) pair this read guard
+        // validates is exactly the one the compiled graph executes against — a
+        // registration cannot interleave between the re-check and the forwards.
+        // The C++ side additionally guards the epoch-check + recompile with its
+        // own `g_lfm2_compiled_mu` and returns the closure BY VALUE, so even a
+        // hypothetical caller that did NOT hold this read lock could not dangle
+        // its closure handle.
+        let use_compiled_pre = self.compiled_path_active();
+        let _compiled_lock = if use_compiled_pre {
+            Some(
+                crate::models::qwen3_5::model::COMPILED_LIFECYCLE_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        } else {
+            None
+        };
+        let mut _weight_guard = None;
+        // `mut` so the seed step below can drop back to native on any failure.
+        let mut use_compiled = if use_compiled_pre {
+            let guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            // Re-check ownership under the read lock — a concurrent load of a
+            // different model could have evicted us between the probe and here.
+            if unsafe { mlx_sys::mlx_lfm2_get_model_id() } == self.model_id {
+                _weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Seed the compiled decode graph ONCE from the post-prefill caches.
+        // On any failure (init bailed, missing handle), drop back to native by
+        // clearing `use_compiled` for the loop. The distinct reset guard fires
+        // `mlx_lfm2_moe_reset()` on EVERY exit path (including `?`
+        // early-returns and a partial/failed seed) so no stale C++ state leaks.
+        let _compiled_reset_guard = if use_compiled {
+            Some(Lfm2CompiledResetGuard)
+        } else {
+            None
+        };
+        let embed_tokens_weight = if use_compiled {
+            // Tied dense embedding only — lfm2 compiled checkpoints (dense OR
+            // MoE) are never packed-quantized on the compiled path (the gate
+            // excludes any `.scales` checkpoint, and bf16 lfm2 ships a dense
+            // embedding). `get_weight()` is infallible (returns MxArray, not
+            // Result).
+            Some(self.embed_tokens.get_weight())
+        } else {
+            None
+        };
+        if use_compiled {
+            let num_layers = self.config.num_hidden_layers as usize;
+
+            // CRITICAL: seed the compiled decode position from the LIVE
+            // attention KV offset, NOT `seq_len`. `seq_len` is the logits
+            // length returned by `chunked_prefill`, which is only the FINAL
+            // chunk for prompts over `PREFILL_STEP_SIZE`, or just the
+            // uncached tail delta on a warm strict-extend reuse hit. The
+            // `KVCache` offset, by contrast, accumulates prefix + delta across
+            // every chunk and across reuse, so it is the true sequence
+            // position. Seeding from `seq_len` would build the C++ causal mask
+            // and KV write index from a too-small offset, masking out valid
+            // prefix tokens and overwriting live slots. All attention layers
+            // must agree on the offset; if any disagrees (corrupt/partial
+            // cache), fall back to native rather than seed a wrong position.
+            let mut cache_offset: Option<i32> = None;
+            let mut offset_ok = true;
+            for cache in self.caches.iter() {
+                if let Lfm2LayerCache::Attention(kv) = cache {
+                    let off = kv.get_offset();
+                    match cache_offset {
+                        None => cache_offset = Some(off),
+                        Some(prev) if prev != off => {
+                            offset_ok = false;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let prefill_len = cache_offset.unwrap_or(0);
+            if !offset_ok || cache_offset.is_none() {
+                // No attention layer (impossible for a real lfm2 config — every
+                // shipping checkpoint interleaves ≥1 full_attention layer) or
+                // attention layers reporting inconsistent offsets (corrupt /
+                // partial cache). Either way, refuse to seed a wrong position
+                // and fall back to native. The debug log distinguishes this
+                // from the missing-handle fallback below so a hypothetical
+                // zero-attention config doesn't fail silently.
+                tracing::debug!(
+                    "lfm2 compiled decode: no consistent attention KV offset \
+                     (offset_ok={offset_ok}, has_offset={}); using native path",
+                    cache_offset.is_some()
+                );
+                offset_ok = false;
+            }
+            // Budget the fixed padded cache from the TRUE position so decode
+            // can never exceed it (slice_update OOB / silent corruption).
+            let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+
+            // Per-layer attn/conv map — built DYNAMICALLY from config (lfm2
+            // mixes conv/attn irregularly; never a modulo/hardcoded pattern).
+            let is_attn: Vec<i32> = (0..num_layers)
+                .map(|i| i32::from(self.config.is_attention_layer(i)))
+                .collect();
+
+            // Cache pointers, stride 2 by ABSOLUTE layer idx. attn layer ->
+            // KVCache keys_ref()/values_ref() (MATERIALIZED above via
+            // eval_lfm2_caches); conv layer -> ArraysCache slot 0, null at +1.
+            let mut cache_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                vec![std::ptr::null_mut(); num_layers * 2];
+            // Carry the offset-consistency check forward: a bad/inconsistent
+            // attention offset must also block the seed (→ native fallback).
+            let mut seed_ok = offset_ok;
+            for (i, cache) in self.caches.iter().enumerate() {
+                match cache {
+                    Lfm2LayerCache::Attention(kv) => match (kv.keys_ref(), kv.values_ref()) {
+                        (Some(k), Some(v)) => {
+                            cache_ptrs[i * 2] = k.as_raw_ptr();
+                            cache_ptrs[i * 2 + 1] = v.as_raw_ptr();
+                        }
+                        _ => {
+                            seed_ok = false;
+                            break;
+                        }
+                    },
+                    Lfm2LayerCache::Conv(c) => match c.get(0) {
+                        Some(state) => {
+                            cache_ptrs[i * 2] = state.as_raw_ptr();
+                            // slot.b stays null — conv branch never reads it.
+                        }
+                        None => {
+                            seed_ok = false;
+                            break;
+                        }
+                    },
+                }
+            }
+
+            if seed_ok {
+                unsafe {
+                    mlx_sys::mlx_lfm2_moe_init_from_prefill(
+                        self.config.num_hidden_layers,
+                        self.config.hidden_size,
+                        self.config.num_attention_heads,
+                        self.config.num_key_value_heads,
+                        self.config.head_dim(),
+                        self.config.rope_theta as f32,
+                        self.config.norm_eps as f32,
+                        self.config.conv_l_cache,
+                        self.config.num_experts.unwrap_or(0),
+                        self.config.num_experts_per_tok.unwrap_or(0),
+                        self.config.num_dense_layers.unwrap_or(0),
+                        i32::from(self.config.norm_topk_prob.unwrap_or(true)),
+                        i32::from(self.config.use_expert_bias.unwrap_or(true)),
+                        i32::from(self.config.tie_embedding),
+                        i32::from(self.config.conv_bias),
+                        max_kv_len,
+                        1,
+                        is_attn.as_ptr(),
+                        cache_ptrs.as_mut_ptr(),
+                        prefill_len,
+                    );
+                }
+                // C++ init is `void` but can still bail internally (a null
+                // slot or a padding/concatenate exception sets g_lfm2_inited
+                // = false). Confirm it actually seeded; if not, drop to native
+                // BEFORE the loop rather than letting the first forward return
+                // null logits and be treated as a fatal error.
+                if unsafe { mlx_sys::mlx_lfm2_moe_is_initialized() } == 0 {
+                    warn!("lfm2 compiled decode: C++ seed did not initialize; using native path");
+                    use_compiled = false;
+                }
+            } else {
+                warn!(
+                    "lfm2 compiled decode: missing/inconsistent post-prefill cache state; using native path"
+                );
+                use_compiled = false;
+            }
+        }
+
+        // Decode loop — double-buffered lazy eval pattern. The per-step forward
+        // is the compiled C++ step when `use_compiled`, else the native forward.
         let mut last_token_in_cache = false;
         for step in 0..max_new_tokens {
             let next_y = if step + 1 < max_new_tokens {
                 let _stream_ctx = StreamContext::new(generation_stream);
 
                 let next_ids = y.reshape(&[1, 1])?;
-                let logits = self.forward(&next_ids)?;
-                let logits = logits.squeeze(Some(&[1]))?;
+                let logits = if use_compiled {
+                    // Compiled path returns [B, vocab] (already 2D).
+                    let emb = embed_tokens_weight.as_ref().ok_or_else(|| {
+                        Error::from_reason("lfm2 compiled decode: missing embedding weight")
+                    })?;
+                    let mut out_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+                    let mut off: i32 = 0;
+                    unsafe {
+                        mlx_sys::mlx_lfm2_moe_forward(
+                            next_ids.as_raw_ptr(),
+                            emb.as_raw_ptr(),
+                            &mut out_ptr,
+                            &mut off,
+                        );
+                    }
+                    if out_ptr.is_null() {
+                        return Err(Error::from_reason(
+                            "lfm2 compiled decode: mlx_lfm2_moe_forward returned null logits",
+                        ));
+                    }
+                    MxArray::from_handle(out_ptr, "lfm2 compiled decode logits")?
+                } else {
+                    let logits = self.forward(&next_ids)?;
+                    logits.squeeze(Some(&[1]))?
+                };
 
                 // Budget enforcement
                 let (next_token, _budget_forced) = if reasoning_tracker.should_force_think_end() {
@@ -657,7 +1021,15 @@ impl Lfm2Inner {
                     (t, false)
                 };
 
-                MxArray::async_eval_arrays(&[&next_token]);
+                if use_compiled {
+                    // Evaluating the token triggers the whole compiled graph
+                    // (logits + caches via the dependency edges).
+                    unsafe {
+                        mlx_sys::mlx_lfm2_moe_eval_token_and_caches(next_token.as_raw_ptr());
+                    }
+                } else {
+                    MxArray::async_eval_arrays(&[&next_token]);
+                }
                 Some(next_token)
             } else {
                 None
@@ -699,6 +1071,21 @@ impl Lfm2Inner {
                 crate::array::synchronize_and_clear_cache();
             }
         }
+
+        // TEARDOWN: when the compiled path ran and the caller wants to reuse the
+        // cache, export the C++ caches back into `self.caches` and MATERIALIZE
+        // them BEFORE `Lfm2CompiledResetGuard` drops (which calls
+        // `mlx_lfm2_moe_reset()` and frees the compiled globals). Exported
+        // handles are lazy copies whose graph still references compiled nodes;
+        // without an eval here the next turn would feed freed buffers to the
+        // GPU. Collect + eval before any fallible op so no `?` can skip
+        // materialization.
+        if use_compiled && reuse_cache {
+            self.export_compiled_caches()?;
+        }
+        // `_compiled_reset_guard` drops at end of function AFTER the export+eval
+        // above and AFTER `save_cache_state`, tearing down the C++ state. The
+        // `_compiled_lock` / `_weight_guard` are likewise held until scope end.
 
         // Save cache state for next call
         self.save_cache_state(reuse_cache, &tokens, &generated_tokens, last_token_in_cache);
@@ -782,7 +1169,8 @@ impl Lfm2Inner {
         think_end_str: Option<String>,
         include_reasoning: bool,
         p: crate::models::qwen3_5::chat_common::ChatParams,
-        enable_thinking: Option<bool>,
+        _enable_thinking: Option<bool>,
+        reasoning_effort: Option<String>,
         report_perf: bool,
         eos_token_id: u32,
     ) -> Result<ChatResult> {
@@ -796,9 +1184,15 @@ impl Lfm2Inner {
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
 
-        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
+        // emits a <think>…</think> block, so reasoning is always tracked AND
+        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
+        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
+        let effective_budget = p
+            .thinking_token_budget
+            .or_else(|| default_thinking_budget_for_effort(reasoning_effort.as_deref()));
         let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
+            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
 
         // === Adapter lifecycle: warm continuation OR cold start. ===
         // See `PagedKVCacheAdapter::finalize_turn_keep_live` for why the
@@ -1213,14 +1607,13 @@ impl Lfm2Inner {
             crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
         }
 
-        // Output norm + lm_head.
+        // Output norm + lm_head. Tied path → `Embedding::as_linear` (packed
+        // quantized matmul or dense `h @ weight^T`).
         hidden_states = self.embedding_norm.forward(&hidden_states)?;
         let logits = if let Some(ref head) = self.lm_head {
             head.forward(&hidden_states)?
         } else {
-            let weight = self.embed_tokens.get_weight();
-            let weight_t = weight.transpose(Some(&[1, 0]))?;
-            hidden_states.matmul(&weight_t)?
+            self.embed_tokens.as_linear(&hidden_states)?
         };
 
         // Slice the last token's logits.
@@ -1307,13 +1700,13 @@ impl Lfm2Inner {
             }
         }
 
+        // Tied path → `Embedding::as_linear` (packed quantized matmul or dense
+        // `h @ weight^T`).
         hidden_states = self.embedding_norm.forward(&hidden_states)?;
         let logits = if let Some(ref head) = self.lm_head {
             head.forward(&hidden_states)?
         } else {
-            let weight = self.embed_tokens.get_weight();
-            let weight_t = weight.transpose(Some(&[1, 0]))?;
-            hidden_states.matmul(&weight_t)?
+            self.embed_tokens.as_linear(&hidden_states)?
         };
         Ok(logits)
     }
@@ -1408,7 +1801,8 @@ impl Lfm2Inner {
         think_end_str: Option<String>,
         include_reasoning: bool,
         p: crate::models::qwen3_5::chat_common::ChatParams,
-        enable_thinking: Option<bool>,
+        _enable_thinking: Option<bool>,
+        reasoning_effort: Option<String>,
         report_perf: bool,
         eos_token_id: u32,
         cb: &StreamSender,
@@ -1424,9 +1818,15 @@ impl Lfm2Inner {
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
 
-        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
+        // emits a <think>…</think> block, so reasoning is always tracked AND
+        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
+        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
+        let effective_budget = p
+            .thinking_token_budget
+            .or_else(|| default_thinking_budget_for_effort(reasoning_effort.as_deref()));
         let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
+            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
 
         // Streaming decode state
         let mut decode_stream = tokenizer.inner().decode_stream(true);
@@ -1581,23 +1981,27 @@ impl Lfm2Inner {
             });
         if full_text.len() > streamed_text_len {
             let residual = full_text[streamed_text_len..].to_string();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(last_is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            // Suppress residual when it is reasoning text and
+            // include_reasoning == false.
+            if include_reasoning || !last_is_reasoning {
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: residual,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(last_is_reasoning),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
         }
 
         // Performance metrics
@@ -1733,23 +2137,27 @@ impl Lfm2Inner {
                 *streamed_text_len,
             );
             *streamed_text_len += token_text.len();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: token_text,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            // Suppress reasoning deltas when include_reasoning == false.
+            // Detokenize + length-advance above stay OUTSIDE this gate.
+            if p.include_reasoning || !is_reasoning {
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: token_text,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(is_reasoning),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
 
             if let Some(reason) = crate::sampling::check_repetition_cutoff(
                 &generated_tokens,
@@ -1835,6 +2243,7 @@ impl Lfm2Inner {
                 include_reasoning,
                 p,
                 enable_thinking,
+                config.reasoning_effort.clone(),
                 report_perf,
                 eos_token_id,
                 cb,
@@ -1880,9 +2289,15 @@ impl Lfm2Inner {
         let prompt_token_count = tokens.len();
 
         // Reasoning tracker
-        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
+        // emits a <think>…</think> block, so reasoning is always tracked AND
+        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
+        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
+        let effective_budget = p
+            .thinking_token_budget
+            .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref()));
         let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
+            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
 
         // Streaming decode state
         let mut decode_stream = tokenizer.inner().decode_stream(true);
@@ -1966,23 +2381,27 @@ impl Lfm2Inner {
                 streamed_text_len,
             );
             streamed_text_len += token_text.len();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: token_text,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            // Suppress reasoning deltas when include_reasoning == false.
+            // Detokenize + length-advance above stay OUTSIDE this gate.
+            if include_reasoning || !is_reasoning {
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: token_text,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(is_reasoning),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
 
             if let Some(reason) = crate::sampling::check_repetition_cutoff(
                 &generated_tokens,
@@ -2016,23 +2435,27 @@ impl Lfm2Inner {
             });
         if full_text.len() > streamed_text_len {
             let residual = full_text[streamed_text_len..].to_string();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(last_is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            // Residual carries the last token's reasoning state; suppress when
+            // it is reasoning text and include_reasoning == false.
+            if include_reasoning || !last_is_reasoning {
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: residual,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(last_is_reasoning),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
         }
 
         // Build final result
@@ -2185,9 +2608,14 @@ impl Lfm2Inner {
         let p = extract_chat_params(&config);
         let report_perf = p.report_performance;
         let max_new_tokens = p.max_new_tokens;
-        let enable_thinking = resolve_enable_thinking(&config);
         let include_reasoning = resolve_include_reasoning(&config);
-        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
+        // emits a <think>…</think> block, so reasoning is always tracked AND
+        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
+        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
+        let effective_budget = p
+            .thinking_token_budget
+            .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref()));
 
         // Capture the full prior-cached length BEFORE appending the
         // delta so we can report it as `cached_tokens` on the returned
@@ -2225,7 +2653,7 @@ impl Lfm2Inner {
         let save_tokens = full_token_history.clone();
 
         let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
+            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
 
         // Prefill: chunked forward pass of the delta on top of existing caches.
         let token_arr: Vec<i32> = delta_tokens.iter().map(|&t| t as i32).collect();
@@ -2682,9 +3110,14 @@ impl Lfm2Inner {
         let p = extract_chat_params(&config);
         let report_perf = p.report_performance;
         let max_new_tokens = p.max_new_tokens;
-        let enable_thinking = resolve_enable_thinking(&config);
         let include_reasoning = resolve_include_reasoning(&config);
-        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
+        // emits a <think>…</think> block, so reasoning is always tracked AND
+        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
+        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
+        let effective_budget = p
+            .thinking_token_budget
+            .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref()));
 
         // Build full token history = cached_history + delta.
         // Capture `prior_cached_len` BEFORE the extend — this is the
@@ -2711,7 +3144,7 @@ impl Lfm2Inner {
         let save_tokens = full_token_history.clone();
 
         let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
+            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
 
         // Streaming decode state
         let mut decode_stream = tokenizer.inner().decode_stream(true);
@@ -2793,23 +3226,27 @@ impl Lfm2Inner {
                 streamed_text_len,
             );
             streamed_text_len += token_text.len();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: token_text,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            // Suppress reasoning deltas when include_reasoning == false.
+            // Detokenize + length-advance above stay OUTSIDE this gate.
+            if include_reasoning || !is_reasoning {
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: token_text,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(is_reasoning),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
 
             if let Some(reason) = crate::sampling::check_repetition_cutoff(
                 &generated_tokens,
@@ -2845,23 +3282,27 @@ impl Lfm2Inner {
             });
         if full_text.len() > streamed_text_len {
             let residual = full_text[streamed_text_len..].to_string();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(last_is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            // Suppress residual when it is reasoning text and
+            // include_reasoning == false.
+            if include_reasoning || !last_is_reasoning {
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: residual,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(last_is_reasoning),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
         }
 
         // Build the final done chunk with parsed tool/thinking info.
@@ -2901,7 +3342,14 @@ impl Lfm2Inner {
                 num_tokens: Some(generated_tokens.len() as u32),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(full_text),
+                raw_text: Some(raw_text_with_reasoning_suppressed(
+                    &full_text,
+                    &generated_tokens,
+                    thinking_enabled,
+                    think_end_id,
+                    think_end_str.as_deref(),
+                    include_reasoning,
+                )),
                 // Delta path reuses the full prior history by construction
                 // — report `prior_cached_len` (captured before the
                 // `self.cached_token_history` extend above) as the
@@ -3002,6 +3450,24 @@ pub(crate) fn handle_lfm2_cmd(inner: &mut Lfm2Inner, cmd: Lfm2Cmd) {
 }
 
 /// Initialize caches matching the layer types.
+/// RAII guard that calls `mlx_lfm2_moe_reset()` on drop, tearing down the
+/// compiled lfm2 decode globals (caches + offset + inited flag).
+///
+/// DISTINCT from qwen3.5's `CompiledResetGuard` (which calls
+/// `mlx_qwen35_compiled_reset()`) — the two compiled families own separate
+/// C++ state and must each reset their own. Ensures the compiled state is
+/// always torn down even when the decode loop returns early via `?`, so the
+/// next generation never sees stale compiled caches.
+struct Lfm2CompiledResetGuard;
+
+impl Drop for Lfm2CompiledResetGuard {
+    fn drop(&mut self) {
+        unsafe {
+            mlx_sys::mlx_lfm2_moe_reset();
+        }
+    }
+}
+
 fn init_caches(config: &Lfm2Config) -> Vec<Lfm2LayerCache> {
     let num_layers = config.num_hidden_layers as usize;
     let mut caches = Vec::with_capacity(num_layers);
@@ -3687,6 +4153,13 @@ mod paged_adapter_construction_tests {
             paged_cache_memory_mb: Some(256),
             paged_block_size: Some(16),
             use_block_paged_cache: use_block_paged,
+            intermediate_size: None,
+            moe_intermediate_size: None,
+            num_experts: None,
+            num_experts_per_tok: None,
+            num_dense_layers: None,
+            norm_topk_prob: Some(true),
+            use_expert_bias: Some(true),
         }
     }
 
@@ -3842,13 +4315,15 @@ mod paged_adapter_construction_tests {
             match &mut layer.operator {
                 OperatorType::Attention(attn) => {
                     let w = attn.q_proj.get_weight();
-                    attn.q_proj.set_weight(&cast(&w)).expect("set q");
+                    attn.q_proj.set_weight(&cast(&w), "q_proj").expect("set q");
                     let w = attn.k_proj.get_weight();
-                    attn.k_proj.set_weight(&cast(&w)).expect("set k");
+                    attn.k_proj.set_weight(&cast(&w), "k_proj").expect("set k");
                     let w = attn.v_proj.get_weight();
-                    attn.v_proj.set_weight(&cast(&w)).expect("set v");
+                    attn.v_proj.set_weight(&cast(&w), "v_proj").expect("set v");
                     let w = attn.out_proj.get_weight();
-                    attn.out_proj.set_weight(&cast(&w)).expect("set o");
+                    attn.out_proj
+                        .set_weight(&cast(&w), "out_proj")
+                        .expect("set o");
                     let w = attn.q_layernorm.get_weight();
                     attn.q_layernorm.set_weight(&cast(&w)).expect("set qn");
                     let w = attn.k_layernorm.get_weight();
@@ -3858,13 +4333,19 @@ mod paged_adapter_construction_tests {
                     let w = conv.conv.get_weight();
                     conv.conv.set_weight(&cast(&w)).expect("set conv_w");
                     let w = conv.in_proj.get_weight();
-                    conv.in_proj.set_weight(&cast(&w)).expect("set in_proj");
+                    conv.in_proj
+                        .set_weight(&cast(&w), "in_proj")
+                        .expect("set in_proj");
                     let w = conv.out_proj.get_weight();
-                    conv.out_proj.set_weight(&cast(&w)).expect("set out_proj");
+                    conv.out_proj
+                        .set_weight(&cast(&w), "out_proj")
+                        .expect("set out_proj");
                 }
             }
 
-            let mlp = &mut layer.feed_forward;
+            let mlp = layer
+                .dense_mlp_mut()
+                .expect("paged_tiny_config layers are all dense MLPs");
             let w = mlp.get_gate_proj_weight();
             mlp.set_gate_proj_weight(&cast(&w)).expect("set gate");
             let w = mlp.get_up_proj_weight();

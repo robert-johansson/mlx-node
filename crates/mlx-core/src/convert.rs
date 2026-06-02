@@ -304,6 +304,18 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         )));
     }
 
+    // LFM2 mxfp/nvfp now SUPPORTED for non-MoE linears (fast-follow #1a): the
+    // lfm2 loader's attention / conv / dense-MLP projections are mode-aware
+    // `LinearProj`/`MLPVariant` backed by `QuantizedLinear`, which threads the
+    // resolved mode (affine / mxfp4 / mxfp8 / nvfp4) into `mlx_quantized_matmul`
+    // at forward time. The MoE experts/gate already supported all four modes.
+    // The EMBEDDING and lm_head remain excluded from quantization (vocab-dim
+    // tensors): `should_quantize` skips `embed_tokens`/`lm_head`, so an
+    // mxfp8/mxfp4/nvfp4 lfm2 checkpoint ships quantized experts + attn/conv/
+    // dense-MLP and a plain bf16 embedding — which the #1a loader can load. A
+    // quant-capable embedding lands in #1b; the prior affine-only gate is thus
+    // removed.
+
     // Validate recipe
     if let Some(ref recipe) = quant_recipe {
         if !do_quantize {
@@ -500,7 +512,10 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
 
     // For models with a sanitizer that handles FP8 dequant + dtype conversion
     // (e.g. qwen3_5_moe), skip the generic dtype conversion and let the sanitizer do it.
-    let has_custom_sanitizer = matches!(model_type.as_deref(), Some("qwen3_5_moe" | "qwen3_5"));
+    let has_custom_sanitizer = matches!(
+        model_type.as_deref(),
+        Some("qwen3_5_moe" | "qwen3_5" | "lfm2_moe" | "lfm2")
+    );
 
     // True for models whose sanitizer arm manages quantization itself — the
     // generic quantize block below must skip these to avoid double-quantizing.
@@ -594,6 +609,17 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             );
             sanitize_qwen35_moe(converted_tensors, &config, &target_dtype)?
         }
+        Some("lfm2_moe" | "lfm2") => {
+            info!(
+                "Applying LFM2 weight sanitization (MLP rename, conv transpose, expert stacking)..."
+            );
+            sanitize_lfm2_moe(
+                converted_tensors,
+                &config,
+                &target_dtype,
+                tie_word_embeddings,
+            )?
+        }
         Some("qianfan-ocr") => {
             info!(
                 "Applying Qianfan-OCR weight sanitization (key renaming, conv2d transposition)..."
@@ -619,7 +645,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         // scope and we want to suppress the generic quantize pass for it.
         Some(other) => {
             return Err(Error::from_reason(format!(
-                "Unknown model type: '{}'. Supported: paddleocr-vl, qwen3_5_moe, qwen3_5, qianfan-ocr, gemma4, privacy-filter",
+                "Unknown model type: '{}'. Supported: paddleocr-vl, qwen3_5_moe, qwen3_5, lfm2_moe, lfm2, qianfan-ocr, gemma4, privacy-filter",
                 other
             )));
         }
@@ -641,6 +667,13 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // downstream loaders dispatch to the correct builder.
     let mut quant_mode_effective = quant_mode.clone();
     let mut quant_group_size_effective = quant_group_size;
+    // lfm2/lfm2_moe opt INTO quantizing the token embedding: their
+    // `nn::Embedding` installs a PACKED-quantized backend (gather-dequant
+    // lookup + quantized tied-head matmul), so the embedding table can be
+    // quantized for real memory savings. Every other family keeps the embedding
+    // bf16 (unchanged). A TIED `lm_head` is dropped at sanitize, so this never
+    // quantizes an output head.
+    let embed_quantizable = matches!(model_type.as_deref(), Some("lfm2") | Some("lfm2_moe"));
     if do_quantize {
         info!(
             "Quantizing weights: bits={}, group_size={}, mode={}{}",
@@ -682,6 +715,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 quant_group_size,
                 &quant_mode,
                 &*predicate,
+                embed_quantizable,
             )?;
 
             // Build per-layer overrides for ALL quantized tensors so that the
@@ -740,6 +774,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 quant_group_size,
                 &quant_mode,
                 &*predicate,
+                embed_quantizable,
             )?;
         } else {
             // No recipe: --q-mxfp overrides the global mode + group_size so the
@@ -767,6 +802,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 quant_bits,
                 effective_gs,
                 &effective_mode,
+                embed_quantizable,
             )?;
             if !per_layer_overrides.is_empty() {
                 info!(
@@ -916,7 +952,17 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
 }
 
 /// Determine whether a weight key should be quantized.
-fn should_quantize(key: &str) -> bool {
+///
+/// `embed_quantizable` opts the model family INTO quantizing the token
+/// embedding (`embed_tokens` / `embedding.`). This is `true` ONLY for
+/// lfm2/lfm2_moe, whose `nn::Embedding` now installs a PACKED-quantized backend
+/// (`load_quantized_packed`) that gather-then-dequantizes on lookup and runs a
+/// quantized matmul for the tied head — so the embedding can be quantized for
+/// real memory savings. For every other family (qwen3_5, gemma4, …) it is
+/// `false` and the embedding is skipped, preserving the prior behavior. A TIED
+/// `lm_head` is always excluded (it is dropped at sanitize time) — the
+/// `lm_head` skip below is unconditional.
+fn should_quantize(key: &str, embed_quantizable: bool) -> bool {
     // Only .weight keys (not .scales, .biases, etc.)
     if !key.ends_with(".weight") {
         return false;
@@ -927,8 +973,17 @@ fn should_quantize(key: &str) -> bool {
         return false;
     }
 
-    // Exclude embeddings and lm_head (output projection shares vocab dimension)
-    if key.contains("embed_tokens") || key.contains("embedding.") || key.contains("lm_head") {
+    // lm_head (output head) is ALWAYS excluded — for tied models it is dropped
+    // at sanitize, for untied models it shares the vocab dimension and loads
+    // through an affine-only head loader.
+    if key.contains("lm_head") {
+        return false;
+    }
+
+    // Token embeddings: excluded by default (vocab-dim tensor). lfm2/lfm2_moe
+    // opt in via `embed_quantizable` — their packed embedding backend handles
+    // a quantized table (gather-dequant lookup + quantized tied-head matmul).
+    if !embed_quantizable && (key.contains("embed_tokens") || key.contains("embedding.")) {
         return false;
     }
 
@@ -939,6 +994,16 @@ fn should_quantize(key: &str) -> bool {
 
     // Exclude conv1d (not a standard matmul shape)
     if key.contains("conv1d") {
+        return false;
+    }
+
+    // Exclude LFM2's depthwise short conv (`*.conv.conv.weight`, shape
+    // [channels, kernel, 1] after the sanitizer transpose). The lfm2 loader
+    // NEVER quantizes this tensor — it routes it through the dedicated bf16
+    // `set_conv_weight` setter. Belt-and-braces over the `last_dim % group_size`
+    // guard below (last dim is 1, which already fails divisibility), so a future
+    // group_size of 1 can never sneak it into the affine quantizer.
+    if key.ends_with("conv.conv.weight") {
         return false;
     }
 
@@ -964,6 +1029,11 @@ fn is_router_gate(key: &str) -> bool {
     // Naming differs across model families:
     // - Qwen3.x MoE: `.mlp.gate.weight`, `.mlp.shared_expert_gate.weight`
     // - Gemma4 MoE: `.mlp.router.proj.weight` (also affine-only at load)
+    // - LFM2 MoE: `.feed_forward.gate.weight` — the per-layer router that
+    //   selects top-K experts. The lfm2 loader resolves its quant params via a
+    //   direct `feed_forward.gate` override lookup (`build_lfm2_gate_ql`), so it
+    //   must receive the explicit 8-bit affine override rather than the low-bit
+    //   default; otherwise routing noise destroys generation quality.
     //
     // Note: `router.proj` is *also* listed in `is_affine_only_key` so the
     // load path refuses non-affine modes. Matching it here as well ensures
@@ -974,6 +1044,7 @@ fn is_router_gate(key: &str) -> bool {
     stripped.ends_with(".mlp.gate")
         || stripped.ends_with(".shared_expert_gate")
         || stripped.ends_with(".router.proj")
+        || stripped.ends_with(".feed_forward.gate")
 }
 
 /// Check if a key is loaded through an affine-only dequantization path and
@@ -1234,7 +1305,7 @@ pub(crate) fn build_recipe_predicate(
         }
 
         // Non-quantizable weights are skipped
-        if !should_quantize(key) {
+        if !should_quantize(key, /* embed_quantizable */ false) {
             return QuantDecision::Skip;
         }
 
@@ -1292,7 +1363,7 @@ pub(crate) fn build_qwen35_recipe(
     let gs = default_group_size;
 
     Box::new(move |key: &str| -> QuantDecision {
-        if !should_quantize(key) {
+        if !should_quantize(key, /* embed_quantizable */ false) {
             return QuantDecision::Skip;
         }
 
@@ -1419,7 +1490,7 @@ pub(crate) fn build_unsloth_recipe(
             };
         }
 
-        if !should_quantize(key) {
+        if !should_quantize(key, /* embed_quantizable */ false) {
             return QuantDecision::Skip;
         }
 
@@ -1938,6 +2009,7 @@ fn quantize_weights_inner(
     default_group_size: i32,
     default_mode: &str,
     predicate: Option<&(dyn Fn(&str) -> QuantDecision + Send + Sync)>,
+    embed_quantizable: bool,
 ) -> Result<HashMap<String, serde_json::Value>> {
     use std::ffi::CString;
 
@@ -1956,11 +2028,47 @@ fn quantize_weights_inner(
     let mut entries: Vec<QuantEntry> = Vec::new();
 
     for key in weights.keys() {
+        // Guard against re-quantizing an ALREADY-quantized checkpoint. The
+        // normal flow is float (bf16/f16/f32) input with no quant sidecars, so
+        // both checks below are no-ops there. They only fire when a converted
+        // (already-quantized) checkpoint is fed back through `--quantize`.
+        //
+        // This loop is in its read-only PHASE 1 (collecting `entries`); the map
+        // is not mutated until the quantize phase below, so sidecar presence and
+        // dtype are tested against the pristine INPUT map.
+        if let Some(base) = key.strip_suffix(".weight") {
+            // (a) Skip if a quant sidecar already exists for this group. A
+            // packed/affine group carries `{base}.scales`; an FP8 group carries
+            // `{base}.weight_scale_inv`. Convert has no dequant-then-requant
+            // path, so re-quantizing here would double-quantize / corrupt.
+            if weights.contains_key(&format!("{base}.scales"))
+                || weights.contains_key(&format!("{base}.weight_scale_inv"))
+            {
+                info!(
+                    "skipping quantization of '{}': already quantized (sidecar present)",
+                    key
+                );
+                continue;
+            }
+            // (b) Skip if the source weight is not floating-point. `mlx_quantize`
+            // only accepts float inputs; a packed `Uint32` (affine/mxfp) or FP8
+            // `Uint8` weight would crash or be silently corrupted.
+            if let Some(array) = weights.get(key)
+                && let Ok(dt) = array.dtype()
+                && !matches!(dt, DType::Float32 | DType::Float16 | DType::BFloat16)
+            {
+                info!(
+                    "skipping quantization of '{}': non-float dtype {:?}",
+                    key, dt
+                );
+                continue;
+            }
+        }
         if let Some(pred) = predicate {
             match pred(key) {
                 QuantDecision::Skip => continue,
                 QuantDecision::Default => {
-                    if !should_quantize(key) {
+                    if !should_quantize(key, embed_quantizable) {
                         continue;
                     }
                     entries.push(QuantEntry {
@@ -1985,7 +2093,7 @@ fn quantize_weights_inner(
             }
         } else {
             // Legacy path: use should_quantize + is_router_gate
-            if !should_quantize(key) {
+            if !should_quantize(key, embed_quantizable) {
                 continue;
             }
             // Mirror `apply_mxfp_upgrade`'s exclusions for affine-only
@@ -2009,9 +2117,17 @@ fn quantize_weights_inner(
             //
             // `embed_tokens` matches both the top-level Gemma4 embedding
             // and the PLE `embed_tokens_per_layer` via substring.
+            //
+            // EXCEPTION (lfm2/lfm2_moe): when `embed_quantizable`, the lfm2
+            // PACKED embedding backend (`load_quantized_packed`) DOES support
+            // mxfp4/mxfp8/nvfp4 (mode threaded through gather-dequant +
+            // quantized matmul), so the embedding keys must NOT be force-
+            // downgraded to affine here — they keep the global non-affine mode.
             let is_non_affine_default =
                 default_mode == "mxfp4" || default_mode == "mxfp8" || default_mode == "nvfp4";
-            if is_non_affine_default && is_affine_only_key(key) {
+            let is_lfm2_packed_embed =
+                embed_quantizable && (key.contains("embed_tokens") || key.contains("embedding."));
+            if is_non_affine_default && is_affine_only_key(key) && !is_lfm2_packed_embed {
                 entries.push(QuantEntry {
                     key: key.clone(),
                     bits: 8,
@@ -2153,31 +2269,49 @@ fn quantize_weights(
     bits: i32,
     group_size: i32,
     mode: &str,
+    embed_quantizable: bool,
 ) -> Result<HashMap<String, serde_json::Value>> {
-    quantize_weights_inner(weights, bits, group_size, mode, None)
+    quantize_weights_inner(weights, bits, group_size, mode, None, embed_quantizable)
 }
 
 /// Public wrapper for quantize_weights, accessible from other crate modules (e.g., GGUF converter).
 /// Returns the per-layer override map; see `quantize_weights` for why this matters.
+///
+/// `embed_quantizable` gates quantizing the token embedding (lfm2/lfm2_moe only);
+/// see `should_quantize`. GGUF/other callers pass `false` to preserve the
+/// embedding-skip behavior.
 pub(crate) fn quantize_weights_pub(
     weights: &mut HashMap<String, MxArray>,
     bits: i32,
     group_size: i32,
     mode: &str,
+    embed_quantizable: bool,
 ) -> Result<HashMap<String, serde_json::Value>> {
-    quantize_weights(weights, bits, group_size, mode)
+    quantize_weights(weights, bits, group_size, mode, embed_quantizable)
 }
 
 /// Quantize weights with a recipe predicate, returning per-layer overrides.
 /// Used by GGUF converter and convert_model when a recipe is specified.
+///
+/// `embed_quantizable` only affects the predicate's `Default` fall-through and
+/// the legacy `is_affine_only_key` force (lfm2/lfm2_moe opt-in); a recipe that
+/// emits explicit `Custom`/`Skip` decisions for the embedding is unaffected.
 pub(crate) fn quantize_weights_with_recipe_pub(
     weights: &mut HashMap<String, MxArray>,
     bits: i32,
     group_size: i32,
     mode: &str,
     predicate: &(dyn Fn(&str) -> QuantDecision + Send + Sync),
+    embed_quantizable: bool,
 ) -> Result<HashMap<String, serde_json::Value>> {
-    quantize_weights_inner(weights, bits, group_size, mode, Some(predicate))
+    quantize_weights_inner(
+        weights,
+        bits,
+        group_size,
+        mode,
+        Some(predicate),
+        embed_quantizable,
+    )
 }
 
 /// FP8 E4M3 block-wise dequantization: weight * scale_inv with block_size=128
@@ -2675,6 +2809,314 @@ fn sanitize_qwen35_moe(
     }
 
     info!("  After sanitization: {} tensors", new_weights.len());
+
+    Ok(new_weights)
+}
+
+/// Sanitize an LFM2 / LFM2-MoE HuggingFace checkpoint into the exact on-disk
+/// layout the lfm2 loader (`models::lfm2::persistence::sanitize_weights`) reads.
+///
+/// INVERSE-CONSISTENCY with the loader is the contract here. The loader STRIPS
+/// the `model.` prefix on read, applies the SAME MLP rename, the SAME conv
+/// transpose, and the SAME expert stacking. So this converter must:
+///
+/// - KEEP the on-disk `model.` prefix (do NOT re-prefix to
+///   `language_model.model.*` — that is qwen3_5_moe-specific and would break
+///   the lfm2 loader's `strip_prefix("model.")`).
+/// - Rename `feed_forward.{w1,w2,w3}` -> `{gate_proj,down_proj,up_proj}` (covers
+///   both dense `feed_forward.wN` and per-expert `experts.{e}.wN`).
+/// - Transpose the depthwise short conv `*.conv.conv.weight` from
+///   `[channels, 1, kernel]` to `[channels, kernel, 1]` (shape[-1] > shape[1]).
+/// - Stack per-expert projections into
+///   `feed_forward.switch_mlp.{proj}.weight` of shape `[num_experts, out, in]`
+///   for every MoE layer (`num_dense_layers..num_hidden_layers`).
+/// - Keep `feed_forward.expert_bias` (f32) untouched and EXCLUDE it from the
+///   f32->target dtype cast.
+/// - Drop `lm_head.weight` when embeddings are tied.
+/// - Cast remaining f32 tensors to `target_dtype`, skipping quantized groups
+///   (`.weight`/`.scales`/`.biases`) and `expert_bias`.
+///
+/// Dense `lfm2` (no `num_experts`) takes the same path minus expert stacking —
+/// every layer's `feed_forward` is dense `{gate,up,down}_proj` after the rename.
+///
+/// Note: this runs BEFORE the generic quantize pass. The lfm2 affine-only gate
+/// upstream guarantees only affine quantization reaches that pass.
+fn sanitize_lfm2_moe(
+    weights: HashMap<String, MxArray>,
+    config: &serde_json::Value,
+    target_dtype_str: &str,
+    tie_word_embeddings: bool,
+) -> Result<HashMap<String, MxArray>> {
+    let target_dtype = match target_dtype_str {
+        "float32" | "f32" => DType::Float32,
+        "float16" | "f16" => DType::Float16,
+        "bfloat16" | "bf16" => DType::BFloat16,
+        other => {
+            warn!("Unknown target dtype '{}', defaulting to bfloat16", other);
+            DType::BFloat16
+        }
+    };
+
+    // LFM2 has no `text_config` nesting — every field is top-level.
+    let num_hidden_layers = config
+        .get("num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    // `num_experts` absent => dense `lfm2` (no expert stacking).
+    let num_experts = config
+        .get("num_experts")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let num_dense_layers = config
+        .get("num_dense_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    info!(
+        "  lfm2 sanitize: num_hidden_layers={}, num_dense_layers={}, num_experts={:?}, target_dtype={:?}",
+        num_hidden_layers, num_dense_layers, num_experts, target_dtype
+    );
+
+    // Step 1: key rename + conv transpose + lm_head drop. KEEP the `model.`
+    // prefix; the loader strips it on read.
+    let mut new_weights: HashMap<String, MxArray> = HashMap::new();
+    for (key, value) in weights.into_iter() {
+        // Drop the tied output head — the loader reuses embed_tokens via
+        // `as_linear()`. (Generic pass already drops it, but a non-tied caller
+        // may still ship one we must keep; only drop when tied.)
+        if key.ends_with("lm_head.weight") && tie_word_embeddings {
+            continue;
+        }
+
+        // Conv transpose: `*.conv.conv.weight` where shape[-1] > shape[1] is the
+        // HF `[channels, 1, kernel]` layout; transpose to `[channels, kernel, 1]`.
+        // Mirrors lfm2 loader `sanitize_weights`.
+        let value = if key.ends_with("conv.conv.weight") {
+            let ndim = value.ndim().unwrap_or(0);
+            if ndim == 3 {
+                let dim1 = value.shape_at(1).unwrap_or(0);
+                let dim2 = value.shape_at(2).unwrap_or(0);
+                if dim2 > dim1 {
+                    value.transpose(Some(&[0, 2, 1]))?
+                } else {
+                    value
+                }
+            } else {
+                value
+            }
+        } else {
+            value
+        };
+
+        // MLP rename scoped to `feed_forward.*` so it catches both dense
+        // (`feed_forward.wN.weight`) and expert (`experts.{e}.wN.weight`) keys
+        // without disturbing unrelated tensors. Renames ALL affine-quant group
+        // suffixes — `.weight`, `.scales`, AND `.biases` — to mirror the loader's
+        // `sanitize_weights`: a pre-quantized affine HF source ships
+        // `feed_forward.wN.{scales,biases}` companions that would otherwise be
+        // left orphaned under `wN.*` and rejected/misclassified by the loader.
+        let new_key = if key.contains("feed_forward") {
+            key.replace("w1.weight", "gate_proj.weight")
+                .replace("w1.scales", "gate_proj.scales")
+                .replace("w1.biases", "gate_proj.biases")
+                .replace("w2.weight", "down_proj.weight")
+                .replace("w2.scales", "down_proj.scales")
+                .replace("w2.biases", "down_proj.biases")
+                .replace("w3.weight", "up_proj.weight")
+                .replace("w3.scales", "up_proj.scales")
+                .replace("w3.biases", "up_proj.biases")
+        } else {
+            key
+        };
+
+        new_weights.insert(new_key, value);
+    }
+
+    // Reject pre-quantized per-expert MoE sources (AFFINE *and* FP8): only the
+    // per-expert `.weight` is stacked into `switch_mlp.*.weight` (Step 2); the
+    // matching quant sidecars are NOT stacked and would be left orphaned under
+    // `experts.{e}.*`, producing a non-loadable checkpoint (Step 3's float-only
+    // guard correctly skips the non-float packed/FP8 `.weight`, so the output
+    // would carry a raw quantized `switch_mlp.*.weight` with orphaned per-expert
+    // sidecars → silent corrupted inference). Fail loud instead — this converter
+    // takes an UNQUANTIZED checkpoint and quantizes it; per-expert pre-quantized
+    // input is unsupported. The sidecar suffixes covered:
+    //   * affine: `.scales` / `.biases`
+    //   * FP8:    `.weight_scale_inv` (the loader's FP8 scale sidecar; Step-1's
+    //             substring rename rewrites `wN.weight_scale_inv` →
+    //             `{proj}.weight_scale_inv` because `wN.weight` is a substring).
+    // Scoped to `feed_forward.experts.*` so it does NOT reject: (a) unquantized
+    // sources (no such sidecars), (b) already-STACKED quantized sources
+    // (`switch_mlp.*.{scales,weight_scale_inv}`, no `experts.`), or (c) dense
+    // (non-expert) FP8/affine (`feed_forward.{gate,up,down}_proj.*`, no
+    // `experts.`).
+    if let Some(bad) = new_weights.keys().find(|k| {
+        k.contains("feed_forward.experts.")
+            && (k.ends_with(".scales")
+                || k.ends_with(".biases")
+                || k.ends_with(".weight_scale_inv"))
+    }) {
+        return Err(Error::from_reason(format!(
+            "lfm2 convert: pre-quantized per-expert MoE source is unsupported \
+             (found '{bad}'); convert from an unquantized checkpoint instead"
+        )));
+    }
+
+    // Step 2: stack per-expert projections for every MoE layer. Byte-identical
+    // to the loader's stacking (`mx.stack` over axis 0 ->
+    // `[num_experts, out, in]`). Skipped entirely for dense `lfm2`.
+    if let Some(num_experts) = num_experts {
+        for l in num_dense_layers..num_hidden_layers {
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                let key0 = format!("model.layers.{l}.feed_forward.experts.0.{proj}.weight");
+                if !new_weights.contains_key(&key0) {
+                    continue;
+                }
+                let mut arrs = Vec::with_capacity(num_experts);
+                for e in 0..num_experts {
+                    let kk = format!("model.layers.{l}.feed_forward.experts.{e}.{proj}.weight");
+                    let a = new_weights.remove(&kk).ok_or_else(|| {
+                        Error::from_reason(format!("lfm2: missing expert weight {kk}"))
+                    })?;
+                    // Root-cause backstop for ALL pre-quantized per-expert sources:
+                    // the corruption is *any non-float expert weight reaching the
+                    // stack* (it would be packed into `switch_mlp.*.weight` with no
+                    // `.scales`, then loaded as plain bf16 → garbage). The name-based
+                    // sidecar reject above catches affine/FP8 sources that ship a
+                    // recognized sidecar; this dtype guard also catches a packed
+                    // weight that arrives WITHOUT any sidecar (e.g. `wN.weight` as
+                    // `Uint32`/`Uint8`). A genuine unquantized source is always
+                    // float here, so this never rejects a supported input.
+                    let dt = a.dtype()?;
+                    if !matches!(dt, DType::Float32 | DType::Float16 | DType::BFloat16) {
+                        return Err(Error::from_reason(format!(
+                            "lfm2 convert: pre-quantized per-expert MoE source is unsupported \
+                             (expert weight '{kk}' has non-float dtype {dt:?}); convert from an \
+                             unquantized checkpoint instead"
+                        )));
+                    }
+                    arrs.push(a);
+                }
+                let refs: Vec<&MxArray> = arrs.iter().collect();
+                let stacked = MxArray::stack(refs, Some(0))?; // [num_experts, out, in]
+                new_weights.insert(
+                    format!("model.layers.{l}.feed_forward.switch_mlp.{proj}.weight"),
+                    stacked,
+                );
+            }
+        }
+    }
+
+    info!(
+        "  After lfm2 rename + expert stacking: {} tensors",
+        new_weights.len()
+    );
+
+    // Step 3: cast every remaining FLOATING-POINT tensor whose dtype differs
+    // from the target to `target_dtype` (so a bf16/f16 source still honors
+    // `--dtype`, not just f32). The cast is float-precision conversion ONLY: it
+    // NEVER touches packed/integer quant data (packed `Uint32` weights, integer
+    // tensors) — those are left in place unchanged. EXCLUDE `expert_bias`
+    // (loader keeps it f32 per `cast_predicate`) and skip any quantized tensor
+    // groups (none exist on this path, but mirror `sanitize_qwen35_moe` for
+    // safety against a pre-quantized source).
+    let quantized_bases: std::collections::HashSet<String> = new_weights
+        .keys()
+        .filter(|k| k.ends_with(".scales"))
+        .map(|k| k.strip_suffix(".scales").unwrap_or(k.as_str()).to_string())
+        .collect();
+    let keys: Vec<String> = new_weights.keys().cloned().collect();
+    for k in keys {
+        if k.ends_with(".expert_bias") {
+            continue;
+        }
+        if k.ends_with(".scales") || k.ends_with(".biases") {
+            continue;
+        }
+        if let Some(base) = k.strip_suffix(".weight")
+            && quantized_bases.contains(base)
+        {
+            continue; // packed quantized weight — leave as-is
+        }
+        let v = new_weights
+            .get(&k)
+            .ok_or_else(|| Error::from_reason(format!("lfm2: tensor {k} vanished during cast")))?;
+        // Cast ONLY floating-point tensors whose dtype differs from the target.
+        // `target_dtype` is always Float32/Float16/BFloat16 (see match above).
+        // Non-float tensors (packed `Uint32` quant weights, integer tensors) are
+        // never `astype`d — casting them would corrupt the packed bit layout.
+        let dt = v.dtype()?;
+        if matches!(dt, DType::Float32 | DType::Float16 | DType::BFloat16) && dt != target_dtype {
+            let converted = v.astype(target_dtype)?;
+            new_weights.insert(k, converted);
+        }
+    }
+
+    // Final invariant (root-cause backstop): the converter must NEVER emit a
+    // non-float `.weight` that the loader would misread. The loader classifies
+    // quantization by sidecar presence, so a non-float weight is acceptable ONLY
+    // if it is BOTH (a) a quantizable tensor class AND (b) carries its quant
+    // sidecar. The earlier per-expert guards (name-based reject + the dtype check
+    // in Step 2) already fail loud on per-expert pre-quantized sources; this is
+    // the comprehensive backstop for the DENSE (non-expert) analog and any
+    // residual.
+    //   * (a) Quantizability is base-aware: the depthwise short conv
+    //     (`conv.conv.weight`) is the one LFM2 `.weight` the loader NEVER
+    //     dequantizes — it is always cloned into a dense `Conv1d` via
+    //     `set_conv_weight` (cf. `should_quantize` excludes it; test
+    //     `lfm2_depthwise_conv_not_quantized`). A non-float conv weight is
+    //     therefore corrupt regardless of any sidecar and must be rejected.
+    //   * (b) Every other non-float weight must keep its `{base}.scales`
+    //     (affine/MXFP/NVFP) or `{base}.weight_scale_inv` (FP8) companion; a
+    //     valid already-quantized tensor passes, a packed weight with no sidecar
+    //     is rejected instead of silently corrupting.
+    let weight_keys: Vec<String> = new_weights
+        .keys()
+        .filter(|k| k.ends_with(".weight"))
+        .cloned()
+        .collect();
+    for k in &weight_keys {
+        let base = k.strip_suffix(".weight").unwrap_or(k);
+        let Some(v) = new_weights.get(k) else {
+            continue;
+        };
+        let dt = v.dtype()?;
+        if matches!(dt, DType::Float32 | DType::Float16 | DType::BFloat16) {
+            continue;
+        }
+        // (a) Always-dense tensor classes must never be non-float, sidecar or
+        // not — the loader has NO quantized path for them (it always loads a plain
+        // float tensor), so a non-float value corrupts regardless of any sidecar.
+        // Exhaustively verified against the loader, exactly two classes:
+        //   * the depthwise short conv `conv.conv.weight` (loaded dense via
+        //     `set_conv_weight`; never quantized);
+        //   * EVERY RMSNorm/LayerNorm weight — all end with `norm.weight`
+        //     (embedding_norm, the final `norm`, per-layer operator_norm/ffn_norm,
+        //     and attn q_layernorm/k_layernorm), loaded via dense norm setters.
+        // No quantizable weight ends with either suffix (linears end in
+        // `_proj.weight`/`gate.weight`, embeddings in `tokens.weight`, and the
+        // affine-capable `lm_head.weight` is handled by (b) via its sidecar), so
+        // this never over-rejects a legitimately-quantized tensor.
+        if k.ends_with("conv.conv.weight") || k.ends_with("norm.weight") {
+            return Err(Error::from_reason(format!(
+                "lfm2 convert: non-float weight '{k}' ({dt:?}) on an always-dense \
+                 tensor class (depthwise conv / RMSNorm) — these are never \
+                 quantized; convert from an unquantized checkpoint instead"
+            )));
+        }
+        // (b) Any other non-float weight must carry its quant sidecar.
+        if !new_weights.contains_key(&format!("{base}.scales"))
+            && !new_weights.contains_key(&format!("{base}.weight_scale_inv"))
+        {
+            return Err(Error::from_reason(format!(
+                "lfm2 convert: non-float weight '{k}' ({dt:?}) has no quant sidecar \
+                 (.scales / .weight_scale_inv) — pre-quantized source is unsupported; \
+                 convert from an unquantized checkpoint instead"
+            )));
+        }
+    }
+
+    info!("  After lfm2 sanitization: {} tensors", new_weights.len());
 
     Ok(new_weights)
 }
@@ -4177,6 +4619,101 @@ mod tests {
     }
 
     #[test]
+    fn quantize_skips_already_quantized_group() {
+        // Regression: feeding an ALREADY-quantized checkpoint back through
+        // `--quantize` must NOT re-quantize the packed `.weight` (would crash in
+        // `mlx_quantize` or double-quantize / corrupt). The shared quantizer
+        // (`quantize_weights_inner`) must SKIP any `.weight` that already carries
+        // a quant sidecar (`{base}.scales` / `{base}.weight_scale_inv`) or whose
+        // dtype is non-float, carrying it through UNCHANGED.
+
+        let h = 64i64; // group_size 64 → packed last dim must be divisible by it
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+
+        // (1) An already-quantized affine group: packed `Uint32` `.weight` of
+        // shape [out, packed]. Both dims chosen so the shape/divisibility gate
+        // would otherwise ACCEPT it — proving the SKIP fires in the new guard,
+        // not as an unrelated shape rejection. Distinct values prove identity.
+        let out = 8i64;
+        let packed = h; // 64, divisible by group_size 64
+        let packed_key = "model.layers.1.feed_forward.switch_mlp.gate_proj.weight";
+        let scales_key = "model.layers.1.feed_forward.switch_mlp.gate_proj.scales";
+        let packed_data: Vec<u32> = (0..(out * packed) as u32).collect();
+        weights.insert(
+            packed_key.into(),
+            MxArray::from_uint32(&packed_data, &[out, packed]).expect("from_uint32 packed"),
+        );
+        // group_size 64 over last dim 64 → 1 group per row.
+        weights.insert(scales_key.into(), lfm2_bf16(&[out, 1], 0.5));
+
+        // Snapshot the packed input bytes for an identity assertion afterwards.
+        let input_packed: Vec<u32> = weights
+            .get(packed_key)
+            .unwrap()
+            .to_uint32()
+            .unwrap()
+            .to_vec();
+
+        // (2) Positive control: a NORMAL float weight in the SAME map with NO
+        // sidecar MUST still be quantized — proving the guard is targeted, not a
+        // global disable. `should_quantize` accepts this key.
+        let float_key = "model.layers.1.feed_forward.switch_mlp.up_proj.weight";
+        weights.insert(float_key.into(), lfm2_bf16(&[out, h], 0.02));
+        assert!(
+            should_quantize(float_key, false),
+            "positive-control weight must be quantize-eligible"
+        );
+
+        // Drive the actual quantize loop. Must SUCCEED (no crash/error).
+        let overrides = quantize_weights(&mut weights, 4, 64, "affine", false)
+            .expect("quantize must not crash on an already-quantized group");
+
+        // The already-quantized packed weight is byte/dtype-identical (NOT
+        // re-quantized) and its scales sidecar is preserved.
+        let out_weight = weights
+            .get(packed_key)
+            .expect("packed weight must remain in output map");
+        assert_eq!(
+            out_weight.dtype().unwrap(),
+            DType::Uint32,
+            "skipped packed weight must stay Uint32 (not re-quantized)"
+        );
+        let out_packed: Vec<u32> = out_weight.to_uint32().unwrap().to_vec();
+        assert_eq!(
+            out_packed, input_packed,
+            "skipped packed weight must be byte-identical to the input"
+        );
+        assert!(
+            weights.contains_key(scales_key),
+            "pre-existing scales sidecar must be preserved"
+        );
+        // The skip must NOT have inserted a fresh affine `.biases` for this group.
+        let gate_biases_key = "model.layers.1.feed_forward.switch_mlp.gate_proj.biases";
+        assert!(
+            !weights.contains_key(gate_biases_key),
+            "skipped group must not gain a new biases sidecar"
+        );
+
+        // Positive control: the float weight WAS quantized (now Uint32 packed,
+        // with fresh `.scales` companion).
+        let q_float = weights
+            .get(float_key)
+            .expect("float weight must remain in output map");
+        assert_eq!(
+            q_float.dtype().unwrap(),
+            DType::Uint32,
+            "float control weight must have been quantized to packed Uint32"
+        );
+        assert!(
+            weights.contains_key("model.layers.1.feed_forward.switch_mlp.up_proj.scales"),
+            "float control weight must gain a fresh scales sidecar"
+        );
+
+        // The default 4-bit affine control needs no per-layer override.
+        let _ = overrides;
+    }
+
+    #[test]
     fn nvfp4_quantize_roundtrip_is_close_to_original() {
         // NVFP4 is lossy (4 bits, group_size 16) so use loose tolerance.
         // Round-trip: quantize -> dequantize -> compare to original.
@@ -4306,5 +4843,594 @@ mod tests {
             "expected MXFP8 error to be much larger than affine 8-bit on router-gate-shaped tensor; \
              got mxfp8={err_mxfp8}, affine8={err_affine}"
         );
+    }
+
+    // ── LFM2 convert sanitizer ──────────────────────────────────────────────
+
+    /// bf16 array filled with `fill`, shaped as given.
+    fn lfm2_bf16(shape: &[i64], fill: f32) -> MxArray {
+        let n: i64 = shape.iter().product();
+        let data: Vec<f32> = vec![fill; n.max(0) as usize];
+        MxArray::from_float32(&data, shape)
+            .expect("from_float32")
+            .astype(DType::BFloat16)
+            .expect("astype bf16")
+    }
+
+    /// f32 array filled with `fill` (for `expert_bias`).
+    fn lfm2_f32(shape: &[i64], fill: f32) -> MxArray {
+        let n: i64 = shape.iter().product();
+        let data: Vec<f32> = vec![fill; n.max(0) as usize];
+        MxArray::from_float32(&data, shape).expect("from_float32")
+    }
+
+    /// Tiny LFM2-MoE config: 3 layers, 1 dense + 2 MoE, 4 experts. Conv layer 0
+    /// (dense), MoE layers 1 and 2.
+    fn lfm2_moe_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "lfm2_moe",
+            "num_hidden_layers": 3,
+            "num_dense_layers": 1,
+            "num_experts": 4,
+            "tie_word_embeddings": true,
+        })
+    }
+
+    /// Build a small HF-style LFM2-MoE param map (keys carry the `model.` prefix
+    /// exactly as on disk). Layer 0 dense, layers 1-2 MoE.
+    fn lfm2_moe_hf_params() -> HashMap<String, MxArray> {
+        let h = 4i64;
+        let inter = 8i64; // dense intermediate
+        let moe_inter = 6i64; // expert intermediate
+        let experts = 4i64;
+
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        p.insert(
+            "model.embed_tokens.weight".into(),
+            lfm2_bf16(&[16, h], 0.01),
+        );
+        p.insert("model.embedding_norm.weight".into(), lfm2_bf16(&[h], 1.0));
+        // Tied output head present on disk — must be dropped.
+        p.insert("lm_head.weight".into(), lfm2_bf16(&[16, h], 0.01));
+
+        // Layer 0: dense conv layer.
+        p.insert(
+            "model.layers.0.operator_norm.weight".into(),
+            lfm2_bf16(&[h], 1.0),
+        );
+        p.insert(
+            "model.layers.0.ffn_norm.weight".into(),
+            lfm2_bf16(&[h], 1.0),
+        );
+        // HF conv weight: [channels, 1, kernel] -> must transpose to [channels, kernel, 1].
+        p.insert(
+            "model.layers.0.conv.conv.weight".into(),
+            lfm2_bf16(&[h, 1, 3], 0.5),
+        );
+        p.insert(
+            "model.layers.0.conv.in_proj.weight".into(),
+            lfm2_bf16(&[3 * h, h], 0.1),
+        );
+        p.insert(
+            "model.layers.0.conv.out_proj.weight".into(),
+            lfm2_bf16(&[h, h], 0.1),
+        );
+        // Dense feed-forward w1/w2/w3 -> gate/down/up.
+        p.insert(
+            "model.layers.0.feed_forward.w1.weight".into(),
+            lfm2_bf16(&[inter, h], 0.1),
+        );
+        p.insert(
+            "model.layers.0.feed_forward.w2.weight".into(),
+            lfm2_bf16(&[h, inter], 0.1),
+        );
+        p.insert(
+            "model.layers.0.feed_forward.w3.weight".into(),
+            lfm2_bf16(&[inter, h], 0.1),
+        );
+
+        // Layers 1 + 2: MoE (one conv-ish + one attention; operator type is
+        // irrelevant to the sanitizer — only the feed_forward matters here).
+        for l in 1..=2 {
+            let pre = format!("model.layers.{l}");
+            p.insert(format!("{pre}.operator_norm.weight"), lfm2_bf16(&[h], 1.0));
+            p.insert(format!("{pre}.ffn_norm.weight"), lfm2_bf16(&[h], 1.0));
+            // Router gate + expert bias (f32, must stay f32).
+            p.insert(
+                format!("{pre}.feed_forward.gate.weight"),
+                lfm2_bf16(&[experts, h], 0.05),
+            );
+            p.insert(
+                format!("{pre}.feed_forward.expert_bias"),
+                lfm2_f32(&[experts], 0.0),
+            );
+            for e in 0..experts {
+                p.insert(
+                    format!("{pre}.feed_forward.experts.{e}.w1.weight"),
+                    lfm2_bf16(&[moe_inter, h], 0.1),
+                );
+                p.insert(
+                    format!("{pre}.feed_forward.experts.{e}.w2.weight"),
+                    lfm2_bf16(&[h, moe_inter], 0.1),
+                );
+                p.insert(
+                    format!("{pre}.feed_forward.experts.{e}.w3.weight"),
+                    lfm2_bf16(&[moe_inter, h], 0.1),
+                );
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn lfm2_sanitize_produces_loader_consistent_keys() {
+        let cfg = lfm2_moe_config();
+        let out = sanitize_lfm2_moe(lfm2_moe_hf_params(), &cfg, "bfloat16", true)
+            .expect("sanitize_lfm2_moe");
+
+        // `model.` prefix KEPT (loader strips it on read).
+        assert!(out.contains_key("model.embed_tokens.weight"));
+        assert!(out.contains_key("model.embedding_norm.weight"));
+        // Must NOT re-prefix to `language_model.model.*`.
+        assert!(
+            !out.keys().any(|k| k.starts_with("language_model.")),
+            "lfm2 keys must not be re-prefixed with language_model.*: {:?}",
+            out.keys().collect::<Vec<_>>()
+        );
+
+        // lm_head dropped (tied).
+        assert!(!out.contains_key("lm_head.weight"));
+
+        // Dense layer 0: w1/w2/w3 renamed.
+        assert!(out.contains_key("model.layers.0.feed_forward.gate_proj.weight"));
+        assert!(out.contains_key("model.layers.0.feed_forward.down_proj.weight"));
+        assert!(out.contains_key("model.layers.0.feed_forward.up_proj.weight"));
+        assert!(!out.contains_key("model.layers.0.feed_forward.w1.weight"));
+        assert!(!out.contains_key("model.layers.0.feed_forward.w2.weight"));
+        assert!(!out.contains_key("model.layers.0.feed_forward.w3.weight"));
+
+        // Conv weight transposed [4,1,3] -> [4,3,1].
+        let conv = out
+            .get("model.layers.0.conv.conv.weight")
+            .expect("conv weight present");
+        let shape = conv.shape().expect("shape");
+        assert_eq!(
+            shape.to_vec(),
+            vec![4, 3, 1],
+            "conv weight must be transposed"
+        );
+
+        // MoE layers 1 + 2: experts stacked into switch_mlp.{proj} [E, out, in].
+        for l in 1..=2 {
+            let pre = format!("model.layers.{l}");
+            for (proj, out_dim, in_dim) in [
+                ("gate_proj", 6i64, 4i64),
+                ("up_proj", 6i64, 4i64),
+                ("down_proj", 4i64, 6i64),
+            ] {
+                let key = format!("{pre}.feed_forward.switch_mlp.{proj}.weight");
+                let stacked = out.get(&key).unwrap_or_else(|| panic!("missing {key}"));
+                let shape = stacked.shape().expect("shape");
+                assert_eq!(
+                    shape.to_vec(),
+                    vec![4, out_dim, in_dim],
+                    "{key} must be [num_experts, out, in]"
+                );
+            }
+            // Individual expert keys consumed.
+            assert!(
+                !out.keys()
+                    .any(|k| k.contains(&format!("layers.{l}.feed_forward.experts."))),
+                "individual expert keys for layer {l} must be consumed"
+            );
+            // Router gate preserved under `feed_forward.gate.weight`.
+            assert!(out.contains_key(&format!("{pre}.feed_forward.gate.weight")));
+            // expert_bias preserved AND still f32.
+            let bias = out
+                .get(&format!("{pre}.feed_forward.expert_bias"))
+                .expect("expert_bias present");
+            assert_eq!(
+                bias.dtype().expect("dtype"),
+                DType::Float32,
+                "expert_bias must stay f32"
+            );
+        }
+    }
+
+    #[test]
+    fn lfm2_sanitize_dense_has_no_expert_stacking() {
+        // Dense `lfm2` config: no `num_experts` -> no stacking, all feed_forward
+        // is dense {gate,up,down}_proj after the rename.
+        let cfg = serde_json::json!({
+            "model_type": "lfm2",
+            "num_hidden_layers": 1,
+            "num_dense_layers": 0,
+            "tie_word_embeddings": false,
+        });
+        let h = 4i64;
+        let inter = 8i64;
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        p.insert(
+            "model.embed_tokens.weight".into(),
+            lfm2_bf16(&[16, h], 0.01),
+        );
+        p.insert("model.embedding_norm.weight".into(), lfm2_bf16(&[h], 1.0));
+        p.insert(
+            "model.layers.0.feed_forward.w1.weight".into(),
+            lfm2_bf16(&[inter, h], 0.1),
+        );
+        p.insert(
+            "model.layers.0.feed_forward.w2.weight".into(),
+            lfm2_bf16(&[h, inter], 0.1),
+        );
+        p.insert(
+            "model.layers.0.feed_forward.w3.weight".into(),
+            lfm2_bf16(&[inter, h], 0.1),
+        );
+
+        let out = sanitize_lfm2_moe(p, &cfg, "bfloat16", false).expect("sanitize dense lfm2");
+        assert!(out.contains_key("model.layers.0.feed_forward.gate_proj.weight"));
+        assert!(out.contains_key("model.layers.0.feed_forward.up_proj.weight"));
+        assert!(out.contains_key("model.layers.0.feed_forward.down_proj.weight"));
+        assert!(
+            !out.keys().any(|k| k.contains("switch_mlp")),
+            "dense lfm2 must not produce switch_mlp keys"
+        );
+    }
+
+    #[test]
+    fn sanitize_lfm2_moe_rejects_per_expert_affine_quant_companions() {
+        // A PRE-QUANTIZED per-expert AFFINE source ships `.scales`/`.biases`
+        // companions next to a packed `Uint32` `.weight`. The converter only
+        // stacks `.weight` into `switch_mlp.*.weight`; the companions would be
+        // orphaned, so it MUST fail loud — never silently cast (which would
+        // corrupt the packed weight) and never produce a non-loadable map.
+        let cfg = lfm2_moe_config(); // 3 layers, 1 dense + 2 MoE, 4 experts.
+
+        let h = 4i64;
+        let moe_inter = 6i64;
+        let experts = 4i64;
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+
+        // Minimal non-expert tensors so the map is plausibly a real checkpoint.
+        p.insert(
+            "model.embed_tokens.weight".into(),
+            lfm2_bf16(&[16, h], 0.01),
+        );
+        p.insert("model.embedding_norm.weight".into(), lfm2_bf16(&[h], 1.0));
+
+        // MoE layer 1: per-expert AFFINE quant companions on `w1` (renamed to
+        // `gate_proj`). Packed `.weight` is `Uint32`; `.scales`/`.biases` are
+        // small float companions. The reject is key-name based and fires before
+        // any cast, so the exact dtypes/shapes here are only for realism.
+        let packed = (moe_inter * h / 8).max(1); // arbitrary small packed length
+        for e in 0..experts {
+            let pre = format!("model.layers.1.feed_forward.experts.{e}");
+            let packed_data: Vec<u32> = vec![0u32; packed as usize];
+            p.insert(
+                format!("{pre}.w1.weight"),
+                MxArray::from_uint32(&packed_data, &[packed]).expect("from_uint32 packed weight"),
+            );
+            p.insert(format!("{pre}.w1.scales"), lfm2_bf16(&[moe_inter, 1], 1.0));
+            p.insert(format!("{pre}.w1.biases"), lfm2_bf16(&[moe_inter, 1], 0.0));
+        }
+
+        let err = sanitize_lfm2_moe(p, &cfg, "bfloat16", true)
+            .err()
+            .expect("per-expert affine quant companions must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("per-expert MoE source is unsupported"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn sanitize_lfm2_moe_rejects_per_expert_fp8_companions() {
+        // A PRE-QUANTIZED per-expert FP8 source ships a `weight_scale_inv` scale
+        // sidecar (the loader's FP8 dequant key) next to a raw FP8/U8 `.weight`.
+        // The converter only stacks `.weight` into `switch_mlp.*.weight`; the
+        // `weight_scale_inv` companions would be left orphaned under
+        // `experts.{e}.*`, and Step 3's float-only guard would skip the non-float
+        // weight — producing a raw quantized `switch_mlp.*.weight` with orphaned
+        // per-expert scale sidecars (silent corrupted inference). It MUST fail
+        // loud. NB Step-1's substring rename rewrites `w1.weight_scale_inv` →
+        // `gate_proj.weight_scale_inv` (because `w1.weight` is a substring), so at
+        // the reject point the sidecar is `...gate_proj.weight_scale_inv`.
+        let cfg = lfm2_moe_config(); // 3 layers, 1 dense + 2 MoE, 4 experts.
+
+        let h = 4i64;
+        let moe_inter = 6i64;
+        let experts = 4i64;
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+
+        // Minimal non-expert tensors so the map is plausibly a real checkpoint.
+        p.insert(
+            "model.embed_tokens.weight".into(),
+            lfm2_bf16(&[16, h], 0.01),
+        );
+        p.insert("model.embedding_norm.weight".into(), lfm2_bf16(&[h], 1.0));
+
+        // MoE layer 1: per-expert FP8 companions on `w1` (renamed to
+        // `gate_proj`). The reject is key-name based and fires before any cast,
+        // so the exact dtypes/shapes here are only for realism: a tiny 1-D array
+        // whose length matches its element count avoids `from_*` panics.
+        let n = moe_inter * h; // weight element count
+        for e in 0..experts {
+            let pre = format!("model.layers.1.feed_forward.experts.{e}");
+            let weight_data: Vec<f32> = vec![0.0f32; n as usize];
+            p.insert(
+                format!("{pre}.w1.weight"),
+                MxArray::from_float32(&weight_data, &[n]).expect("from_float32 fp8 weight"),
+            );
+            // FP8 scale sidecar (`weight_scale_inv`). Tiny 1-D scale array.
+            p.insert(
+                format!("{pre}.w1.weight_scale_inv"),
+                lfm2_bf16(&[moe_inter], 1.0),
+            );
+        }
+
+        let err = sanitize_lfm2_moe(p, &cfg, "bfloat16", true)
+            .err()
+            .expect("per-expert fp8 quant companions must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("per-expert MoE source is unsupported"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn sanitize_lfm2_moe_rejects_per_expert_packed_weight_without_sidecar() {
+        // The hardest variant: a PRE-QUANTIZED per-expert source whose `.weight`
+        // is packed (`Uint32`/`Uint8`) but ships NO recognized sidecar
+        // (`.scales`/`.biases`/`weight_scale_inv`). The name-based reject can't see
+        // it, so the dtype guard inside the stacking loop must catch it — otherwise
+        // the raw packed weight would be stacked into `switch_mlp.*.weight` with no
+        // `.scales`, then loaded as a plain bf16 SwitchGLU weight → garbage.
+        let cfg = lfm2_moe_config(); // 3 layers, 1 dense + 2 MoE, 4 experts.
+
+        let h = 4i64;
+        let moe_inter = 6i64;
+        let experts = 4i64;
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+
+        p.insert(
+            "model.embed_tokens.weight".into(),
+            lfm2_bf16(&[16, h], 0.01),
+        );
+        p.insert("model.embedding_norm.weight".into(), lfm2_bf16(&[h], 1.0));
+
+        // MoE layer 1: per-expert packed `w1`/`w2`/`w3` weights (`Uint32`), no
+        // sidecars at all. A 1-D array whose length matches its element count
+        // avoids `from_*` panics; the dtype guard fires on the first expert.
+        let packed = (moe_inter * h / 8).max(1);
+        for e in 0..experts {
+            let pre = format!("model.layers.1.feed_forward.experts.{e}");
+            for w in ["w1", "w2", "w3"] {
+                let packed_data: Vec<u32> = vec![0u32; packed as usize];
+                p.insert(
+                    format!("{pre}.{w}.weight"),
+                    MxArray::from_uint32(&packed_data, &[packed])
+                        .expect("from_uint32 packed weight"),
+                );
+            }
+        }
+
+        let err = sanitize_lfm2_moe(p, &cfg, "bfloat16", true)
+            .err()
+            .expect("per-expert packed weight without sidecar must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("per-expert MoE source is unsupported"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn sanitize_lfm2_moe_rejects_dense_packed_weight_without_sidecar() {
+        // The DENSE (non-expert) analog of the per-expert no-sidecar case: a dense
+        // layer ships a packed `Uint32` `.weight` with no `.scales`. It is not
+        // touched by the per-expert guards (no `experts.`), so the final invariant
+        // guard must reject it — otherwise it would be saved as a packed weight
+        // with no sidecar and loaded as bf16 → garbage.
+        let cfg = lfm2_moe_config(); // layer 0 is dense (num_dense_layers = 1).
+
+        let h = 4i64;
+        let inter = 8i64;
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        p.insert(
+            "model.embed_tokens.weight".into(),
+            lfm2_bf16(&[16, h], 0.01),
+        );
+        p.insert("model.embedding_norm.weight".into(), lfm2_bf16(&[h], 1.0));
+
+        // Dense layer 0: packed `w1` (renamed to `gate_proj`), NO sidecar.
+        let packed = (inter * h / 8).max(1);
+        let packed_data: Vec<u32> = vec![0u32; packed as usize];
+        p.insert(
+            "model.layers.0.feed_forward.w1.weight".into(),
+            MxArray::from_uint32(&packed_data, &[packed]).expect("from_uint32 packed weight"),
+        );
+
+        let err = sanitize_lfm2_moe(p, &cfg, "bfloat16", true)
+            .err()
+            .expect("dense packed weight without sidecar must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("has no quant sidecar"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn sanitize_lfm2_moe_rejects_quantized_depthwise_conv() {
+        // The depthwise short conv is NEVER quantized — the loader always clones
+        // `conv.conv.weight` into a dense `Conv1d`. A malformed source that ships a
+        // non-float conv weight WITH a `.scales` sidecar would satisfy a naive
+        // sidecar-presence check yet load as a dense conv → garbage. The final
+        // invariant must reject it regardless of the sidecar (base-aware).
+        let cfg = lfm2_moe_config();
+
+        let h = 4i64;
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        p.insert(
+            "model.embed_tokens.weight".into(),
+            lfm2_bf16(&[16, h], 0.01),
+        );
+        p.insert("model.embedding_norm.weight".into(), lfm2_bf16(&[h], 1.0));
+
+        // Layer 0 depthwise conv: packed `Uint32` weight WITH a `.scales` sidecar.
+        let packed = 4i64;
+        let packed_data: Vec<u32> = vec![0u32; packed as usize];
+        p.insert(
+            "model.layers.0.conv.conv.weight".into(),
+            MxArray::from_uint32(&packed_data, &[packed]).expect("from_uint32 packed weight"),
+        );
+        p.insert(
+            "model.layers.0.conv.conv.scales".into(),
+            lfm2_bf16(&[h, 1], 1.0),
+        );
+
+        let err = sanitize_lfm2_moe(p, &cfg, "bfloat16", true)
+            .err()
+            .expect("quantized depthwise conv must be rejected even with a sidecar");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("always-dense"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn sanitize_lfm2_moe_rejects_quantized_norm_weight() {
+        // Norm weights (RMSNorm/LayerNorm) are ALWAYS loaded dense — the loader has
+        // no quantized path for any `*norm.weight`. A malformed source that ships a
+        // non-float norm weight WITH a `.scales` sidecar would satisfy a naive
+        // sidecar check yet load as a dense norm → garbage. The base-aware
+        // invariant must reject every `*norm.weight` non-float value, sidecar or
+        // not. (`embedding_norm` here; per-layer operator_norm/ffn_norm/q_layernorm/
+        // k_layernorm and the final `norm` share the `norm.weight` suffix.)
+        let cfg = lfm2_moe_config();
+
+        let h = 4i64;
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        p.insert(
+            "model.embed_tokens.weight".into(),
+            lfm2_bf16(&[16, h], 0.01),
+        );
+
+        // embedding_norm: packed `Uint32` weight WITH a `.scales` sidecar.
+        let packed = 4i64;
+        let packed_data: Vec<u32> = vec![0u32; packed as usize];
+        p.insert(
+            "model.embedding_norm.weight".into(),
+            MxArray::from_uint32(&packed_data, &[packed]).expect("from_uint32 packed weight"),
+        );
+        p.insert(
+            "model.embedding_norm.scales".into(),
+            lfm2_bf16(&[h, 1], 1.0),
+        );
+
+        let err = sanitize_lfm2_moe(p, &cfg, "bfloat16", true)
+            .err()
+            .expect("quantized norm weight must be rejected even with a sidecar");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("always-dense"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn sanitize_lfm2_moe_keeps_already_stacked_quant_group() {
+        // The final invariant guard must NOT over-reject a legitimately quantized
+        // tensor: an already-STACKED affine quant group (`switch_mlp.*.weight`
+        // packed `Uint32` + matching `switch_mlp.*.scales`) carries its sidecar, so
+        // it passes through untouched (no `experts.` → no stacking; `.scales`
+        // present → Step-3 skips the cast; sidecar present → final guard passes).
+        let cfg = lfm2_moe_config();
+
+        let h = 4i64;
+        let moe_inter = 6i64;
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        p.insert(
+            "model.embed_tokens.weight".into(),
+            lfm2_bf16(&[16, h], 0.01),
+        );
+        p.insert("model.embedding_norm.weight".into(), lfm2_bf16(&[h], 1.0));
+
+        // MoE layer 1: already-stacked affine quant group with sidecar.
+        let packed = (moe_inter * h / 8).max(1);
+        let packed_data: Vec<u32> = vec![0u32; packed as usize];
+        let base = "model.layers.1.feed_forward.switch_mlp.gate_proj";
+        p.insert(
+            format!("{base}.weight"),
+            MxArray::from_uint32(&packed_data, &[packed]).expect("from_uint32 packed weight"),
+        );
+        p.insert(format!("{base}.scales"), lfm2_bf16(&[moe_inter, 1], 1.0));
+
+        let out = sanitize_lfm2_moe(p, &cfg, "bfloat16", true)
+            .expect("already-stacked quant group must pass");
+        assert!(out.contains_key(&format!("{base}.weight")));
+        assert!(out.contains_key(&format!("{base}.scales")));
+    }
+
+    #[test]
+    fn lfm2_router_gate_is_router_gate() {
+        // The lfm2 router (`feed_forward.gate`) MUST be treated as a router gate
+        // so it routes to the 8-bit affine branch.
+        assert!(is_router_gate(
+            "language_model.model.layers.5.feed_forward.gate.weight"
+        ));
+        assert!(is_router_gate("model.layers.5.feed_forward.gate.weight"));
+        // Sanity: qwen-style gates still match.
+        assert!(is_router_gate("model.layers.0.mlp.gate.weight"));
+    }
+
+    #[test]
+    fn lfm2_depthwise_conv_not_quantized() {
+        // The depthwise short conv must never be quantized.
+        assert!(!should_quantize(
+            "model.layers.0.conv.conv.weight",
+            /* embed_quantizable */ false
+        ));
+        // But the conv in/out projections (standard matmuls) SHOULD be.
+        assert!(should_quantize("model.layers.0.conv.in_proj.weight", false));
+        assert!(should_quantize(
+            "model.layers.0.conv.out_proj.weight",
+            false
+        ));
+        // And stacked experts SHOULD be quantizable.
+        assert!(should_quantize(
+            "model.layers.1.feed_forward.switch_mlp.gate_proj.weight",
+            false
+        ));
+    }
+
+    #[test]
+    fn embed_tokens_quantized_only_when_embed_quantizable() {
+        // Default (non-lfm2): the token embedding is SKIPPED (preserves
+        // qwen3_5/gemma4 behavior).
+        assert!(!should_quantize(
+            "model.embed_tokens.weight",
+            /* embed_quantizable */ false
+        ));
+        assert!(!should_quantize(
+            "model.language_model.embedding.weight",
+            false
+        ));
+
+        // lfm2/lfm2_moe opt-in: the PACKED embedding backend handles a
+        // quantized table, so the embedding IS quantizable.
+        assert!(should_quantize(
+            "model.embed_tokens.weight",
+            /* embed_quantizable */ true
+        ));
+
+        // A TIED lm_head is ALWAYS excluded, even when embeds are quantizable
+        // (it is dropped at sanitize; we never quantize an output head here).
+        assert!(!should_quantize("lm_head.weight", true));
+        assert!(!should_quantize("lm_head.weight", false));
     }
 }

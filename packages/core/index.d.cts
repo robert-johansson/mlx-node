@@ -3456,6 +3456,36 @@ export interface Lfm2Config {
    * fully flat `Lfm2LayerCache` path on all layers.
    */
   useBlockPagedCache?: boolean | undefined;
+  /**
+   * MLP intermediate size for the DENSE-in-MoE layers (`layer_idx <
+   * num_dense_layers`). Used DIRECTLY (no 2/3 `computed_ff_dim()` shrink).
+   * Only present on MoE checkpoints.
+   */
+  intermediateSize?: number | undefined;
+  /** Per-expert MLP intermediate size for the sparse MoE layers. */
+  moeIntermediateSize?: number | undefined;
+  /** Total number of routed experts. */
+  numExperts?: number | undefined;
+  /** Top-k experts selected per token. */
+  numExpertsPerTok?: number | undefined;
+  /** Number of leading DENSE layers before MoE layers begin. */
+  numDenseLayers?: number | undefined;
+  /**
+   * Renormalize the top-k routing weights to sum to 1 (`/(sum+1e-20)`).
+   *
+   * `Option<bool>` so TS callers may omit it (napi renders bare `bool` as
+   * required). Absent (None) is read as `true` everywhere via
+   * `.unwrap_or(true)`, matching the prior `default = "default_true"`.
+   */
+  normTopkProb?: boolean | undefined;
+  /**
+   * Add the learned per-expert bias to the post-softmax gates BEFORE top-k.
+   *
+   * `Option<bool>` so TS callers may omit it (napi renders bare `bool` as
+   * required). Absent (None) is read as `true` everywhere via
+   * `.unwrap_or(true)`, matching the prior `default = "default_true"`.
+   */
+  useExpertBias?: boolean | undefined;
 }
 
 export interface MemorySnapshot {
