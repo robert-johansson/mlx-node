@@ -516,7 +516,14 @@ pub fn item(a: &MxArray) -> Result<f64> {
     if ok {
         Ok(value)
     } else {
-        Err(Error::from_reason("item: array must have size 1"))
+        // false = either a non-size-1 array, or a guarded MLX throw (e.g. the
+        // Metal buffer limit) — surface the real detail if the shim recorded one
+        // so it is catchable rather than an abort (bean genmlx-5ucd).
+        let msg = match crate::array::take_last_native_error() {
+            Some(detail) => format!("MLX error in item: {}", detail),
+            None => "item: array must have size 1".to_string(),
+        };
+        Err(Error::from_reason(msg))
     }
 }
 

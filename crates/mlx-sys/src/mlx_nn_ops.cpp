@@ -22,9 +22,9 @@ void mlx_array_eval(mlx_array* handle) {
       arr->eval();
     }
   } catch (const std::exception& e) {
-    mlx_trace_native_error("array_eval", e.what());
+    mlx_report_error("array_eval", e.what());
   } catch (...) {
-    mlx_trace_native_error("array_eval", "unknown exception");
+    mlx_report_error("array_eval", "unknown exception");
   }
 }
 
@@ -39,9 +39,9 @@ void mlx_async_eval(mlx_array** handles, size_t count) {
     }
     mlx::core::async_eval(std::move(arrays));
   } catch (const std::exception& e) {
-    mlx_trace_native_error("async_eval", e.what());
+    mlx_report_error("async_eval", e.what());
   } catch (...) {
-    mlx_trace_native_error("async_eval", "unknown exception");
+    mlx_report_error("async_eval", "unknown exception");
   }
 }
 
@@ -59,10 +59,10 @@ bool mlx_eval(mlx_array** handles, size_t count) {
     mlx::core::eval(std::move(arrays));
     return true;
   } catch (const std::exception& e) {
-    mlx_trace_native_error("eval", e.what());
+    mlx_report_error("eval", e.what());
     return false;
   } catch (...) {
-    mlx_trace_native_error("eval", "unknown exception");
+    mlx_report_error("eval", "unknown exception");
     return false;
   }
 }
@@ -195,11 +195,13 @@ bool mlx_array_item_at_uint32(mlx_array* handle, size_t index, uint32_t* out) {
 // One C++ call instead of separate eval + flatten + copy_to_buffer.
 bool mlx_array_item_f64(mlx_array* handle, double* out) {
   if (!handle || !out) return false;
-  auto arr = reinterpret_cast<array*>(handle);
-  if (arr->size() != 1) return false;
-  arr->eval();
-  *out = read_scalar<double>(*arr, 0);
-  return true;
+  MLX_GUARD_BOOL("array_item_f64",
+    auto arr = reinterpret_cast<array*>(handle);
+    if (arr->size() != 1) return false;
+    arr->eval();  // can throw at the Metal buffer limit; guarded -> catchable
+    *out = read_scalar<double>(*arr, 0);
+    return true;
+  )
 }
 
 int32_t mlx_array_dtype(mlx_array* handle) {
@@ -928,10 +930,10 @@ mlx_array* mlx_fast_scaled_dot_product_attention(mlx_array* queries,
         *q, *k, *v, scale, mask_mode, mask_arr, std::nullopt);
     return reinterpret_cast<mlx_array*>(new array(std::move(result)));
   } catch (const std::exception& e) {
-    mlx_trace_native_error("fast_scaled_dot_product_attention", e.what());
+    mlx_report_error("fast_scaled_dot_product_attention", e.what());
     return nullptr;
   } catch (...) {
-    mlx_trace_native_error("fast_scaled_dot_product_attention", "unknown exception");
+    mlx_report_error("fast_scaled_dot_product_attention", "unknown exception");
     return nullptr;
   }
 }

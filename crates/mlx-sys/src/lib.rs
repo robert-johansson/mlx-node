@@ -14,6 +14,11 @@ pub struct mlx_stream {
 }
 
 unsafe extern "C-unwind" {
+    /// Take (and clear) the last MLX exception message recorded by the C++ shim on
+    /// THIS thread, or null if none. Lets a null/false shim return become a
+    /// catchable napi error instead of an uncatchable abort (bean genmlx-5ucd).
+    /// The pointer is valid only until the next shim call on this thread — copy now.
+    pub fn mlx_take_last_error() -> *const core::ffi::c_char;
     pub fn mlx_seed(seed: u64);
     pub fn mlx_array_from_int32(data: *const i32, shape: *const i64, ndim: usize)
     -> *mut mlx_array;

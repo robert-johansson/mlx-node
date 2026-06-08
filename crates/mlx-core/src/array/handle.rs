@@ -1,15 +1,35 @@
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
+/// Take (and clear) the last MLX exception message the C++ shim recorded on this
+/// thread. The shim catches MLX throws (e.g. "[metal::malloc] Resource limit
+/// (499000) exceeded") and returns a null/false sentinel instead of letting the
+/// exception abort the process; this surfaces the detail so the sentinel can
+/// become a CATCHABLE napi error (bean genmlx-5ucd).
+pub(crate) fn take_last_native_error() -> Option<String> {
+    let p = unsafe { sys::mlx_take_last_error() };
+    if p.is_null() {
+        None
+    } else {
+        // Copy immediately — the pointer is only valid until the next shim call.
+        Some(
+            unsafe { std::ffi::CStr::from_ptr(p) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
 pub(crate) fn check_handle(
     handle: *mut sys::mlx_array,
     context: &str,
 ) -> Result<*mut sys::mlx_array> {
     if handle.is_null() {
-        Err(Error::from_reason(format!(
-            "null handle returned: {}",
-            context
-        )))
+        let msg = match take_last_native_error() {
+            Some(detail) => format!("MLX error in {}: {}", context, detail),
+            None => format!("null handle returned: {}", context),
+        };
+        Err(Error::from_reason(msg))
     } else {
         Ok(handle)
     }

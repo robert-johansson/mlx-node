@@ -91,6 +91,43 @@ struct PagedAttentionInputs {
 
 }  // namespace mlx::core::fast::paged
 
+// --- Native error surface (bean genmlx-5ucd) --------------------------------
+// MLX allocators throw std::runtime_error (e.g. "[metal::malloc] Resource limit
+// (499000) exceeded") when a hard Metal limit is hit. If that escapes an
+// unwrapped shim function it unwinds out to the NAPI frame and ABORTS the whole
+// process (uncatchable libc++abi terminate -> SIGTRAP). Instead, shim functions
+// catch it, record it here, and return a sentinel (nullptr / false); the Rust
+// side (check_handle / bool call sites) turns the sentinel + this message into a
+// CATCHABLE napi error. Defined once in mlx_array_ops.cpp; thread-local so each
+// MLX worker thread has its own slot.
+extern "C" void mlx_record_native_error(const char* context, const char* detail);
+extern "C" const char* mlx_take_last_error();
+
+// Wrap a shim function body that returns mlx_array*: on any MLX exception, record
+// it and return nullptr instead of letting it abort the process.
+#define MLX_GUARD_PTR(ctx, ...)                       \
+  try {                                               \
+    __VA_ARGS__                                        \
+  } catch (const std::exception& e) {                 \
+    mlx_report_error(ctx, e.what());                  \
+    return nullptr;                                   \
+  } catch (...) {                                      \
+    mlx_report_error(ctx, "unknown exception");       \
+    return nullptr;                                   \
+  }
+
+// Same, for a shim function that returns bool (false = failure).
+#define MLX_GUARD_BOOL(ctx, ...)                      \
+  try {                                               \
+    __VA_ARGS__                                        \
+  } catch (const std::exception& e) {                 \
+    mlx_report_error(ctx, e.what());                  \
+    return false;                                     \
+  } catch (...) {                                      \
+    mlx_report_error(ctx, "unknown exception");       \
+    return false;                                     \
+  }
+
 namespace {
 using mlx::core::add;
 using mlx::core::arange;
@@ -144,6 +181,14 @@ inline void mlx_trace_native_error(const char* context, const char* detail) {
     }
   }
   out << "\"\n";
+}
+
+// Record an MLX exception for the Rust boundary to surface as a catchable error,
+// and (if MLX_INFERENCE_TRACE is on) also file-trace it. Use from shim catch
+// blocks via MLX_GUARD_PTR / MLX_GUARD_BOOL.
+inline void mlx_report_error(const char* context, const char* detail) {
+  mlx_record_native_error(context, detail);
+  mlx_trace_native_error(context, detail);
 }
 
 // Comparison operations
@@ -286,33 +331,39 @@ int32_t from_mlx_dtype(mlx::core::Dtype dtype) {
 // flatten handles broadcasts and non-contiguous strides, producing a
 // contiguous 1D array. astype converts if needed. Single eval.
 bool copy_to_buffer(const array& arr, float* out, size_t len) {
-  auto host = flatten(arr);
-  if (host.dtype() != mlx::core::float32)
-    host = astype(host, mlx::core::float32);
-  host.eval();
-  if (host.size() != len) return false;
-  std::copy(host.data<float>(), host.data<float>() + len, out);
-  return true;
+  MLX_GUARD_BOOL("copy_to_buffer_f32",
+    auto host = flatten(arr);
+    if (host.dtype() != mlx::core::float32)
+      host = astype(host, mlx::core::float32);
+    host.eval();
+    if (host.size() != len) return false;
+    std::copy(host.data<float>(), host.data<float>() + len, out);
+    return true;
+  )
 }
 
 bool copy_to_buffer(const array& arr, int32_t* out, size_t len) {
-  auto host = flatten(arr);
-  if (host.dtype() != mlx::core::int32)
-    host = astype(host, mlx::core::int32);
-  host.eval();
-  if (host.size() != len) return false;
-  std::copy(host.data<int32_t>(), host.data<int32_t>() + len, out);
-  return true;
+  MLX_GUARD_BOOL("copy_to_buffer_i32",
+    auto host = flatten(arr);
+    if (host.dtype() != mlx::core::int32)
+      host = astype(host, mlx::core::int32);
+    host.eval();
+    if (host.size() != len) return false;
+    std::copy(host.data<int32_t>(), host.data<int32_t>() + len, out);
+    return true;
+  )
 }
 
 bool copy_to_buffer(const array& arr, uint32_t* out, size_t len) {
-  auto host = flatten(arr);
-  if (host.dtype() != mlx::core::uint32)
-    host = astype(host, mlx::core::uint32);
-  host.eval();
-  if (host.size() != len) return false;
-  std::copy(host.data<uint32_t>(), host.data<uint32_t>() + len, out);
-  return true;
+  MLX_GUARD_BOOL("copy_to_buffer_u32",
+    auto host = flatten(arr);
+    if (host.dtype() != mlx::core::uint32)
+      host = astype(host, mlx::core::uint32);
+    host.eval();
+    if (host.size() != len) return false;
+    std::copy(host.data<uint32_t>(), host.data<uint32_t>() + len, out);
+    return true;
+  )
 }
 
 }  // namespace

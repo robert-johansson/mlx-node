@@ -2,6 +2,28 @@
 
 extern "C" {
 
+// --- Native error surface (bean genmlx-5ucd). Single definition; declared in
+// mlx_common.h. Thread-local: each MLX worker thread gets its own slot. The
+// returned C-string is valid until the next record on the same thread, so the
+// Rust side must copy it immediately (napi Error::from_reason does). ----------
+static thread_local std::string g_mlx_last_error;
+static thread_local bool g_mlx_has_error = false;
+
+void mlx_record_native_error(const char* context, const char* detail) {
+  // Store only the MLX detail (e.what()); the Rust side adds its own call-site
+  // context, so prefixing it here too would double it. `context` is still used
+  // by the file tracer (mlx_report_error -> mlx_trace_native_error).
+  (void)context;
+  g_mlx_last_error.assign(detail ? detail : "");
+  g_mlx_has_error = true;
+}
+
+const char* mlx_take_last_error() {
+  if (!g_mlx_has_error) return nullptr;
+  g_mlx_has_error = false;
+  return g_mlx_last_error.c_str();
+}
+
 void mlx_seed(uint64_t seed) {
   mlx::core::random::seed(seed);
 }
@@ -9,33 +31,41 @@ void mlx_seed(uint64_t seed) {
 mlx_array* mlx_array_from_int32(const int32_t* data,
                                 const int64_t* shape,
                                 size_t ndim) {
-  Shape target_shape = make_shape(shape, ndim);
-  auto arr = new mlx::core::array(data, target_shape, mlx::core::int32);
-  return reinterpret_cast<mlx_array*>(arr);
+  MLX_GUARD_PTR("array_from_int32",
+    Shape target_shape = make_shape(shape, ndim);
+    auto arr = new mlx::core::array(data, target_shape, mlx::core::int32);
+    return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 mlx_array* mlx_array_from_int64(const int64_t* data,
                                 const int64_t* shape,
                                 size_t ndim) {
-  Shape target_shape = make_shape(shape, ndim);
-  auto arr = new mlx::core::array(data, target_shape, mlx::core::int64);
-  return reinterpret_cast<mlx_array*>(arr);
+  MLX_GUARD_PTR("array_from_int64",
+    Shape target_shape = make_shape(shape, ndim);
+    auto arr = new mlx::core::array(data, target_shape, mlx::core::int64);
+    return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 mlx_array* mlx_array_from_uint32(const uint32_t* data,
                                  const int64_t* shape,
                                  size_t ndim) {
-  Shape target_shape = make_shape(shape, ndim);
-  auto arr = new array(data, target_shape, mlx::core::uint32);
-  return reinterpret_cast<mlx_array*>(arr);
+  MLX_GUARD_PTR("array_from_uint32",
+    Shape target_shape = make_shape(shape, ndim);
+    auto arr = new array(data, target_shape, mlx::core::uint32);
+    return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 mlx_array* mlx_array_from_float32(const float* data,
                                   const int64_t* shape,
                                   size_t ndim) {
-  Shape target_shape = make_shape(shape, ndim);
-  auto arr = new array(data, target_shape, mlx::core::float32);
-  return reinterpret_cast<mlx_array*>(arr);
+  MLX_GUARD_PTR("array_from_float32",
+    Shape target_shape = make_shape(shape, ndim);
+    auto arr = new array(data, target_shape, mlx::core::float32);
+    return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 // Create array from bfloat16 raw bytes (uint16 representation)
@@ -43,12 +73,14 @@ mlx_array* mlx_array_from_float32(const float* data,
 mlx_array* mlx_array_from_bfloat16(const uint16_t* data,
                                    const int64_t* shape,
                                    size_t ndim) {
-  Shape target_shape = make_shape(shape, ndim);
-  // bfloat16_t has the same memory layout as uint16_t (just the bits_ field)
-  // so we can safely reinterpret_cast
-  auto bf16_data = reinterpret_cast<const mlx::core::bfloat16_t*>(data);
-  auto arr = new array(bf16_data, target_shape, mlx::core::bfloat16);
-  return reinterpret_cast<mlx_array*>(arr);
+  MLX_GUARD_PTR("array_from_bfloat16",
+    Shape target_shape = make_shape(shape, ndim);
+    // bfloat16_t has the same memory layout as uint16_t (just the bits_ field)
+    // so we can safely reinterpret_cast
+    auto bf16_data = reinterpret_cast<const mlx::core::bfloat16_t*>(data);
+    auto arr = new array(bf16_data, target_shape, mlx::core::bfloat16);
+    return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 // Create array from float16 raw bytes (uint16 representation)
@@ -56,11 +88,13 @@ mlx_array* mlx_array_from_bfloat16(const uint16_t* data,
 mlx_array* mlx_array_from_float16(const uint16_t* data,
                                   const int64_t* shape,
                                   size_t ndim) {
-  Shape target_shape = make_shape(shape, ndim);
-  // float16_t has the same memory layout as uint16_t
-  auto f16_data = reinterpret_cast<const mlx::core::float16_t*>(data);
-  auto arr = new array(f16_data, target_shape, mlx::core::float16);
-  return reinterpret_cast<mlx_array*>(arr);
+  MLX_GUARD_PTR("array_from_float16",
+    Shape target_shape = make_shape(shape, ndim);
+    // float16_t has the same memory layout as uint16_t
+    auto f16_data = reinterpret_cast<const mlx::core::float16_t*>(data);
+    auto arr = new array(f16_data, target_shape, mlx::core::float16);
+    return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 // Create array from uint8 raw bytes
@@ -73,7 +107,7 @@ mlx_array* mlx_array_from_uint8(const uint8_t* data,
     auto arr = new array(data, target_shape, mlx::core::uint8);
     return reinterpret_cast<mlx_array*>(arr);
   } catch (const std::exception& e) {
-    std::cerr << "[MLX] mlx_array_from_uint8: " << e.what() << std::endl;
+    mlx_report_error("array_from_uint8", e.what());
     return nullptr;
   }
 }
@@ -98,32 +132,42 @@ mlx_array* mlx_from_fp8(mlx_array* handle, int32_t target_dtype) {
 }
 
 mlx_array* mlx_array_scalar_float(double value) {
-  auto arr = new array(static_cast<float>(value));
-  return reinterpret_cast<mlx_array*>(arr);
+  MLX_GUARD_PTR("array_scalar_float",
+    auto arr = new array(static_cast<float>(value));
+    return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 // Create a scalar with a specific dtype (no AsType node) — matches Python's array(val, dtype)
 mlx_array* mlx_array_scalar_float_dtype(double value, int32_t dtype) {
-  auto dt = to_mlx_dtype(dtype);
-  auto arr = new array(static_cast<float>(value), dt);
-  return reinterpret_cast<mlx_array*>(arr);
+  MLX_GUARD_PTR("array_scalar_float_dtype",
+    auto dt = to_mlx_dtype(dtype);
+    auto arr = new array(static_cast<float>(value), dt);
+    return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 mlx_array* mlx_array_scalar_int(int32_t value) {
-  auto arr = new array(value);
-  return reinterpret_cast<mlx_array*>(arr);
+  MLX_GUARD_PTR("array_scalar_int",
+    auto arr = new array(value);
+    return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 mlx_array* mlx_array_zeros(const int64_t* shape, size_t ndim, int32_t dtype) {
-  Shape target_shape = make_shape(shape, ndim);
-  auto arr = new array(zeros(target_shape, to_mlx_dtype(dtype)));
-  return reinterpret_cast<mlx_array*>(arr);
+  MLX_GUARD_PTR("array_zeros",
+    Shape target_shape = make_shape(shape, ndim);
+    auto arr = new array(zeros(target_shape, to_mlx_dtype(dtype)));
+    return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 mlx_array* mlx_array_ones(const int64_t* shape, size_t ndim, int32_t dtype) {
-  Shape target_shape = make_shape(shape, ndim);
-  auto arr = new array(ones(target_shape, to_mlx_dtype(dtype)));
-  return reinterpret_cast<mlx_array*>(arr);
+  MLX_GUARD_PTR("array_ones",
+    Shape target_shape = make_shape(shape, ndim);
+    auto arr = new array(ones(target_shape, to_mlx_dtype(dtype)));
+    return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 mlx_array* mlx_array_full(const int64_t* shape,
@@ -131,12 +175,14 @@ mlx_array* mlx_array_full(const int64_t* shape,
                           mlx_array* value_handle,
                           int32_t dtype,
                           bool has_dtype) {
-  auto value = reinterpret_cast<array*>(value_handle);
-  Shape target_shape = make_shape(shape, ndim);
-  array result =
-      has_dtype ? full(std::move(target_shape), *value, to_mlx_dtype(dtype))
-                : full(std::move(target_shape), *value);
-  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  MLX_GUARD_PTR("array_full",
+    auto value = reinterpret_cast<array*>(value_handle);
+    Shape target_shape = make_shape(shape, ndim);
+    array result =
+        has_dtype ? full(std::move(target_shape), *value, to_mlx_dtype(dtype))
+                  : full(std::move(target_shape), *value);
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_reshape(mlx_array* handle,
