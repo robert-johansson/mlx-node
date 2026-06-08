@@ -244,6 +244,46 @@ int32_t mlx_get_cache_memory(uint64_t* out_value) {
   }
 }
 
+// Get the number of live Metal buffer allocations (active + cached). Each
+// counts toward the macOS resource limit (~499000); GenMLX's Layer-2 proactive
+// sweep reads this to reclaim dead buffers BEFORE the wall is hit. Returns 0 on
+// success, -1 on caught exception. See `mlx_get_peak_memory` for the
+// fallible-FFI contract rationale.
+int32_t mlx_get_num_resources(uint64_t* out_value) {
+  try {
+    size_t v = mlx::core::get_num_resources();
+    if (out_value != nullptr) {
+      *out_value = static_cast<uint64_t>(v);
+    }
+    return 0;
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] Exception in get_num_resources: " << e.what() << std::endl;
+    return -1;
+  } catch (...) {
+    std::cerr << "[MLX] Unknown exception in get_num_resources" << std::endl;
+    return -1;
+  }
+}
+
+// Get the Metal buffer resource limit (the count at which allocations fail).
+// Returns 0 on success, -1 on caught exception. See `mlx_get_peak_memory` for
+// the fallible-FFI contract rationale.
+int32_t mlx_get_resource_limit(uint64_t* out_value) {
+  try {
+    size_t v = mlx::core::get_resource_limit();
+    if (out_value != nullptr) {
+      *out_value = static_cast<uint64_t>(v);
+    }
+    return 0;
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] Exception in get_resource_limit: " << e.what() << std::endl;
+    return -1;
+  } catch (...) {
+    std::cerr << "[MLX] Unknown exception in get_resource_limit" << std::endl;
+    return -1;
+  }
+}
+
 // Reset peak memory counter to zero. Returns 0 on success, -1 on caught
 // exception. See `mlx_get_peak_memory` for the fallible-FFI contract
 // rationale. On no-Metal hosts the underlying `mlx::core::reset_peak_memory()`

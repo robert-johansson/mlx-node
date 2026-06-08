@@ -784,6 +784,8 @@ unsafe extern "C-unwind" {
     pub fn mlx_get_peak_memory(out_value: *mut u64) -> i32;
     pub fn mlx_get_active_memory(out_value: *mut u64) -> i32;
     pub fn mlx_get_cache_memory(out_value: *mut u64) -> i32;
+    pub fn mlx_get_num_resources(out_value: *mut u64) -> i32;
+    pub fn mlx_get_resource_limit(out_value: *mut u64) -> i32;
     pub fn mlx_reset_peak_memory() -> i32;
     pub fn mlx_set_memory_limit(limit: u64, out_old_limit: *mut u64) -> i32;
     pub fn mlx_get_memory_limit(out_value: *mut u64) -> i32;

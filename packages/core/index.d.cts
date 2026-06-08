@@ -3213,10 +3213,20 @@ export declare function getMemoryLimit(): number
 /** Sample MLX's GPU memory counters. See [`GpuMemorySnapshot`]. */
 export declare function getMemorySnapshot(): GpuMemorySnapshot
 
+/**
+ * Live Metal buffer allocation count (active + cached). Counts toward the
+ * macOS resource limit (~499000); the membrane's Layer-2 proactive sweep
+ * reads this to reclaim dead buffers before the limit is hit.
+ */
+export declare function getNumResources(): number
+
 export declare function getPeakMemory(): number
 
 /** Retrieve all collected profiling data as a `ProfilingSession`. */
 export declare function getProfilingData(): ProfilingSession
+
+/** The Metal buffer resource limit (count at which allocations fail). */
+export declare function getResourceLimit(): number
 
 export declare function getWiredLimit(): number
 

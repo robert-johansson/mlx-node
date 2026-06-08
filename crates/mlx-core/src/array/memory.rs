@@ -242,6 +242,26 @@ pub fn get_peak_memory() -> f64 {
     if rc != 0 { 0.0 } else { v as f64 }
 }
 
+/// Get the number of live Metal buffer allocations (active + cached). Each
+/// counts toward the macOS resource limit (~499000). The GenMLX membrane's
+/// Layer-2 proactive sweep reads this to reclaim dead buffers before the wall.
+/// Returns 0.0 if the shim caught an exception (degraded-Metal host) — a 0
+/// count safely disables the count-pressure heuristic.
+pub fn get_num_resources() -> f64 {
+    let mut v: u64 = 0;
+    let rc = unsafe { sys::mlx_get_num_resources(&mut v) };
+    if rc != 0 { 0.0 } else { v as f64 }
+}
+
+/// Get the Metal buffer resource limit (the count at which allocations fail).
+/// Returns 0.0 if the shim caught an exception; callers fall back to a
+/// hard-coded default in that case.
+pub fn get_resource_limit() -> f64 {
+    let mut v: u64 = 0;
+    let rc = unsafe { sys::mlx_get_resource_limit(&mut v) };
+    if rc != 0 { 0.0 } else { v as f64 }
+}
+
 /// Reset peak memory counter to zero.
 /// Internal Rust-only function. Best-effort: silently ignores the failure
 /// return on degraded-Metal hosts (the cleanup hooks that call this don't

@@ -37,6 +37,20 @@ pub fn get_peak_memory() -> f64 {
     crate::array::memory::get_peak_memory()
 }
 
+/// Live Metal buffer allocation count (active + cached). Counts toward the
+/// macOS resource limit (~499000); the membrane's Layer-2 proactive sweep
+/// reads this to reclaim dead buffers before the limit is hit.
+#[napi(js_name = "getNumResources")]
+pub fn get_num_resources() -> f64 {
+    crate::array::memory::get_num_resources()
+}
+
+/// The Metal buffer resource limit (count at which allocations fail).
+#[napi(js_name = "getResourceLimit")]
+pub fn get_resource_limit() -> f64 {
+    crate::array::memory::get_resource_limit()
+}
+
 #[napi(js_name = "resetPeakMemory")]
 pub fn reset_peak_memory() {
     crate::array::memory::reset_peak_memory();
