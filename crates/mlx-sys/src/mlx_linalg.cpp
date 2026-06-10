@@ -15,43 +15,55 @@ extern "C" {
 // ============================================================================
 
 mlx_array* mlx_linalg_cholesky(mlx_array* handle, bool upper) {
+  MLX_GUARD_PTR("linalg_cholesky",
   auto arr = reinterpret_cast<array*>(handle);
   array result = linalg::cholesky(*arr, upper, cpu_stream());
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_linalg_solve(mlx_array* a_handle, mlx_array* b_handle) {
+  MLX_GUARD_PTR("linalg_solve",
   auto a = reinterpret_cast<array*>(a_handle);
   auto b = reinterpret_cast<array*>(b_handle);
   array result = linalg::solve(*a, *b, cpu_stream());
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_linalg_solve_triangular(mlx_array* a_handle,
                                         mlx_array* b_handle,
                                         bool upper) {
+  MLX_GUARD_PTR("linalg_solve_triangular",
   auto a = reinterpret_cast<array*>(a_handle);
   auto b = reinterpret_cast<array*>(b_handle);
   array result = linalg::solve_triangular(*a, *b, upper, cpu_stream());
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_linalg_inv(mlx_array* handle) {
+  MLX_GUARD_PTR("linalg_inv",
   auto arr = reinterpret_cast<array*>(handle);
   array result = linalg::inv(*arr, cpu_stream());
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_linalg_tri_inv(mlx_array* handle, bool upper) {
+  MLX_GUARD_PTR("linalg_tri_inv",
   auto arr = reinterpret_cast<array*>(handle);
   array result = linalg::tri_inv(*arr, upper, cpu_stream());
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_linalg_cholesky_inv(mlx_array* handle, bool upper) {
+  MLX_GUARD_PTR("linalg_cholesky_inv",
   auto arr = reinterpret_cast<array*>(handle);
   array result = linalg::cholesky_inv(*arr, upper, cpu_stream());
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 void mlx_linalg_qr(mlx_array* handle,
@@ -80,22 +92,28 @@ void mlx_linalg_eigh(mlx_array* handle, const char* uplo,
 }
 
 mlx_array* mlx_linalg_eigvalsh(mlx_array* handle, const char* uplo) {
+  MLX_GUARD_PTR("linalg_eigvalsh",
   auto arr = reinterpret_cast<array*>(handle);
   array result = linalg::eigvalsh(*arr, std::string(uplo), cpu_stream());
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 // Norm can run on GPU — no CPU stream needed
 mlx_array* mlx_linalg_norm(mlx_array* handle, double ord) {
+  MLX_GUARD_PTR("linalg_norm",
   auto arr = reinterpret_cast<array*>(handle);
   array result = linalg::norm(*arr, ord);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_linalg_norm_default(mlx_array* handle) {
+  MLX_GUARD_PTR("linalg_norm_default",
   auto arr = reinterpret_cast<array*>(handle);
   array result = linalg::norm(*arr);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 }  // extern "C"

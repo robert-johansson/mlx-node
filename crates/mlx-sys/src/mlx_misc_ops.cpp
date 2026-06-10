@@ -151,6 +151,7 @@ mlx_array* mlx_compiled_sample_full(
     float top_p,
     float min_p
 ) {
+  MLX_GUARD_PTR("compiled_sample_full",
   auto logits = *reinterpret_cast<array*>(logits_handle);
 
   // Fast path: temperature == 0 means argmax (greedy)
@@ -189,6 +190,7 @@ mlx_array* mlx_compiled_sample_full(
   auto inv_temp = mlx::core::array(1.0f / temperature);
   auto result = categorical_with_temp(logprobs, inv_temp);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 // ============================================================================

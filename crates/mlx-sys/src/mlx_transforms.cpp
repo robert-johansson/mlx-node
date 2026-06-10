@@ -24,6 +24,7 @@ mlx_array* mlx_vmap_apply(VmapFunctionPtr fn_ptr,
                            mlx_array** output_handles,
                            size_t max_outputs,
                            size_t* num_outputs) {
+  MLX_GUARD_PTR("vmap_apply",
   // Convert input handles to arrays
   std::vector<array> inputs;
   inputs.reserve(input_count);
@@ -72,6 +73,7 @@ mlx_array* mlx_vmap_apply(VmapFunctionPtr fn_ptr,
   }
 
   return nullptr; // success
+  )
 }
 
 // ============================================================================

@@ -26,10 +26,12 @@ extern "C" {
 // ============================================================================
 
 mlx_array* mlx_random_key(uint64_t seed) {
+  MLX_GUARD_PTR("random_key",
   array result = rng::key(seed);
   result.eval();
   result = mlx::core::stop_gradient(result);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 void mlx_random_split(mlx_array* key_handle,
@@ -43,11 +45,13 @@ void mlx_random_split(mlx_array* key_handle,
 }
 
 mlx_array* mlx_random_split_n(mlx_array* key_handle, int n) {
+  MLX_GUARD_PTR("random_split_n",
   auto key = reinterpret_cast<array*>(key_handle);
   array result = rng::split(*key, n, cpu_stream());
   result.eval();
   result = mlx::core::stop_gradient(result);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 // --- Key-based sampling functions (LAZY — no eval) ---
@@ -55,6 +59,7 @@ mlx_array* mlx_random_split_n(mlx_array* key_handle, int n) {
 mlx_array* mlx_random_uniform_key(mlx_array* key_handle,
                                    const int64_t* shape, size_t ndim,
                                    float low, float high, int32_t dtype) {
+  MLX_GUARD_PTR("random_uniform_key",
   auto key = reinterpret_cast<array*>(key_handle);
   auto sh = make_shape(shape, ndim);
   auto dt = to_mlx_dtype(dtype);
@@ -63,71 +68,84 @@ mlx_array* mlx_random_uniform_key(mlx_array* key_handle,
   auto result = mlx::core::stop_gradient(
       rng::uniform(lo, hi, sh, dt, std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_random_normal_key(mlx_array* key_handle,
                                   const int64_t* shape, size_t ndim,
                                   int32_t dtype) {
+  MLX_GUARD_PTR("random_normal_key",
   auto key = reinterpret_cast<array*>(key_handle);
   auto sh = make_shape(shape, ndim);
   auto dt = to_mlx_dtype(dtype);
   auto result = mlx::core::stop_gradient(
       rng::normal(sh, dt, std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_random_bernoulli_key(mlx_array* key_handle,
                                      float prob,
                                      const int64_t* shape, size_t ndim) {
+  MLX_GUARD_PTR("random_bernoulli_key",
   auto key = reinterpret_cast<array*>(key_handle);
   auto sh = make_shape(shape, ndim);
   auto result = mlx::core::stop_gradient(
       rng::bernoulli(prob, sh, std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_random_categorical_key(mlx_array* key_handle,
                                        mlx_array* logits_handle,
                                        int axis) {
+  MLX_GUARD_PTR("random_categorical_key",
   auto key = reinterpret_cast<array*>(key_handle);
   auto logits = reinterpret_cast<array*>(logits_handle);
   auto result = mlx::core::stop_gradient(
       rng::categorical(*logits, axis, std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_random_randint_key(mlx_array* key_handle,
                                    int low, int high,
                                    const int64_t* shape, size_t ndim,
                                    int32_t dtype) {
+  MLX_GUARD_PTR("random_randint_key",
   auto key = reinterpret_cast<array*>(key_handle);
   auto sh = make_shape(shape, ndim);
   auto dt = to_mlx_dtype(dtype);
   auto result = mlx::core::stop_gradient(
       rng::randint(low, high, sh, dt, std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_random_gumbel_key(mlx_array* key_handle,
                                   const int64_t* shape, size_t ndim,
                                   int32_t dtype) {
+  MLX_GUARD_PTR("random_gumbel_key",
   auto key = reinterpret_cast<array*>(key_handle);
   auto sh = make_shape(shape, ndim);
   auto dt = to_mlx_dtype(dtype);
   auto result = mlx::core::stop_gradient(
       rng::gumbel(sh, dt, std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_random_laplace_key(mlx_array* key_handle,
                                    const int64_t* shape, size_t ndim,
                                    int32_t dtype) {
+  MLX_GUARD_PTR("random_laplace_key",
   auto key = reinterpret_cast<array*>(key_handle);
   auto sh = make_shape(shape, ndim);
   auto dt = to_mlx_dtype(dtype);
   auto result = mlx::core::stop_gradient(
       rng::laplace(sh, dt, std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_random_truncated_normal_key(mlx_array* key_handle,
@@ -135,6 +153,7 @@ mlx_array* mlx_random_truncated_normal_key(mlx_array* key_handle,
                                             mlx_array* upper_handle,
                                             const int64_t* shape, size_t ndim,
                                             int32_t dtype) {
+  MLX_GUARD_PTR("random_truncated_normal_key",
   auto key = reinterpret_cast<array*>(key_handle);
   auto lower = reinterpret_cast<array*>(lower_handle);
   auto upper = reinterpret_cast<array*>(upper_handle);
@@ -144,6 +163,7 @@ mlx_array* mlx_random_truncated_normal_key(mlx_array* key_handle,
       rng::truncated_normal(*lower, *upper, sh, dt,
                             std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_random_multivariate_normal_key(mlx_array* key_handle,
@@ -152,6 +172,7 @@ mlx_array* mlx_random_multivariate_normal_key(mlx_array* key_handle,
                                                const int64_t* shape,
                                                size_t ndim,
                                                int32_t dtype) {
+  MLX_GUARD_PTR("random_multivariate_normal_key",
   auto key = reinterpret_cast<array*>(key_handle);
   auto mean = reinterpret_cast<array*>(mean_handle);
   auto cov = reinterpret_cast<array*>(cov_handle);
@@ -161,6 +182,7 @@ mlx_array* mlx_random_multivariate_normal_key(mlx_array* key_handle,
       rng::multivariate_normal(*mean, *cov, sh, dt,
                                std::optional<array>(*key)));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 }  // extern "C"

@@ -1101,6 +1101,7 @@ mlx_array* mlx_conv2d(
     int dilation_h, int dilation_w,
     int groups
 ) {
+  MLX_GUARD_PTR("conv2d",
     auto inp = reinterpret_cast<mlx::core::array*>(input);
     auto wt = reinterpret_cast<mlx::core::array*>(weight);
     mlx::core::array result = mlx::core::conv2d(
@@ -1111,6 +1112,7 @@ mlx_array* mlx_conv2d(
         groups
     );
     return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_conv_transpose2d(
@@ -1121,6 +1123,7 @@ mlx_array* mlx_conv_transpose2d(
     int dilation_h, int dilation_w,
     int groups
 ) {
+  MLX_GUARD_PTR("conv_transpose2d",
     auto inp = reinterpret_cast<mlx::core::array*>(input);
     auto wt = reinterpret_cast<mlx::core::array*>(weight);
 
@@ -1138,6 +1141,7 @@ mlx_array* mlx_conv_transpose2d(
         groups
     );
     return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+  )
 }
 
 // ============================================
