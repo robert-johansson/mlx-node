@@ -86,6 +86,9 @@ typedef size_t (*CompileFunctionPtr)(mlx_array* const* inputs,
                                       size_t max_outputs,
                                       void* context);
 
+// Returns the number of outputs written, 0 on failure (the Rust caller
+// treats 0 outputs as an error). compile() traces and evaluates the inner
+// function, so Metal allocation throws can surface here.
 size_t mlx_compile_apply(CompileFunctionPtr fn_ptr,
                           void* context,
                           mlx_array* const* input_handles,
@@ -93,6 +96,7 @@ size_t mlx_compile_apply(CompileFunctionPtr fn_ptr,
                           bool shapeless,
                           mlx_array** output_handles,
                           size_t max_outputs) {
+  MLX_GUARD_VAL("compile_apply", 0,
   // Convert input handles
   std::vector<array> inputs;
   inputs.reserve(input_count);
@@ -138,6 +142,7 @@ size_t mlx_compile_apply(CompileFunctionPtr fn_ptr,
         reinterpret_cast<mlx_array*>(new array(std::move(results[i])));
   }
   return count;
+  )
 }
 
 }  // extern "C"

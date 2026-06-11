@@ -128,6 +128,33 @@ extern "C" const char* mlx_take_last_error();
     return false;                                     \
   }
 
+// Same, for a void shim that signals failure through out-params: the caller
+// must null/zero its out-params BEFORE the guarded body so the Rust side can
+// detect the failure (null handle -> check_handle -> catchable napi error).
+#define MLX_GUARD_VOID(ctx, ...)                      \
+  try {                                               \
+    __VA_ARGS__                                        \
+  } catch (const std::exception& e) {                 \
+    mlx_report_error(ctx, e.what());                  \
+    return;                                           \
+  } catch (...) {                                      \
+    mlx_report_error(ctx, "unknown exception");       \
+    return;                                           \
+  }
+
+// Same, for a shim returning a count/size: `sentinel` (typically 0) signals
+// failure. Only usable where the sentinel is not a legitimate success value.
+#define MLX_GUARD_VAL(ctx, sentinel, ...)             \
+  try {                                               \
+    __VA_ARGS__                                        \
+  } catch (const std::exception& e) {                 \
+    mlx_report_error(ctx, e.what());                  \
+    return sentinel;                                  \
+  } catch (...) {                                      \
+    mlx_report_error(ctx, "unknown exception");       \
+    return sentinel;                                  \
+  }
+
 namespace {
 using mlx::core::add;
 using mlx::core::arange;

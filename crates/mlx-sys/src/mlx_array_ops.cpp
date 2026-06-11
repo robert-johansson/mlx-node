@@ -25,7 +25,11 @@ const char* mlx_take_last_error() {
 }
 
 void mlx_seed(uint64_t seed) {
+  // rng::seed allocates the global key array -> can throw under Metal
+  // pressure; a failed seed leaves the previous global key in place.
+  MLX_GUARD_VOID("seed",
   mlx::core::random::seed(seed);
+  )
 }
 
 mlx_array* mlx_array_from_int32(const int32_t* data,
@@ -552,12 +556,14 @@ mlx_array* mlx_array_slice_assign_axis(mlx_array* src_handle,
 }
 
 // Optimized in-place slice assignment along a single axis - no allocation
-// Modifies src directly
-void mlx_array_slice_assign_axis_inplace(mlx_array* src_handle,
+// Modifies src directly. Returns false (with the error recorded) if the
+// slice_update throws — the array is left unmodified in that case.
+bool mlx_array_slice_assign_axis_inplace(mlx_array* src_handle,
                                           mlx_array* update_handle,
                                           size_t axis,
                                           int64_t start,
                                           int64_t end) {
+  MLX_GUARD_BOOL("array_slice_assign_axis_inplace",
   auto src = reinterpret_cast<array*>(src_handle);
   auto update = reinterpret_cast<array*>(update_handle);
 
@@ -575,6 +581,8 @@ void mlx_array_slice_assign_axis_inplace(mlx_array* src_handle,
   // Perform slice update and modify src in-place
   array result = slice_update(*src, *update, std::move(start_shape), std::move(stop_shape));
   src->overwrite_descriptor(result);
+  return true;
+  )
 }
 
 // Optimized slice along a single axis - no allocation for shape access

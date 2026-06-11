@@ -207,6 +207,12 @@ void mlx_compiled_sample_and_logprobs(
     mlx_array** out_token,
     mlx_array** out_logprobs
 ) {
+  // Null out-params first: on an MLX throw (scalar array construction and
+  // the compiled sampler both allocate) the Rust caller turns the null
+  // handles into a catchable napi error instead of the process aborting.
+  *out_token = nullptr;
+  *out_logprobs = nullptr;
+  MLX_GUARD_VOID("compiled_sample_and_logprobs",
   auto logits = *reinterpret_cast<array*>(logits_handle);
 
   // Compute logprobs once
@@ -314,6 +320,7 @@ void mlx_compiled_sample_and_logprobs(
 
   *out_token = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
   *out_logprobs = reinterpret_cast<mlx_array*>(new array(std::move(original_logprobs)));
+  )
 }
 
 // Stop gradient: detach tensor from computation graph

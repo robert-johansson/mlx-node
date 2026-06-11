@@ -113,17 +113,26 @@ impl MxArray {
         end: i64,
         update: &MxArray,
     ) -> Result<()> {
-        unsafe {
+        let ok = unsafe {
             sys::mlx_array_slice_assign_axis_inplace(
                 self.handle.0,
                 update.handle.0,
                 axis,
                 start,
                 end,
-            );
+            )
+        };
+        if ok {
+            Ok(())
+        } else {
+            let msg = match crate::array::handle::take_last_native_error() {
+                Some(detail) => {
+                    format!("MLX error in slice_assign_axis_inplace: {detail}")
+                }
+                None => "slice_assign_axis_inplace failed".to_string(),
+            };
+            Err(Error::from_reason(msg))
         }
-
-        Ok(())
     }
 
     #[napi]

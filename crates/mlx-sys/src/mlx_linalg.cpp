@@ -66,29 +66,45 @@ mlx_array* mlx_linalg_cholesky_inv(mlx_array* handle, bool upper) {
   )
 }
 
+// The void out-param decompositions null their out-params before the guarded
+// body: validation throws (non-square input) and Metal allocation throws both
+// surface as null handles -> check_handle -> catchable napi error.
 void mlx_linalg_qr(mlx_array* handle,
                     mlx_array** q_out, mlx_array** r_out) {
+  *q_out = nullptr;
+  *r_out = nullptr;
+  MLX_GUARD_VOID("linalg_qr",
   auto arr = reinterpret_cast<array*>(handle);
   auto [q, r] = linalg::qr(*arr, cpu_stream());
   *q_out = reinterpret_cast<mlx_array*>(new array(std::move(q)));
   *r_out = reinterpret_cast<mlx_array*>(new array(std::move(r)));
+  )
 }
 
 void mlx_linalg_svd(mlx_array* handle,
                      mlx_array** u_out, mlx_array** s_out, mlx_array** vt_out) {
+  *u_out = nullptr;
+  *s_out = nullptr;
+  *vt_out = nullptr;
+  MLX_GUARD_VOID("linalg_svd",
   auto arr = reinterpret_cast<array*>(handle);
   auto results = linalg::svd(*arr, cpu_stream());
   *u_out = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
   *s_out = reinterpret_cast<mlx_array*>(new array(std::move(results[1])));
   *vt_out = reinterpret_cast<mlx_array*>(new array(std::move(results[2])));
+  )
 }
 
 void mlx_linalg_eigh(mlx_array* handle, const char* uplo,
                       mlx_array** eigvals_out, mlx_array** eigvecs_out) {
+  *eigvals_out = nullptr;
+  *eigvecs_out = nullptr;
+  MLX_GUARD_VOID("linalg_eigh",
   auto arr = reinterpret_cast<array*>(handle);
   auto [eigvals, eigvecs] = linalg::eigh(*arr, std::string(uplo), cpu_stream());
   *eigvals_out = reinterpret_cast<mlx_array*>(new array(std::move(eigvals)));
   *eigvecs_out = reinterpret_cast<mlx_array*>(new array(std::move(eigvecs)));
+  )
 }
 
 mlx_array* mlx_linalg_eigvalsh(mlx_array* handle, const char* uplo) {

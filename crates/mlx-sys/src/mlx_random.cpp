@@ -34,14 +34,24 @@ mlx_array* mlx_random_key(uint64_t seed) {
   )
 }
 
+// Called on EVERY GenMLX sample (key threading), so this is the highest-
+// frequency Metal allocation site in inference loops. Unguarded, a malloc
+// throw here (e.g. "[metal::malloc] Resource limit exceeded" under buffer-
+// count pressure in long SBC sweeps) escaped through the extern "C" frame
+// and aborted the process (genmlx-8w48). Out-params are nulled first so the
+// Rust side surfaces the failure as a catchable napi error.
 void mlx_random_split(mlx_array* key_handle,
                       mlx_array** k1_out, mlx_array** k2_out) {
+  *k1_out = nullptr;
+  *k2_out = nullptr;
+  MLX_GUARD_VOID("random_split",
   auto key = reinterpret_cast<array*>(key_handle);
   auto [k1, k2] = rng::split(*key, cpu_stream());
   k1.eval();
   k2.eval();
   *k1_out = reinterpret_cast<mlx_array*>(new array(std::move(k1)));
   *k2_out = reinterpret_cast<mlx_array*>(new array(std::move(k2)));
+  )
 }
 
 mlx_array* mlx_random_split_n(mlx_array* key_handle, int n) {

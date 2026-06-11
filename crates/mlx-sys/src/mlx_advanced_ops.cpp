@@ -725,6 +725,9 @@ void* mlx_array_get_metal_buffer(mlx_array* handle) {
     // not when CUDA or other GPU backends might be in use
     if (!mlx::core::metal::is_available()) return nullptr;
 
+    // eval can throw under Metal pressure -> guarded (nullptr sentinel,
+    // consistent with the documented null cases above).
+    MLX_GUARD_PTR("array_get_metal_buffer",
     auto& arr = *reinterpret_cast<array*>(handle);
 
     // Ensure array is evaluated
@@ -736,6 +739,7 @@ void* mlx_array_get_metal_buffer(mlx_array* handle) {
     // When Metal backend is available, all MLX buffers use MTLBuffer
     // (Metal uses unified memory architecture on Apple Silicon)
     return const_cast<void*>(arr.buffer().ptr());
+    )
 }
 
 /// Get the byte offset into the Metal buffer for this array
@@ -743,6 +747,7 @@ void* mlx_array_get_metal_buffer(mlx_array* handle) {
 /// Note: offset() already returns bytes (used with char* in MLX internals)
 size_t mlx_array_get_buffer_offset(mlx_array* handle) {
     if (!handle) return 0;
+    MLX_GUARD_VAL("array_get_buffer_offset", 0,
     auto& arr = *reinterpret_cast<array*>(handle);
 
     // eval not strictly needed for offset, but ensure consistency
@@ -750,6 +755,7 @@ size_t mlx_array_get_buffer_offset(mlx_array* handle) {
 
     // offset() returns byte offset (see array.h line 374: char* + offset)
     return arr.data_size() > 0 ? static_cast<size_t>(arr.offset()) : 0;
+    )
 }
 
 /// Get the data size of the array in number of elements (NOT bytes)
@@ -770,7 +776,9 @@ size_t mlx_array_get_itemsize(mlx_array* handle) {
 /// Synchronize - ensure all MLX operations are complete
 /// Call this before dispatching external Metal kernels
 void mlx_metal_synchronize() {
+    MLX_GUARD_VOID("metal_synchronize",
     mlx::core::synchronize();
+    )
 }
 
 // ================================================================================

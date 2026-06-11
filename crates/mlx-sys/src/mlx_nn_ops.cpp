@@ -602,12 +602,16 @@ mlx_array* mlx_array_roll(mlx_array* handle, int32_t shift, int32_t axis) {
 }
 
 // Returns the number of splits, and fills the output array with handles
+// Returns the number of split handles written, 0 on failure (split throws
+// std::invalid_argument on a bad axis/sections; the Rust caller rejects
+// sections < 1 up front, so a legitimate result is always >= 1).
 size_t mlx_array_split_multi(mlx_array* handle,
                              int32_t indices_or_sections,
                              int32_t axis,
                              uint64_t* out_handles,
                              size_t max_outputs) {
   if (!handle || !out_handles) return 0;
+  MLX_GUARD_VAL("array_split_multi", 0,
   auto arr = reinterpret_cast<array*>(handle);
   auto splits = mlx::core::split(*arr, indices_or_sections, axis);
   size_t count = std::min(splits.size(), max_outputs);
@@ -616,6 +620,7 @@ size_t mlx_array_split_multi(mlx_array* handle,
         reinterpret_cast<uint64_t>(new array(std::move(splits[i])));
   }
   return count;
+  )
 }
 
 // Keep the old single-output version for backwards compatibility

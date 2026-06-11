@@ -237,7 +237,7 @@ unsafe extern "C-unwind" {
         axis: usize,
         start: i64,
         end: i64,
-    );
+    ) -> bool;
     // Optimized slice along a single axis - no shape allocation
     pub fn mlx_array_slice_axis(
         src_handle: *mut mlx_array,
