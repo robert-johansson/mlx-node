@@ -96,6 +96,15 @@ extern "C" size_t mlx_compute_gradients(LossFunctionPtr loss_fn,
     return 0;
   }
 
+  // The whole body can throw: grad() runs the forward trace eagerly (the
+  // loss callback re-enters MLX FFI ops — rng::split evals eagerly, Metal
+  // allocation can hit the resource-count wall) and the LossFunctionWrapper
+  // deliberately rethrows into this frame. Unguarded, that unwinds through
+  // this extern "C" frame to std::terminate -> SIGTRAP (genmlx-8w48: the
+  // mvr-5d x hmc SBC crash class — this was the last unguarded
+  // MLX-exception path in mlx-sys).
+  MLX_GUARD_VAL("compute_gradients", 0,
+
   // Get input arrays
   // MEMORY NOTE: This looks like it copies arrays, but MLX arrays use
   // shared_ptr<ArrayDesc> internally. The "copy" just increments a reference
@@ -143,6 +152,7 @@ extern "C" size_t mlx_compute_gradients(LossFunctionPtr loss_fn,
   }
 
   return gradients.size();
+  )
 }
 
 /**
@@ -166,6 +176,11 @@ extern "C" size_t mlx_value_and_gradients(LossFunctionPtr loss_fn,
       input_count == 0) {
     return 0;
   }
+
+  // Full-body guard: the inner try below covers the vjp call, but the
+  // value_and_grad construction and handle stores can also throw — and an
+  // escape here aborts the process (genmlx-8w48).
+  MLX_GUARD_VAL("value_and_grad", 0,
 
   // Get input arrays
   // MEMORY NOTE: This looks like it copies arrays, but MLX arrays use
@@ -206,6 +221,9 @@ extern "C" size_t mlx_value_and_gradients(LossFunctionPtr loss_fn,
     value = std::move(result.first);
     gradients = std::move(result.second);
   } catch (const std::exception& e) {
+    // Record for the Rust side (mlx_take_last_error) so the napi error
+    // carries the real MLX message instead of a generic "returned 0".
+    mlx_report_error("value_and_grad", e.what());
     std::cerr << "[MLX AUTOGRAD ERROR] value_and_grad failed: " << e.what() << std::endl;
     return 0;
   }
@@ -228,6 +246,7 @@ extern "C" size_t mlx_value_and_gradients(LossFunctionPtr loss_fn,
   }
 
   return gradients.size();
+  )
 }
 
 // ============================================================================

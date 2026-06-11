@@ -1,5 +1,41 @@
 #include "mlx_common.h"
 
+#include <execinfo.h>
+
+// --- Fatal-exception diagnostics (bean genmlx-8w48) --------------------------
+// Bun's panic handler intercepts std::terminate with only "A C++ exception
+// occurred" and suppresses the macOS crash report, leaving no frame evidence
+// when an exception escapes a path the MLX_GUARD shims cannot cover — above
+// all a throw inside an MLX scheduler worker-thread task, which never crosses
+// a guarded FFI frame (the vendored scheduler runs tasks with no try/catch).
+// Install a process-global terminate handler at module load that prints the
+// in-flight exception's what() and a native backtrace of the dying thread to
+// stderr before aborting, so any future escape self-identifies in the log.
+static void mlx_terminate_handler() {
+  fprintf(stderr, "\n[mlx-node] FATAL: std::terminate");
+  if (auto eptr = std::current_exception()) {
+    try {
+      std::rethrow_exception(eptr);
+    } catch (const std::exception& e) {
+      fprintf(stderr, " — uncaught C++ exception: %s\n", e.what());
+    } catch (...) {
+      fprintf(stderr, " — uncaught non-std C++ exception\n");
+    }
+  } else {
+    fprintf(stderr, " (no active exception)\n");
+  }
+  void* frames[64];
+  int n = backtrace(frames, 64);
+  backtrace_symbols_fd(frames, n, 2);
+  fflush(stderr);
+  abort();
+}
+
+static const bool g_mlx_terminate_handler_installed = [] {
+  std::set_terminate(mlx_terminate_handler);
+  return true;
+}();
+
 extern "C" {
 
 // --- Native error surface (bean genmlx-5ucd). Single definition; declared in
