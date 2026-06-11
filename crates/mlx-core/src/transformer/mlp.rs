@@ -1,4 +1,6 @@
 use crate::array::MxArray;
+// Only the test-only `forward_with_cache` uses Activations on the Rust side;
+// the production forward routes through the fused C++ SwiGLU kernels.
 #[cfg(test)]
 use crate::nn::Activations;
 use crate::nn::Linear;

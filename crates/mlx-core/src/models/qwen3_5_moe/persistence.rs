@@ -11,7 +11,8 @@ use tracing::{info, warn};
 use crate::array::{DType, MxArray};
 use crate::models::mtp_drafter::{DrafterBodyVariant, MTP_MOE_LAYER_LINEAR_SUFFIXES};
 use crate::models::quant_dispatch::{
-    default_per_layer_quant, effective_plq_for, parse_quant_block, resolve_default_mode,
+    default_per_layer_quant, effective_plq_for, has_sym8_mode, parse_quant_block,
+    resolve_default_mode,
 };
 use crate::models::qwen3_5::persistence::{
     MTP_LAYER_LINEAR_SUFFIXES, augment_mtplx_mtp_quantization_with_suffixes, load_vision_weights,
@@ -19,6 +20,7 @@ use crate::models::qwen3_5::persistence::{
 };
 use crate::models::qwen3_5::persistence_common::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
+    prewarm_checkpoint_pages,
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
@@ -477,6 +479,16 @@ fn apply_weights_moe_inner(
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
 ) -> Result<()> {
+    // sym8 is consumed by the DENSE Qwen3.5 loader only (eager int8 W8A8
+    // path). The MoE loader has no sym8 dispatch — fail loud instead of
+    // letting the Sym8 match arms below silently fall back to dense weights
+    // (an int8 [N,K] tensor through `set_weight` would be garbage).
+    if has_sym8_mode(top_level_mode, per_layer_quant) {
+        return Err(Error::from_reason(
+            "sym8 checkpoints are not supported by the qwen3_5_moe loader yet \
+             (sym8 v1 is dense Qwen3.5 only). Re-convert with an affine quant mode.",
+        ));
+    }
     let is_quantized = is_quantized_checkpoint(params);
     let (default_plq, default_gate_plq) =
         compute_moe_defaults(params, top_level_mode, quant_bits, quant_group_size);
@@ -498,6 +510,9 @@ fn apply_weights_moe_inner(
             PerLayerMode::Affine => {
                 try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
             }
+            // Unreachable: the sym8 guard at the top of this function
+            // rejects sym8 checkpoints before any builder runs.
+            PerLayerMode::Sym8 => None,
         }
     };
 
@@ -510,6 +525,9 @@ fn apply_weights_moe_inner(
             PerLayerMode::Affine => {
                 try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
             }
+            // Unreachable: the sym8 guard at the top of this function
+            // rejects sym8 checkpoints before any builder runs.
+            PerLayerMode::Sym8 => None,
         }
     };
 
@@ -1039,6 +1057,19 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
 
                     // Load all weights
                     let mut raw_params = load_all_safetensors(path, false)?;
+
+                    // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval
+                    // of any mmap-backed weight (FP8 dequant + MTP-norm probe in
+                    // `sanitize_weights`, the per-layer finalize in
+                    // `apply_weights_moe_inner`, and the final `materialize_weights`).
+                    // On a slow/cold mmap source (e.g. a model served off a USB SSD)
+                    // the first GPU op to page-fault a cold region can exceed the
+                    // macOS GPU command-buffer watchdog (~5 s) and abort uncatchably.
+                    // Reading the shards (plus any `mtp-drafter/`) on the CPU first
+                    // makes every later eval hit resident pages. See
+                    // `prewarm_checkpoint_pages`.
+                    prewarm_checkpoint_pages(path);
+
                     // MTP head discovery precedence (backward-compat mandatory):
                     //   1. inline `mtp.*` tensors in the body shards (existing
                     //      MoE-MTP checkpoints — kept as-is by sanitize);
@@ -1530,6 +1561,16 @@ fn register_moe_weights_with_cpp(
                 PerLayerMode::Mxfp8 => "mxfp8",
                 PerLayerMode::Mxfp4 => "mxfp4",
                 PerLayerMode::Nvfp4 => "nvfp4",
+                // Unreachable: `apply_weights_moe_inner` rejects sym8
+                // checkpoints before registration runs. Refuse rather than
+                // hand the compiled registry a mode it cannot dispatch.
+                PerLayerMode::Sym8 => {
+                    warn!(
+                        "sym8 prefix '{}' reached the MoE quant-info registry; skipping",
+                        prefix
+                    );
+                    continue;
+                }
             };
             let c_prefix = CString::new(prefix).expect("Prefix contains null byte");
             let c_mode = CString::new(mode_str).expect("Mode string contains null byte");

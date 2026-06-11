@@ -11,6 +11,10 @@ const QUANT_MODE_DEFAULTS: Record<string, [number, number]> = {
   mxfp4: [4, 32],
   mxfp8: [8, 32],
   nvfp4: [4, 16],
+  // sym8 is per-output-channel symmetric int8 — bits is always 8 and there is
+  // NO quant group (the 64 is the affine-fallback group_size for forced-affine
+  // layers; sym8 layers themselves carry one f32 scale per output row).
+  sym8: [8, 64],
 };
 
 function printHelp() {
@@ -38,9 +42,16 @@ Vision Arguments:
 
 Quantization Arguments:
   --quantize, -q        Enable quantization of converted weights
-  --q-bits <int>        Quantization bits (default per --q-mode: affine=4, mxfp4=4, mxfp8=8, nvfp4=4)
-  --q-group-size <int>  Group size (default per --q-mode: affine=64, mxfp4=32, mxfp8=32, nvfp4=16)
-  --q-mode <string>     Mode: "affine" (default), "mxfp4", "mxfp8", or "nvfp4"
+  --q-bits <int>        Quantization bits (default per --q-mode: affine=4, mxfp4=4, mxfp8=8, nvfp4=4, sym8=8)
+  --q-group-size <int>  Group size (default per --q-mode: affine=64, mxfp4=32, mxfp8=32, nvfp4=16; not applicable to sym8)
+  --q-mode <string>     Mode: "affine" (default), "mxfp4", "mxfp8", "nvfp4", or "sym8".
+                        sym8 = per-output-channel symmetric int8 (SafeTensors
+                        input only; dense qwen3_5, lfm2/lfm2_moe, gemma4 in v1):
+                        int8 [N,K] .weight + f32 [N] .scales, no .biases,
+                        no group_size.
+                        Routers/gates, 3D stacked experts, embeddings, and
+                        K%16!=0 layers fall back to 8-bit affine (or bf16)
+                        with per-layer overrides. NOT mlx-lm-loadable.
   --q-mxfp              Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
                         Applies after the recipe predicate: any 8-bit affine
                         decision becomes mxfp8, any 4-bit becomes mxfp4. Requires
@@ -161,10 +172,24 @@ export async function run(argv: string[]) {
   const quantMode = args['q-mode'];
   const quantMtp = args['q-mtp'] ?? 'off';
 
-  const validQuantModes = ['affine', 'mxfp4', 'mxfp8', 'nvfp4'];
+  const validQuantModes = ['affine', 'mxfp4', 'mxfp8', 'nvfp4', 'sym8'];
   if (quantMode !== undefined && !validQuantModes.includes(quantMode)) {
     console.error(`Error: --q-mode must be one of ${validQuantModes.join(', ')}`);
     process.exit(1);
+  }
+
+  // sym8 invariants (mirrors crates/mlx-core/src/convert.rs): bits is
+  // definitionally 8 and there is no quant group (one f32 scale per output
+  // channel) — an explicit --q-group-size would silently do nothing.
+  if (args.quantize && quantMode === 'sym8') {
+    if (quantBits !== undefined && quantBits !== 8) {
+      console.error(`Error: sym8 requires bits=8 (got bits=${quantBits}); sym8 is per-output-channel symmetric int8`);
+      process.exit(1);
+    }
+    if (quantGroupSize !== undefined) {
+      console.error('Error: sym8 is per-output-channel symmetric; --q-group-size is not applicable — omit it');
+      process.exit(1);
+    }
   }
 
   const validQuantMtpPolicies = ['off', 'cyankiwi', 'all', 'split', 'drafter'];
@@ -310,6 +335,15 @@ export async function run(argv: string[]) {
     }
     if (quantMtp !== 'off') {
       console.error('Error: --q-mtp is only supported for SafeTensors Qwen MTP conversion');
+      process.exit(1);
+    }
+    // The GGUF backend (crates/mlx-core/src/utils/gguf.rs) only accepts
+    // affine/mxfp8/mxfp4/nvfp4 — reject sym8 upfront instead of surfacing a
+    // late native error.
+    if (args.quantize && quantMode === 'sym8') {
+      console.error(
+        'Error: --q-mode sym8 is not supported for GGUF input; sym8 is available for SafeTensors models (dense qwen3_5, lfm2/lfm2_moe, gemma4 in v1)',
+      );
       process.exit(1);
     }
 
@@ -460,8 +494,9 @@ export async function run(argv: string[]) {
     const qBits = effectiveQuantBits || defaultBits;
     const qGs = quantGroupSize || defaultGs;
     const qMxfpSuffix = args['q-mxfp'] ? ', --q-mxfp: 8b->mxfp8, 4b->mxfp4' : '';
+    const qGsLabel = qMode === 'sym8' ? 'per-output-channel' : `group_size=${qGs}`;
     console.log(
-      `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}${quantMtp !== 'off' ? `, mtp=${quantMtp}` : ''}`,
+      `Quantize:   ${qBits}-bit ${qMode} (${qGsLabel})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}${quantMtp !== 'off' ? `, mtp=${quantMtp}` : ''}`,
     );
   }
   if (imatrixPath) {

@@ -10,9 +10,12 @@ use tracing::info;
 use crate::array::{DType, MxArray};
 use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, default_per_layer_quant, effective_plq_for,
+    ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8, has_sym8_mode,
     load_quant_settings_from_disk, resolve_default_mode,
 };
-use crate::models::qwen3_5::persistence_common::{dequant_fp8_weights, load_all_safetensors};
+use crate::models::qwen3_5::persistence_common::{
+    dequant_fp8_weights, load_all_safetensors, prewarm_checkpoint_pages,
+};
 use crate::models::qwen3_5_moe::persistence::try_build_quantized_switch_linear;
 use crate::models::qwen3_5_moe::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
@@ -21,7 +24,7 @@ use crate::models::qwen3_5_moe::quantized_linear::{
     try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
     try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
     try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
-    try_build_quantized_linear,
+    try_build_quantized_linear, try_build_sym8_quantized_linear,
 };
 use crate::models::qwen3_5_moe::switch_glu::SwitchGLU;
 use crate::tokenizer::Qwen3Tokenizer;
@@ -33,22 +36,41 @@ use super::model::{Lfm2Inner, Lfm2Model, handle_lfm2_cmd};
 
 /// Build the quantized expert SwitchLinear for `prefix`, dispatching on the
 /// per-layer quant mode. Mirrors qwen3_5_moe's `try_build_qsl`.
+///
+/// `Ok(None)` = "the `.weight`/`.scales` group is incomplete" (the caller
+/// fails loud naming the projection); `Err` = a mode this builder must never
+/// silently skip (sym8 — see below).
 fn build_lfm2_qsl(
     params: &HashMap<String, MxArray>,
     prefix: &str,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     default_plq: PerLayerQuant,
-) -> Option<QuantizedSwitchLinear> {
+) -> Result<Option<QuantizedSwitchLinear>> {
     // Experts are never gate-prefixed, so `gate_default = None` is fine here.
     let plq = effective_plq_for(prefix, per_layer_quant, default_plq, None);
-    match plq.mode {
+    // int8 STORAGE with non-sym8 metadata = config drift — fail loud before
+    // the int8 stack can flow into the affine/mxfp QSL builders.
+    ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "lfm2_moe")?;
+    Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
         PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, prefix),
         PerLayerMode::Affine => {
             try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
         }
-    }
+        // FAIL-LOUD: the 3-D stacked experts have no sym8 dispatch
+        // (`gather_qmm` has no sym8 pack). Convert force-emits affine-8
+        // per-layer overrides for experts under a sym8 default, so resolving
+        // sym8 here means a malformed/hand-edited checkpoint — loading the
+        // int8 stack as another pack would emit garbage.
+        PerLayerMode::Sym8 => {
+            return Err(Error::from_reason(format!(
+                "lfm2_moe: expert projection '{prefix}' resolved to sym8 quantization, but 3-D \
+                 stacked experts have no sym8 kernel (convert force-emits affine-8 overrides for \
+                 experts under a sym8 default) — malformed checkpoint, refusing to load"
+            )));
+        }
+    })
 }
 
 /// Build the quantized router-gate QuantizedLinear for `prefix`.
@@ -62,43 +84,69 @@ fn build_lfm2_gate_ql(
     prefix: &str,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     default_gate_plq: PerLayerQuant,
-) -> Option<QuantizedLinear> {
+) -> Result<Option<QuantizedLinear>> {
     let plq = per_layer_quant
         .get(prefix)
         .copied()
         .unwrap_or(default_gate_plq);
-    match plq.mode {
+    // int8 STORAGE with non-sym8 metadata = config drift — fail loud before
+    // the int8 tensor can flow into the affine/mxfp builders.
+    ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "lfm2_moe")?;
+    Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
         PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
         PerLayerMode::Affine => {
             try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
         }
-    }
+        // FAIL-LOUD: the router gate is deliberately kept affine-8 by convert
+        // (it force-emits a per-layer override for `*.feed_forward.gate` under
+        // a sym8 default — `default_gate_plq` is affine too), so resolving
+        // sym8 here means a malformed/hand-edited checkpoint.
+        PerLayerMode::Sym8 => {
+            return Err(Error::from_reason(format!(
+                "lfm2_moe: router gate '{prefix}' resolved to sym8 quantization, but the router \
+                 gate has no sym8 dispatch (convert force-emits an affine-8 override for it \
+                 under a sym8 default) — malformed checkpoint, refusing to load"
+            )));
+        }
+    })
 }
 
 /// Build a NON-MoE `QuantizedLinear` for `base`, dispatching on the resolved
 /// per-layer quant mode. Mirrors `build_lfm2_gate_ql` but for the standalone
 /// non-MoE projections (attention q/k/v/out, conv in/out, dense-MLP gate/up/
-/// down). Supports ALL four modes (affine / mxfp4 / mxfp8 / nvfp4) by routing
-/// to the matching qwen3_5 builder; the returned `QuantizedLinear` threads the
-/// correct mode into `mlx_quantized_matmul` at forward time. Returns `None`
-/// when the `.weight`/`.scales` group is incomplete (the caller fails loud).
+/// down). Supports ALL five modes (affine / mxfp4 / mxfp8 / nvfp4 / sym8) by
+/// routing to the matching qwen3_5 builder; the returned `QuantizedLinear`
+/// threads the correct mode into `mlx_quantized_matmul` at forward time
+/// (sym8 routes its `forward` to the int8 W8A8/W8A16 kernels instead).
+///
+/// `Ok(None)` = the `.weight`/`.scales` group is incomplete (the caller fails
+/// loud); `Err` = the sym8 builder's fail-loud validation tripped (a
+/// malformed sym8 layer must NEVER silently fall back to dense/bf16 — an
+/// int8 weight loaded dense emits garbage; see
+/// `try_build_sym8_quantized_linear`).
 fn build_lfm2_non_moe_ql(
     params: &HashMap<String, MxArray>,
     base: &str,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     default_plq: PerLayerQuant,
-) -> Option<QuantizedLinear> {
+) -> Result<Option<QuantizedLinear>> {
     // Non-MoE bases never take the gate branch of `effective_plq_for` (it keys
     // on `.mlp.gate` / `.mlp.shared_expert_gate`), so `gate_default = None`.
     let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
-    match plq.mode {
+    // int8 STORAGE with non-sym8 metadata = config drift / stale quantization
+    // metadata — fail loud before dispatch. This also keeps a metadata-skewed
+    // sym8 checkpoint out of the compiled C++ path's affine quant-info
+    // registration (the compiled gate keys on config metadata only).
+    ensure_int8_storage_resolves_sym8(params, base, plq.mode, "lfm2")?;
+    Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, base),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, base),
         PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, base),
         PerLayerMode::Affine => try_build_quantized_linear(params, base, plq.group_size, plq.bits),
-    }
+        PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, base)?,
+    })
 }
 
 /// Load a NON-MoE `LinearProj` either quantized (ANY mode) or plain bf16, keyed
@@ -130,19 +178,27 @@ fn load_linear_proj_quantized_or_bf16(
 ) -> Result<()> {
     if params.contains_key(&format!("{base}.scales")) {
         // A `.scales` companion marks the tensor quantized. The packed
-        // `.weight` MUST be present; `build_lfm2_non_moe_ql` returns `None`
-        // otherwise — fail loud naming the tensor rather than leave random
-        // init (mirrors the MoE branch's fail-loud contract).
-        let ql =
-            build_lfm2_non_moe_ql(params, base, per_layer_quant, default_plq).ok_or_else(|| {
+        // `.weight` MUST be present; `build_lfm2_non_moe_ql` returns
+        // `Ok(None)` otherwise — fail loud naming the tensor rather than
+        // leave random init (mirrors the MoE branch's fail-loud contract).
+        // The `?` preserves the sym8 builder's own descriptive `Err` (its
+        // validation failures must surface verbatim, not be flattened into
+        // the generic missing-group message).
+        let ql = build_lfm2_non_moe_ql(params, base, per_layer_quant, default_plq)?.ok_or_else(
+            || {
                 Error::from_reason(format!(
                     "lfm2: quantized non-MoE tensor '{base}' has '.scales' but its packed \
                      '.weight' could not be resolved (missing weight/scales) — refusing to load \
                      with random init"
                 ))
-            })?;
+            },
+        )?;
         proj.set_quantized(ql);
     } else if let Some(w) = params.get(&format!("{base}.weight")) {
+        // No `.scales` ⇒ dense route. A truncated sym8 group (int8 `.weight`
+        // whose `.scales` was stripped) lands HERE — the dtype guard fails
+        // loud instead of letting int8 bytes reach a dense bf16 matmul.
+        ensure_dense_weight_floating(&format!("{base}.weight"), w)?;
         proj.set_weight(w, base)?;
     }
     Ok(())
@@ -178,22 +234,23 @@ fn load_dense_mlp_variant(
         // Quantized dense MLP: build all three projections and swap the variant
         // to `Quantized` in place. A missing half on ANY projection fails loud
         // (validate_mandatory_weights already rejects lone-half groups, but the
-        // builder-level guard catches any skew it cannot see).
-        let gate_proj = build_lfm2_non_moe_ql(params, &gate_base, per_layer_quant, default_plq)
+        // builder-level guard catches any skew it cannot see). The first `?`
+        // preserves the sym8 builder's own descriptive `Err`.
+        let gate_proj = build_lfm2_non_moe_ql(params, &gate_base, per_layer_quant, default_plq)?
             .ok_or_else(|| {
                 Error::from_reason(format!(
                     "lfm2: quantized dense-MLP projection '{gate_base}' could not be built \
                      (missing weight/scales)"
                 ))
             })?;
-        let up_proj = build_lfm2_non_moe_ql(params, &up_base, per_layer_quant, default_plq)
+        let up_proj = build_lfm2_non_moe_ql(params, &up_base, per_layer_quant, default_plq)?
             .ok_or_else(|| {
                 Error::from_reason(format!(
                     "lfm2: quantized dense-MLP projection '{up_base}' could not be built \
                      (missing weight/scales)"
                 ))
             })?;
-        let down_proj = build_lfm2_non_moe_ql(params, &down_base, per_layer_quant, default_plq)
+        let down_proj = build_lfm2_non_moe_ql(params, &down_base, per_layer_quant, default_plq)?
             .ok_or_else(|| {
                 Error::from_reason(format!(
                     "lfm2: quantized dense-MLP projection '{down_base}' could not be built \
@@ -210,13 +267,19 @@ fn load_dense_mlp_variant(
         // construction); load each projection's weight through the eager-dense
         // `Linear` setters. lfm2 never calls `finalize_gate_up`, so the E39
         // stacked fast path stays inert and `set_*_proj_weight` is sufficient.
+        // Each dense load is dtype-guarded: a truncated sym8 group (int8
+        // `.weight`, `.scales` stripped on ALL THREE projections) classifies
+        // as dense and would otherwise smuggle int8 bytes into bf16 matmuls.
         if let Some(w) = params.get(&format!("{gate_base}.weight")) {
+            ensure_dense_weight_floating(&format!("{gate_base}.weight"), w)?;
             ff.set_gate_proj_weight(w)?;
         }
         if let Some(w) = params.get(&format!("{up_base}.weight")) {
+            ensure_dense_weight_floating(&format!("{up_base}.weight"), w)?;
             ff.set_up_proj_weight(w)?;
         }
         if let Some(w) = params.get(&format!("{down_base}.weight")) {
+            ensure_dense_weight_floating(&format!("{down_base}.weight"), w)?;
             ff.set_down_proj_weight(w)?;
         }
     }
@@ -227,13 +290,32 @@ fn load_dense_mlp_variant(
 /// into `mlx_dequantize` / `mlx_quantized_matmul`. The per-mode group_size /
 /// bits constants are forced by the FP modes (the `.scales` companion encodes
 /// the format); affine carries its own `bits` / `group_size` from the PLQ.
-fn plq_to_packed_params(plq: PerLayerQuant) -> (i32, i32, &'static str) {
-    match plq.mode {
+///
+/// `ctx` names the tensor/prefix for the sym8 rejection: sym8 has no MLX
+/// pack (its int8 weight is consumed by the dedicated W8A8/W8A16 kernels,
+/// never `mlx_quantized_matmul`/`mlx_dequantize`), so the two packed-quant
+/// consumers of this helper — the embedding loader and the compiled-path
+/// quant-info registration — must fail loud rather than hand "sym8" to MLX.
+/// The compiled-path quant-info loop branches sym8 to its dedicated "sym8"
+/// registration BEFORE calling here (see `register_weights_with_cpp_locked`),
+/// and convert keeps the lfm2 embedding DENSE bf16 under a sym8 default (a
+/// packed embedding's `.scales` would bar the whole compiled path), so a
+/// sym8 arrival here is defense-in-depth against a malformed checkpoint.
+fn plq_to_packed_params(plq: PerLayerQuant, ctx: &str) -> Result<(i32, i32, &'static str)> {
+    Ok(match plq.mode {
         PerLayerMode::Affine => (plq.group_size, plq.bits, "affine"),
         PerLayerMode::Mxfp8 => (MXFP8_GROUP_SIZE, MXFP8_BITS, "mxfp8"),
         PerLayerMode::Mxfp4 => (MXFP4_GROUP_SIZE, MXFP4_BITS, "mxfp4"),
         PerLayerMode::Nvfp4 => (NVFP4_GROUP_SIZE, NVFP4_BITS, "nvfp4"),
-    }
+        PerLayerMode::Sym8 => {
+            return Err(Error::from_reason(format!(
+                "lfm2: '{ctx}' resolved to sym8 quantization, but this packed-quant path \
+                 (embedding / packed quant-info) has no sym8 dispatch — convert never emits \
+                 sym8 for these tensors (the lfm2 embedding stays dense bf16 under a sym8 \
+                 default), so this checkpoint is malformed; refusing to load"
+            )));
+        }
+    })
 }
 
 /// Load a NON-MoE `Embedding` either PACKED-quantized (ANY mode) or plain bf16,
@@ -267,11 +349,16 @@ fn load_embedding_affine_or_bf16(
             ))
         })?;
         let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
-        let (group_size, bits, mode) = plq_to_packed_params(plq);
+        // Rejects sym8 (descriptive Err): the packed embedding backend feeds
+        // `mlx_dequantize`/`mlx_quantized_matmul`, which have no sym8 pack.
+        let (group_size, bits, mode) = plq_to_packed_params(plq, base)?;
         // mxfp4/mxfp8/nvfp4 carry no quant biases; affine may.
         let biases = params.get(&format!("{base}.biases"));
         embedding.load_quantized_packed(weight, scales, biases, group_size, bits, mode)?;
     } else if let Some(w) = params.get(&format!("{base}.weight")) {
+        // Dense fallback (no `.scales`): a stripped quant group must never
+        // reach the dense lookup / tied-lm_head matmul.
+        ensure_dense_weight_floating(&format!("{base}.weight"), w)?;
         embedding.load_weight(w)?;
     }
     Ok(())
@@ -311,6 +398,9 @@ fn load_lm_head_affine_or_bf16(
         let biases = params.get(&format!("{base}.biases"));
         linear.load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
     } else if let Some(w) = params.get(&format!("{base}.weight")) {
+        // Dense fallback (no `.scales`): same stripped-quant-group dtype
+        // guard as every other quantizable dense route.
+        ensure_dense_weight_floating(&format!("{base}.weight"), w)?;
         linear.set_weight(w)?;
     }
     Ok(())
@@ -596,9 +686,21 @@ fn sanitize_weights(
     }
 
     // Cast f32 tensors to bf16 to avoid dtype promotion issues. EXCLUDE
-    // `expert_bias` so it stays f32 (matches `lfm2_moe.py::cast_predicate`).
+    // `expert_bias` so it stays f32 (matches `lfm2_moe.py::cast_predicate`)
+    // and sym8 `.scales` (mandatory f32 [N] — the sym8 builder fail-louds on
+    // bf16 scales). sym8 siblings are identified content-based (Int8 sibling
+    // `.weight`) because the quant config is read AFTER sanitize; affine/mxfp
+    // `.scales` (packed Uint32 weights) keep today's bf16 cast.
+    let sym8_scales: std::collections::HashSet<String> = sanitized
+        .keys()
+        .filter_map(|k| {
+            let prefix = k.strip_suffix(".scales")?;
+            let w = sanitized.get(&format!("{prefix}.weight"))?;
+            (w.dtype().ok()? == DType::Int8).then(|| k.clone())
+        })
+        .collect();
     for (k, value) in sanitized.iter_mut() {
-        if k.ends_with(".expert_bias") {
+        if k.ends_with(".expert_bias") || sym8_scales.contains(k) {
             continue;
         }
         if value.dtype().is_ok_and(|dt| dt == DType::Float32)
@@ -769,7 +871,7 @@ fn apply_weights(
                 // rejects lone-half groups, so this is the belt-and-braces
                 // guard for any builder-level skew it cannot see.
                 let ql =
-                    build_lfm2_gate_ql(params, &gate_prefix, per_layer_quant, default_gate_plq)
+                    build_lfm2_gate_ql(params, &gate_prefix, per_layer_quant, default_gate_plq)?
                         .ok_or_else(|| {
                             Error::from_reason(format!(
                                 "lfm2_moe: layer {i} is quantized but the router gate \
@@ -782,27 +884,30 @@ fn apply_weights(
                 let gp = format!("{prefix}.feed_forward.switch_mlp.gate_proj");
                 let up = format!("{prefix}.feed_forward.switch_mlp.up_proj");
                 let dp = format!("{prefix}.feed_forward.switch_mlp.down_proj");
-                let g =
-                    build_lfm2_qsl(params, &gp, per_layer_quant, default_plq).ok_or_else(|| {
+                let g = build_lfm2_qsl(params, &gp, per_layer_quant, default_plq)?.ok_or_else(
+                    || {
                         Error::from_reason(format!(
                             "lfm2_moe: layer {i} is quantized but expert projection \
                              '{gp}' could not be built (missing weight/scales)"
                         ))
-                    })?;
-                let u =
-                    build_lfm2_qsl(params, &up, per_layer_quant, default_plq).ok_or_else(|| {
+                    },
+                )?;
+                let u = build_lfm2_qsl(params, &up, per_layer_quant, default_plq)?.ok_or_else(
+                    || {
                         Error::from_reason(format!(
                             "lfm2_moe: layer {i} is quantized but expert projection \
                              '{up}' could not be built (missing weight/scales)"
                         ))
-                    })?;
-                let d =
-                    build_lfm2_qsl(params, &dp, per_layer_quant, default_plq).ok_or_else(|| {
+                    },
+                )?;
+                let d = build_lfm2_qsl(params, &dp, per_layer_quant, default_plq)?.ok_or_else(
+                    || {
                         Error::from_reason(format!(
                             "lfm2_moe: layer {i} is quantized but expert projection \
                              '{dp}' could not be built (missing weight/scales)"
                         ))
-                    })?;
+                    },
+                )?;
                 moe.set_switch_mlp(SwitchGLU::new_quantized(g, u, d));
             } else {
                 // DENSE (bf16) MoE branch. `is_quant` is false, so NO projection
@@ -822,22 +927,41 @@ fn apply_weights(
                         )));
                     }
                 }
+                // Every dense setter below is dtype-guarded: a STRIPPED quant
+                // group (int8 sym8 / packed-uint32 affine `.weight` whose
+                // `.scales` sidecars were ALL removed) makes `is_quant` false
+                // and lands here — the `.scales` re-scan above cannot see it.
+                // Non-float storage must never enter the dense router/expert
+                // matmul routes.
                 if let Some(w) = params.get(&format!("{gate_prefix}.weight")) {
+                    ensure_dense_weight_floating(&format!("{gate_prefix}.weight"), w)?;
                     moe.set_gate_weight(w)?;
                 }
                 if let Some(w) = params.get(&format!(
                     "{prefix}.feed_forward.switch_mlp.gate_proj.weight"
                 )) {
+                    ensure_dense_weight_floating(
+                        &format!("{prefix}.feed_forward.switch_mlp.gate_proj.weight"),
+                        w,
+                    )?;
                     moe.set_switch_mlp_gate_proj_weight(w);
                 }
                 if let Some(w) =
                     params.get(&format!("{prefix}.feed_forward.switch_mlp.up_proj.weight"))
                 {
+                    ensure_dense_weight_floating(
+                        &format!("{prefix}.feed_forward.switch_mlp.up_proj.weight"),
+                        w,
+                    )?;
                     moe.set_switch_mlp_up_proj_weight(w);
                 }
                 if let Some(w) = params.get(&format!(
                     "{prefix}.feed_forward.switch_mlp.down_proj.weight"
                 )) {
+                    ensure_dense_weight_floating(
+                        &format!("{prefix}.feed_forward.switch_mlp.down_proj.weight"),
+                        w,
+                    )?;
                     moe.set_switch_mlp_down_proj_weight(w);
                 }
             }
@@ -1296,6 +1420,18 @@ impl Lfm2Inner {
 
         // Load safetensors
         let mut params = load_all_safetensors(path, false)?;
+
+        // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval of any
+        // mmap-backed weight (FP8 dequant in `dequant_fp8_weights`, the tensor
+        // rewiring in `sanitize_weights`, the per-layer finalize in
+        // `apply_weights`, and the final `materialize_weights`). On a slow/cold
+        // mmap source (e.g. a model served off a USB SSD) the first GPU op to
+        // page-fault a cold region can exceed the macOS GPU command-buffer
+        // watchdog (~5 s) and abort uncatchably. Reading the shards on the CPU
+        // first makes every later eval hit resident pages. See
+        // `prewarm_checkpoint_pages`.
+        prewarm_checkpoint_pages(path);
+
         info!("Loaded {} tensors from safetensors", params.len());
 
         // FP8 dequantization (if applicable)
@@ -1322,6 +1458,22 @@ impl Lfm2Inner {
         // (compiled-PAGED ~1.5×). Explicit `use_block_paged_cache` in config.json
         // always wins.
         let is_quantized = params.keys().any(|k| k.ends_with(".scales"));
+        // sym8 scope: lfm2 consumes sym8 checkpoints FLAT only (compiled-FLAT
+        // when registration succeeds, eager-FLAT when it aborts). The
+        // quantized default below already resolves to flat; an explicit
+        // `use_block_paged_cache: true` pin must ALSO be forced flat —
+        // eager-PAGED would be numerically fine (LinearProj dispatches sym8)
+        // but slow, and compiled-PAGED is structurally barred anyway (the f32
+        // [N] sym8 `.scales` fail the paged arm's `non_quant_floats_bf16`
+        // invariant). Mirrors the qwen3.5 sym8 paged-pin override.
+        let checkpoint_has_sym8 = has_sym8_mode(top_level_mode, &per_layer_quant);
+        if checkpoint_has_sym8 && config.use_block_paged_cache == Some(true) {
+            tracing::warn!(
+                "LFM2: sym8 checkpoint pinned use_block_paged_cache:true; sym8 v1 is \
+                 eager-FLAT only — forcing use_block_paged_cache=false."
+            );
+            config.use_block_paged_cache = Some(false);
+        }
         {
             let resolved = Lfm2Config::resolve_use_block_paged_default(
                 config.use_block_paged_cache,
@@ -1456,6 +1608,18 @@ impl Lfm2Inner {
         // compiled slot — same needless eviction the dtype gate closed for f16.
         let paged_block_size_ok = inner.config.paged_block_size.unwrap_or(16)
             == crate::models::qwen3_5::model::CPP_PAGED_REQUIRED_BLOCK_SIZE;
+        // sym8 compiled-FLAT port (mirrors qwen3.5's registration): a sym8
+        // checkpoint registers like any other quantized checkpoint. The shared
+        // compiled `linear_proj` dispatches registry mode "sym8" to
+        // `sym8_linear_proj`, and `register_weights_with_cpp_locked` builds the
+        // layout it asserts — the contiguous [K,N] int8 kernel operand as
+        // `{prefix}.weight` plus the [N,K] checkpoint tensor as
+        // `{prefix}.weight_nk` — aborting to eager on ANY sym8 registration
+        // failure (weights cleared, model_id never published, load NOT failed).
+        // Compiled-PAGED stays structurally barred for sym8: the paged-pin
+        // override above forces sym8 onto FLAT, and the f32 [N] sym8 `.scales`
+        // keys fail the `non_quant_floats_bf16` invariant the paged arm
+        // requires — only the FLAT arm (which consults neither) registers.
         if should_register_compiled(
             is_quantized,
             is_flat,
@@ -1543,10 +1707,12 @@ impl Lfm2Inner {
 ///     transposed to `[hidden, E]` by `mlx_store_weight` like any 2D linear.
 ///   * `feed_forward.expert_bias`, shape `[E]` (1D, f32) — stored as-is.
 ///
-/// Still returns early (storing nothing, publishing no id) for quantized
-/// (`.scales`-suffixed, incl. quantized MoE) checkpoints, mirroring the
-/// call-site gate. The call-site gate registers BOTH flat
-/// (`use_block_paged_cache == Some(false)`) AND paged (the default) bf16/f16
+/// QUANTIZED checkpoints (`.scales`-suffixed, incl. quantized MoE) register
+/// too: every `.weight`/`.scales`/`.biases` is stored verbatim plus one
+/// per-prefix quant-info entry (step 4a), EXCEPT sym8 prefixes, which swap in
+/// the [K,N] int8 kernel operand + a `.weight_nk` sidecar (see the sym8 notes
+/// inside `register_weights_with_cpp_locked`). The call-site gate registers
+/// BOTH flat (`use_block_paged_cache == Some(false)`) AND paged (the default)
 /// checkpoints, so this registration is not flat-only; the per-step dispatcher
 /// picks the flat (`lfm2_decode_fn`) or paged (`lfm2_decode_fn_paged`) compiled
 /// graph against the SAME registered weight map. `conv_bias=true` checkpoints ARE
@@ -1636,8 +1802,12 @@ fn non_quant_float_weights_are_bf16(params: &HashMap<String, MxArray>) -> Result
 ///     per-projection quant-info; see `register_weights_with_cpp_locked`), but ONLY
 ///     when `quant_compiled_eligible` (the `MLX_LFM2_DISABLE_QUANT_COMPILED` escape
 ///     hatch is unset AND the input embedding is a dense, non-packed-quant table —
-///     the C++ does a dense `take` over it). When that bool is false, quantized
-///     checkpoints register no compiled path and run eager (the prior behavior).
+///     the C++ does a dense `take` over it). sym8 checkpoints are INCLUDED
+///     (flat-compiled): the registration builds the [K,N] kernel operand +
+///     `.weight_nk` layout the shared `sym8_linear_proj` asserts, and aborts to
+///     eager (without failing the load) on any sym8 registration error. When
+///     `quant_compiled_eligible` is false, quantized checkpoints register no
+///     compiled path and run eager (the prior behavior).
 ///
 /// Every other decline (model-id eviction race, seed-time pool failures, mid-cycle
 /// forward errors) is runtime-only and handled by the lock-release + RAII reset
@@ -1701,49 +1871,154 @@ fn register_weights_with_cpp_locked(
     // (3) Clear the shared map (also resets the active model id + quant-info).
     unsafe { mlx_sys::mlx_clear_weights() };
 
-    // (4) Store every sanitized weight. `mlx_store_weight` auto-transposes
-    // ndim==2 (incl. the MoE router gate); 3D stacked experts + 3D conv weight +
-    // 1D norms / biases / expert_bias are left untouched. Quantized checkpoints
-    // store `.weight`/`.scales`/`.biases` verbatim; per-prefix quant-info is
-    // registered in (4a) below so the compiled graph dispatches the authoritative
-    // (mode, bits, group_size) instead of inferring from companion presence.
-    for (name, arr) in params {
-        let c_name = std::ffi::CString::new(name.as_str())
-            .map_err(|e| Error::from_reason(format!("Weight name contains NUL byte: {e}")))?;
-        unsafe {
-            mlx_sys::mlx_store_weight(c_name.as_ptr(), arr.as_raw_ptr());
-        }
-    }
+    // sym8 checkpoints register too (compiled-FLAT port, mirroring qwen3.5's
+    // `register_weights_with_cpp`). Layout contract (the C++ asserts it at
+    // dispatch — see `sym8_linear_proj` in mlx_qwen35_common.h): for a sym8
+    // prefix we store the CONTIGUOUS [K,N] int8 KERNEL OPERAND as
+    // `{prefix}.weight` — NOT the checkpoint's [N,K] tensor — plus the [N,K]
+    // CHECKPOINT tensor as `{prefix}.weight_nk` (the decode QMV's simd_sum
+    // kernel streams [N,K] row-major) and the f32 [N] `.scales`. This mirrors
+    // the load-time hoist the eager `QuantizedLinear::new_sym8` does
+    // (`int8_gemm::sym8_kernel_operand`), so per-forward weight reshaping
+    // stays zero on both paths. The [K,N] operand built here is a SECOND int8
+    // copy of each sym8 layer (the eager layers keep their own for fallback);
+    // the `.weight_nk` entry shares the params-map buffer (no extra copy).
+    let sym8_checkpoint = has_sym8_mode(top_level_mode, per_layer_quant);
 
-    // (4a) Register per-projection quant-info for every `.scales` companion so the
-    // compiled `linear_proj` / `lfm2_switch_linear` dispatch the Rust-authoritative
-    // (mode, bits, group_size) rather than the companion-tensor heuristic (which
-    // would silently mislabel MXFP4 / NVFP4 as MXFP8). Mirrors
-    // `qwen3_5_moe::register_moe_weights_with_cpp`, but resolves the LFM2 router
-    // gate (`*.feed_forward.gate`) via the SAME direct-lookup-then-`default_gate_plq`
-    // logic as `build_lfm2_gate_ql` (LFM2's gate prefix is `feed_forward.gate`,
-    // which `effective_plq_for`'s gate branch — keyed on `.mlp.gate` — does NOT
-    // match), and every other projection via `effective_plq_for(prefix, .., None)`
-    // exactly as `build_lfm2_qsl` / `build_lfm2_ql` do, so the compiled path
-    // dispatches the identical kernel to the eager loaders. `*.expert_bias` (no
-    // `.scales` companion) is untouched. A no-op for bf16/f16 checkpoints (no
-    // `.scales` keys). `mlx_clear_weights` above already wiped the prior map.
+    // Resolve the PLQ defaults BEFORE the store loop: sym8 prefixes swap in
+    // the [K,N] kernel operand at store time, which needs the same per-prefix
+    // mode resolution `apply_weights` used. (4a) reuses the same defaults.
     let (default_plq, default_gate_plq) =
         compute_lfm2_moe_defaults(params, top_level_mode, quant_bits, quant_group_size);
-    let mut quant_info_count = 0usize;
-    for name in params.keys() {
-        let Some(prefix) = name.strip_suffix(".scales") else {
-            continue;
-        };
-        let plq = if prefix.ends_with(".feed_forward.gate") {
+    // Per-prefix PLQ resolution shared by the sym8 store swap and the (4a)
+    // quant-info loop. LFM2's router gate (`*.feed_forward.gate`) resolves via
+    // the SAME direct-lookup-then-`default_gate_plq` logic as
+    // `build_lfm2_gate_ql` (LFM2's gate prefix is `feed_forward.gate`, which
+    // `effective_plq_for`'s gate branch — keyed on `.mlp.gate` — does NOT
+    // match); every other projection via `effective_plq_for(prefix, .., None)`
+    // exactly as `build_lfm2_qsl` / `build_lfm2_non_moe_ql` do, so the
+    // compiled path dispatches the identical kernel to the eager loaders.
+    let plq_for = |prefix: &str| -> PerLayerQuant {
+        if prefix.ends_with(".feed_forward.gate") {
             per_layer_quant
                 .get(prefix)
                 .copied()
                 .unwrap_or(default_gate_plq)
         } else {
             effective_plq_for(prefix, per_layer_quant, default_plq, None)
+        }
+    };
+
+    // Fail-safe abort for sym8 registration errors (mirrors qwen3.5's
+    // `abort_registration`): wipe the half-populated C++ state and leave
+    // model_id UNSET (`mlx_lfm2_get_model_id() != model_id`), so every forward
+    // for this model takes the eager Rust path. Correctness is preserved
+    // (eager sym8 is the reference path); only the compiled-decode speedup is
+    // lost — and loudly. A sym8 registration failure must NOT fail the load:
+    // the call sites return `Ok(())` after invoking this. The compile-epoch
+    // bump preserves the step-(5) invariant — a stale compiled closure must
+    // never stay reachable after a failed re-registration.
+    let abort_registration = |reason: &str| {
+        tracing::warn!(
+            "lfm2 sym8 compiled registration ABORTED for model_id={model_id}: {reason} — \
+             clearing C++ weights; model stays unregistered (eager Rust forward path)."
+        );
+        unsafe { mlx_sys::mlx_clear_weights() };
+        unsafe { mlx_sys::mlx_lfm2_invalidate_compiled() };
+    };
+
+    // Reserved sidecar suffix pre-scan: `{prefix}.weight_nk` is GENERATED by
+    // the sym8 store arm below (the [N,K] decode-QMV orientation). A
+    // checkpoint-supplied tensor under that suffix could clobber the generated
+    // sidecar (HashMap iteration order is arbitrary) and silently corrupt
+    // compiled decode logits. Reject BEFORE any store/operand work so the
+    // abort is deterministic and no FFI side effects run on malformed input —
+    // abort to eager (which never reads the suffix). No converter emits this
+    // key; only a corrupt/adversarial checkpoint can carry it.
+    if let Some(reserved) = params.keys().find(|k| k.ends_with(".weight_nk")) {
+        abort_registration(&format!(
+            "checkpoint key '{reserved}' uses the reserved sym8 sidecar suffix `.weight_nk`"
+        ));
+        return Ok(());
+    }
+
+    let store = |name: &str, arr: &MxArray| -> Result<()> {
+        let c_name = std::ffi::CString::new(name)
+            .map_err(|e| Error::from_reason(format!("Weight name contains NUL byte: {e}")))?;
+        unsafe {
+            mlx_sys::mlx_store_weight(c_name.as_ptr(), arr.as_raw_ptr());
+        }
+        Ok(())
+    };
+
+    // (4) Store every sanitized weight. `mlx_store_weight` auto-transposes
+    // ndim==2 (incl. the MoE router gate); 3D stacked experts + 3D conv weight +
+    // 1D norms / biases / expert_bias are left untouched. Quantized checkpoints
+    // store `.weight`/`.scales`/`.biases` verbatim — EXCEPT sym8 prefixes,
+    // which store the [K,N] kernel operand + `.weight_nk` sidecar (see the
+    // layout-contract comment above); per-prefix quant-info is registered in
+    // (4a) below so the compiled graph dispatches the authoritative
+    // (mode, bits, group_size) instead of inferring from companion presence.
+    for (name, arr) in params {
+        // sym8 layout swap: the gate mirrors `try_build_sym8_quantized_linear`'s
+        // "is this layer sym8-quantized" signal — a `.scales` companion + an
+        // effective PLQ mode of Sym8. Non-sym8 layers in a mixed checkpoint
+        // (e.g. the affine-8-forced router gate / K%16-failed linears) store
+        // verbatim below.
+        if sym8_checkpoint
+            && let Some(prefix) = name.strip_suffix(".weight")
+            && params.contains_key(&format!("{prefix}.scales"))
+            && plq_for(prefix).mode == PerLayerMode::Sym8
+        {
+            match crate::models::qwen3_5::int8_gemm::sym8_kernel_operand(arr) {
+                Ok(w_kn) => store(name, &w_kn)?,
+                Err(e) => {
+                    abort_registration(&format!(
+                        "failed to build [K,N] kernel operand for '{}': {}",
+                        name, e.reason
+                    ));
+                    return Ok(());
+                }
+            }
+            // ALSO register the [N,K] CHECKPOINT tensor under
+            // `{prefix}.weight_nk`: the compiled decode QMV's simd_sum kernel
+            // streams the [N,K] row-major orientation (the [K,N] operand above
+            // stays for the prefill GEMM + fallback kernels). This stores the
+            // params-map array HANDLE — the buffer is shared with the eager
+            // layer's checkpoint tensor, so the only double-stored copy
+            // remains the [K,N] operand.
+            store(&format!("{prefix}.weight_nk"), arr)?;
+            continue;
+        }
+        store(name, arr)?;
+    }
+
+    // (4a) Register per-projection quant-info for every `.scales` companion so the
+    // compiled `linear_proj` / `lfm2_switch_linear` dispatch the Rust-authoritative
+    // (mode, bits, group_size) rather than the companion-tensor heuristic (which
+    // would silently mislabel MXFP4 / NVFP4 as MXFP8). Mirrors
+    // `qwen3_5_moe::register_moe_weights_with_cpp`; per-prefix resolution is the
+    // shared `plq_for` above (gate-aware, identical to the eager loaders).
+    // `*.expert_bias` (no `.scales` companion) is untouched. A no-op for
+    // bf16/f16 checkpoints (no `.scales` keys). `mlx_clear_weights` above
+    // already wiped the prior map.
+    let mut quant_info_count = 0usize;
+    let mut sym8_info_count = 0usize;
+    for name in params.keys() {
+        let Some(prefix) = name.strip_suffix(".scales") else {
+            continue;
         };
-        let (group_size, bits, mode_str) = plq_to_packed_params(plq);
+        let plq = plq_for(prefix);
+        // sym8 has no MLX pack: `plq_to_packed_params` (which also serves the
+        // packed-embedding loader) deliberately REJECTS Sym8, so branch to the
+        // direct "sym8" registration FIRST. The compiled `linear_proj`
+        // dispatches "sym8" to the int8 W8A8/W8A16 kernel path; the matching
+        // `.weight` entry stored above is the [K,N] kernel operand.
+        let (group_size, bits, mode_str) = if plq.mode == PerLayerMode::Sym8 {
+            (plq.group_size, plq.bits, "sym8")
+        } else {
+            plq_to_packed_params(plq, prefix)?
+        };
         let c_prefix = std::ffi::CString::new(prefix)
             .map_err(|e| Error::from_reason(format!("Quant-info prefix has NUL byte: {e}")))?;
         let c_mode = std::ffi::CString::new(mode_str)
@@ -1751,12 +2026,29 @@ fn register_weights_with_cpp_locked(
         unsafe {
             mlx_sys::mlx_store_quant_info(c_prefix.as_ptr(), c_mode.as_ptr(), bits, group_size);
         }
+        // Load-time safety assertion (mirrors qwen3.5): a sym8 layer must
+        // round-trip out of the C++ registry as EXACTLY "sym8". A coerced/
+        // missing entry would make the compiled forward fall through to
+        // quantized_matmul and read the int8 operand as a packed-uint32 pack —
+        // garbage logits. Fail-safe: abort registration so the model decodes
+        // on the eager Rust path instead.
+        if plq.mode == PerLayerMode::Sym8 {
+            let round_trips =
+                unsafe { mlx_sys::mlx_quant_info_mode_matches(c_prefix.as_ptr(), c_mode.as_ptr()) };
+            if !round_trips {
+                abort_registration(&format!(
+                    "quant-info mode for sym8 prefix '{prefix}' did not round-trip as \"sym8\""
+                ));
+                return Ok(());
+            }
+            sym8_info_count += 1;
+        }
         quant_info_count += 1;
     }
     if quant_info_count > 0 {
         info!(
             "Registered {quant_info_count} per-projection quant-info entries for the lfm2 \
-             compiled forward path"
+             compiled forward path ({sym8_info_count} sym8)"
         );
     }
     debug_assert_eq!(
@@ -1764,6 +2056,18 @@ fn register_weights_with_cpp_locked(
         params.keys().filter(|k| k.ends_with(".scales")).count(),
         "every .scales companion must register exactly one quant-info entry"
     );
+
+    // Belt-and-braces for the sym8 layout contract (mirrors qwen3.5): a
+    // checkpoint whose DEFAULT mode is sym8 must have registered at least one
+    // sym8 quant-info entry — zero means the detection gates above silently
+    // disagreed with `apply_weights` (e.g. a prefix-normalization drift) and
+    // the compiled path would mis-dispatch. Abort to eager.
+    if sym8_checkpoint && top_level_mode == Some(PerLayerMode::Sym8) && sym8_info_count == 0 {
+        abort_registration(
+            "checkpoint is sym8-default but no sym8 quant-info entries were registered",
+        );
+        return Ok(());
+    }
 
     // (4b) Synthesize a ZERO expert_bias for any MoE layer that declares
     // `use_expert_bias` but whose checkpoint OMITS `feed_forward.expert_bias`
@@ -1869,6 +2173,7 @@ impl Lfm2Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::qwen3_5_moe::quantized_linear::{SYM8_BITS, SYM8_GROUP_SIZE, SYM8_MODE};
 
     /// Build a tiny all-MoE config (num_dense_layers=0) with one conv layer
     /// and one attention layer. `use_block_paged_cache: Some(false)` skips the
@@ -2265,6 +2570,168 @@ mod tests {
             "F1: omitting expert_bias must be backfilled by zero-synthesis \
              (count_without={count_without} count_with={count_with}); the compiled \
              path would otherwise read a missing expert_bias and diverge from native"
+        );
+    }
+
+    /// sym8 compiled-FLAT registration port: a sym8-resolved prefix must store
+    /// the [K,N] kernel operand under `{prefix}.weight` PLUS the [N,K]
+    /// checkpoint tensor under `{prefix}.weight_nk`, and its quant-info must
+    /// round-trip out of the C++ registry as EXACTLY "sym8" (the compiled
+    /// `linear_proj` dispatches that mode to `sym8_linear_proj`). No FFI
+    /// getter exists to read a stored tensor back, so the [K,N] orientation
+    /// itself is pinned by the C++ `sym8_linear_proj` fail-loud assertions at
+    /// the first compiled forward (e2e battery); this test pins the sidecar
+    /// count, the mode round-trip, and the id publish. Holds
+    /// COMPILED_WEIGHTS_RWLOCK (write, poison-recovered) and calls the
+    /// `_locked` worker directly (the wrapper would deadlock re-taking the
+    /// non-reentrant RwLock).
+    #[test]
+    fn register_sym8_stores_weight_nk_sidecar_and_sym8_quant_info() {
+        let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let config = tiny_moe_config(/* use_expert_bias */ false);
+        // bf16 MoE fixture with ONE sym8 attention projection: swap the bf16
+        // q_proj for an int8 [N,K] + f32 [N] sym8 group. Registration only
+        // builds the transpose operand (plain MLX ops, eval'd at load) — it
+        // never runs the int8 NA kernels, so no GPU-gen skip is needed.
+        let mut params = full_bf16_moe_params();
+        params.remove("layers.1.self_attn.q_proj.weight");
+        synth_sym8_group(&mut params, "layers.1.self_attn.q_proj", 4, 4);
+
+        let model_id = 0xF1F2_0001u64;
+        register_weights_with_cpp_locked(
+            &params,
+            model_id,
+            &config,
+            Some(PerLayerMode::Sym8),
+            &HashMap::new(),
+            SYM8_BITS,
+            SYM8_GROUP_SIZE,
+        )
+        .expect("well-formed sym8 registration must succeed");
+
+        let count = unsafe { mlx_sys::mlx_weight_count() };
+        assert_eq!(
+            count,
+            params.len() + 1,
+            "sym8 registration must add exactly one .weight_nk sidecar \
+             (every params tensor + the [N,K] checkpoint orientation)"
+        );
+
+        let c_prefix = std::ffi::CString::new("layers.1.self_attn.q_proj").expect("CString");
+        let c_sym8 = std::ffi::CString::new("sym8").expect("CString");
+        assert!(
+            unsafe { mlx_sys::mlx_quant_info_mode_matches(c_prefix.as_ptr(), c_sym8.as_ptr()) },
+            "sym8 prefix must round-trip out of the C++ registry as \"sym8\""
+        );
+
+        assert_eq!(
+            unsafe { mlx_sys::mlx_lfm2_get_model_id() },
+            model_id,
+            "successful sym8 registration must publish the model id"
+        );
+
+        // Clean up the shared map so this destructive test leaves no live id.
+        unsafe { mlx_sys::mlx_clear_weights() };
+    }
+
+    /// sym8 abort fail-safe: a deliberately-broken sym8 group (a `.scales`
+    /// companion next to a bf16 — NOT int8 — `.weight`, resolving mode Sym8)
+    /// makes `sym8_kernel_operand` reject the operand build. Registration
+    /// must ABORT to eager: return `Ok` (a registration failure must NOT fail
+    /// the load), wipe the half-populated weight map, and never publish the
+    /// model id (`compiled_path_active()` stays false → eager decode).
+    #[test]
+    fn broken_sym8_registration_aborts_to_eager_without_failing_load() {
+        let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let config = tiny_moe_config(/* use_expert_bias */ false);
+        // The fixture q_proj.weight stays bf16; adding a `.scales` sibling
+        // under a sym8 default makes the prefix resolve Sym8 → the [K,N]
+        // operand build fails on the non-int8 dtype.
+        let mut params = full_bf16_moe_params();
+        params.insert("layers.1.self_attn.q_proj.scales".into(), f32a(&[4], 0.01));
+
+        let model_id = 0xF1F2_0002u64;
+        register_weights_with_cpp_locked(
+            &params,
+            model_id,
+            &config,
+            Some(PerLayerMode::Sym8),
+            &HashMap::new(),
+            SYM8_BITS,
+            SYM8_GROUP_SIZE,
+        )
+        .expect("a broken sym8 registration must abort to eager, not Err the load");
+
+        assert_eq!(
+            unsafe { mlx_sys::mlx_weight_count() },
+            0,
+            "abort must clear the half-populated weight map"
+        );
+        assert_eq!(
+            unsafe { mlx_sys::mlx_lfm2_get_model_id() },
+            0,
+            "abort must leave the model unregistered (compiled path stays off)"
+        );
+    }
+
+    /// Reserved-key collision: `{prefix}.weight_nk` is GENERATED by the sym8
+    /// store arm; a checkpoint-SUPPLIED tensor under that key could clobber
+    /// the generated sidecar (HashMap iteration order is arbitrary) and
+    /// silently corrupt compiled decode logits. The pre-scan must treat the
+    /// reserved suffix as malformed input and abort to eager BEFORE any
+    /// store/operand work: `Ok` return (never fail the load), weight map
+    /// wiped, model id never published. The sym8 group uses a kernel-valid
+    /// K=16 shape so the abort can only come from the reserved-key pre-scan,
+    /// never from an operand-build failure.
+    #[test]
+    fn checkpoint_supplied_weight_nk_aborts_registration() {
+        let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let config = tiny_moe_config(/* use_expert_bias */ false);
+        let mut params = full_bf16_moe_params();
+        params.remove("layers.1.self_attn.q_proj.weight");
+        synth_sym8_group(&mut params, "layers.1.self_attn.q_proj", 4, 16);
+        // Adversarial: a same-shaped int8 tensor under the RESERVED sidecar
+        // key — without the pre-scan this races the generated sidecar on
+        // HashMap order and can win silently.
+        let stale: Vec<f32> = vec![9.0; 64];
+        params.insert(
+            "layers.1.self_attn.q_proj.weight_nk".into(),
+            MxArray::from_float32(&stale, &[4, 16])
+                .expect("from_float32")
+                .astype(DType::Int8)
+                .expect("astype int8"),
+        );
+
+        let model_id = 0xF1F2_0003u64;
+        register_weights_with_cpp_locked(
+            &params,
+            model_id,
+            &config,
+            Some(PerLayerMode::Sym8),
+            &HashMap::new(),
+            SYM8_BITS,
+            SYM8_GROUP_SIZE,
+        )
+        .expect("a reserved-key abort must not Err the load");
+
+        assert_eq!(
+            unsafe { mlx_sys::mlx_weight_count() },
+            0,
+            "reserved `.weight_nk` checkpoint key must abort and wipe the weight map"
+        );
+        assert_eq!(
+            unsafe { mlx_sys::mlx_lfm2_get_model_id() },
+            0,
+            "reserved-key abort must leave the model unregistered (eager decode)"
         );
     }
 
@@ -3329,6 +3796,333 @@ mod tests {
         );
     }
 
+    // ===== sym8 (per-output-channel symmetric int8) loader dispatch =====
+    //
+    // lfm2 reuses qwen3_5's concrete `QuantizedLinear`, so the EAGER forward
+    // already dispatches mode=="sym8" to the int8 kernels; these tests pin the
+    // LOADER seam: the non-MoE builder must install a sym8 backend for a
+    // well-formed group, surface the sym8 builder's descriptive Err for a
+    // malformed one (NEVER a silent dense/bf16 fallback), and the
+    // experts / router-gate / packed-embedding paths — which have no sym8
+    // dispatch — must fail loud.
+
+    /// Synthesize a well-formed sym8 group under `{base}.*`: int8 `[n,k]`
+    /// weight (values in [-127,127]) + positive f32 `[n]` scales.
+    fn synth_sym8_group(p: &mut HashMap<String, MxArray>, base: &str, n: i64, k: i64) {
+        let q: Vec<f32> = (0..n * k).map(|i| ((i % 255) - 127) as f32).collect();
+        let w = MxArray::from_float32(&q, &[n, k])
+            .expect("from_float32")
+            .astype(DType::Int8)
+            .expect("astype int8");
+        let s: Vec<f32> = (0..n).map(|i| 0.001 + (i as f32) * 1e-4).collect();
+        p.insert(format!("{base}.weight"), w);
+        p.insert(
+            format!("{base}.scales"),
+            MxArray::from_float32(&s, &[n]).expect("scales"),
+        );
+    }
+
+    /// The sym8 default PLQ (group_size is null/meaningless for sym8;
+    /// `SYM8_GROUP_SIZE` is the struct-field placeholder).
+    fn sym8_default_plq() -> PerLayerQuant {
+        default_per_layer_quant(SYM8_BITS, SYM8_GROUP_SIZE, PerLayerMode::Sym8)
+    }
+
+    #[test]
+    fn loader_installs_sym8_backend_for_non_moe_linear() {
+        if unsafe { mlx_sys::mlx_gpu_architecture_gen() } < 17 {
+            eprintln!("[skip] sym8 loader test: int8 kernels need an M5+ GPU (gen >= 17)");
+            return;
+        }
+        let (n, k) = (8i64, 32i64); // K % 16 == 0 (kernel contract)
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        synth_sym8_group(&mut params, "x_proj", n, k);
+
+        let mut proj = LinearProj::Standard(
+            Linear::new(k as u32, n as u32, Some(false)).expect("Linear::new"),
+        );
+        load_linear_proj_quantized_or_bf16(
+            &mut proj,
+            &params,
+            "x_proj",
+            &HashMap::new(),
+            sym8_default_plq(),
+        )
+        .expect("well-formed sym8 group must load");
+        match &proj {
+            LinearProj::Quantized(ql) => {
+                assert_eq!(ql.mode(), SYM8_MODE, "backend must be mode=sym8")
+            }
+            LinearProj::Standard(_) => {
+                panic!("sym8 group must install a quantized backend, not dense")
+            }
+        }
+    }
+
+    #[test]
+    fn sym8_non_moe_malformed_fails_loud_never_dense_fallback() {
+        // (a) `.scales` present but `.weight` missing → the sym8 builder's
+        // descriptive Err must surface through the load helper (NOT the
+        // generic missing-group message a `.ok().flatten()` would produce,
+        // and NEVER a silent dense load). This builder arm fires before its
+        // GPU-gen gate, so the case is host-independent.
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        synth_sym8_group(&mut p, "x_proj", 8, 32);
+        p.remove("x_proj.weight");
+        let mut proj = LinearProj::Standard(Linear::new(32, 8, Some(false)).expect("Linear::new"));
+        let err = load_linear_proj_quantized_or_bf16(
+            &mut proj,
+            &p,
+            "x_proj",
+            &HashMap::new(),
+            sym8_default_plq(),
+        )
+        .expect_err("sym8 scales without weight must fail loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("sym8"),
+            "error must come from the sym8 builder, got: {msg}"
+        );
+
+        // (b) unexpected `.biases` sidecar (sym8 is symmetric) → Err.
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        synth_sym8_group(&mut p, "x_proj", 8, 32);
+        p.insert("x_proj.biases".into(), f32a(&[8], 0.0));
+        let mut proj = LinearProj::Standard(Linear::new(32, 8, Some(false)).expect("Linear::new"));
+        let err = load_linear_proj_quantized_or_bf16(
+            &mut proj,
+            &p,
+            "x_proj",
+            &HashMap::new(),
+            sym8_default_plq(),
+        )
+        .expect_err("sym8 .biases sidecar must fail loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("sym8"),
+            "error must come from the sym8 builder, got: {msg}"
+        );
+
+        // (c) a bf16 layer in a sym8-default checkpoint (NO `.scales`
+        // sidecar) legitimately loads the dense Standard arm — the builder's
+        // Ok(None) semantics never even engage (the load helper keys on
+        // `.scales` presence).
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        p.insert("x_proj.weight".into(), bf16(&[8, 32], 0.1));
+        let mut proj = LinearProj::Standard(Linear::new(32, 8, Some(false)).expect("Linear::new"));
+        load_linear_proj_quantized_or_bf16(
+            &mut proj,
+            &p,
+            "x_proj",
+            &HashMap::new(),
+            sym8_default_plq(),
+        )
+        .expect("scales-less bf16 layer under a sym8 default must load dense");
+        assert!(matches!(proj, LinearProj::Standard(_)));
+    }
+
+    #[test]
+    fn moe_builders_reject_sym8_mode() {
+        let params: HashMap<String, MxArray> = HashMap::new();
+        // 3-D stacked experts have no sym8 dispatch — Err before any tensor
+        // is touched.
+        let err = match build_lfm2_qsl(
+            &params,
+            "layers.0.feed_forward.switch_mlp.gate_proj",
+            &HashMap::new(),
+            sym8_default_plq(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expert builder must reject sym8"),
+        };
+        assert!(format!("{err}").contains("sym8"));
+
+        // Router gate: a per-layer override resolving to sym8 must Err too
+        // (convert force-emits affine-8 for the gate, so this is malformed).
+        let mut plq_map: HashMap<String, PerLayerQuant> = HashMap::new();
+        plq_map.insert("layers.0.feed_forward.gate".into(), sym8_default_plq());
+        let err = match build_lfm2_gate_ql(
+            &params,
+            "layers.0.feed_forward.gate",
+            &plq_map,
+            default_per_layer_quant(GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE, PerLayerMode::Affine),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("router-gate builder must reject sym8"),
+        };
+        assert!(format!("{err}").contains("sym8"));
+    }
+
+    #[test]
+    fn packed_embedding_and_quant_info_reject_sym8() {
+        // Direct: the packed-params mapper has no sym8 pack (it feeds
+        // `mlx_dequantize` / `mlx_quantized_matmul` / `mlx_store_quant_info`).
+        let err = plq_to_packed_params(sym8_default_plq(), "embed_tokens")
+            .expect_err("plq_to_packed_params must reject sym8");
+        assert!(format!("{err}").contains("sym8"));
+
+        // Through the embedding loader: a sym8-resolved packed embedding must
+        // fail loud instead of handing mode="sym8" to MLX. Convert force-emits
+        // affine-8 for the lfm2 embedding under a sym8 default, so this is
+        // defense-in-depth against a malformed checkpoint.
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        synth_sym8_group(&mut p, "embed_tokens", 8, 32);
+        let mut embedding = Embedding::new(8, 32).expect("Embedding::new");
+        let err = load_embedding_affine_or_bf16(
+            &mut embedding,
+            &p,
+            "embed_tokens",
+            &HashMap::new(),
+            sym8_default_plq(),
+        )
+        .expect_err("sym8 packed embedding must fail loud");
+        assert!(format!("{err}").contains("sym8"));
+    }
+
+    /// Finding 2 (truncated sym8 group): an int8 `.weight` with NO `.scales`
+    /// sidecar classifies as "not quantized", so it reaches the DENSE
+    /// fallback — the dtype guard must fail loud there, never `set_weight`
+    /// int8 bytes into a dense bf16 projection (shape validates, dtype does
+    /// not, logits would be garbage).
+    #[test]
+    fn truncated_sym8_group_int8_weight_never_loads_dense() {
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        synth_sym8_group(&mut p, "x_proj", 8, 32);
+        p.remove("x_proj.scales");
+
+        let mut proj = LinearProj::Standard(Linear::new(32, 8, Some(false)).expect("Linear::new"));
+        let err = load_linear_proj_quantized_or_bf16(
+            &mut proj,
+            &p,
+            "x_proj",
+            &HashMap::new(),
+            sym8_default_plq(),
+        )
+        .expect_err("int8 weight without .scales must fail loud, not dense-load");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Int8") && msg.contains("x_proj.weight"),
+            "error must name the key and the non-float dtype, got: {msg}"
+        );
+        assert!(
+            matches!(proj, LinearProj::Standard(_)),
+            "the projection must be left untouched (no dense set, no quantized install)"
+        );
+    }
+
+    /// Round-2 Finding B (stripped MoE sidecars): an lfm2_moe layer whose quant
+    /// sidecars were ALL removed (int8/packed `.weight`s remain, no `.scales`
+    /// anywhere) classifies as dense (`moe_layer_is_quantized` false), passes
+    /// the stray-`.scales` re-scan (there are none), and used to install the
+    /// non-float storage through the dense router/expert setters. Both the
+    /// router gate and the 3-D stacked expert projections must now fail loud
+    /// at the dtype guard — never load int8 bytes into dense matmul routes.
+    #[test]
+    fn stripped_moe_sidecars_int8_router_and_experts_fail_loud() {
+        let int8 = |shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![1.0f32; n.max(0) as usize], shape)
+                .expect("from_float32")
+                .astype(DType::Int8)
+                .expect("astype int8")
+        };
+        let run = |params: &HashMap<String, MxArray>| {
+            let config = tiny_moe_config(/* use_expert_bias */ false);
+            let mut inner = Lfm2Inner::new(config).expect("Lfm2Inner::new");
+            apply_weights(
+                &mut inner,
+                params,
+                DEFAULT_QUANT_BITS,
+                DEFAULT_QUANT_GROUP_SIZE,
+                None,
+                &HashMap::new(),
+            )
+        };
+
+        // (a) stripped EXPERT group: int8 3-D `switch_mlp.gate_proj` stack
+        // (shape [num_experts, inter, hidden]), no `.scales` anywhere → the
+        // expert dtype guard must fail loud naming the key.
+        let key = "layers.0.feed_forward.switch_mlp.gate_proj.weight";
+        let mut params = full_bf16_moe_params();
+        params.insert(key.into(), int8(&[4, 4, 4]));
+        let err = run(&params).expect_err("int8 expert stack without scales must fail loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Int8") && msg.contains(key),
+            "error must name the key and the non-float dtype, got: {msg}"
+        );
+
+        // (b) stripped ROUTER gate: int8 `feed_forward.gate.weight`, no
+        // `.scales` anywhere → the router dtype guard must fail loud.
+        let key = "layers.0.feed_forward.gate.weight";
+        let mut params = full_bf16_moe_params();
+        params.insert(key.into(), int8(&[4, 4]));
+        let err = run(&params).expect_err("int8 router gate without scales must fail loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Int8") && msg.contains(key),
+            "error must name the key and the non-float dtype, got: {msg}"
+        );
+
+        // Control: the untouched all-bf16 fixture keeps loading.
+        run(&full_bf16_moe_params()).expect("all-bf16 MoE fixture must keep loading");
+    }
+
+    /// Finding 3 (metadata skew): int8 sym8 STORAGE (`.weight` int8 + f32
+    /// `.scales`) whose per-layer mode resolves AFFINE must fail loud with
+    /// the config-drift message — never flow into the affine builder (or,
+    /// downstream, the compiled C++ path's affine quant-info registration).
+    #[test]
+    fn int8_storage_with_affine_metadata_fails_loud() {
+        let affine_plq = default_per_layer_quant(4, 64, PerLayerMode::Affine);
+
+        // Non-MoE seam: through `load_linear_proj_quantized_or_bf16` (the
+        // `.scales`-present arm dispatches `build_lfm2_non_moe_ql`).
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        synth_sym8_group(&mut p, "x_proj", 8, 32);
+        let mut proj = LinearProj::Standard(Linear::new(32, 8, Some(false)).expect("Linear::new"));
+        let err = load_linear_proj_quantized_or_bf16(
+            &mut proj,
+            &p,
+            "x_proj",
+            &HashMap::new(),
+            affine_plq,
+        )
+        .expect_err("int8 storage resolving affine must fail loud (config drift)");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("config drift") && msg.contains("Affine"),
+            "error must carry the config-drift diagnosis and the resolved mode, got: {msg}"
+        );
+        assert!(
+            matches!(proj, LinearProj::Standard(_)),
+            "the projection must be left untouched"
+        );
+
+        // Stacked-experts seam: a 3-D int8 expert stack with affine metadata
+        // must hit the same guard in `build_lfm2_qsl`, never the affine QSL
+        // builder.
+        let base = "layers.0.feed_forward.switch_mlp.gate_proj";
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        let w = MxArray::from_float32(&vec![1.0f32; 2 * 4 * 16], &[2, 4, 16])
+            .expect("from_float32")
+            .astype(DType::Int8)
+            .expect("astype int8");
+        p.insert(format!("{base}.weight"), w);
+        p.insert(
+            format!("{base}.scales"),
+            MxArray::from_float32(&[0.01f32; 2 * 4], &[2, 4]).expect("scales"),
+        );
+        let err = match build_lfm2_qsl(&p, base, &HashMap::new(), affine_plq) {
+            Err(e) => e,
+            Ok(_) => panic!("int8 expert stack with affine metadata must fail loud"),
+        };
+        assert!(
+            format!("{err}").contains("config drift"),
+            "expert-stack skew must carry the config-drift diagnosis, got: {err}"
+        );
+    }
+
     #[test]
     fn validation_accepts_conv_depthwise_weight_without_scales() {
         // The depthwise `conv.conv.weight` is NEVER quantized: even in a fully
@@ -3622,6 +4416,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sanitize_preserves_f32_scales_only_for_int8_sym8_siblings() {
+        // sanitize_weights' blanket f32->bf16 cast must EXEMPT sym8 `.scales`
+        // (f32 [N] with an Int8 sibling `.weight` — the sym8 builder fail-louds
+        // on bf16 scales) while still casting affine `.scales` (Uint32 packed
+        // sibling) and plain f32 tensors. Mirrors the gemma4 test of the same
+        // name; caught live by a real sym8 lfm2 checkpoint failing to load.
+        let mut config = tiny_moe_config(true);
+        config.num_experts = None; // dense: expert-stacking pass is a no-op
+        config.num_dense_layers = None;
+
+        let f32_arr =
+            |len: usize, shape: &[i64]| MxArray::from_float32(&vec![0.5f32; len], shape).unwrap();
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        // sym8-shaped layer: int8 [N,K] weight + f32 [N] scales.
+        let w_i8 = f32_arr(4 * 16, &[4, 16]).astype(DType::Int8).unwrap();
+        params.insert("model.layers.1.self_attn.q_proj.weight".into(), w_i8);
+        params.insert(
+            "model.layers.1.self_attn.q_proj.scales".into(),
+            f32_arr(4, &[4]),
+        );
+        // affine-shaped layer: packed uint32 weight + f32 group scales.
+        let w_u32 = f32_arr(4 * 2, &[4, 2]).astype(DType::Uint32).unwrap();
+        params.insert("model.layers.1.self_attn.k_proj.weight".into(), w_u32);
+        params.insert(
+            "model.layers.1.self_attn.k_proj.scales".into(),
+            f32_arr(4, &[4, 1]),
+        );
+        // Plain f32 tensor — the cast the exemption must NOT disturb.
+        params.insert("model.norm.weight".into(), f32_arr(16, &[16]));
+
+        let out = sanitize_weights(&mut params, &config).expect("sanitize");
+        let dt = |k: &str| out.get(k).unwrap().dtype().unwrap();
+        assert_eq!(
+            dt("layers.1.self_attn.q_proj.scales"),
+            DType::Float32,
+            "sym8 .scales (Int8 sibling weight) must stay f32"
+        );
+        assert_eq!(dt("layers.1.self_attn.q_proj.weight"), DType::Int8);
+        assert_eq!(
+            dt("layers.1.self_attn.k_proj.scales"),
+            DType::BFloat16,
+            "affine .scales (Uint32 sibling weight) must keep the bf16 cast"
+        );
+        assert_eq!(dt("norm.weight"), DType::BFloat16);
     }
 
     #[test]
