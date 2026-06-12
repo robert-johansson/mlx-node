@@ -277,9 +277,14 @@ where
     }
 
     if num_grads == 0 {
-        return Err(Error::from_reason(
-            "compute_gradients: MLX autograd failed (returned 0)".to_string(),
-        ));
+        // The C++ shim records the real MLX exception message (MLX_GUARD_VAL)
+        // before returning the 0 sentinel — surface it instead of a generic
+        // failure so callers can tell pressure throws from math errors.
+        let msg = match crate::array::take_last_native_error() {
+            Some(detail) => format!("compute_gradients: {}", detail),
+            None => "compute_gradients: MLX autograd failed (returned 0)".to_string(),
+        };
+        return Err(Error::from_reason(msg));
     }
 
     if num_grads != input_count {
