@@ -639,3 +639,51 @@ pub fn key_multivariate_normal(
 ) -> Result<MxArray> {
     key.key_multivariate_normal(mean, cov, &to_shape(&shape), dtype)
 }
+
+// ============================================================================
+// Fused NN primitives (f6ov: GenMLX-owned LLM forward pass)
+//
+// These delegate to the STABLE MLX fast:: / nn ops (mlx-sys mlx_fast_*) that
+// upstream model refactors never touch, so a GenMLX-owned CLJS forward composed
+// over them is decoupled from upstream's per-model forward structs. SDPA takes
+// an EXPLICIT mask array (not the "causal" string mode, which null-ptrs across
+// MLX builds — genmlx-7siy); pass null/None for no mask.
+// ============================================================================
+
+/// RMSNorm: x * rsqrt(mean(x^2) + eps) * weight (variance in f32 for stability).
+#[napi(js_name = "rmsNorm")]
+pub fn rms_norm(x: &MxArray, weight: &MxArray, eps: f64) -> Result<MxArray> {
+    crate::utils::functional::rms_norm_functional(x, weight, eps)
+}
+
+/// Rotary position embedding (fast::rope). offset = KV-cache position.
+#[napi]
+pub fn rope(
+    x: &MxArray,
+    dims: i32,
+    traditional: bool,
+    base: f64,
+    scale: f64,
+    offset: i32,
+) -> Result<MxArray> {
+    crate::nn::RoPE::new(dims, Some(traditional), Some(base), Some(scale)).forward(x, Some(offset))
+}
+
+/// Scaled dot-product attention with an EXPLICIT optional mask array.
+/// q/k/v: [batch, n_heads, seq, head_dim]; scale = 1/sqrt(head_dim).
+#[napi(js_name = "scaledDotProductAttention")]
+pub fn scaled_dot_product_attention(
+    queries: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    scale: f64,
+    mask: Option<&MxArray>,
+) -> Result<MxArray> {
+    crate::array::scaled_dot_product_attention(queries, keys, values, scale, mask)
+}
+
+/// SiLU / swish activation: x * sigmoid(x) (dtype-preserving).
+#[napi]
+pub fn silu(x: &MxArray) -> Result<MxArray> {
+    crate::nn::Activations::silu(x)
+}

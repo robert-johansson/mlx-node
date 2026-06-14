@@ -4309,7 +4309,13 @@ export interface RewardStats {
   p75: number
 }
 
+/** RMSNorm: x * rsqrt(mean(x^2) + eps) * weight (variance in f32 for stability). */
+export declare function rmsNorm(x: MxArray, weight: MxArray, eps: number): MxArray
+
 export declare function roll(a: MxArray, shift: number, axis: number): MxArray
+
+/** Rotary position embedding (fast::rope). offset = KV-cache position. */
+export declare function rope(x: MxArray, dims: number, traditional: boolean, base: number, scale: number, offset: number): MxArray
 
 export declare function round(a: MxArray | number): MxArray
 
@@ -4371,6 +4377,12 @@ export declare function scalar(value: number): MxArray
 
 /** Create an int32 scalar array. */
 export declare function scalarInt(value: number): MxArray
+
+/**
+ * Scaled dot-product attention with an EXPLICIT optional mask array.
+ * q/k/v: [batch, n_heads, seq, head_dim]; scale = 1/sqrt(head_dim).
+ */
+export declare function scaledDotProductAttention(queries: MxArray, keys: MxArray, values: MxArray, scale: number, mask?: MxArray | undefined | null): MxArray
 
 export declare function searchsorted(a: MxArray, values: MxArray, right?: boolean | undefined | null): MxArray
 
@@ -4454,6 +4466,9 @@ export declare function shapeOf(a: MxArray): Array<number>
 export declare function sigmoid(a: MxArray | number): MxArray
 
 export declare function sign(a: MxArray | number): MxArray
+
+/** SiLU / swish activation: x * sigmoid(x) (dtype-preserving). */
+export declare function silu(x: MxArray): MxArray
 
 export declare function sin(a: MxArray | number): MxArray
 
