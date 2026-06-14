@@ -687,3 +687,11 @@ pub fn scaled_dot_product_attention(
 pub fn silu(x: &MxArray) -> Result<MxArray> {
     crate::nn::Activations::silu(x)
 }
+
+/// Load all tensors from a .safetensors file as a {name -> MxArray} map (f6ov
+/// P1: GenMLX-owned weight loading, decoupled from upstream's model structs).
+/// Lazy — tensors are graph leaves, materialized on first eval.
+#[napi(js_name = "loadSafetensors")]
+pub fn load_safetensors(path: String) -> Result<std::collections::HashMap<String, MxArray>> {
+    crate::utils::safetensors::load_safetensors_lazy(&path)
+}

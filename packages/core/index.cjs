@@ -865,6 +865,7 @@ module.exports.linalgInv = nativeBinding.linalgInv;
 module.exports.linalgNorm = nativeBinding.linalgNorm;
 module.exports.linalgSolve = nativeBinding.linalgSolve;
 module.exports.linspace = nativeBinding.linspace;
+module.exports.loadSafetensors = nativeBinding.loadSafetensors;
 module.exports.log = nativeBinding.log;
 module.exports.log10 = nativeBinding.log10;
 module.exports.log1p = nativeBinding.log1p;

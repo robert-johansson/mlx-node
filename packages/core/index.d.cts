@@ -3665,6 +3665,13 @@ export declare function linalgSolve(a: MxArray, b: MxArray): MxArray
 
 export declare function linspace(start: number, stop: number, num?: number | undefined | null, dtype?: DType | undefined | null): MxArray
 
+/**
+ * Load all tensors from a .safetensors file as a {name -> MxArray} map (f6ov
+ * P1: GenMLX-owned weight loading, decoupled from upstream's model structs).
+ * Lazy — tensors are graph leaves, materialized on first eval.
+ */
+export declare function loadSafetensors(path: string): Record<string, MxArray>
+
 export declare function log(a: MxArray | number): MxArray
 
 export declare function log10(a: MxArray | number): MxArray
