@@ -556,19 +556,31 @@ pub fn size_of(a: &MxArray) -> Result<u64> {
 // Random ops (key-based, module-level)
 // ============================================================================
 
+// Keyed-PRNG: the FFI (mlx_sys::mlx_random_*_key) is inlined here directly so the
+// matching MxArray methods can be deleted from stock mlx-core. `dt as i32` equals
+// the old `dt.code()` (DType is #[repr(i32)] with matching discriminants). Bodies
+// are otherwise byte-identical to the former mlx-core methods.
+
 #[napi(js_name = "randomKey")]
 pub fn random_key(seed: f64) -> Result<MxArray> {
-    MxArray::random_key(seed as i64)
+    let handle = unsafe { mlx_sys::mlx_random_key(seed as u64) };
+    MxArray::from_handle(handle, "random_key")
 }
 
 #[napi(js_name = "randomSplit")]
 pub fn random_split(key: &MxArray) -> Result<Vec<MxArray>> {
-    key.random_split()
+    let mut k1: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+    let mut k2: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+    unsafe { mlx_sys::mlx_random_split(key.as_raw_ptr(), &mut k1, &mut k2) };
+    let a = MxArray::from_handle(k1, "split_k1")?;
+    let b = MxArray::from_handle(k2, "split_k2")?;
+    Ok(vec![a, b])
 }
 
 #[napi(js_name = "randomSplitN")]
 pub fn random_split_n(key: &MxArray, n: i32) -> Result<MxArray> {
-    key.random_split_n(n)
+    let handle = unsafe { mlx_sys::mlx_random_split_n(key.as_raw_ptr(), n) };
+    MxArray::from_handle(handle, "split_n")
 }
 
 #[napi(js_name = "keyUniform")]
@@ -579,22 +591,50 @@ pub fn key_uniform(
     high: Option<f64>,
     dtype: Option<DType>,
 ) -> Result<MxArray> {
-    key.key_uniform(&to_shape(&shape), low, high, dtype)
+    let dt = dtype.unwrap_or(DType::Float32);
+    let shp = to_shape(&shape);
+    let handle = unsafe {
+        mlx_sys::mlx_random_uniform_key(
+            key.as_raw_ptr(),
+            shp.as_ptr(),
+            shp.len(),
+            low.unwrap_or(0.0) as f32,
+            high.unwrap_or(1.0) as f32,
+            dt as i32,
+        )
+    };
+    MxArray::from_handle(handle, "key_uniform")
 }
 
 #[napi(js_name = "keyNormal")]
 pub fn key_normal(key: &MxArray, shape: Vec<f64>, dtype: Option<DType>) -> Result<MxArray> {
-    key.key_normal(&to_shape(&shape), dtype)
+    let dt = dtype.unwrap_or(DType::Float32);
+    let shp = to_shape(&shape);
+    let handle = unsafe {
+        mlx_sys::mlx_random_normal_key(key.as_raw_ptr(), shp.as_ptr(), shp.len(), dt as i32)
+    };
+    MxArray::from_handle(handle, "key_normal")
 }
 
 #[napi(js_name = "keyBernoulli")]
 pub fn key_bernoulli(key: &MxArray, prob: f64, shape: Vec<f64>) -> Result<MxArray> {
-    key.key_bernoulli(prob, &to_shape(&shape))
+    let shp = to_shape(&shape);
+    let handle = unsafe {
+        mlx_sys::mlx_random_bernoulli_key(key.as_raw_ptr(), prob as f32, shp.as_ptr(), shp.len())
+    };
+    MxArray::from_handle(handle, "key_bernoulli")
 }
 
 #[napi(js_name = "keyCategorical")]
 pub fn key_categorical(key: &MxArray, logits: &MxArray, axis: Option<i32>) -> Result<MxArray> {
-    key.key_categorical(logits, axis)
+    let handle = unsafe {
+        mlx_sys::mlx_random_categorical_key(
+            key.as_raw_ptr(),
+            logits.as_raw_ptr(),
+            axis.unwrap_or(-1),
+        )
+    };
+    MxArray::from_handle(handle, "key_categorical")
 }
 
 #[napi(js_name = "keyRandint")]
@@ -605,17 +645,39 @@ pub fn key_randint(
     shape: Vec<f64>,
     dtype: Option<DType>,
 ) -> Result<MxArray> {
-    key.key_randint(low, high, &to_shape(&shape), dtype)
+    let dt = dtype.unwrap_or(DType::Int32);
+    let shp = to_shape(&shape);
+    let handle = unsafe {
+        mlx_sys::mlx_random_randint_key(
+            key.as_raw_ptr(),
+            low,
+            high,
+            shp.as_ptr(),
+            shp.len(),
+            dt as i32,
+        )
+    };
+    MxArray::from_handle(handle, "key_randint")
 }
 
 #[napi(js_name = "keyGumbel")]
 pub fn key_gumbel(key: &MxArray, shape: Vec<f64>, dtype: Option<DType>) -> Result<MxArray> {
-    key.key_gumbel(&to_shape(&shape), dtype)
+    let dt = dtype.unwrap_or(DType::Float32);
+    let shp = to_shape(&shape);
+    let handle = unsafe {
+        mlx_sys::mlx_random_gumbel_key(key.as_raw_ptr(), shp.as_ptr(), shp.len(), dt as i32)
+    };
+    MxArray::from_handle(handle, "key_gumbel")
 }
 
 #[napi(js_name = "keyLaplace")]
 pub fn key_laplace(key: &MxArray, shape: Vec<f64>, dtype: Option<DType>) -> Result<MxArray> {
-    key.key_laplace(&to_shape(&shape), dtype)
+    let dt = dtype.unwrap_or(DType::Float32);
+    let shp = to_shape(&shape);
+    let handle = unsafe {
+        mlx_sys::mlx_random_laplace_key(key.as_raw_ptr(), shp.as_ptr(), shp.len(), dt as i32)
+    };
+    MxArray::from_handle(handle, "key_laplace")
 }
 
 #[napi(js_name = "keyTruncatedNormal")]
@@ -626,7 +688,19 @@ pub fn key_truncated_normal(
     shape: Vec<f64>,
     dtype: Option<DType>,
 ) -> Result<MxArray> {
-    key.key_truncated_normal(lower, upper, &to_shape(&shape), dtype)
+    let dt = dtype.unwrap_or(DType::Float32);
+    let shp = to_shape(&shape);
+    let handle = unsafe {
+        mlx_sys::mlx_random_truncated_normal_key(
+            key.as_raw_ptr(),
+            lower.as_raw_ptr(),
+            upper.as_raw_ptr(),
+            shp.as_ptr(),
+            shp.len(),
+            dt as i32,
+        )
+    };
+    MxArray::from_handle(handle, "key_truncated_normal")
 }
 
 #[napi(js_name = "keyMultivariateNormal")]
@@ -637,7 +711,19 @@ pub fn key_multivariate_normal(
     shape: Vec<f64>,
     dtype: Option<DType>,
 ) -> Result<MxArray> {
-    key.key_multivariate_normal(mean, cov, &to_shape(&shape), dtype)
+    let dt = dtype.unwrap_or(DType::Float32);
+    let shp = to_shape(&shape);
+    let handle = unsafe {
+        mlx_sys::mlx_random_multivariate_normal_key(
+            key.as_raw_ptr(),
+            mean.as_raw_ptr(),
+            cov.as_raw_ptr(),
+            shp.as_ptr(),
+            shp.len(),
+            dt as i32,
+        )
+    };
+    MxArray::from_handle(handle, "key_multivariate_normal")
 }
 
 // ============================================================================

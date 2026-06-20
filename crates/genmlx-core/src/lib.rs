@@ -8,7 +8,10 @@
 //! NO `#[global_allocator]` here — mlx-core already installs mimalloc; a second
 //! global-allocator attribute in the final artifact is a hard compile error.
 //!
-//! `transforms`/`memory_napi`/keyed-PRNG stay in mlx-core for this increment and
-//! reach the addon through the rlib dependency (no move, no duplicate registration).
+//! `transforms` + `memory_napi` are relocated here (free functions; the orphan
+//! rule forbids re-`impl MxArray` outside mlx-core), and the keyed-PRNG FFI is
+//! inlined into `genmlx`'s free fns — so mlx-core is stock above the substrate.
 
 pub mod genmlx;
+pub mod memory_napi;
+pub mod transforms;

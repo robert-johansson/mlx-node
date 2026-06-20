@@ -28,11 +28,9 @@ pub mod stream;
 pub mod tensor;
 pub mod tokenizer;
 pub mod tools;
-pub mod transforms;
-// Moved out of mlx-core into the GenMLX-owned `genmlx-core` superset addon crate
-// (avoids duplicate #[napi] registration once genmlx-core links mlx-core as rlib).
-// pub mod genmlx;
-pub mod memory_napi;
+// `transforms`, `memory_napi`, `genmlx`, and the keyed-PRNG block were moved into
+// the GenMLX-owned `genmlx-core` superset addon crate (it links mlx-core as rlib);
+// this keeps mlx-core stock above the mlx-sys substrate.
 pub mod tracing;
 pub mod training_model;
 pub mod training_state;

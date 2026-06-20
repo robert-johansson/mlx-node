@@ -94,7 +94,7 @@ pub struct MxArray {
 }
 
 impl MxArray {
-    pub(crate) fn from_handle(handle: *mut sys::mlx_array, context: &str) -> Result<Self> {
+    pub fn from_handle(handle: *mut sys::mlx_array, context: &str) -> Result<Self> {
         Ok(Self {
             handle: Arc::new(MxHandle(check_handle(handle, context)?)),
         })
