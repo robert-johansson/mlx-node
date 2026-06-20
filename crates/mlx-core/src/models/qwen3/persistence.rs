@@ -15,7 +15,6 @@ use tracing::info;
 
 use crate::array::MxArray;
 use crate::tokenizer::Qwen3Tokenizer;
-use crate::utils::safetensors::load_safetensors_lazy;
 
 use super::model::{Qwen3Cmd, Qwen3Inner, handle_qwen3_cmd};
 use super::{Qwen3Config, Qwen3Model};
@@ -412,28 +411,8 @@ fn parse_config(raw_config: &Value) -> Result<Qwen3Config> {
 
 /// Load weights from SafeTensors, mapping HuggingFace names to our naming convention.
 fn load_safetensors_mapped(path: &Path) -> Result<HashMap<String, MxArray>> {
-    let safetensors_path = if path.join("weights.safetensors").exists() {
-        path.join("weights.safetensors")
-    } else {
-        path.join("model.safetensors")
-    };
-
-    if !safetensors_path.exists() {
-        return Err(Error::new(
-            Status::InvalidArg,
-            format!(
-                "No supported weight file found in {}. Expected weights.safetensors or model.safetensors",
-                path.display()
-            ),
-        ));
-    }
-
-    info!(
-        "Loading model from SafeTensors format: {} (mmap)",
-        safetensors_path.display()
-    );
-
-    let mut param_map = load_safetensors_lazy(&safetensors_path)?;
+    // genmlx-o94r: single-file OR sharded (model-0000X-of-0000N.safetensors).
+    let mut param_map = crate::utils::safetensors::load_model_weights(path)?;
     info!("  Loaded {} tensors", param_map.len());
 
     let mut mapped_params: HashMap<String, MxArray> = HashMap::new();

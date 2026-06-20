@@ -679,6 +679,97 @@ fn u16_to_bytes(data: &[u16]) -> Vec<u8> {
     data.iter().flat_map(|&x| x.to_le_bytes()).collect()
 }
 
+/// Load a model directory's weights, supporting BOTH single-file and SHARDED
+/// checkpoints (genmlx-o94r). Any HuggingFace checkpoint above ~3GB is split
+/// into `model-0000X-of-0000N.safetensors` + `model.safetensors.index.json`, so
+/// the legacy single-file loaders could not load them from mlx-community/.
+/// Resolution order:
+///   1. `weights.safetensors`                       (single, preferred)
+///   2. `model.safetensors`                          (single)
+///   3. `model-XXXXX-of-YYYYY.safetensors` shards    (HF sharded layout, globbed)
+///   4. `model.safetensors.index.json` `weight_map`  (explicit, non-standard names)
+/// Returns a merged, LAZY tensor map (mmap-backed graph leaves, materialized on
+/// first eval — near-zero memory at load). Mirrors the proven sharded logic in
+/// `qwen3_5::persistence_common::load_all_safetensors`; the legacy qwen3 / lfm2
+/// / gemma4 loaders route through this.
+pub fn load_model_weights<P: AsRef<std::path::Path>>(
+    dir: P,
+) -> Result<HashMap<String, crate::array::MxArray>> {
+    use std::collections::{HashMap, HashSet};
+    let dir = dir.as_ref();
+
+    // 1-2. Single-file.
+    for name in ["weights.safetensors", "model.safetensors"] {
+        let p = dir.join(name);
+        if p.exists() {
+            return load_safetensors_lazy(&p);
+        }
+    }
+
+    // 3. Globbed HF shards: model-00001-of-00004.safetensors (sorted, deduped by
+    // filesystem). Each shard is lazy-loaded and merged.
+    let mut shard_files: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_shard = (name.starts_with("model-")
+                || name.starts_with("model.safetensors-"))
+                && name.ends_with(".safetensors")
+                && name.contains("-of-");
+            if is_shard {
+                shard_files.push(entry.path());
+            }
+        }
+    }
+    if !shard_files.is_empty() {
+        shard_files.sort();
+        let mut merged: HashMap<String, crate::array::MxArray> = HashMap::new();
+        for shard in &shard_files {
+            merged.extend(load_safetensors_lazy(shard)?);
+        }
+        return Ok(merged);
+    }
+
+    // 4. Explicit index.json weight_map (covers non-`model-*` shard naming).
+    let index_path = dir.join("model.safetensors.index.json");
+    if index_path.exists() {
+        let data = std::fs::read_to_string(&index_path).map_err(|e| {
+            Error::from_reason(format!("Failed to read {}: {}", index_path.display(), e))
+        })?;
+        let index: serde_json::Value = serde_json::from_str(&data).map_err(|e| {
+            Error::from_reason(format!("Failed to parse {}: {}", index_path.display(), e))
+        })?;
+        let weight_map = index
+            .get("weight_map")
+            .and_then(|m| m.as_object())
+            .ok_or_else(|| {
+                Error::from_reason(format!("{}: missing object 'weight_map'", index_path.display()))
+            })?;
+        let shards: HashSet<&str> = weight_map.values().filter_map(|v| v.as_str()).collect();
+        let mut merged: HashMap<String, crate::array::MxArray> = HashMap::new();
+        for shard in shards {
+            let p = dir.join(shard);
+            if !p.exists() {
+                return Err(Error::from_reason(format!(
+                    "Shard listed in index but missing on disk: {}",
+                    p.display()
+                )));
+            }
+            merged.extend(load_safetensors_lazy(&p)?);
+        }
+        if !merged.is_empty() {
+            return Ok(merged);
+        }
+    }
+
+    Err(Error::from_reason(format!(
+        "No supported weight file found in {}. Expected weights.safetensors, \
+         model.safetensors, model-XXXXX-of-YYYYY.safetensors shards, or \
+         model.safetensors.index.json",
+        dir.display()
+    )))
+}
+
 /// Load tensors from a safetensors file using MLX's native lazy loader.
 /// Arrays are backed by deferred disk reads — data is only materialized on eval.
 /// This uses near-zero memory at load time vs the eager `SafeTensorsFile::load_tensors`.
