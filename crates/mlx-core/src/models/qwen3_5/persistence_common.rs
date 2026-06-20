@@ -4,7 +4,6 @@
 //! safetensors loading, FP8 dequantization, and config parsing helpers.
 
 use std::collections::HashMap;
-use std::fs;
 use std::path::Path;
 
 use napi::bindgen_prelude::*;
@@ -24,72 +23,28 @@ pub(crate) fn load_all_safetensors(
     dir: &Path,
     load_vision: bool,
 ) -> Result<HashMap<String, MxArray>> {
-    let single_path = if dir.join("weights.safetensors").exists() {
-        Some(dir.join("weights.safetensors"))
-    } else if dir.join("model.safetensors").exists() {
-        Some(dir.join("model.safetensors"))
-    } else {
-        None
-    };
+    // genmlx-o94r: single-file / sharded base-weight resolution now lives in the
+    // ONE shared resolver `utils::safetensors::load_model_weights` (the legacy
+    // qwen3 loader routes through it too). This file keeps only the VLM vision
+    // add-on. load_model_weights handles weights.safetensors / model.safetensors
+    // / globbed model-X-of-Y shards / model.safetensors.index.json — a superset
+    // of the prior glob-only logic.
+    let mut params = crate::utils::safetensors::load_model_weights(dir)?;
 
-    if let Some(path) = single_path {
-        info!("Loading weights from: {} (mmap)", path.display());
-        let mut params = load_safetensors_lazy(&path)?;
-
-        // Also load vision.safetensors if present (VLM models)
-        if load_vision {
-            let vision_path = dir.join("vision.safetensors");
-            if vision_path.exists() {
-                info!(
-                    "Loading vision weights from: {} (mmap)",
-                    vision_path.display()
-                );
-                let vision_params = load_safetensors_lazy(&vision_path)?;
-                info!("Loaded {} vision tensors", vision_params.len());
-                params.extend(vision_params);
-            }
-        }
-
-        return Ok(params);
-    }
-
-    let mut shard_files: Vec<std::path::PathBuf> = Vec::new();
-    let entries = fs::read_dir(dir)
-        .map_err(|e| Error::from_reason(format!("Failed to read model directory: {}", e)))?;
-
-    for entry in entries {
-        let entry = entry
-            .map_err(|e| Error::from_reason(format!("Failed to read directory entry: {}", e)))?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        let is_shard = (name.starts_with("model-") || name.starts_with("model.safetensors-"))
-            && name.ends_with(".safetensors")
-            && name.contains("-of-");
-        if is_shard {
-            shard_files.push(entry.path());
+    if load_vision {
+        let vision_path = dir.join("vision.safetensors");
+        if vision_path.exists() {
+            info!(
+                "Loading vision weights from: {} (mmap)",
+                vision_path.display()
+            );
+            let vision_params = load_safetensors_lazy(&vision_path)?;
+            info!("Loaded {} vision tensors", vision_params.len());
+            params.extend(vision_params);
         }
     }
 
-    if shard_files.is_empty() {
-        return Err(Error::from_reason(format!(
-            "No safetensors files found in {}",
-            dir.display()
-        )));
-    }
-
-    shard_files.sort();
-    info!(
-        "Loading {} sharded safetensors files (mmap)",
-        shard_files.len()
-    );
-
-    let mut all_params: HashMap<String, MxArray> = HashMap::new();
-    for shard_path in &shard_files {
-        info!("  Loading shard: {} (mmap)", shard_path.display());
-        let shard_params = load_safetensors_lazy(shard_path)?;
-        all_params.extend(shard_params);
-    }
-
-    Ok(all_params)
+    Ok(params)
 }
 
 /// FP8 E4M3 block-wise dequantization: weight * scale_inv with block_size=128
