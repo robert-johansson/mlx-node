@@ -1,0 +1,25 @@
+[package]
+name = "genmlx-core"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# The GenMLX-owned superset NAPI addon. Depends on stock mlx-core (rlib) +
+# mlx-sys and adds the ported genmlx NAPI surface, emitting ONE .node addon
+# that shares one NAPI type registry + one MLX runtime with mlx-core.
+# (Spike genmlx-53lu proved mlx-core's #[napi] ctors survive the rlib->cdylib
+# link with no -force_load.)
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# `{ workspace = true }` makes napi/napi-derive resolve to the EXACT same
+# versions as mlx-core via the shared lock — a version skew would silently
+# split the addon into two NAPI registries ("Failed to recover MxArray").
+mlx-core    = { workspace = true } # stock core as rlib (MxArray, ops, keyed-PRNG, one MLX runtime)
+mlx-sys     = { workspace = true } # direct FFI: genmlx.rs names mlx_sys::mlx_array_item_f64
+napi        = { workspace = true }
+napi-derive = { workspace = true }
+
+[build-dependencies]
+napi-build  = { workspace = true }

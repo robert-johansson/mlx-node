@@ -29,7 +29,9 @@ pub mod tensor;
 pub mod tokenizer;
 pub mod tools;
 pub mod transforms;
-pub mod genmlx;
+// Moved out of mlx-core into the GenMLX-owned `genmlx-core` superset addon crate
+// (avoids duplicate #[napi] registration once genmlx-core links mlx-core as rlib).
+// pub mod genmlx;
 pub mod memory_napi;
 pub mod tracing;
 pub mod training_model;

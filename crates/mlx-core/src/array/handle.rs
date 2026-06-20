@@ -6,7 +6,7 @@ use napi::bindgen_prelude::*;
 /// (499000) exceeded") and returns a null/false sentinel instead of letting the
 /// exception abort the process; this surfaces the detail so the sentinel can
 /// become a CATCHABLE napi error (bean genmlx-5ucd).
-pub(crate) fn take_last_native_error() -> Option<String> {
+pub fn take_last_native_error() -> Option<String> {
     let p = unsafe { sys::mlx_take_last_error() };
     if p.is_null() {
         None
