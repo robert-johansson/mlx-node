@@ -71,12 +71,17 @@ pub(crate) fn compute_loss_and_gradients_autograd(
     group_size: i32,
     loss_config: grpo_loss::GRPOLossConfig,
     use_checkpointing: bool,
+    reference_params: Option<&HashMap<String, MxArray>>,
 ) -> Result<(f64, HashMap<String, MxArray>)> {
-    // Early validation: KL penalty (beta > 0) requires reference model which isn't supported
-    if loss_config.beta > 0.0 {
+    // KL penalty (beta > 0) needs frozen reference-model params (the base policy) to
+    // compute reference logprobs for the KL-to-base term. The caller (the model train
+    // step) snapshots them lazily on the first KL-enabled step; a missing snapshot
+    // here is an internal error, not a user-facing limitation.
+    if loss_config.beta > 0.0 && reference_params.is_none() {
         return Err(Error::from_reason(
-            "KL penalty (beta > 0) requires reference model logprobs which is not yet supported in autograd mode. \
-             Set klCoef: 0.0 in your config to disable KL penalty.",
+            "KL penalty (beta > 0) requires reference model params (the frozen base \
+             policy), but none were provided — internal error: the model train step \
+             must snapshot them. Set klCoef: 0.0 to disable the KL penalty.",
         ));
     }
 
@@ -181,6 +186,28 @@ pub(crate) fn compute_loss_and_gradients_autograd(
     // 4. Concatenate prompts + completions for full sequence
     let input_ids = MxArray::concatenate(&padded_prompts, &padded_completions, 1)?;
 
+    // 4b. Reference-model completion logprobs for the KL-to-base penalty.
+    //
+    // Computed ONCE here, OUTSIDE value_and_grad, via a no-grad forward through the
+    // FROZEN reference params. It is therefore a constant w.r.t. the trainable params
+    // — the k3 KL term `exp(ref−lp) − (ref−lp) − 1` in grpo_loss differentiates only
+    // through the policy logprobs `lp`. `None` when beta == 0 (the default), so the
+    // zero-KL path is byte-for-byte unchanged. Shape [B, T_completion].
+    let ref_logprobs: Option<MxArray> = if loss_config.beta > 0.0 {
+        let rp = reference_params.ok_or_else(|| {
+            Error::from_reason("KL penalty requires reference model params (internal error)")
+        })?;
+        Some(compute_reference_logprobs(
+            model_type,
+            rp,
+            &input_ids,
+            &padded_completions,
+            &loss_config,
+        )?)
+    } else {
+        None
+    };
+
     // Check if we should use chunked autograd (separate autograd per chunk)
     // This is different from chunked forward - it runs autograd multiple times
     // and accumulates gradients, allowing memory to be freed between chunks.
@@ -204,6 +231,7 @@ pub(crate) fn compute_loss_and_gradients_autograd(
             &loss_config,
             chunk_size,
             use_checkpointing,
+            ref_logprobs.as_ref(),
         );
     }
 
@@ -217,6 +245,7 @@ pub(crate) fn compute_loss_and_gradients_autograd(
     let completion_masks_clone = completion_masks.clone();
     let config_clone = model_type.clone();
     let loss_config_clone = loss_config.clone();
+    let ref_logprobs_clone = ref_logprobs.clone();
 
     // 5. Define loss function for autograd
     // This closure will be called by MLX with updated parameter values
@@ -325,7 +354,7 @@ pub(crate) fn compute_loss_and_gradients_autograd(
             &advantages_clone,
             &completion_masks_clone,
             loss_config_clone.clone(),
-            None, // no reference model
+            ref_logprobs_clone.as_ref(), // KL-to-base reference (None when beta == 0)
         )?;
 
         Ok(loss)
@@ -395,6 +424,7 @@ fn compute_loss_and_gradients_chunked_autograd(
     loss_config: &grpo_loss::GRPOLossConfig,
     chunk_size: i64,
     use_checkpointing: bool,
+    ref_logprobs: Option<&MxArray>,
 ) -> Result<(f64, HashMap<String, MxArray>)> {
     let batch_size = input_ids.shape_at(0)?;
     let total_seq_len = input_ids.shape_at(1)?;
@@ -416,6 +446,11 @@ fn compute_loss_and_gradients_chunked_autograd(
         let chunk_old_logprobs = padded_old_logprobs.slice(&[start, 0], &[end, completion_len])?;
         let chunk_advantages = advantages.slice(&[start], &[end])?;
         let chunk_masks = completion_masks.slice(&[start, 0], &[end, completion_len])?;
+        // Slice the precomputed reference logprobs for this chunk (KL-to-base).
+        let chunk_ref_logprobs = match ref_logprobs {
+            Some(r) => Some(r.slice(&[start, 0], &[end, completion_len])?),
+            None => None,
+        };
 
         // Clone data for closure
         let param_names_clone = param_names.to_vec();
@@ -424,6 +459,7 @@ fn compute_loss_and_gradients_chunked_autograd(
         let chunk_old_logprobs_clone = chunk_old_logprobs.clone();
         let chunk_advantages_clone = chunk_advantages.clone();
         let chunk_masks_clone = chunk_masks.clone();
+        let chunk_ref_logprobs_clone = chunk_ref_logprobs.clone();
         let config_clone = model_type.clone();
         let loss_config_clone = loss_config.clone();
         let lm_head_chunk_size = loss_config.lm_head_chunk_size;
@@ -517,7 +553,7 @@ fn compute_loss_and_gradients_chunked_autograd(
                 &chunk_advantages_clone,
                 &chunk_masks_clone,
                 loss_config_clone.clone(),
-                None,
+                chunk_ref_logprobs_clone.as_ref(), // KL-to-base reference (None when beta == 0)
             )?;
 
             Ok(loss)
@@ -577,4 +613,88 @@ fn compute_loss_and_gradients_chunked_autograd(
         .collect::<HashMap<_, _>>();
 
     Ok((avg_loss, gradients))
+}
+
+/// Compute reference-model completion logprobs (no-grad) for the KL-to-base penalty.
+///
+/// Mirrors the policy forward in the autograd loss closure, but runs through the
+/// FROZEN reference params (`reference_params`) and OUTSIDE `value_and_grad`, so the
+/// result is a constant w.r.t. the trainable params — the gradient of the k3 KL term
+/// (`exp(ref−lp) − (ref−lp) − 1`) flows only through the policy logprobs `lp`. Honors
+/// `lm_head_chunk_size` / `vocab_chunk_size` for the same peak-memory bounds as the
+/// policy forward. Returns completion logprobs `[B, T_completion]`, clamped to
+/// `[-20, 0]` to match the policy/old-logprob clamping. No gradient checkpointing
+/// (there is no backward pass).
+fn compute_reference_logprobs(
+    model_type: &ModelType,
+    reference_params: &HashMap<String, MxArray>,
+    input_ids: &MxArray,
+    padded_completions: &MxArray,
+    loss_config: &grpo_loss::GRPOLossConfig,
+) -> Result<MxArray> {
+    let batch_size = input_ids.shape_at(0)?;
+    let total_seq_len = input_ids.shape_at(1)?;
+    let completion_len = padded_completions.shape_at(1)?;
+    let prompt_len = total_seq_len - completion_len;
+
+    // No-grad forward ⇒ no checkpoint contexts are actually populated.
+    let mut ckpt = autograd::CheckpointContexts::new();
+
+    let completion_logprobs = if let Some(chunk_size) = loss_config.lm_head_chunk_size {
+        // Chunked LM head path (memory-efficient): hidden states → chunked logprobs.
+        let hidden_states = functional::forward_hidden_states_dispatch(
+            model_type,
+            reference_params,
+            input_ids,
+            false,
+            &mut ckpt,
+        )?;
+        let completion_hidden = hidden_states.slice(
+            &[0, prompt_len, 0],
+            &[batch_size, total_seq_len, model_type.hidden_size() as i64],
+        )?;
+        let lm_head_weight = if model_type.tie_word_embeddings() {
+            reference_params
+                .get("embedding.weight")
+                .ok_or_else(|| Error::from_reason("Missing embedding.weight (reference)"))?
+        } else {
+            reference_params
+                .get("lm_head.weight")
+                .ok_or_else(|| Error::from_reason("Missing lm_head.weight (reference)"))?
+        };
+        functional::chunked_lm_head_selective_logprobs(
+            &completion_hidden,
+            lm_head_weight,
+            padded_completions,
+            chunk_size,
+            model_type.tie_word_embeddings(),
+        )?
+    } else {
+        // Full path: forward → completion logits → memory-efficient selective log-softmax.
+        let logits = functional::forward_functional_dispatch(
+            model_type,
+            reference_params,
+            input_ids,
+            false,
+            &mut ckpt,
+        )?;
+        let completion_logits = logits.slice(
+            &[0, prompt_len, 0],
+            &[batch_size, total_seq_len, model_type.vocab_size() as i64],
+        )?;
+        efficient_selective_log_softmax(
+            &completion_logits,
+            padded_completions,
+            loss_config.vocab_chunk_size,
+            None,
+            None,
+        )?
+    };
+
+    // Clamp to the policy/old-logprob range, then eval to materialize + detach: the
+    // loss closure captures this as a constant input (no gradient flows into it).
+    let clamped = completion_logprobs.clip(Some(-20.0), Some(0.0))?;
+    clamped.eval();
+    crate::array::heavy_cleanup();
+    Ok(clamped)
 }

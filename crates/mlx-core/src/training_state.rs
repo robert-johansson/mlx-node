@@ -39,6 +39,15 @@ pub(crate) struct ModelThreadTrainingState {
     /// Completion logprob arrays cached from GenerateForTraining.
     pub cached_completion_logprobs: Option<Vec<MxArray>>,
 
+    // === Reference model (KL-to-base penalty, genmlx-65d5) ===
+    /// Frozen snapshot of the base-policy params for the KL-to-base penalty.
+    /// Populated lazily on the first train step where `beta > 0` (an Arc-clone of
+    /// `get_parameters_sync` — cheap; the optimizer replaces weights rather than
+    /// mutating their buffers, so the snapshot stays frozen as training proceeds).
+    /// `None` when KL is off (the default) ⇒ no extra memory. Persists across
+    /// steps (NOT dropped by `clear_generation_cache`); freed with the state.
+    pub reference_params: Option<HashMap<String, MxArray>>,
+
     // === Config (copied from engine config on init) ===
     pub learning_rate: f64,
     pub gradient_clip_norm: Option<f64>,
@@ -73,6 +82,7 @@ impl ModelThreadTrainingState {
             cached_prompt_tokens: None,
             cached_completion_tokens: None,
             cached_completion_logprobs: None,
+            reference_params: None,
             learning_rate,
             gradient_clip_norm,
             gradient_clip_value,
@@ -277,6 +287,7 @@ mod tests {
         assert!(state.cached_prompt_tokens.is_none());
         assert!(state.cached_completion_tokens.is_none());
         assert!(state.cached_completion_logprobs.is_none());
+        assert!(state.reference_params.is_none());
         assert!(state.optimizer.is_none());
         assert_eq!(state.learning_rate, 1e-4);
         assert_eq!(state.grad_accumulation_steps, 1);
