@@ -5,6 +5,7 @@
 //! This eliminates ClojureScript-side `ensure-mx` and BigInt64Array conversion.
 
 use mlx_core::array::{DType, MxArray};
+use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
@@ -29,10 +30,55 @@ fn to_shape(shape: &[f64]) -> Vec<i64> {
     shape.iter().map(|&x| x as i64).collect()
 }
 
+/// Take (and clear) the last MLX exception message the C++ shim recorded on this
+/// thread. Inlined here (W-B) over the pub `mlx_sys::mlx_take_last_error` FFI so
+/// the mlx-core `take_last_native_error` re-export can revert to `pub(crate)`.
+/// The shim records MLX throws (e.g. the Metal buffer limit) and returns a
+/// null/false sentinel instead of aborting; this surfaces the detail so the
+/// sentinel becomes a CATCHABLE napi error (bean genmlx-5ucd).
+fn take_last_native_error() -> Option<String> {
+    let p = unsafe { sys::mlx_take_last_error() };
+    if p.is_null() {
+        None
+    } else {
+        // Copy immediately — the pointer is only valid until the next shim call.
+        Some(
+            unsafe { std::ffi::CStr::from_ptr(p) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+/// Validate that all axes are within bounds for the array's dimensions.
+/// Negative axes are normalized (axis + ndim) before checking bounds [0, ndim).
+/// Copied from mlx-core reduction.rs so the reduction free fns below (which now
+/// call the FFI directly) keep the same out-of-bounds guard the deleted methods
+/// had — prevents an invalid axis reaching the C++ boundary as undefined behavior.
+fn validate_axes(arr: &MxArray, axes: &[i32], context: &str) -> Result<()> {
+    let ndim = arr.ndim()? as i32;
+    for &axis in axes {
+        let normalized = if axis < 0 { axis + ndim } else { axis };
+        if normalized < 0 || normalized >= ndim {
+            return Err(Error::from_reason(format!(
+                "{}: axis {} is out of bounds for array with {} dimension{}",
+                context,
+                axis,
+                ndim,
+                if ndim == 1 { "" } else { "s" },
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Unary ops: (MxArray | number) -> MxArray
 // ============================================================================
 
+// STOCK unary ops: delegate to stock mlx-core `MxArray::$name()` methods. These
+// methods still live in mlx-core (they are upstream, not GenMLX additions), so
+// these free fns keep delegating unchanged.
 macro_rules! genmlx_unary {
     ($($name:ident),+ $(,)?) => {
         $(
@@ -48,15 +94,39 @@ macro_rules! genmlx_unary {
 }
 
 genmlx_unary!(
-    exp, log, log2, log10, expm1,
+    exp, log, log2, log10,
     sin, cos, tan, arcsin, arccos, arctan,
     sinh, cosh, tanh,
     sqrt, square, abs, negative, sign, reciprocal,
-    sigmoid, erf, erfinv, lgamma, digamma,
+    erf,
     floor, ceil, round,
-    flatten,
     isnan, isinf, isfinite,
     logical_not,
+);
+
+// GenMLX-added unary ops: the matching mlx-core methods are being deleted (W-B),
+// so these call the mlx-sys FFI directly. `$ffi` is the `sys::mlx_array_<op>`
+// symbol; bodies are byte-identical to the former mlx-core method bodies.
+macro_rules! genmlx_unary_ffi {
+    ($($name:ident => $ffi:ident, $ctx:literal);+ $(;)?) => {
+        $(
+            #[napi]
+            pub fn $name(a: Either<&MxArray, f64>) -> Result<MxArray> {
+                let arr = to_mx(a)?;
+                let handle = unsafe { sys::$ffi(arr.as_raw_ptr()) };
+                MxArray::from_handle(handle, $ctx)
+            }
+        )+
+    };
+}
+
+genmlx_unary_ffi!(
+    expm1 => mlx_array_expm1, "expm1";
+    sigmoid => mlx_array_sigmoid, "sigmoid";
+    erfinv => mlx_array_erfinv, "erfinv";
+    lgamma => mlx_array_lgamma, "lgamma";
+    digamma => mlx_array_digamma, "digamma";
+    flatten => mlx_array_flatten, "flatten";
 );
 
 // Ops with custom JS names
@@ -71,18 +141,16 @@ pub fn log1p(a: Either<&MxArray, f64>) -> Result<MxArray> {
 
 #[napi(js_name = "besselI0e")]
 pub fn bessel_i0e(a: Either<&MxArray, f64>) -> Result<MxArray> {
-    match a {
-        Either::A(arr) => arr.bessel_i0e(),
-        Either::B(num) => MxArray::scalar_float(num)?.bessel_i0e(),
-    }
+    let arr = to_mx(a)?;
+    let handle = unsafe { sys::mlx_array_bessel_i0e(arr.as_raw_ptr()) };
+    MxArray::from_handle(handle, "bessel_i0e")
 }
 
 #[napi(js_name = "besselI1e")]
 pub fn bessel_i1e(a: Either<&MxArray, f64>) -> Result<MxArray> {
-    match a {
-        Either::A(arr) => arr.bessel_i1e(),
-        Either::B(num) => MxArray::scalar_float(num)?.bessel_i1e(),
-    }
+    let arr = to_mx(a)?;
+    let handle = unsafe { sys::mlx_array_bessel_i1e(arr.as_raw_ptr()) };
+    MxArray::from_handle(handle, "bessel_i1e")
 }
 
 #[napi(js_name = "stopGradient")]
@@ -96,7 +164,9 @@ pub fn stop_gradient(a: &MxArray) -> Result<MxArray> {
 
 #[napi]
 pub fn softmax(a: Either<&MxArray, f64>, axis: Option<i32>) -> Result<MxArray> {
-    to_mx(a)?.softmax(axis.unwrap_or(-1))
+    let arr = to_mx(a)?;
+    let handle = unsafe { sys::mlx_array_softmax(arr.as_raw_ptr(), axis.unwrap_or(-1)) };
+    MxArray::from_handle(handle, "softmax")
 }
 
 #[napi(js_name = "logSoftmax")]
@@ -133,12 +203,24 @@ pub fn nan_to_num(
     posinf_val: Option<f64>,
     neginf_val: Option<f64>,
 ) -> Result<MxArray> {
-    to_mx(a)?.nan_to_num(nan_val, posinf_val, neginf_val)
+    let arr = to_mx(a)?;
+    let handle = unsafe {
+        sys::mlx_array_nan_to_num(
+            arr.as_raw_ptr(),
+            nan_val.unwrap_or(0.0) as f32,
+            posinf_val.is_some(),
+            posinf_val.unwrap_or(0.0) as f32,
+            neginf_val.is_some(),
+            neginf_val.unwrap_or(0.0) as f32,
+        )
+    };
+    MxArray::from_handle(handle, "nan_to_num")
 }
 
 #[napi]
 pub fn diag(a: &MxArray, k: Option<i32>) -> Result<MxArray> {
-    a.diag(k)
+    let handle = unsafe { sys::mlx_array_diag(a.as_raw_ptr(), k.unwrap_or(0)) };
+    MxArray::from_handle(handle, "diag")
 }
 
 #[napi(js_name = "trace")]
@@ -148,13 +230,22 @@ pub fn trace_(
     axis1: Option<i32>,
     axis2: Option<i32>,
 ) -> Result<MxArray> {
-    a.trace_(offset, axis1, axis2)
+    let handle = unsafe {
+        sys::mlx_array_trace(
+            a.as_raw_ptr(),
+            offset.unwrap_or(0),
+            axis1.unwrap_or(0),
+            axis2.unwrap_or(1),
+        )
+    };
+    MxArray::from_handle(handle, "trace")
 }
 
 // ============================================================================
 // Binary ops: (MxArray | number, MxArray | number) -> MxArray
 // ============================================================================
 
+// STOCK binary ops: delegate to stock mlx-core `MxArray::$name()` methods.
 macro_rules! genmlx_binary {
     ($($name:ident),+ $(,)?) => {
         $(
@@ -174,8 +265,32 @@ macro_rules! genmlx_binary {
 genmlx_binary!(
     add, sub, mul, div,
     power, maximum, minimum,
-    floor_divide, remainder, logaddexp,
-    matmul, inner, outer,
+    floor_divide, remainder,
+    matmul,
+);
+
+// GenMLX-added binary ops: matching mlx-core methods deleted (W-B) → direct FFI.
+macro_rules! genmlx_binary_ffi {
+    ($($name:ident => $ffi:ident, $ctx:literal);+ $(;)?) => {
+        $(
+            #[napi]
+            pub fn $name(
+                a: Either<&MxArray, f64>,
+                b: Either<&MxArray, f64>,
+            ) -> Result<MxArray> {
+                let a_arr = to_mx(a)?;
+                let b_arr = to_mx(b)?;
+                let handle = unsafe { sys::$ffi(a_arr.as_raw_ptr(), b_arr.as_raw_ptr()) };
+                MxArray::from_handle(handle, $ctx)
+            }
+        )+
+    };
+}
+
+genmlx_binary_ffi!(
+    logaddexp => mlx_array_logaddexp, "logaddexp";
+    inner => mlx_array_inner, "inner";
+    outer => mlx_array_outer, "outer";
 );
 
 // ============================================================================
@@ -205,6 +320,7 @@ pub fn where_(
 // Reduction ops (accept number[] axes via Vec<i32>)
 // ============================================================================
 
+// STOCK reductions: delegate to stock mlx-core `MxArray::$name()` methods.
 macro_rules! genmlx_reduce {
     ($($name:ident),+ $(,)?) => {
         $(
@@ -220,7 +336,39 @@ macro_rules! genmlx_reduce {
     };
 }
 
-genmlx_reduce!(sum, mean, prod, max, min, all, any, logsumexp);
+genmlx_reduce!(sum, mean, prod, max, min, logsumexp);
+
+// GenMLX-added reductions (`all`/`any`): matching mlx-core methods deleted
+// (W-B) → direct FFI. Bodies are byte-identical to the former methods, including
+// the validate_axes guard and the None=null-ptr path.
+macro_rules! genmlx_reduce_ffi {
+    ($($name:ident => $ffi:ident, $ctx:literal);+ $(;)?) => {
+        $(
+            #[napi]
+            pub fn $name(
+                a: Either<&MxArray, f64>,
+                axes: Option<Vec<i32>>,
+                keepdims: Option<bool>,
+            ) -> Result<MxArray> {
+                let arr = to_mx(a)?;
+                let kd = keepdims.unwrap_or(false);
+                let handle = match axes.as_deref() {
+                    Some(ax) => {
+                        validate_axes(&arr, ax, $ctx)?;
+                        unsafe { sys::$ffi(arr.as_raw_ptr(), ax.as_ptr(), ax.len(), kd) }
+                    }
+                    None => unsafe { sys::$ffi(arr.as_raw_ptr(), std::ptr::null(), 0, kd) },
+                };
+                MxArray::from_handle(handle, $ctx)
+            }
+        )+
+    };
+}
+
+genmlx_reduce_ffi!(
+    all => mlx_array_all, "all";
+    any => mlx_array_any, "any";
+);
 
 // var and std have an extra ddof parameter
 #[napi]
@@ -255,7 +403,10 @@ pub fn cumprod(a: &MxArray, axis: Option<i32>) -> Result<MxArray> {
 
 #[napi]
 pub fn logcumsumexp(a: &MxArray, axis: Option<i32>, reverse: Option<bool>) -> Result<MxArray> {
-    a.logcumsumexp(axis.unwrap_or(0), reverse)
+    let ax = axis.unwrap_or(0);
+    validate_axes(a, &[ax], "logcumsumexp")?;
+    let handle = unsafe { sys::mlx_array_logcumsumexp(a.as_raw_ptr(), ax, reverse.unwrap_or(false)) };
+    MxArray::from_handle(handle, "logcumsumexp")
 }
 
 #[napi]
@@ -270,12 +421,16 @@ pub fn argmin(a: &MxArray, axis: Option<i32>, keepdims: Option<bool>) -> Result<
 
 #[napi]
 pub fn topk(a: &MxArray, k: i32, axis: Option<i32>) -> Result<MxArray> {
-    a.topk(k, axis)
+    let handle = unsafe { sys::mlx_array_topk(a.as_raw_ptr(), k, axis.unwrap_or(-1)) };
+    MxArray::from_handle(handle, "topk")
 }
 
 #[napi]
 pub fn searchsorted(a: &MxArray, values: &MxArray, right: Option<bool>) -> Result<MxArray> {
-    a.searchsorted(values, right)
+    let handle = unsafe {
+        sys::mlx_array_searchsorted(a.as_raw_ptr(), values.as_raw_ptr(), right.unwrap_or(false))
+    };
+    MxArray::from_handle(handle, "searchsorted")
 }
 
 // ============================================================================
@@ -443,64 +598,119 @@ pub fn from_int32(data: &[i32], shape: Vec<f64>) -> Result<MxArray> {
 // Linear algebra
 // ============================================================================
 
+// All linalg ops below are GenMLX-added; matching mlx-core methods deleted (W-B).
+// Bodies call mlx-sys `mlx_linalg_*` FFI directly, byte-identical to the former
+// methods (with `self.handle.0` → `a.as_raw_ptr()`).
+
 #[napi]
 pub fn cholesky(a: &MxArray, upper: Option<bool>) -> Result<MxArray> {
-    a.cholesky(upper)
+    let handle = unsafe { sys::mlx_linalg_cholesky(a.as_raw_ptr(), upper.unwrap_or(false)) };
+    MxArray::from_handle(handle, "cholesky")
 }
 
 #[napi(js_name = "linalgSolve")]
 pub fn linalg_solve(a: &MxArray, b: &MxArray) -> Result<MxArray> {
-    a.linalg_solve(b)
+    let handle = unsafe { sys::mlx_linalg_solve(a.as_raw_ptr(), b.as_raw_ptr()) };
+    MxArray::from_handle(handle, "solve")
 }
 
 #[napi(js_name = "solveTriangular")]
 pub fn solve_triangular(a: &MxArray, b: &MxArray, upper: Option<bool>) -> Result<MxArray> {
-    a.solve_triangular(b, upper)
+    let handle = unsafe {
+        sys::mlx_linalg_solve_triangular(a.as_raw_ptr(), b.as_raw_ptr(), upper.unwrap_or(false))
+    };
+    MxArray::from_handle(handle, "solve_triangular")
 }
 
 #[napi(js_name = "linalgInv")]
 pub fn linalg_inv(a: &MxArray) -> Result<MxArray> {
-    a.linalg_inv()
+    let handle = unsafe { sys::mlx_linalg_inv(a.as_raw_ptr()) };
+    MxArray::from_handle(handle, "inv")
 }
 
 #[napi(js_name = "triInv")]
 pub fn tri_inv(a: &MxArray, upper: Option<bool>) -> Result<MxArray> {
-    a.tri_inv(upper)
+    let handle = unsafe { sys::mlx_linalg_tri_inv(a.as_raw_ptr(), upper.unwrap_or(false)) };
+    MxArray::from_handle(handle, "tri_inv")
 }
 
 #[napi(js_name = "choleskyInv")]
 pub fn cholesky_inv(a: &MxArray, upper: Option<bool>) -> Result<MxArray> {
-    a.cholesky_inv(upper)
+    let handle = unsafe { sys::mlx_linalg_cholesky_inv(a.as_raw_ptr(), upper.unwrap_or(false)) };
+    MxArray::from_handle(handle, "cholesky_inv")
 }
 
+/// QR decomposition. Returns [Q, R] as a two-element array.
 #[napi]
 pub fn qr(a: &MxArray) -> Result<Vec<MxArray>> {
-    a.qr()
+    let mut q_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut r_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe { sys::mlx_linalg_qr(a.as_raw_ptr(), &mut q_ptr, &mut r_ptr) };
+    let q = MxArray::from_handle(q_ptr, "qr_q")?;
+    let r = MxArray::from_handle(r_ptr, "qr_r")?;
+    Ok(vec![q, r])
 }
 
+/// SVD decomposition. Returns [U, S, Vt] as a three-element array.
 #[napi]
 pub fn svd(a: &MxArray) -> Result<Vec<MxArray>> {
-    a.svd()
+    let mut u_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut s_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut vt_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe { sys::mlx_linalg_svd(a.as_raw_ptr(), &mut u_ptr, &mut s_ptr, &mut vt_ptr) };
+    let u = MxArray::from_handle(u_ptr, "svd_u")?;
+    let s = MxArray::from_handle(s_ptr, "svd_s")?;
+    let vt = MxArray::from_handle(vt_ptr, "svd_vt")?;
+    Ok(vec![u, s, vt])
 }
 
+/// Eigendecomposition of symmetric matrix. Returns [eigenvalues, eigenvectors].
 #[napi]
 pub fn eigh(a: &MxArray, uplo: Option<String>) -> Result<Vec<MxArray>> {
-    a.eigh(uplo)
+    let uplo_str = uplo.unwrap_or_else(|| "L".to_string());
+    let c_str = std::ffi::CString::new(uplo_str)
+        .map_err(|e| napi::Error::from_reason(format!("Invalid UPLO: {e}")))?;
+    let mut eigvals_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut eigvecs_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe {
+        sys::mlx_linalg_eigh(
+            a.as_raw_ptr(),
+            c_str.as_ptr(),
+            &mut eigvals_ptr,
+            &mut eigvecs_ptr,
+        )
+    };
+    let eigvals = MxArray::from_handle(eigvals_ptr, "eigh_eigvals")?;
+    let eigvecs = MxArray::from_handle(eigvecs_ptr, "eigh_eigvecs")?;
+    Ok(vec![eigvals, eigvecs])
 }
 
 #[napi]
 pub fn eigvalsh(a: &MxArray, uplo: Option<String>) -> Result<MxArray> {
-    a.eigvalsh(uplo)
+    let uplo_str = uplo.unwrap_or_else(|| "L".to_string());
+    let c_str = std::ffi::CString::new(uplo_str)
+        .map_err(|e| napi::Error::from_reason(format!("Invalid UPLO: {e}")))?;
+    let handle = unsafe { sys::mlx_linalg_eigvalsh(a.as_raw_ptr(), c_str.as_ptr()) };
+    MxArray::from_handle(handle, "eigvalsh")
 }
 
 #[napi(js_name = "linalgNorm")]
 pub fn linalg_norm(a: &MxArray, ord: Option<f64>) -> Result<MxArray> {
-    a.linalg_norm(ord)
+    let handle = match ord {
+        Some(o) => unsafe { sys::mlx_linalg_norm(a.as_raw_ptr(), o) },
+        None => unsafe { sys::mlx_linalg_norm_default(a.as_raw_ptr()) },
+    };
+    MxArray::from_handle(handle, "norm")
 }
 
 #[napi]
 pub fn einsum(subscripts: String, operands: Vec<&MxArray>) -> Result<MxArray> {
-    MxArray::einsum(subscripts, operands)
+    let c_str = std::ffi::CString::new(subscripts)
+        .map_err(|e| napi::Error::from_reason(format!("Invalid subscripts: {e}")))?;
+    let handles: Vec<*mut sys::mlx_array> = operands.iter().map(|a| a.as_raw_ptr()).collect();
+    let handle =
+        unsafe { sys::mlx_array_einsum(c_str.as_ptr(), handles.as_ptr(), handles.len()) };
+    MxArray::from_handle(handle, "einsum")
 }
 
 // ============================================================================
@@ -512,14 +722,14 @@ pub fn einsum(subscripts: String, operands: Vec<&MxArray>) -> Result<MxArray> {
 #[napi]
 pub fn item(a: &MxArray) -> Result<f64> {
     let mut value: f64 = 0.0;
-    let ok = unsafe { mlx_sys::mlx_array_item_f64(a.as_raw_ptr(), &mut value) };
+    let ok = unsafe { sys::mlx_array_item_f64(a.as_raw_ptr(), &mut value) };
     if ok {
         Ok(value)
     } else {
         // false = either a non-size-1 array, or a guarded MLX throw (e.g. the
         // Metal buffer limit) — surface the real detail if the shim recorded one
         // so it is catchable rather than an abort (bean genmlx-5ucd).
-        let msg = match mlx_core::array::take_last_native_error() {
+        let msg = match take_last_native_error() {
             Some(detail) => format!("MLX error in item: {}", detail),
             None => "item: array must have size 1".to_string(),
         };
@@ -534,7 +744,11 @@ pub fn astype(a: &MxArray, dtype: DType) -> Result<MxArray> {
 
 #[napi(js_name = "shapeOf")]
 pub fn shape_of(a: &MxArray) -> Result<Vec<i32>> {
-    a.shape_array()
+    // Inlined from the former mlx-core `shape_array` method (deleted in W-B).
+    let ndim = unsafe { sys::mlx_array_ndim(a.as_raw_ptr()) };
+    let mut shape = vec![0i64; ndim];
+    unsafe { sys::mlx_array_shape(a.as_raw_ptr(), shape.as_mut_ptr()) };
+    Ok(shape.into_iter().map(|x| x as i32).collect())
 }
 
 #[napi(js_name = "ndimOf")]
@@ -780,4 +994,125 @@ pub fn silu(x: &MxArray) -> Result<MxArray> {
 #[napi(js_name = "loadSafetensors")]
 pub fn load_safetensors(path: String) -> Result<std::collections::HashMap<String, MxArray>> {
     mlx_core::utils::safetensors::load_safetensors_lazy(&path)
+}
+
+// ============================================================================
+// Autograd (relocated from mlx-core into genmlx-core, W-B)
+//
+// These were `MxArray.valueAndGrad` / `MxArray.computeGradients` static methods
+// in mlx-core; the orphan rule forbids re-`impl MxArray` outside mlx-core, so
+// here they are module-level free fns wrapping the stock-pub generic
+// `mlx_core::autograd::{value_and_grad, compute_gradients}`. The JS-closure →
+// MxArray recipe is the one already proven in `transforms.rs` (the same
+// into_instance / napi_unwrap dance). The JS surface moves from the MxArray
+// class to top-level addon exports — bodies and FFI are otherwise unchanged.
+// ============================================================================
+
+/// Build a loss closure that calls a JS function synchronously via raw NAPI.
+///
+/// The JS function receives MxArray arguments and must return a scalar MxArray.
+/// All calls are synchronous on the JS thread — safe because MLX's
+/// value_and_grad / compute_gradients are synchronous.
+fn make_js_loss_closure(
+    raw_env: napi::sys::napi_env,
+    raw_func: napi::sys::napi_value,
+) -> impl FnMut(&[MxArray]) -> Result<MxArray> {
+    move |params: &[MxArray]| -> Result<MxArray> {
+        unsafe {
+            let env_wrapper = Env::from_raw(raw_env);
+
+            // Convert each MxArray param to a JS MxArray instance. Clone the Arc
+            // (O(1)) — both Rust and JS hold references; C++ owns the underlying
+            // handle, the Arc prevents premature Rust-side cleanup mid-callback.
+            let mut js_args: Vec<napi::sys::napi_value> = Vec::with_capacity(params.len());
+            for param in params {
+                let cloned = param.clone();
+                let instance = cloned.into_instance(&env_wrapper)?;
+                js_args.push(instance.raw());
+            }
+
+            // Call the JS function synchronously (this = global).
+            let mut result: napi::sys::napi_value = std::ptr::null_mut();
+            let mut global: napi::sys::napi_value = std::ptr::null_mut();
+            napi::sys::napi_get_global(raw_env, &mut global);
+            let status = napi::sys::napi_call_function(
+                raw_env,
+                global,
+                raw_func,
+                js_args.len(),
+                if js_args.is_empty() {
+                    std::ptr::null()
+                } else {
+                    js_args.as_ptr()
+                },
+                &mut result,
+            );
+
+            if status != napi::sys::Status::napi_ok || result.is_null() {
+                return Err(Error::from_reason("JS loss function call failed"));
+            }
+
+            // Extract MxArray from the returned napi_value (NAPI-RS #[napi]
+            // classes are unwrapped via napi_unwrap). Clone the Arc so we own it.
+            let mut wrapped: *mut std::ffi::c_void = std::ptr::null_mut();
+            let unwrap_status = napi::sys::napi_unwrap(raw_env, result, &mut wrapped);
+            if unwrap_status != napi::sys::Status::napi_ok || wrapped.is_null() {
+                return Err(Error::from_reason(
+                    "JS loss function must return an MxArray",
+                ));
+            }
+            let loss_ref = &*(wrapped as *const MxArray);
+            Ok(loss_ref.clone())
+        }
+    }
+}
+
+/// Compute value and gradients of a JS loss function.
+///
+/// The loss function receives MxArray arguments and must return a scalar MxArray.
+/// Returns `[lossValue, grad0, grad1, ...]`.
+///
+/// ```js
+/// const [loss, dx, dy] = valueAndGrad((x, y) => x.mul(y).sum(), [x, y]);
+/// ```
+#[napi(js_name = "valueAndGrad")]
+pub fn value_and_grad(
+    env: Env,
+    #[napi(ts_arg_type = "(...args: MxArray[]) => MxArray")]
+    loss_fn: napi::bindgen_prelude::Function<'static>,
+    inputs: Vec<&MxArray>,
+) -> Result<Vec<MxArray>> {
+    if inputs.is_empty() {
+        return Err(Error::from_reason("valueAndGrad: inputs cannot be empty"));
+    }
+    let raw_env = env.raw();
+    let raw_func =
+        unsafe { napi::bindgen_prelude::ToNapiValue::to_napi_value(raw_env, loss_fn)? };
+    let loss_closure = make_js_loss_closure(raw_env, raw_func);
+    let input_refs: Vec<&MxArray> = inputs.iter().copied().collect();
+    let (loss, grads) = mlx_core::autograd::value_and_grad(input_refs, loss_closure)?;
+    let mut result = Vec::with_capacity(1 + grads.len());
+    result.push(loss);
+    result.extend(grads);
+    Ok(result)
+}
+
+/// Compute only gradients (not loss value) of a JS function.
+/// Returns `[grad0, grad1, ...]`.
+#[napi(js_name = "computeGradients")]
+pub fn compute_gradients(
+    env: Env,
+    #[napi(ts_arg_type = "(...args: MxArray[]) => MxArray")]
+    loss_fn: napi::bindgen_prelude::Function<'static>,
+    inputs: Vec<&MxArray>,
+) -> Result<Vec<MxArray>> {
+    if inputs.is_empty() {
+        return Err(Error::from_reason("computeGradients: inputs cannot be empty"));
+    }
+    let raw_env = env.raw();
+    let raw_func =
+        unsafe { napi::bindgen_prelude::ToNapiValue::to_napi_value(raw_env, loss_fn)? };
+    let loss_closure = make_js_loss_closure(raw_env, raw_func);
+    let input_refs: Vec<&MxArray> = inputs.iter().copied().collect();
+    mlx_core::autograd::compute_gradients(input_refs, loss_closure)
 }
