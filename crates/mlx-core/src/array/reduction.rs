@@ -205,72 +205,9 @@ impl MxArray {
     }
 
     // ================================================================
-    // GenMLX consolidation: additional reductions
+    // The GenMLX consolidation reductions (all/any/topk/logcumsumexp/
+    // searchsorted) were relocated to `genmlx-core/src/genmlx.rs` as
+    // module-level free fns calling the same mlx-sys FFI directly (W-B),
+    // with `validate_axes` copied alongside them — mlx-core is stock here.
     // ================================================================
-
-    #[napi]
-    pub fn all(&self, axes: Option<&[i32]>, keepdims: Option<bool>) -> Result<MxArray> {
-        let kd = keepdims.unwrap_or(false);
-        let handle = match axes {
-            Some(ax) => {
-                validate_axes(self, ax, "all")?;
-                unsafe {
-                    sys::mlx_array_all(self.handle.0, ax.as_ptr(), ax.len(), kd)
-                }
-            }
-            None => unsafe {
-                sys::mlx_array_all(self.handle.0, std::ptr::null(), 0, kd)
-            },
-        };
-        MxArray::from_handle(handle, "all")
-    }
-
-    #[napi]
-    pub fn any(&self, axes: Option<&[i32]>, keepdims: Option<bool>) -> Result<MxArray> {
-        let kd = keepdims.unwrap_or(false);
-        let handle = match axes {
-            Some(ax) => {
-                validate_axes(self, ax, "any")?;
-                unsafe {
-                    sys::mlx_array_any(self.handle.0, ax.as_ptr(), ax.len(), kd)
-                }
-            }
-            None => unsafe {
-                sys::mlx_array_any(self.handle.0, std::ptr::null(), 0, kd)
-            },
-        };
-        MxArray::from_handle(handle, "any")
-    }
-
-    #[napi]
-    pub fn topk(&self, k: i32, axis: Option<i32>) -> Result<MxArray> {
-        let ax = axis.unwrap_or(-1);
-        let handle = unsafe { sys::mlx_array_topk(self.handle.0, k, ax) };
-        MxArray::from_handle(handle, "topk")
-    }
-
-    #[napi]
-    pub fn logcumsumexp(&self, axis: i32, reverse: Option<bool>) -> Result<MxArray> {
-        validate_axes(self, &[axis], "logcumsumexp")?;
-        let handle = unsafe {
-            sys::mlx_array_logcumsumexp(
-                self.handle.0,
-                axis,
-                reverse.unwrap_or(false),
-            )
-        };
-        MxArray::from_handle(handle, "logcumsumexp")
-    }
-
-    #[napi]
-    pub fn searchsorted(&self, values: &MxArray, right: Option<bool>) -> Result<MxArray> {
-        let handle = unsafe {
-            sys::mlx_array_searchsorted(
-                self.handle.0,
-                values.handle.0,
-                right.unwrap_or(false),
-            )
-        };
-        MxArray::from_handle(handle, "searchsorted")
-    }
 }

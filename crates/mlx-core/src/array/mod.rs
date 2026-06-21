@@ -19,9 +19,11 @@ mod shape;
 pub use attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 pub use banded_attention::{banded_attention, banded_attention_reference};
 pub(crate) use handle::{MxHandle, check_handle};
-// Promoted to `pub` so the genmlx-core superset addon (which depends on mlx-core
-// as an rlib) can surface MLX exception detail through its ported NAPI layer.
-pub use handle::take_last_native_error;
+// `take_last_native_error` is mlx-core-internal again (W-B): genmlx-core inlines
+// its own copy over the pub `mlx_sys::mlx_take_last_error` FFI, so this no longer
+// needs to be `pub` — reverting the only other mlx-core pub patch besides
+// `from_handle` keeps the residual delta at one line.
+pub(crate) use handle::take_last_native_error;
 pub use padding::{
     LeftPaddedSequences, PaddedSequences, left_pad_sequences, pad_float_sequences, pad_sequences,
 };
