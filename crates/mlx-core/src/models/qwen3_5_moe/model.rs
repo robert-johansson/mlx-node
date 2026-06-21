@@ -5513,6 +5513,24 @@ impl Qwen35MoeInner {
 
         reset_peak_memory();
 
+        // KL-to-base (genmlx-65d5): lazily snapshot the frozen reference params on the
+        // first KL-enabled step. An Arc-clone of the current weights — at the first
+        // step (beta>0 from the start, the normal case) these ARE the base policy, and
+        // the optimizer replaces weights rather than mutating buffers, so the snapshot
+        // stays frozen as training proceeds. Skipped when beta == 0 (no extra memory).
+        if loss_config.beta > 0.0
+            && self
+                .training_state
+                .as_ref()
+                .map(|ts| ts.reference_params.is_none())
+                .unwrap_or(false)
+        {
+            let snapshot = self.get_parameters_sync()?;
+            if let Some(ts) = self.training_state.as_mut() {
+                ts.reference_params = Some(snapshot);
+            }
+        }
+
         // Get cached generation results from training_state
         let ts = self.training_state.as_ref().ok_or_else(|| {
             napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
@@ -5580,6 +5598,7 @@ impl Qwen35MoeInner {
             group_size,
             loss_config,
             use_checkpointing,
+            ts.reference_params.as_ref(),
         )?;
 
         // Check for NaN/Inf loss
