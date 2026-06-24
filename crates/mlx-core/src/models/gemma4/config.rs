@@ -48,6 +48,20 @@ pub struct Gemma4Config {
     #[serde(default)]
     pub attention_k_eq_v: bool,
 
+    /// True for the unified multimodal Gemma 4 checkpoint
+    /// (`model_type == "gemma4_unified"` or
+    /// `architectures[0] == "Gemma4UnifiedForConditionalGeneration"`).
+    /// The text decoder is shared, but the unified checkpoint carries
+    /// vision/audio embedder weights that must be dropped in a text-only load.
+    #[serde(default)]
+    pub is_unified: bool,
+
+    /// `text_config.use_bidirectional_attention` from the unified checkpoint
+    /// (e.g. `"vision"`). Parsed for a stable struct surface; the text-only
+    /// decode path does not consume it.
+    #[serde(default)]
+    pub use_bidirectional_attention: Option<String>,
+
     // Logit softcapping: tanh(logits / cap) * cap
     #[serde(default)]
     pub final_logit_softcapping: Option<f64>,
@@ -99,10 +113,42 @@ pub struct Gemma4Config {
 
     // Vision fields (None when no vision_config in config.json — text-only model)
     pub vision_config: Option<super::vision_config::Gemma4VisionConfig>,
+    /// Encoder-free vision config for the unified multimodal checkpoint.
+    /// `Some` only when `is_unified` and the checkpoint carries a
+    /// `vision_config` sub-dict. Disjoint from `vision_config` (the SigLIP
+    /// path) — the unified vision embedder is built from this instead.
+    #[serde(default)]
+    pub unified_vision_config: Option<super::unified_vision_config::UnifiedVisionConfig>,
     pub image_token_id: Option<i32>,               // 258880
     pub boi_token_id: Option<i32>,                 // 255999
     pub eoi_token_id: Option<i32>,                 // 258882
     pub vision_soft_tokens_per_image: Option<i32>, // 280
+
+    // Audio fields — only present for the unified multimodal checkpoint that
+    // carries an `audio_config` sub-dict. The unified audio path is encoder-free
+    // (raw 640-sample windows projected into the text embedding space); these
+    // ids drive the placeholder expansion and the masked-scatter merge.
+    /// True when the checkpoint declares an `audio_config` sub-dict. Parallels
+    /// `unified_vision_config.is_some()`; gates the un-drop + load of
+    /// `embed_audio` weights and the audio merge path.
+    #[serde(default)]
+    pub has_audio: bool,
+    /// Audio placeholder token id (258881). Each `<audio>` placeholder expands to
+    /// `boa + audio_token × n_frames + eoa`.
+    #[serde(default)]
+    pub audio_token_id: Option<i32>,
+    /// Begin-of-audio token id (256000), emitted before the audio token run.
+    #[serde(default)]
+    pub boa_token_id: Option<i32>,
+    /// End-of-audio token id, parsed from the config's `eoa_token_index` (258883).
+    /// A real appended token (like `eoi`), despite the "index" name.
+    #[serde(default)]
+    pub eoa_token_id: Option<i32>,
+    /// Raw audio samples per audio token (640 = 40 ms @ 16 kHz), from
+    /// `audio_config.audio_samples_per_token`. Frame size for the encoder-free
+    /// pad+reshape feature extractor.
+    #[serde(default)]
+    pub audio_samples_per_token: Option<i32>,
 
     // Paged attention options (opt-in)
     /// GPU memory budget for paged KV cache in megabytes.

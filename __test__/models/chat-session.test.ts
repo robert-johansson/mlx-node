@@ -91,8 +91,12 @@ function makeMockModel() {
     async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> => makeChatResult('start-reply'),
   );
   const chatSessionContinue = vi.fn(
-    async (_userMessage: string, _images: Uint8Array[] | null, _config?: ChatConfig | null): Promise<ChatResult> =>
-      makeChatResult('continue-reply'),
+    async (
+      _userMessage: string,
+      _images: Uint8Array[] | null,
+      _audio: Uint8Array[] | null,
+      _config?: ChatConfig | null,
+    ): Promise<ChatResult> => makeChatResult('continue-reply'),
   );
   const chatSessionContinueTool = vi.fn(
     async (
@@ -113,6 +117,7 @@ function makeMockModel() {
   const chatStreamSessionContinue = vi.fn(async function* (
     _userMessage: string,
     _images: Uint8Array[] | null,
+    _audio: Uint8Array[] | null,
     _config?: ChatConfig | null,
   ): AsyncGenerator<ChatStreamEvent> {
     yield { text: 'cont', done: false };
@@ -200,11 +205,14 @@ describe('ChatSession', () => {
 
       expect(chatSessionContinue.mock.calls[0][0]).toBe('Second');
       expect(chatSessionContinue.mock.calls[0][1]).toBeNull();
+      // arg[2] is the new audio param; delta continues never carry audio.
+      expect(chatSessionContinue.mock.calls[0][2]).toBeNull();
       expect(chatSessionContinue.mock.calls[1][0]).toBe('Third');
       expect(chatSessionContinue.mock.calls[1][1]).toBeNull();
+      expect(chatSessionContinue.mock.calls[1][2]).toBeNull();
 
       for (const call of chatSessionContinue.mock.calls) {
-        expect(call[2]?.reuseCache).toBe(true);
+        expect(call[3]?.reuseCache).toBe(true);
       }
     });
 
@@ -216,7 +224,67 @@ describe('ChatSession', () => {
       await session.send('Second', { config: { reuseCache: false } });
 
       expect(chatSessionStart.mock.calls[0][1]?.reuseCache).toBe(true);
-      expect(chatSessionContinue.mock.calls[0][2]?.reuseCache).toBe(true);
+      expect(chatSessionContinue.mock.calls[0][3]?.reuseCache).toBe(true);
+    });
+
+    // Regression guard for the Phase 3b audio-surface ABI shift. The
+    // shared chat surface inserts an `audio` positional argument between
+    // `images` and `config`. A QianfanOCR-shaped model (handwritten NAPI
+    // methods, not the `chat_napi_surface!` macro) must carry the SAME
+    // positional ABI as the macro families, or the delta path would push
+    // the caller's `config` into the audio slot and silently drop it. We
+    // model the native binding as a positional recorder (it only knows
+    // arguments by index) and assert `config` lands in slot 3, never the
+    // audio slot.
+    it('delivers (userMessage, images, audio, config) to a Qianfan-shaped continue without dropping config', async () => {
+      const continueArgs: unknown[][] = [];
+      const qianfanShaped: SessionCapableModel = {
+        chatSessionStart: vi.fn(
+          async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> =>
+            makeChatResult('start-reply'),
+        ),
+        // Positional recorder: a native NAPI binding sees its arguments by
+        // index only, so capturing `arguments` here detects any slot shift.
+        chatSessionContinue: vi.fn(async function (this: unknown, ...args: unknown[]): Promise<ChatResult> {
+          continueArgs.push(args);
+          return makeChatResult('continue-reply');
+        }) as unknown as SessionCapableModel['chatSessionContinue'],
+        chatSessionContinueTool: vi.fn(
+          async (): Promise<ChatResult> => makeChatResult('tool-reply'),
+        ) as unknown as SessionCapableModel['chatSessionContinueTool'],
+        chatStreamSessionStart: vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+          yield finalChunk('start-reply');
+        }) as unknown as SessionCapableModel['chatStreamSessionStart'],
+        chatStreamSessionContinue: vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+          yield finalChunk('cont-reply');
+        }) as unknown as SessionCapableModel['chatStreamSessionContinue'],
+        chatStreamSessionContinueTool: vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+          yield finalChunk('tool-reply');
+        }) as unknown as SessionCapableModel['chatStreamSessionContinueTool'],
+        resetCaches: vi.fn(() => undefined),
+      };
+
+      const session = new ChatSession(qianfanShaped, {
+        defaultConfig: { maxNewTokens: 7 },
+      });
+
+      // Turn 0 routes through start; turn 1 takes the cheap delta path.
+      await session.send('First');
+      await session.send('Second');
+
+      expect(continueArgs).toHaveLength(1);
+      const [userMessage, images, audio, config] = continueArgs[0];
+      expect(userMessage).toBe('Second');
+      expect(images).toBeNull();
+      // audio MUST be the third positional argument and null on a delta —
+      // if the ABI were the pre-fix shape, `config` would land here.
+      expect(audio).toBeNull();
+      // config MUST land in slot 3, fully intact (not shifted into audio).
+      expect(config).toBeDefined();
+      expect((config as ChatConfig | undefined)?.maxNewTokens).toBe(7);
+      expect((config as ChatConfig | undefined)?.reuseCache).toBe(true);
+      // No stray fifth positional argument.
+      expect(continueArgs[0]).toHaveLength(4);
     });
 
     it('merges defaultConfig and per-call config (per-call wins)', async () => {
@@ -412,6 +480,38 @@ describe('ChatSession', () => {
       expect(chatSessionContinue).toHaveBeenCalledTimes(1);
       // lastImagesKey is unchanged — cache still holds the image.
       expect(session.hasImages).toBe(true);
+    });
+
+    it('an audio-change restart preserves the untouched image key and does not re-detect the same image', async () => {
+      // A restart driven by a change in only ONE modality replays the
+      // FULL history through the start path, so the post-restart sticky
+      // keys must be derived from that history — not from the single
+      // turn's literal media args (which null the untouched modality).
+      const audX = new Uint8Array([9, 9, 9]);
+      const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
+      const session = new ChatSession(model);
+
+      // Turn 1: image start.
+      await session.send('describe', { images: [imgA] });
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(session.hasImages).toBe(true);
+
+      // Turn 2: audio-only turn → audio change → full restart. Image A is
+      // still present in the replayed history, so the image key must be
+      // rehydrated from history, not nulled by the per-turn audio args.
+      await session.send('transcribe', { audio: [audX] });
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      // The image is still live in the native cache — hasImages must NOT
+      // lie (this assertion fails before the fix, passes after).
+      expect(session.hasImages).toBe(true);
+
+      // Turn 3: refer back to the SAME image A. Because lastImagesKey was
+      // preserved as key(A), this is NOT detected as an image change, so
+      // it routes through the cheap delta path — no spurious third start
+      // that would duplicate image A in the prompt.
+      await session.send('what was in the image?', { images: [imgA] });
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(chatSessionContinue).toHaveBeenCalledTimes(1);
     });
 
     it('hasImages stays true across text-only follow-ups and tool turns', async () => {
@@ -1488,6 +1588,709 @@ describe('ChatSession', () => {
       // Retry succeeds: turnCount goes 1 → 2 (not 1 → 3).
       for await (const _e of session.sendStream('turn 2 retry')) void _e;
       expect(session.turns).toBe(2);
+    });
+
+    // -----------------------------------------------------------------
+    // gemma4 empty-done-chunk history commit
+    //
+    // gemma4 is the only family whose native streaming `finish` emits a
+    // terminal chunk with `text: ''` (the visible text was already
+    // streamed as per-token deltas). The history commit must therefore
+    // fall back to the accumulated VISIBLE deltas instead of storing an
+    // empty assistant turn — otherwise any cold-restart that resends
+    // `this.history` (e.g. the media→text restart) loses the reply.
+    //
+    // History is private, so these assert through the image-change
+    // restart, which replays the full committed history into
+    // `chatStreamSessionStart`.
+    // -----------------------------------------------------------------
+
+    const gemmaImgA = new Uint8Array([91, 92, 93]);
+    const gemmaImgB = new Uint8Array([94, 95, 96]);
+
+    /**
+     * Read back the committed assistant content of the FIRST streamed
+     * turn by triggering an image-change restart and inspecting the
+     * replayed `chatStreamSessionStart` history.
+     */
+    async function committedAssistantViaRestart(firstTurnDeltas: ChatStreamEvent[]): Promise<string | undefined> {
+      let startCall = 0;
+      const chatStreamSessionStart = vi.fn(async function* (
+        _messages: ChatMessage[],
+        _config?: ChatConfig | null,
+      ): AsyncGenerator<ChatStreamEvent> {
+        startCall++;
+        if (startCall === 1) {
+          for (const ev of firstTurnDeltas) yield ev;
+          return;
+        }
+        // Restart stream — content does not matter for the assertion.
+        yield finalChunk('restart-reply');
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      // Turn 1: gemma4-shape stream with an image attached so the next
+      // (different-image) send is detected as an image change.
+      for await (const _e of session.sendStream('turn 1', { images: [gemmaImgA] })) void _e;
+      expect(session.turns).toBe(1);
+
+      // Turn 2: image-change restart replays the committed history.
+      for await (const _e of session.sendStream('turn 2', { images: [gemmaImgB] })) void _e;
+
+      const restartMessages = chatStreamSessionStart.mock.calls[1][0];
+      const assistant = restartMessages.find((m) => m.role === 'assistant');
+      return assistant?.content;
+    }
+
+    it('commits the accumulated visible text when the done chunk is empty (gemma4)', async () => {
+      // Visible deltas streamed, then a gemma4-shape empty final chunk.
+      const content = await committedAssistantViaRestart([
+        { text: 'Pa', done: false, isReasoning: false },
+        { text: 'ris', done: false, isReasoning: false },
+        finalChunk(''),
+      ]);
+      expect(content).toBe('Paris');
+    });
+
+    it('excludes reasoning deltas from the empty-done-chunk commit (gemma4)', async () => {
+      // Reasoning-body delta must NOT leak into stored history; only the
+      // visible delta survives when the final chunk is empty.
+      const content = await committedAssistantViaRestart([
+        { text: 'thinking…', done: false, isReasoning: true },
+        { text: 'Answer', done: false, isReasoning: false },
+        finalChunk(''),
+      ]);
+      expect(content).toBe('Answer');
+    });
+
+    it('commits the non-empty done-chunk text verbatim (non-gemma regression)', async () => {
+      // For families whose final chunk carries non-empty `text`, the
+      // commit must use that text unchanged — `||` ≡ `??` here. The
+      // accumulated visible deltas must NOT override it.
+      const content = await committedAssistantViaRestart([
+        { text: 'partial-stream-text', done: false, isReasoning: false },
+        finalChunk('cont-reply'),
+      ]);
+      expect(content).toBe('cont-reply');
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Media-held delta rejection → transparent cold replay
+  //
+  // After an image/audio turn, gemma4's native session refuses a
+  // text-only delta with a typed `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`
+  // rejection. The session layer must catch that exact prefix and replay
+  // the full conversation through the cold start path instead of letting
+  // the raw error escape. The native streaming wrapper converts the
+  // worker-thread sink error into a THROWN error on the generator's first
+  // iteration (verified against `packages/lm/src/stream.ts` `if (item.error)
+  // throw item.error`), so both `send()` and `sendStream()` see a thrown
+  // rejection before any chunk is emitted.
+  // -------------------------------------------------------------------
+
+  describe('media-held continuation → cold replay', () => {
+    const RESTART_PREFIX = 'IMAGE_CHANGE_REQUIRES_SESSION_RESTART:';
+    const imgA = new Uint8Array([7, 7, 7]);
+
+    function mediaHeldError(): Error {
+      return new Error(`${RESTART_PREFIX}chat_tokens_delta_sync is text-only; session currently holds image state`);
+    }
+
+    it('send(): media-held delta rejection replays through chatSessionStart', async () => {
+      const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
+      const session = new ChatSession(model, { system: 'You are helpful.' });
+
+      // Turn 1: image start succeeds.
+      await session.send('describe', { images: [imgA] });
+      expect(session.turns).toBe(1);
+      expect(session.hasImages).toBe(true);
+
+      // Turn 2: text-only follow-up routes through the delta path, but the
+      // native session (media held) rejects with the typed prefix. The
+      // session must catch it and replay through chatSessionStart.
+      chatSessionContinue.mockRejectedValueOnce(mediaHeldError());
+      const result = await session.send('what about the top-right?');
+
+      // Resolves with the replayed reply — no throw.
+      expect(result.text).toBe('start-reply');
+      // The delta path was attempted exactly once before the replay.
+      expect(chatSessionContinue).toHaveBeenCalledTimes(1);
+      // The replay ran through the start path (turn-1 start + turn-2 replay).
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+
+      // The replay re-rendered the FULL history, including the prior image
+      // turn, plus the new text-only user turn (no media attached).
+      const replayMessages = chatSessionStart.mock.calls[1][0];
+      expect(replayMessages).toEqual([
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'describe', images: [imgA] },
+        { role: 'assistant', content: 'start-reply' },
+        { role: 'user', content: 'what about the top-right?' },
+      ]);
+
+      // History appended exactly once for this turn (user + assistant), and
+      // turnCount advanced by exactly one.
+      expect(session.turns).toBe(2);
+      // The trailing image key was rehydrated from history, so the cache
+      // still reflects the held image.
+      expect(session.hasImages).toBe(true);
+
+      // inFlight cleared — a follow-up send is accepted.
+      const followUp = await session.send('and the bottom-left?');
+      expect(followUp.text).toBe('continue-reply');
+      expect(session.turns).toBe(3);
+    });
+
+    it('send(): a non-prefix delta rejection propagates without replay', async () => {
+      const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.send('describe', { images: [imgA] });
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+
+      chatSessionContinue.mockRejectedValueOnce(new Error('some other native failure'));
+      await expect(session.send('text follow-up')).rejects.toThrow('some other native failure');
+
+      // No replay — chatSessionStart not called a second time.
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      // The failed turn did not advance the counter.
+      expect(session.turns).toBe(1);
+
+      // inFlight cleared — a follow-up still routes through the delta path.
+      await session.send('recover');
+      expect(session.turns).toBe(2);
+    });
+
+    it('sendStream(): media-held delta rejection replays through chatStreamSessionStart', async () => {
+      let continueCalls = 0;
+      const chatStreamSessionContinue = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        continueCalls++;
+        // First continue (the media-held delta): throw before any chunk,
+        // exactly how stream.ts surfaces the native sink error.
+        throw mediaHeldError();
+        // eslint-disable-next-line no-unreachable
+        yield finalChunk('unreachable');
+      });
+      let startCalls = 0;
+      const startHistories: ChatMessage[][] = [];
+      const chatStreamSessionStart = vi.fn(async function* (messages: ChatMessage[]): AsyncGenerator<ChatStreamEvent> {
+        startCalls++;
+        startHistories.push(messages);
+        if (startCalls === 1) {
+          // Turn-1 image start.
+          yield { text: 'A', done: false };
+          yield finalChunk('describe-reply');
+          return;
+        }
+        // Turn-2 replay.
+        yield { text: 'replayed', done: false };
+        yield finalChunk('replayed-reply');
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue,
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model, { system: 'You are helpful.' });
+
+      // Turn 1: streamed image start.
+      for await (const _e of session.sendStream('describe', { images: [imgA] })) void _e;
+      expect(session.turns).toBe(1);
+      expect(session.hasImages).toBe(true);
+
+      // Turn 2: text follow-up, media-held rejection → transparent replay.
+      const events: ChatStreamEvent[] = [];
+      for await (const e of session.sendStream('what about the top-right?')) events.push(e);
+
+      // The replayed reply was yielded; no duplicate / partial emission of
+      // the failed delta (the failed continue produced no chunk).
+      expect(events.map((e) => e.text)).toEqual(['replayed', 'replayed-reply']);
+      expect(events[events.length - 1].done).toBe(true);
+      expect((events[events.length - 1] as ChatStreamFinal).finishReason).toBe('stop');
+
+      // Delta path attempted once; replay ran through the start stream.
+      expect(continueCalls).toBe(1);
+      expect(startCalls).toBe(2);
+
+      // The replay re-rendered the FULL history incl. the prior image turn.
+      expect(startHistories[1]).toEqual([
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'describe', images: [imgA] },
+        { role: 'assistant', content: 'describe-reply' },
+        { role: 'user', content: 'what about the top-right?' },
+      ]);
+
+      // History pushed exactly once; turnCount +1.
+      expect(session.turns).toBe(2);
+      expect(session.hasImages).toBe(true);
+
+      // inFlight cleared — a follow-up streams cleanly.
+      for await (const _e of session.sendStream('and the bottom-left?')) void _e;
+      expect(session.turns).toBe(3);
+    });
+
+    it('sendStream(): caller break mid-replay leaves consistent state', async () => {
+      const chatStreamSessionContinue = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        throw mediaHeldError();
+        // eslint-disable-next-line no-unreachable
+        yield finalChunk('unreachable');
+      });
+      // Both turn-1 (the image start stream) and the turn-2 replay run
+      // through the streamed start. The first call (turn 1) completes
+      // normally; the second (the replay) emits one delta and never reaches
+      // done so the caller can break mid-stream, exercising the
+      // runStartStreamPath rollback finally.
+      let startCalls = 0;
+      const chatStreamSessionStart = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        startCalls++;
+        if (startCalls === 1) {
+          yield finalChunk('describe-reply');
+          return;
+        }
+        // Replay stream: emit one delta, never reach done — caller breaks.
+        yield { text: 'partial-replay', done: false };
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart: vi.fn(async () => makeChatResult('recovery-reply')),
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue,
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      // Turn 1: streamed image start succeeds.
+      for await (const _e of session.sendStream('describe', { images: [imgA] })) void _e;
+      expect(session.turns).toBe(1);
+      expect(session.hasImages).toBe(true);
+
+      // Turn 2: media-held rejection → replay stream, caller breaks after
+      // one partial delta. The replay is dispatched as a media-change
+      // restart (caches wiped up front), so the runStartStreamPath rollback
+      // resets turnCount → 0 and clears the image key, forcing the next
+      // call to re-route through the start path with the preserved history.
+      let seen = 0;
+      for await (const _e of session.sendStream('text follow-up')) {
+        seen++;
+        break;
+      }
+      expect(seen).toBe(1);
+      expect(session.turns).toBe(0);
+      expect(session.hasImages).toBe(false);
+
+      // inFlight cleared — a recovery send routes through the start path
+      // with the preserved history (turn-1 conversation + the new turn).
+      const recovery = await session.send('recover', { images: [imgA] });
+      expect(recovery.text).toBe('recovery-reply');
+      const recoveryMessages = (model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(recoveryMessages).toEqual([
+        { role: 'user', content: 'describe', images: [imgA] },
+        { role: 'assistant', content: 'describe-reply' },
+        { role: 'user', content: 'recover', images: [imgA] },
+      ]);
+      expect(session.turns).toBe(1);
+    });
+
+    it('sendStream(): a non-prefix mid-stream throw still propagates (no replay)', async () => {
+      const chatStreamSessionContinue = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        yield { text: 'partial', done: false };
+        throw new Error('mid-stream native failure');
+        // eslint-disable-next-line no-unreachable
+        yield finalChunk('unreachable');
+      });
+      const chatStreamSessionStart = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        yield finalChunk('turn-1-reply');
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue,
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      // Turn 1 via streamed start.
+      for await (const _e of session.sendStream('turn 1')) void _e;
+      expect(session.turns).toBe(1);
+
+      // Turn 2: a non-prefix throw AFTER a token was emitted must NOT be
+      // swallowed into a replay — it propagates, and no replay start runs.
+      await expect(async () => {
+        for await (const _e of session.sendStream('turn 2')) void _e;
+      }).rejects.toThrow('mid-stream native failure');
+
+      // Only the turn-1 start stream ran; no replay was triggered.
+      expect(chatStreamSessionStart).toHaveBeenCalledTimes(1);
+      expect(session.turns).toBe(1);
+    });
+
+    it('sendToolResult(): media-held rejection replays through chatSessionStart', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      const session = new ChatSession(model, { system: 'You are helpful.' });
+
+      // Turn 1: image start whose assistant reply carries exactly one ok
+      // tool call — the legal pre-state for a tool-result dispatch.
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
+      await session.send('describe', { images: [imgA] });
+      expect(session.turns).toBe(1);
+      expect(session.hasImages).toBe(true);
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      // Tool result: the native session (media held) rejects the
+      // tool-result delta with the typed prefix. The session must catch
+      // it and replay through chatSessionStart.
+      chatSessionContinueTool.mockRejectedValueOnce(mediaHeldError());
+      const result = await session.sendToolResult('c1', 'tool-out');
+
+      // Resolves with the replayed reply — no throw.
+      expect(result.text).toBe('start-reply');
+      // The delta path was attempted exactly once before the replay.
+      expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
+      // The replay ran through the start path (turn-1 start + replay).
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+
+      // The replay re-rendered the FULL history: the prior image turn, the
+      // assistant tool-call turn, and the pending tool message (isError
+      // omitted → undefined).
+      const replayMessages = chatSessionStart.mock.calls[1][0];
+      expect(replayMessages).toEqual([
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'describe', images: [imgA] },
+        { role: 'assistant', content: 'first-call', toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }] },
+        { role: 'tool', content: 'tool-out', toolCallId: 'c1', isError: undefined },
+      ]);
+
+      // History advanced by exactly one turn.
+      expect(session.turns).toBe(2);
+      // Trailing image key rehydrated from history — cache still reflects
+      // the held image.
+      expect(session.hasImages).toBe(true);
+
+      // inFlight cleared — a follow-up send is accepted (the replay reply
+      // had no outstanding tool calls, so the plain path is legal).
+      const followUp = await session.send('and now?');
+      expect(followUp.text).toBe('continue-reply');
+      expect(session.turns).toBe(3);
+    });
+
+    it('sendToolResult(): preserves isError through the cold replay', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      const session = new ChatSession(model, { system: 'You are helpful.' });
+
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
+      await session.send('describe', { images: [imgA] });
+
+      chatSessionContinueTool.mockRejectedValueOnce(mediaHeldError());
+      await session.sendToolResult('c1', '{"error":"boom"}', { isError: true });
+
+      // The pending tool message carried through the replay keeps the
+      // structured error flag so the wire-format marker re-renders.
+      const replayMessages = chatSessionStart.mock.calls[1][0];
+      expect(replayMessages[replayMessages.length - 1]).toEqual({
+        role: 'tool',
+        content: '{"error":"boom"}',
+        toolCallId: 'c1',
+        isError: true,
+      });
+    });
+
+    it('sendToolResult(): a non-prefix tool-result rejection propagates without replay', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      const session = new ChatSession(model);
+
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
+      await session.send('describe', { images: [imgA] });
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+
+      chatSessionContinueTool.mockRejectedValueOnce(new Error('some other native failure'));
+      await expect(session.sendToolResult('c1', 'tool-out')).rejects.toThrow('some other native failure');
+
+      // No replay — chatSessionStart not called a second time.
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      // The failed turn did not advance the counter and left the
+      // outstanding-call flag intact for a retry.
+      expect(session.turns).toBe(1);
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      // inFlight cleared — a retry against the same outstanding call works.
+      await session.sendToolResult('c1', 'retry');
+      expect(chatSessionContinueTool).toHaveBeenCalledTimes(2);
+    });
+
+    it('sendToolResultStream(): media-held rejection replays through chatStreamSessionStart', async () => {
+      let toolCalls = 0;
+      const chatStreamSessionContinueTool = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        toolCalls++;
+        // The media-held tool delta: throw before any chunk, exactly how
+        // stream.ts surfaces the native sink error on the first iteration.
+        throw mediaHeldError();
+        // eslint-disable-next-line no-unreachable
+        yield finalChunk('unreachable');
+      });
+      let startCalls = 0;
+      const startHistories: ChatMessage[][] = [];
+      const chatStreamSessionStart = vi.fn(async function* (messages: ChatMessage[]): AsyncGenerator<ChatStreamEvent> {
+        startCalls++;
+        startHistories.push(messages);
+        if (startCalls === 1) {
+          // Turn-1 image start whose reply carries one ok tool call.
+          yield { text: 'A', done: false };
+          yield finalChunkWithSingleToolCall('describe-reply', 'c1');
+          return;
+        }
+        // Tool-result replay.
+        yield { text: 'replayed', done: false };
+        yield finalChunk('replayed-reply');
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool,
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model, { system: 'You are helpful.' });
+
+      // Turn 1: streamed image start emits a single ok tool call.
+      for await (const _e of session.sendStream('describe', { images: [imgA] })) void _e;
+      expect(session.turns).toBe(1);
+      expect(session.hasImages).toBe(true);
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      // Tool result: media-held rejection → transparent replay.
+      const events: ChatStreamEvent[] = [];
+      for await (const e of session.sendToolResultStream('c1', 'tool-out')) events.push(e);
+
+      // The replayed reply was yielded; no duplicate / partial emission of
+      // the failed delta (the failed tool continue produced no chunk).
+      expect(events.map((e) => e.text)).toEqual(['replayed', 'replayed-reply']);
+      expect(events[events.length - 1].done).toBe(true);
+      expect((events[events.length - 1] as ChatStreamFinal).finishReason).toBe('stop');
+
+      // Tool delta attempted once; replay ran through the start stream.
+      expect(toolCalls).toBe(1);
+      expect(startCalls).toBe(2);
+
+      // The replay re-rendered the FULL history incl. the prior image turn,
+      // the assistant tool-call turn, and the pending tool message.
+      expect(startHistories[1]).toEqual([
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'describe', images: [imgA] },
+        { role: 'assistant', content: 'describe-reply', toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }] },
+        { role: 'tool', content: 'tool-out', toolCallId: 'c1', isError: undefined },
+      ]);
+
+      // History committed exactly once; turnCount +1.
+      expect(session.turns).toBe(2);
+      expect(session.hasImages).toBe(true);
+
+      // inFlight cleared — a follow-up streams cleanly.
+      for await (const _e of session.sendStream('and now?')) void _e;
+      expect(session.turns).toBe(3);
+    });
+
+    it('sendToolResultStream(): a non-prefix tool throw still propagates (no replay)', async () => {
+      const chatStreamSessionContinueTool = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        throw new Error('tool native failure');
+        // eslint-disable-next-line no-unreachable
+        yield finalChunk('unreachable');
+      });
+      let startCalls = 0;
+      const chatStreamSessionStart = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        startCalls++;
+        yield finalChunkWithSingleToolCall('turn-1-reply', 'c1');
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool,
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      // Turn 1 via streamed start emits one ok tool call.
+      for await (const _e of session.sendStream('turn 1')) void _e;
+      expect(session.turns).toBe(1);
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      // Tool result: a non-prefix throw must NOT be swallowed into a
+      // replay — it propagates, and no replay start runs.
+      await expect(async () => {
+        for await (const _e of session.sendToolResultStream('c1', 'tool-out')) void _e;
+      }).rejects.toThrow('tool native failure');
+
+      // Only the turn-1 start stream ran; no replay was triggered.
+      expect(startCalls).toBe(1);
+      expect(session.turns).toBe(1);
+    });
+
+    it('sendToolResultStream(): an interrupted media-held replay leaves a cold session that the next sendToolResult self-heals through the start path', async () => {
+      const chatStreamSessionContinueTool = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        // The media-held tool delta: throw before any chunk, as
+        // stream.ts surfaces the native sink error on the first
+        // iteration.
+        throw mediaHeldError();
+        // eslint-disable-next-line no-unreachable
+        yield finalChunk('unreachable');
+      });
+      // Streamed start drives both the turn-1 image start (one ok tool
+      // call) and the interrupted turn-2 replay (one delta, never
+      // reaches done → caller breaks → rollback to turnCount 0).
+      let startStreamCalls = 0;
+      const chatStreamSessionStart = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        startStreamCalls++;
+        if (startStreamCalls === 1) {
+          yield { text: 'A', done: false };
+          yield finalChunkWithSingleToolCall('describe-reply', 'c1');
+          return;
+        }
+        // The replay stream: emit one partial delta, never reach done.
+        yield { text: 'partial-replay', done: false };
+      });
+      const chatSessionStart = vi.fn(
+        async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> =>
+          makeChatResult('recovered-reply'),
+      );
+      const model: SessionCapableModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool,
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model, { system: 'You are helpful.' });
+
+      // Turn 1: streamed image start emits a single ok tool call.
+      for await (const _e of session.sendStream('describe', { images: [imgA] })) void _e;
+      expect(session.turns).toBe(1);
+      expect(session.hasImages).toBe(true);
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      // Tool result: media-held rejection → replay stream, but the
+      // caller BREAKS after the first partial delta, before done:true.
+      // The replay was a media-change restart (caches wiped up front),
+      // so the runStartStreamPath rollback resets turnCount → 0 and
+      // clears the media keys, leaving the session cold while the
+      // unresolved tool-call flag is still set.
+      let seen = 0;
+      for await (const _e of session.sendToolResultStream('c1', 'tool-out')) {
+        seen++;
+        break;
+      }
+      expect(seen).toBe(1);
+      expect(session.turns).toBe(0);
+      expect(session.hasImages).toBe(false);
+      // The tool-call flag survives the rollback — the bug is that the
+      // delta path would now hard-error against the wiped cache.
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      // The natural retry must self-heal: route through the cold start
+      // path (chatSessionStart), NOT a second tool delta, and resolve
+      // with the replayed reply.
+      const retry = await session.sendToolResult('c1', 'tool-out');
+      expect(retry.text).toBe('recovered-reply');
+      // The tool delta was attempted exactly once (the interrupted
+      // replay); the retry never re-dispatched it.
+      expect(chatStreamSessionContinueTool).toHaveBeenCalledTimes(1);
+      // The retry resolved through the start path.
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(session.turns).toBe(1);
+
+      // The replay history includes the prior media turn, the assistant
+      // tool-call turn, and the pending tool message.
+      expect(chatSessionStart.mock.calls[0][0]).toEqual([
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'describe', images: [imgA] },
+        { role: 'assistant', content: 'describe-reply', toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }] },
+        { role: 'tool', content: 'tool-out', toolCallId: 'c1', isError: undefined },
+      ]);
+    });
+
+    it('sendToolResult(): a media-held replay that THROWS before success leaves a cold session that the next sendToolResult self-heals', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      const session = new ChatSession(model, { system: 'You are helpful.' });
+
+      // Turn 1: image start whose assistant reply carries one ok tool
+      // call — the legal pre-state for a tool-result dispatch.
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
+      await session.send('describe', { images: [imgA] });
+      expect(session.turns).toBe(1);
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      // Tool result: the delta rejects with the media-held prefix, and
+      // the replay's chatSessionStart ALSO rejects once — the cold
+      // start prefill fails before success, so the runStartPath
+      // rollback resets turnCount → 0 (media-change restart) and the
+      // first call throws.
+      chatSessionContinueTool.mockRejectedValueOnce(mediaHeldError());
+      chatSessionStart.mockRejectedValueOnce(new Error('replay-prefill-fail'));
+      await expect(session.sendToolResult('c1', 'tool-out')).rejects.toThrow('replay-prefill-fail');
+      expect(session.turns).toBe(0);
+      // The tool-call flag survives the rollback.
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      // The retry must self-heal through the cold start path now that
+      // chatSessionStart succeeds — NOT a second doomed tool delta.
+      const retry = await session.sendToolResult('c1', 'tool-out');
+      expect(retry.text).toBe('start-reply');
+      // The delta was attempted exactly once (the original media-held
+      // try); the retry routed straight through the start path.
+      expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
+      // chatSessionStart: turn-1 start + the failed replay + the
+      // successful retry replay = 3 total.
+      expect(chatSessionStart).toHaveBeenCalledTimes(3);
+      expect(session.turns).toBe(1);
+
+      // The retry replay re-rendered the full preserved history plus the
+      // pending tool message.
+      expect(chatSessionStart.mock.calls[2][0]).toEqual([
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'describe', images: [imgA] },
+        { role: 'assistant', content: 'first-call', toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }] },
+        { role: 'tool', content: 'tool-out', toolCallId: 'c1', isError: undefined },
+      ]);
     });
   });
 

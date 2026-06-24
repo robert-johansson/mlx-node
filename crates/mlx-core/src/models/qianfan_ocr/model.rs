@@ -2329,6 +2329,8 @@ impl QianfanOCRModel {
         messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
+        reject_unsupported_audio_in_messages(&messages)?;
+
         let thread = self.thread.as_ref().ok_or_else(|| {
             Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
         })?;
@@ -2361,15 +2363,26 @@ impl QianfanOCRModel {
     /// model backends. Qianfan-OCR is a VLM but the continue path cannot
     /// splice new vision features into a live KV cache — image changes
     /// always require a fresh session start.
+    ///
+    /// `audio` exists only to keep this method's positional ABI aligned
+    /// with the shared chat surface every other family exposes (the
+    /// `chat_napi_surface!` macro inserts `audio` between `images` and
+    /// `config`). Qianfan-OCR has no audio support, so a non-empty
+    /// `audio` is rejected at the boundary with the shared no-audio
+    /// error; `None` / empty is a complete no-op and audio is never
+    /// threaded into the model thread.
     #[napi(
-        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined"
+        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, audio: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined"
     )]
     pub async fn chat_session_continue(
         &self,
         user_message: String,
         images: Option<Vec<Uint8Array>>,
+        audio: Option<Vec<Uint8Array>>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
+        reject_unsupported_audio(audio.as_deref())?;
+
         let thread = self.thread.as_ref().ok_or_else(|| {
             Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
         })?;
@@ -2436,6 +2449,8 @@ impl QianfanOCRModel {
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
+        reject_unsupported_audio_in_messages(&messages)?;
+
         let thread = self.thread.as_ref().ok_or_else(|| {
             Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
         })?;
@@ -2465,16 +2480,24 @@ impl QianfanOCRModel {
     }
 
     /// Streaming variant of `chatSessionContinue`.
+    ///
+    /// `audio` mirrors the non-streaming entry point: it exists only to
+    /// keep the positional ABI aligned with the shared chat surface, and
+    /// a non-empty value is rejected at the boundary with the shared
+    /// no-audio error. `None` / empty is a complete no-op.
     #[napi(
-        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, audio: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
     pub async fn chat_stream_session_continue(
         &self,
         user_message: String,
         images: Option<Vec<Uint8Array>>,
+        audio: Option<Vec<Uint8Array>>,
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
+        reject_unsupported_audio(audio.as_deref())?;
+
         let thread = self.thread.as_ref().ok_or_else(|| {
             Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
         })?;
@@ -2882,6 +2905,48 @@ fn compute_prefix_match(new_tokens: &[u32], cached_tokens: &[u32]) -> usize {
         .count()
 }
 
+/// Boundary guard for the `audio` parameter on Qianfan-OCR's chat-continue
+/// entry points.
+///
+/// The shared chat surface (`chat_napi_surface!`) carries an `audio`
+/// positional argument between `images` and `config`. Qianfan-OCR keeps the
+/// same positional ABI so it can be driven through the same `ChatSession` /
+/// `makeStreamingModel` plumbing, but it has no audio support. A non-empty
+/// `audio` is therefore rejected here with the shared no-audio message
+/// (prefixed with [`crate::engine::IMAGE_CHANGE_RESTART_PREFIX`], matching the
+/// fresh-turn audio rejection in `engine::session`). `None` / empty audio is a
+/// complete no-op: it returns `Ok(())` and is never threaded into the model
+/// thread, so existing text + image behaviour stays byte-identical.
+fn reject_unsupported_audio(audio: Option<&[Uint8Array]>) -> Result<()> {
+    if audio.is_some_and(|clips| !clips.is_empty()) {
+        return Err(Error::from_reason(format!(
+            "{} this model has no audio support; audio messages are not supported",
+            crate::engine::IMAGE_CHANGE_RESTART_PREFIX
+        )));
+    }
+    Ok(())
+}
+
+/// Boundary guard for the `audio` field carried by `ChatMessage` on
+/// Qianfan-OCR's chat-start entry points.
+///
+/// The shared `ChatMessage` struct carries an `audio` field so the unified
+/// `ChatSession` surface can ship audio clips to families that support them.
+/// Qianfan-OCR bypasses the shared engine core (which rejects first-turn audio
+/// for families that don't support it), so it must reject audio itself before
+/// dispatching the message batch to the model thread. Any message with a
+/// non-empty `audio` is rejected with the same shared no-audio message the
+/// continue guard uses (prefixed with
+/// [`crate::engine::IMAGE_CHANGE_RESTART_PREFIX`]); messages with no audio /
+/// empty audio vecs are a complete no-op so text + image starts stay
+/// byte-identical.
+fn reject_unsupported_audio_in_messages(messages: &[ChatMessage]) -> Result<()> {
+    for msg in messages {
+        reject_unsupported_audio(msg.audio.as_deref())?;
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2954,6 +3019,87 @@ mod tests {
         let b: Vec<u32> = vec![1, 2, 3];
         assert_eq!(compute_prefix_match(&a, &b), 0);
         assert_eq!(compute_prefix_match(&b, &a), 0);
+    }
+
+    #[test]
+    fn test_reject_unsupported_audio_none_is_noop() {
+        // `None` audio (the only value the TS delta path ever ships) and an
+        // explicitly empty audio vec are both complete no-ops so Qianfan's
+        // text + image behaviour stays byte-identical.
+        assert!(reject_unsupported_audio(None).is_ok());
+        let empty: Vec<Uint8Array> = Vec::new();
+        assert!(reject_unsupported_audio(Some(&empty)).is_ok());
+    }
+
+    #[test]
+    fn test_reject_unsupported_audio_nonempty_rejects_with_prefix() {
+        // A non-empty audio argument is rejected at the boundary with the
+        // shared no-audio message. The error is prefixed so the TS
+        // `ChatSession` layer treats it uniformly with the other families.
+        let clips = vec![Uint8Array::new(vec![0u8, 1u8, 2u8])];
+        let err = reject_unsupported_audio(Some(&clips)).expect_err("non-empty audio must reject");
+        let msg = &err.reason;
+        assert!(
+            msg.starts_with(crate::engine::IMAGE_CHANGE_RESTART_PREFIX),
+            "audio rejection must carry the restart prefix, got: {msg}"
+        );
+        assert!(
+            msg.contains("no audio support"),
+            "audio rejection must mention no audio support, got: {msg}"
+        );
+    }
+
+    /// Build a minimal user `ChatMessage` with the given audio clips for the
+    /// start-path guard tests. `audio: None` models the text/image path the
+    /// TS layer normally ships.
+    fn user_message_with_audio(audio: Option<Vec<Uint8Array>>) -> ChatMessage {
+        ChatMessage {
+            role: "user".to_string(),
+            content: "describe this".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            images: None,
+            audio,
+        }
+    }
+
+    #[test]
+    fn test_reject_unsupported_audio_in_messages_none_is_noop() {
+        // Messages with no audio and messages whose audio vec is empty are
+        // both complete no-ops so Qianfan's text + image start path stays
+        // byte-identical.
+        let no_audio = vec![user_message_with_audio(None)];
+        assert!(reject_unsupported_audio_in_messages(&no_audio).is_ok());
+
+        let empty_audio = vec![user_message_with_audio(Some(Vec::new()))];
+        assert!(reject_unsupported_audio_in_messages(&empty_audio).is_ok());
+
+        assert!(reject_unsupported_audio_in_messages(&[]).is_ok());
+    }
+
+    #[test]
+    fn test_reject_unsupported_audio_in_messages_nonempty_rejects_with_prefix() {
+        // A message carrying a non-empty audio clip is rejected at the start
+        // boundary with the shared no-audio message, prefixed so the TS
+        // `ChatSession` layer treats it uniformly with the other families.
+        let clips = vec![Uint8Array::new(vec![0u8, 1u8, 2u8])];
+        let messages = vec![
+            user_message_with_audio(None),
+            user_message_with_audio(Some(clips)),
+        ];
+        let err = reject_unsupported_audio_in_messages(&messages)
+            .expect_err("a message with non-empty audio must reject");
+        let msg = &err.reason;
+        assert!(
+            msg.starts_with(crate::engine::IMAGE_CHANGE_RESTART_PREFIX),
+            "audio rejection must carry the restart prefix, got: {msg}"
+        );
+        assert!(
+            msg.contains("no audio support"),
+            "audio rejection must mention no audio support, got: {msg}"
+        );
     }
 
     #[test]

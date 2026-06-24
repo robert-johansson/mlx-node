@@ -90,6 +90,33 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
     // Gemma4 HF configs wrap text params in a `text_config` sub-dict
     let text_cfg = raw.get("text_config");
 
+    // Unified multimodal checkpoint: `model_type == "gemma4_unified"` or the
+    // unified conditional-generation architecture. The text decoder is shared
+    // with the dense `gemma4` family; this flag drives the load-time skip of
+    // the vision/audio embedder weights the unified checkpoint carries.
+    let is_unified = raw.get("model_type").and_then(|v| v.as_str()) == Some("gemma4_unified")
+        || raw
+            .get("architectures")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            == Some("Gemma4UnifiedForConditionalGeneration");
+
+    // Audio is enabled ONLY for a unified checkpoint whose `audio_config` is a
+    // real (non-null) sub-dict. Keying on mere key-presence regresses every
+    // non-unified gemma4: E2B ships a LEGACY mel `audio_config` dict (model_type
+    // `gemma4`) and 26B/31B ship `audio_config: null` — both yield
+    // `get("audio_config").is_some() == true`, which would wrongly keep+require
+    // `embed_audio.*` and break their loads. Gate on `is_unified` + non-null.
+    let has_audio = is_unified && raw.get("audio_config").is_some_and(|ac| !ac.is_null());
+
+    // `text_config.use_bidirectional_attention` (unified: "vision"). Parsed for
+    // a stable struct surface; the text-only decode path does not read it.
+    let use_bidirectional_attention = text_cfg
+        .and_then(|tc| tc.get("use_bidirectional_attention"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
     // Helper to read EOS token IDs (can be int or array)
     let eos_token_ids = if let Some(tc) = text_cfg {
         parse_eos_token_ids(&tc["eos_token_id"])
@@ -164,6 +191,8 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
         },
         // HF config uses `attention_k_eq_v` (not `k_is_v`)
         attention_k_eq_v: get_config_bool(&raw, text_cfg, &["attention_k_eq_v"], false),
+        is_unified,
+        use_bidirectional_attention,
         final_logit_softcapping: {
             let v = get_config_f64(&raw, text_cfg, &["final_logit_softcapping"], 0.0);
             if v > 0.0 { Some(v) } else { None }
@@ -200,10 +229,25 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
             if v > 0 { Some(v) } else { None }
         },
 
-        // Vision fields — only present when config.json contains a vision_config sub-dict
-        vision_config: raw
-            .get("vision_config")
-            .map(super::vision_config::Gemma4VisionConfig::from_json),
+        // Vision fields — only present when config.json contains a vision_config sub-dict.
+        // The unified checkpoint's `vision_config` has a different (non-SigLIP) shape that
+        // the dense `Gemma4VisionConfig` parser would mis-read and wrongly enable a vision
+        // tower for, so we leave it unset and load the unified model as text-only.
+        vision_config: if is_unified {
+            None
+        } else {
+            raw.get("vision_config")
+                .map(super::vision_config::Gemma4VisionConfig::from_json)
+        },
+        // The unified checkpoint's encoder-free vision path is parsed from the
+        // same `vision_config` sub-dict, but into its own struct so the SigLIP
+        // parser above stays untouched for the dense gemma4 family.
+        unified_vision_config: if is_unified {
+            raw.get("vision_config")
+                .map(super::unified_vision_config::UnifiedVisionConfig::from_json)
+        } else {
+            None
+        },
         image_token_id: raw
             .get("image_token_id")
             .and_then(|v| v.as_i64())
@@ -220,6 +264,42 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
             .get("vision_soft_tokens_per_image")
             .and_then(|v| v.as_i64())
             .map(|v| v as i32),
+
+        // Audio fields — gated on `has_audio` (unified + non-null `audio_config`)
+        // so every non-unified gemma4 stays inert (all None), even when it carries
+        // a legacy or null `audio_config`.
+        has_audio,
+        audio_token_id: if has_audio {
+            raw.get("audio_token_id")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32)
+        } else {
+            None
+        },
+        boa_token_id: if has_audio {
+            raw.get("boa_token_id")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32)
+        } else {
+            None
+        },
+        // The end-of-audio token is stored under `eoa_token_index` but is a real
+        // appended token id (parallel to `eoi_token_id`).
+        eoa_token_id: if has_audio {
+            raw.get("eoa_token_index")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32)
+        } else {
+            None
+        },
+        audio_samples_per_token: if has_audio {
+            raw.get("audio_config")
+                .and_then(|ac| ac.get("audio_samples_per_token"))
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32)
+        } else {
+            None
+        },
 
         // Paged-attention knobs — opt-in, default to None so existing
         // checkpoints without these keys load unchanged.
@@ -494,6 +574,62 @@ fn validate_required_weights(
         ));
     }
 
+    // Unified encoder-free vision embedder. When the checkpoint declares a
+    // unified vision config, the loader (`apply_unified_vision_embedder_weights`
+    // + `apply_embed_vision_projection`) installs each tensor only `if let
+    // Some(...)`, so a missing key silently keeps the constructor default
+    // (pos_embedding stays mx.zeros, LayerNorms/Linear stay constructor-init).
+    // That loads "successfully" with random/zero vision weights → coherent-looking
+    // but image-WRONG output. Fail closed here, on the same load path that already
+    // validates the text weights, before any apply runs.
+    //
+    // The real `gemma-4-12b-it` checkpoint ships patch_dense and all three
+    // LayerNorms (patch_ln1/patch_ln2/pos_norm) with BOTH `.weight` and `.bias`,
+    // plus a single `vision_embedder.pos_embedding` tensor.
+    if config.unified_vision_config.is_some() {
+        let vision_keys = [
+            "vision_embedder.patch_ln1.weight",
+            "vision_embedder.patch_ln1.bias",
+            "vision_embedder.patch_ln2.weight",
+            "vision_embedder.patch_ln2.bias",
+            "vision_embedder.pos_norm.weight",
+            "vision_embedder.pos_norm.bias",
+            "vision_embedder.patch_dense.weight",
+            "vision_embedder.patch_dense.bias",
+            "vision_embedder.pos_embedding",
+        ];
+        for key in &vision_keys {
+            if !has(key) {
+                return Err(Error::from_reason(format!(
+                    "Missing required weight: {}",
+                    key
+                )));
+            }
+        }
+
+        // embed_vision.embedding_projection: a dense group ships `.weight`; an
+        // affine-quantized group ships `.weight` (packed) + `.scales`. Either
+        // way the `.weight` key must be present — a scales-only group (stripped
+        // `.weight`) would otherwise load as constructor-random weights, like
+        // the lm_head check above.
+        if !has("embed_vision.embedding_projection.weight") {
+            return Err(Error::from_reason(
+                "Missing required weight: embed_vision.embedding_projection.weight",
+            ));
+        }
+    }
+
+    // Encoder-free audio projection. Same fail-closed contract as the vision
+    // embedder above: the loader installs `embed_audio.*` only `if let Some`, so
+    // a missing key would silently keep the constructor-random Linear and emit
+    // coherent-but-audio-WRONG output. Require the projection `.weight` whenever
+    // the checkpoint declares an `audio_config`.
+    if config.has_audio && !has("embed_audio.embedding_projection.weight") {
+        return Err(Error::from_reason(
+            "Missing required weight: embed_audio.embedding_projection.weight",
+        ));
+    }
+
     Ok(())
 }
 
@@ -535,18 +671,32 @@ pub fn sanitize_weights(
                 clean_key
             };
 
-        // Skip audio encoder weights (always — not supported yet)
-        if clean_key.starts_with("audio_tower.")
-            || clean_key.starts_with("audio_encoder.")
-            || clean_key.starts_with("embed_audio.")
-        {
+        // Skip audio ENCODER weights (always — the unified audio path is
+        // encoder-free, so a real `audio_tower.`/`audio_encoder.` would be a
+        // non-unified mel encoder we do not implement).
+        if clean_key.starts_with("audio_tower.") || clean_key.starts_with("audio_encoder.") {
+            continue;
+        }
+        // The unified checkpoint ships `embed_audio.*` (the raw-window
+        // projection). Keep it only when the checkpoint declares an
+        // `audio_config`; otherwise drop it so non-unified loads stay
+        // byte-identical and do not error on an unexpected weight.
+        if !config.has_audio && clean_key.starts_with("embed_audio.") {
             continue;
         }
 
-        // Skip vision weights only when vision_config is absent (text-only mode)
+        // Skip vision weights only when neither vision path is active. The
+        // SigLIP tower keys (`vision_tower.`/`vision_encoder.`/
+        // `multi_modal_projector.`) belong to the dense gemma4 family; the
+        // unified checkpoint instead ships `vision_embedder.` + `embed_vision.`.
+        // `embed_vision.` is shared by both paths. When a text-only load has
+        // neither config, every vision prefix is dropped so the load does not
+        // error on an unexpected weight.
         if config.vision_config.is_none()
+            && config.unified_vision_config.is_none()
             && (clean_key.starts_with("vision_tower.")
                 || clean_key.starts_with("vision_encoder.")
+                || clean_key.starts_with("vision_embedder.")
                 || clean_key.starts_with("multi_modal_projector.")
                 || clean_key.starts_with("embed_vision."))
         {
@@ -1258,14 +1408,30 @@ fn apply_vision_weights(
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
 ) -> Result<()> {
-    let vc = match &config.vision_config {
-        Some(c) => c,
-        None => return Ok(()), // No vision — nothing to do
-    };
-
     let is_mxfp8 = is_mxfp8_checkpoint(params);
     let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
     let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
+
+    // --- Unified encoder-free vision embedder ---
+    // The unified checkpoint ships `vision_embedder.*` (patch LayerNorms +
+    // dense + 2D pos embedding + pos_norm) instead of a SigLIP tower. Load
+    // those into the dedicated embedder; the shared `embed_vision.*`
+    // projection is loaded by the block below.
+    if let Some(ref mut ve) = inner.unified_vision_embedder {
+        apply_unified_vision_embedder_weights(ve, params)?;
+    }
+
+    // The remaining SigLIP-tower logic only runs for the dense gemma4 family.
+    // Skip it (but keep the `embed_vision.` projection handling below) when the
+    // checkpoint has no SigLIP `vision_config`.
+    let vc = match &config.vision_config {
+        Some(c) => c,
+        None => {
+            apply_embed_vision_projection(inner, params, per_layer_quant, default_plq)?;
+            info!("Vision weights applied successfully");
+            return Ok(());
+        }
+    };
 
     // --- Vision Tower ---
     if let Some(ref mut vision_tower) = inner.vision_tower {
@@ -1406,55 +1572,170 @@ fn apply_vision_weights(
         }
     }
 
-    // --- Multimodal Embedder ---
-    // Affine-quantized checkpoints (e.g. Q8) ship this projection in packed
-    // form, so route through `Linear::load_quantized` when `.scales` is
-    // present. The dense `set_weight` path otherwise trips the shape guard.
-    if let Some(ref mut embedder) = inner.embed_vision {
-        let proj_prefix = "embed_vision.embedding_projection";
-        let vision_plq = per_layer_quant
-            .get(proj_prefix)
-            .copied()
-            .unwrap_or(default_plq);
-        if vision_plq.mode != PerLayerMode::Affine
-            && params.contains_key(&format!("{}.scales", proj_prefix))
-        {
-            return Err(Error::from_reason(format!(
-                "gemma4 {} load: Non-affine FP mode {:?} is not supported; affine only",
-                proj_prefix, vision_plq.mode
-            )));
-        }
-        if params.contains_key(&format!("{}.scales", proj_prefix))
-            && let Some(w) = params.get(&format!("{}.weight", proj_prefix))
-        {
-            let scales = params
-                .get(&format!("{}.scales", proj_prefix))
-                .ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "Missing {}.scales for quantized vision embedding projection",
-                        proj_prefix
-                    ))
-                })?;
-            let biases = params.get(&format!("{}.biases", proj_prefix));
-            embedder.embedding_projection.load_quantized(
-                w,
-                scales,
-                biases,
-                vision_plq.group_size,
-                vision_plq.bits,
-            )?;
-        } else if let Some(w) = params.get(&format!("{}.weight", proj_prefix)) {
-            // Dense fallback — dtype-guarded: a packed/int8 `.weight` whose
-            // `.scales` sidecar was stripped lands here (the quantized branch
-            // above keys on `.scales` presence), and an unguarded
-            // `set_weight` would install non-float storage into the dense
-            // linear (the shape can validate while the dtype is garbage).
-            ensure_dense_weight_floating(&format!("{}.weight", proj_prefix), w)?;
-            embedder.embedding_projection.set_weight(w)?;
-        }
-    }
+    apply_embed_vision_projection(inner, params, per_layer_quant, default_plq)?;
 
     info!("Vision weights applied successfully");
+    Ok(())
+}
+
+/// Load the shared `embed_vision.embedding_projection` weight. Used by both the
+/// SigLIP tower path and the unified encoder-free path.
+///
+/// Affine-quantized checkpoints (e.g. Q8) ship this projection in packed form,
+/// so route through `Linear::load_quantized` when `.scales` is present. The
+/// dense `set_weight` path otherwise trips the shape guard.
+fn apply_embed_vision_projection(
+    inner: &mut Gemma4Inner,
+    params: &HashMap<String, MxArray>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+) -> Result<()> {
+    let Some(embedder) = inner.embed_vision.as_mut() else {
+        return Ok(());
+    };
+    let proj_prefix = "embed_vision.embedding_projection";
+    let vision_plq = per_layer_quant
+        .get(proj_prefix)
+        .copied()
+        .unwrap_or(default_plq);
+    if vision_plq.mode != PerLayerMode::Affine
+        && params.contains_key(&format!("{}.scales", proj_prefix))
+    {
+        return Err(Error::from_reason(format!(
+            "gemma4 {} load: Non-affine FP mode {:?} is not supported; affine only",
+            proj_prefix, vision_plq.mode
+        )));
+    }
+    if params.contains_key(&format!("{}.scales", proj_prefix))
+        && let Some(w) = params.get(&format!("{}.weight", proj_prefix))
+    {
+        let scales = params
+            .get(&format!("{}.scales", proj_prefix))
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Missing {}.scales for quantized vision embedding projection",
+                    proj_prefix
+                ))
+            })?;
+        let biases = params.get(&format!("{}.biases", proj_prefix));
+        embedder.embedding_projection.load_quantized(
+            w,
+            scales,
+            biases,
+            vision_plq.group_size,
+            vision_plq.bits,
+        )?;
+    } else if let Some(w) = params.get(&format!("{}.weight", proj_prefix)) {
+        // Dense fallback — dtype-guarded: a packed/int8 `.weight` whose
+        // `.scales` sidecar was stripped lands here (the quantized branch
+        // above keys on `.scales` presence), and an unguarded `set_weight`
+        // would install non-float storage into the dense linear (the shape
+        // can validate while the dtype is garbage).
+        ensure_dense_weight_floating(&format!("{}.weight", proj_prefix), w)?;
+        embedder.embedding_projection.set_weight(w)?;
+    }
+    Ok(())
+}
+
+/// Load the encoder-free unified `embed_audio.embedding_projection` weight.
+///
+/// Mirrors [`apply_embed_vision_projection`]: dense bf16 `.weight` in the real
+/// `gemma-4-12b-it` checkpoint, routed through `load_quantized` if an affine
+/// `.scales` sidecar is present. No-op when the model has no audio embedder.
+fn apply_audio_weights(
+    inner: &mut Gemma4Inner,
+    params: &HashMap<String, MxArray>,
+    quant_bits: i32,
+    quant_group_size: i32,
+    top_level_mode: Option<PerLayerMode>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+) -> Result<()> {
+    let Some(embedder) = inner.embed_audio.as_mut() else {
+        return Ok(());
+    };
+    let is_mxfp8 = is_mxfp8_checkpoint(params);
+    let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
+    let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
+
+    let proj_prefix = "embed_audio.embedding_projection";
+    let audio_plq = per_layer_quant
+        .get(proj_prefix)
+        .copied()
+        .unwrap_or(default_plq);
+    if audio_plq.mode != PerLayerMode::Affine
+        && params.contains_key(&format!("{}.scales", proj_prefix))
+    {
+        return Err(Error::from_reason(format!(
+            "gemma4 {} load: Non-affine FP mode {:?} is not supported; affine only",
+            proj_prefix, audio_plq.mode
+        )));
+    }
+    if params.contains_key(&format!("{}.scales", proj_prefix))
+        && let Some(w) = params.get(&format!("{}.weight", proj_prefix))
+    {
+        let scales = params
+            .get(&format!("{}.scales", proj_prefix))
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Missing {}.scales for quantized audio embedding projection",
+                    proj_prefix
+                ))
+            })?;
+        let biases = params.get(&format!("{}.biases", proj_prefix));
+        embedder.embedding_projection.load_quantized(
+            w,
+            scales,
+            biases,
+            audio_plq.group_size,
+            audio_plq.bits,
+        )?;
+    } else if let Some(w) = params.get(&format!("{}.weight", proj_prefix)) {
+        ensure_dense_weight_floating(&format!("{}.weight", proj_prefix), w)?;
+        embedder.embedding_projection.set_weight(w)?;
+    }
+    info!("Audio weights applied successfully");
+    Ok(())
+}
+
+/// Load the unified encoder-free vision embedder weights:
+/// `vision_embedder.{patch_ln1,patch_ln2,pos_norm}.{weight,bias}`,
+/// `vision_embedder.patch_dense.{weight,bias}`, and
+/// `vision_embedder.pos_embedding`. All are dense bf16 in the checkpoint.
+fn apply_unified_vision_embedder_weights(
+    ve: &mut super::vision_embedder::Gemma4UnifiedVisionEmbedder,
+    params: &HashMap<String, MxArray>,
+) -> Result<()> {
+    use crate::nn::LayerNorm;
+
+    let eps = ve.eps();
+    let load_layernorm = |name: &str| -> Result<Option<LayerNorm>> {
+        let w = params.get(&format!("vision_embedder.{name}.weight"));
+        let b = params.get(&format!("vision_embedder.{name}.bias"));
+        match (w, b) {
+            (Some(w), b) => Ok(Some(LayerNorm::from_weights(w, b, Some(eps))?)),
+            _ => Ok(None),
+        }
+    };
+
+    if let Some(ln) = load_layernorm("patch_ln1")? {
+        ve.patch_ln1 = ln;
+    }
+    if let Some(ln) = load_layernorm("patch_ln2")? {
+        ve.patch_ln2 = ln;
+    }
+    if let Some(ln) = load_layernorm("pos_norm")? {
+        ve.pos_norm = ln;
+    }
+
+    if let Some(w) = params.get("vision_embedder.patch_dense.weight") {
+        ve.patch_dense.set_weight(w)?;
+    }
+    if let Some(b) = params.get("vision_embedder.patch_dense.bias") {
+        ve.patch_dense.set_bias(Some(b))?;
+    }
+    if let Some(w) = params.get("vision_embedder.pos_embedding") {
+        ve.pos_embedding = w.clone();
+    }
     Ok(())
 }
 
@@ -1694,6 +1975,16 @@ impl Gemma4Inner {
             &per_layer_quant,
         )?;
 
+        // Apply the encoder-free audio projection (unified checkpoints only).
+        apply_audio_weights(
+            &mut inner,
+            &params,
+            quant_bits,
+            quant_group_size,
+            top_level_mode,
+            &per_layer_quant,
+        )?;
+
         // Materialize weights in chunked evals to avoid Metal command buffer
         // timeouts on large models. Without this, weights remain as lazy mmap
         // references and every decode step re-reads ~48GB from disk.
@@ -1791,23 +2082,32 @@ impl Gemma4Model {
                 let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
                 let model_id = inner.model_id;
                 let has_vision = inner.image_processor.is_some();
+                let has_audio = inner.embed_audio.is_some();
                 let paged_active = inner.paged_adapter.is_some();
                 Ok((
                     inner,
-                    (model_id, has_vision, cache_limit_guard, paged_active),
+                    (
+                        model_id,
+                        has_vision,
+                        has_audio,
+                        cache_limit_guard,
+                        paged_active,
+                    ),
                 ))
             },
             crate::engine::cmd::handle_chat_cmd::<super::model::Gemma4Inner>,
         );
 
-        let (model_id, has_vision, cache_limit_guard, paged_active) = init_rx
-            .await
-            .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
+        let (model_id, has_vision, has_audio, cache_limit_guard, paged_active) =
+            init_rx
+                .await
+                .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
         Ok(Gemma4Model {
             thread: Some(thread),
             model_id,
             has_vision,
+            has_audio,
             initialized: true,
             paged_active,
             _cache_limit_guard: Some(cache_limit_guard),
@@ -1818,6 +2118,191 @@ impl Gemma4Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write a `config.json` into a fresh temp dir and run `parse_config` on it.
+    /// Returns the parsed config plus the temp dir path so the caller can clean up.
+    fn parse_config_from_json(json: serde_json::Value) -> (Gemma4Config, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "gemma4_parse_config_test_{}_{}",
+            std::process::id(),
+            id
+        ));
+        fs::create_dir_all(&dir).expect("create temp config dir");
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_string(&json).expect("serialize config json"),
+        )
+        .expect("write config.json");
+        let cfg = parse_config(&dir).expect("parse_config");
+        (cfg, dir)
+    }
+
+    /// The unified 12B checkpoint advertises `model_type == "gemma4_unified"`
+    /// (and the unified conditional-generation architecture) plus a
+    /// `text_config.use_bidirectional_attention == "vision"`. `parse_config`
+    /// must flag it `is_unified` and surface that field, while a plain `gemma4`
+    /// checkpoint stays `is_unified == false`.
+    #[test]
+    fn parse_config_detects_unified_text_model() {
+        let unified = serde_json::json!({
+            "model_type": "gemma4_unified",
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+            "tie_word_embeddings": true,
+            "text_config": {
+                "model_type": "gemma4_unified_text",
+                "hidden_size": 3840,
+                "num_hidden_layers": 48,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 8,
+                "head_dim": 256,
+                "intermediate_size": 15360,
+                "use_bidirectional_attention": "vision"
+            },
+            "vision_config": {
+                "model_type": "gemma4_unified_vision",
+                "model_patch_size": 48,
+                "mm_embed_dim": 3840,
+                "mm_posemb_size": 1120,
+                "num_soft_tokens": 280,
+                "output_proj_dims": 3840,
+                "patch_size": 16,
+                "pooling_kernel_size": 3,
+                "rms_norm_eps": 1e-6
+            },
+            "image_token_id": 258880,
+            "audio_token_id": 258881,
+            "boa_token_id": 256000,
+            "eoa_token_index": 258883,
+            "audio_config": {
+                "model_type": "gemma4_unified_audio",
+                "audio_embed_dim": 640,
+                "audio_samples_per_token": 640,
+                "output_proj_dims": 640,
+                "hidden_size": 640,
+                "rms_norm_eps": 1e-6
+            }
+        });
+        let (cfg, dir) = parse_config_from_json(unified);
+        assert!(cfg.is_unified, "gemma4_unified must set is_unified=true");
+        // Audio fields parse from the unified config (top-level ids + audio_config).
+        assert!(cfg.has_audio, "audio_config presence must set has_audio");
+        assert_eq!(cfg.audio_token_id, Some(258881));
+        assert_eq!(cfg.boa_token_id, Some(256000));
+        assert_eq!(
+            cfg.eoa_token_id,
+            Some(258883),
+            "eoa_token_id must parse from eoa_token_index"
+        );
+        assert_eq!(cfg.audio_samples_per_token, Some(640));
+        assert_eq!(
+            cfg.use_bidirectional_attention.as_deref(),
+            Some("vision"),
+            "use_bidirectional_attention must round-trip from text_config"
+        );
+        // Unified vision_config must NOT enable the dense SigLIP vision tower.
+        assert!(
+            cfg.vision_config.is_none(),
+            "unified checkpoint must load text-only (vision_config None)"
+        );
+        // The encoder-free unified vision config must be populated instead.
+        let uvc = cfg
+            .unified_vision_config
+            .as_ref()
+            .expect("unified checkpoint must populate unified_vision_config");
+        assert_eq!(uvc.model_patch_size, 48);
+        assert_eq!(uvc.mm_embed_dim, 3840);
+        assert_eq!(uvc.mm_posemb_size, 1120);
+        assert_eq!(uvc.num_soft_tokens, 280);
+        assert_eq!(uvc.output_proj_dims, 3840);
+        assert_eq!(uvc.patch_size, 16);
+        assert_eq!(uvc.pooling_kernel_size, 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A plain gemma4 checkpoint must never populate `unified_vision_config`,
+    /// even if it carries a (SigLIP) `vision_config`.
+    #[test]
+    fn parse_config_plain_gemma4_has_no_unified_vision_config() {
+        let plain = serde_json::json!({
+            "model_type": "gemma4_text",
+            "text_config": { "hidden_size": 3840 }
+        });
+        let (cfg, dir) = parse_config_from_json(plain);
+        assert!(
+            cfg.unified_vision_config.is_none(),
+            "plain gemma4 must leave unified_vision_config None"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_config_unified_via_architecture_only() {
+        let unified = serde_json::json!({
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+            "text_config": { "hidden_size": 3840 }
+        });
+        let (cfg, dir) = parse_config_from_json(unified);
+        assert!(
+            cfg.is_unified,
+            "architecture alone must set is_unified=true"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_config_plain_gemma4_is_not_unified() {
+        let plain = serde_json::json!({
+            "model_type": "gemma4_text",
+            "text_config": { "hidden_size": 3840 }
+        });
+        let (cfg, dir) = parse_config_from_json(plain);
+        assert!(!cfg.is_unified, "plain gemma4 must keep is_unified=false");
+        assert_eq!(cfg.use_bidirectional_attention, None);
+        // No audio_config → audio stays inert (purely additive for unified).
+        assert!(!cfg.has_audio, "plain gemma4 must keep has_audio=false");
+        assert_eq!(cfg.audio_token_id, None);
+        assert_eq!(cfg.boa_token_id, None);
+        assert_eq!(cfg.eoa_token_id, None);
+        assert_eq!(cfg.audio_samples_per_token, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_config_non_unified_audio_config_stays_inert() {
+        // Real non-unified gemma4 checkpoints DO carry an `audio_config` key:
+        // E2B ships a legacy mel dict, 26B/31B ship `audio_config: null`. Keying
+        // `has_audio` on mere presence would wrongly enable the unified raw-window
+        // audio path and break their loads. All must stay inert.
+        for audio_config in [
+            // E2B-shape: legacy mel `audio_config` object (would mis-load a
+            // [1536,1536] projection into a 640→hidden embedder).
+            serde_json::json!({ "model_type": "gemma4_unified_audio", "audio_embed_dim": 1536 }),
+            // 26B/31B-shape: explicit null.
+            serde_json::Value::Null,
+        ] {
+            let plain = serde_json::json!({
+                "model_type": "gemma4",
+                "text_config": { "hidden_size": 3840 },
+                "audio_config": audio_config,
+                // Even a stray top-level audio_token_id must not leak in.
+                "audio_token_id": 258881,
+            });
+            let (cfg, dir) = parse_config_from_json(plain);
+            assert!(!cfg.is_unified, "model_type gemma4 must stay non-unified");
+            assert!(
+                !cfg.has_audio,
+                "non-unified gemma4 must keep has_audio=false regardless of audio_config"
+            );
+            assert_eq!(cfg.audio_token_id, None, "audio ids must stay None");
+            assert_eq!(cfg.boa_token_id, None);
+            assert_eq!(cfg.eoa_token_id, None);
+            assert_eq!(cfg.audio_samples_per_token, None);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
 
     /// sym8's mandatory f32 `[N]` `.scales` (sibling `.weight` is Int8) must
     /// survive `sanitize_weights`' blanket f32->bf16 cast — the exemption is
@@ -2560,5 +3045,143 @@ mod tests {
         );
         assert!(!per_layer_quant.contains_key("layers.0.mlp.experts.gate_up_proj"));
         assert!(!per_layer_quant.contains_key("layers.0.mlp.experts.down_proj"));
+    }
+
+    /// Unified vision loader must fail closed. The encoder-free vision path
+    /// (`apply_unified_vision_embedder_weights` + `apply_embed_vision_projection`)
+    /// installs each tensor only `if let Some(...)`, so a missing key silently
+    /// keeps the constructor default (pos_embedding stays mx.zeros, LayerNorms
+    /// stay constructor-init) → a truncated shard loads "successfully" with
+    /// random/zero vision weights. When `unified_vision_config` is populated,
+    /// `validate_required_weights` must reject a params map that is missing any
+    /// required `vision_embedder.*` / `embed_vision.embedding_projection.weight`
+    /// key, naming the missing key (matching the bias requirement the real
+    /// `gemma-4-12b-it` checkpoint ships: patch_dense + all 3 LayerNorms carry
+    /// both `.weight` and `.bias`).
+    #[test]
+    fn validate_required_weights_unified_vision_fails_closed() {
+        // Minimal text config PLUS a unified_vision_config sub-dict so the
+        // vision branch in validate_required_weights is exercised.
+        let config: Gemma4Config = serde_json::from_value(serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 64,
+            "unified_vision_config": {
+                "model_patch_size": 48,
+                "mm_embed_dim": 3840,
+                "mm_posemb_size": 1120,
+                "num_soft_tokens": 280,
+                "output_proj_dims": 3840,
+                "patch_size": 16,
+                "pooling_kernel_size": 3,
+                "rms_norm_eps": 1e-6
+            }
+        }))
+        .expect("unified-vision Gemma4Config");
+        assert!(
+            config.unified_vision_config.is_some(),
+            "test config must populate unified_vision_config"
+        );
+
+        // The validator only checks key presence, so a 1-element dummy works.
+        let dummy = || MxArray::from_float32(&[0.0], &[1]).expect("dummy");
+
+        // The full required key set: all text keys plus every required unified
+        // vision key.
+        let full = || -> HashMap<String, MxArray> {
+            let mut p: HashMap<String, MxArray> = HashMap::new();
+            for key in [
+                // Text weights (already validated by the text path).
+                "embed_tokens.weight",
+                "norm.weight",
+                "lm_head.weight",
+                "layers.0.self_attn.q_proj.weight",
+                "layers.0.self_attn.k_proj.weight",
+                "layers.0.self_attn.v_proj.weight",
+                "layers.0.self_attn.o_proj.weight",
+                "layers.0.self_attn.q_norm.weight",
+                "layers.0.self_attn.k_norm.weight",
+                "layers.0.layer_scalar",
+                "layers.0.mlp.gate_proj.weight",
+                "layers.0.mlp.up_proj.weight",
+                "layers.0.mlp.down_proj.weight",
+                "layers.0.input_layernorm.weight",
+                "layers.0.post_attention_layernorm.weight",
+                "layers.0.pre_feedforward_layernorm.weight",
+                "layers.0.post_feedforward_layernorm.weight",
+                // Unified vision weights — patch_dense + all 3 LayerNorms carry
+                // BOTH weight and bias in the real checkpoint.
+                "vision_embedder.patch_ln1.weight",
+                "vision_embedder.patch_ln1.bias",
+                "vision_embedder.patch_ln2.weight",
+                "vision_embedder.patch_ln2.bias",
+                "vision_embedder.pos_norm.weight",
+                "vision_embedder.pos_norm.bias",
+                "vision_embedder.patch_dense.weight",
+                "vision_embedder.patch_dense.bias",
+                "vision_embedder.pos_embedding",
+                "embed_vision.embedding_projection.weight",
+            ] {
+                p.insert(key.to_string(), dummy());
+            }
+            p
+        };
+
+        // Happy path: the complete set (text + unified vision) validates.
+        validate_required_weights(&full(), &config)
+            .expect("complete unified-vision key set must validate");
+
+        // Negative: each required unified vision key, when absent, must fail
+        // validation with an error that names the missing key (the documented
+        // example, pos_embedding, included).
+        for missing in [
+            "vision_embedder.pos_embedding",
+            "vision_embedder.patch_ln1.weight",
+            "vision_embedder.patch_ln1.bias",
+            "vision_embedder.patch_ln2.weight",
+            "vision_embedder.patch_ln2.bias",
+            "vision_embedder.pos_norm.weight",
+            "vision_embedder.pos_norm.bias",
+            "vision_embedder.patch_dense.weight",
+            "vision_embedder.patch_dense.bias",
+            "embed_vision.embedding_projection.weight",
+        ] {
+            let mut p = full();
+            p.remove(missing);
+            let err = validate_required_weights(&p, &config).unwrap_err();
+            assert!(
+                format!("{err}").contains(missing),
+                "missing unified vision key '{missing}' must fail closed and name the key, got: {err}"
+            );
+        }
+
+        // A plain text config (no unified_vision_config) must NOT require any
+        // vision key — the unified gate must not leak into the text path.
+        let text_only: Gemma4Config = serde_json::from_value(serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 64,
+        }))
+        .expect("text-only Gemma4Config");
+        assert!(text_only.unified_vision_config.is_none());
+        let mut p = full();
+        // Strip every vision key — a text-only model still validates.
+        p.retain(|k, _| !k.starts_with("vision_embedder.") && !k.starts_with("embed_vision."));
+        validate_required_weights(&p, &text_only)
+            .expect("text-only config must not require unified vision keys");
     }
 }

@@ -88,6 +88,38 @@ import type { ChatConfig, ChatMessage, ChatResult, ToolCall, ToolCallResult, Too
 import type { ChatStreamEvent } from './stream.js';
 
 /**
+ * Typed prefix the native delta path uses to reject a text-only
+ * continuation while the session still holds image/audio KV state
+ * (gemma4 raises this after a media turn). The native session refuses
+ * to advance the cheap delta on top of media KV, so the session layer
+ * recognizes this exact prefix and transparently replays the whole
+ * conversation through the cold start path instead of surfacing the
+ * raw error to the caller.
+ *
+ * MUST stay byte-for-byte identical to the Rust constant
+ * `IMAGE_CHANGE_RESTART_PREFIX` in
+ * `crates/mlx-core/src/engine/cache.rs` — it is not exported across the
+ * NAPI boundary, so the two literals are kept in sync by hand. The
+ * native message starts with this prefix and is delivered as the
+ * `Error.message`: on the sync delta path as a rejected promise, and on
+ * the streaming delta path as a thrown error on the generator's first
+ * iteration (the native worker-thread sink error is re-thrown by the
+ * `packages/lm/src/stream.ts` bridge before any chunk is yielded).
+ */
+const IMAGE_CHANGE_RESTART_PREFIX = 'IMAGE_CHANGE_REQUIRES_SESSION_RESTART:';
+
+/**
+ * Whether `err` is the native media-held delta rejection (see
+ * {@link IMAGE_CHANGE_RESTART_PREFIX}). The native message begins with
+ * the literal prefix and reaches both the sync and streaming bridges
+ * unwrapped (NAPI surfaces `Error.from_reason` as `Error.message`
+ * verbatim), so a `startsWith` match is exact.
+ */
+function isMediaHeldRestartError(err: unknown): boolean {
+  return err instanceof Error && err.message.startsWith(IMAGE_CHANGE_RESTART_PREFIX);
+}
+
+/**
  * Convert the parsed `ToolCallResult[]` emitted by the native chat
  * pipeline into the `ToolCall[]` shape expected by
  * `ChatMessage.toolCalls` (and, by extension, the jinja chat
@@ -196,6 +228,7 @@ export interface SessionCapableModel {
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null,
+    audio: Uint8Array[] | null,
     config?: ChatConfig | null,
   ): Promise<ChatResult>;
   chatSessionContinueTool(
@@ -221,6 +254,7 @@ export interface SessionCapableModel {
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null,
+    audio: Uint8Array[] | null,
     config?: ChatConfig | null,
     signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent>;
@@ -330,6 +364,13 @@ export interface SendOptions {
    */
   images?: Uint8Array[];
   /**
+   * Optional audio bytes (encoded WAV) attached to this user turn. When
+   * the audio set differs from the session's current `lastAudioKey`, the
+   * session forcibly restarts via `chatSessionStart` (mirrors `images`).
+   * Only the unified Gemma 4 audio checkpoint consumes this.
+   */
+  audio?: Uint8Array[];
+  /**
    * Per-call `ChatConfig` overlay applied on top of the session's
    * `defaultConfig`. `reuseCache` is always forced on regardless of
    * what the caller passes. The overlay is shallow-merged on top of
@@ -402,6 +443,26 @@ export interface ChatSessionOptions {
  * and the existing stream bridge.
  */
 function computeImagesKey(images: Uint8Array[] | undefined): string | null {
+  return computeByteListKey(images);
+}
+
+/**
+ * Audio counterpart of {@link computeImagesKey}: a stable, order-sensitive
+ * byte-identity key for a list of encoded audio buffers. Used by `send()` /
+ * `sendStream()` to decide whether a new audio set must cold-restart the
+ * server-side session. Shares the exact FNV-1a framing as the image key.
+ */
+function computeAudioKey(audio: Uint8Array[] | undefined): string | null {
+  return computeByteListKey(audio);
+}
+
+/**
+ * FNV-1a 64-bit byte-identity key for a length-framed list of byte buffers.
+ * Returns `null` for an empty/absent list so callers can distinguish
+ * "no media" from "media changed". Shared by the image and audio keys.
+ */
+function computeByteListKey(buffers: Uint8Array[] | undefined): string | null {
+  const images = buffers;
   if (!images || images.length === 0) return null;
   // FNV-1a 64-bit. Split into two 32-bit halves because JavaScript
   // doesn't have a native 64-bit integer type and BigInt ops are
@@ -497,6 +558,14 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    */
   private lastImagesKey: string | null = null;
 
+  /**
+   * Hex-encoded byte-identity key of the audio set currently bound to the
+   * server's KV cache (see {@link computeAudioKey}). `null` when no audio is
+   * cached. A `send()` whose new key differs triggers a full
+   * `chatSessionStart` restart — the audio counterpart of `lastImagesKey`.
+   */
+  private lastAudioKey: string | null = null;
+
   private turnCount = 0;
   private inFlight = false;
 
@@ -578,24 +647,46 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     try {
       const mergedConfig = this.mergeConfig(opts.config);
       const newImagesKey = computeImagesKey(opts.images);
-      // Only an explicit NEW image set can trigger a restart. Omitting
-      // `images` (newImagesKey === null) is interpreted as "keep the
-      // current image cache state" — the server-side cache already
-      // holds any prior image context, so a text-only follow-up like
-      // "what about the top-right?" can stay on the cheap delta path
-      // even after an image turn.
+      const newAudioKey = computeAudioKey(opts.audio);
+      // Only an explicit NEW image/audio set can trigger a restart. Omitting
+      // `images`/`audio` (key === null) is interpreted as "keep the current
+      // media cache state" — the server-side cache already holds any prior
+      // media context, so a text-only follow-up like "what about the
+      // top-right?" can stay on the cheap delta path even after a media turn.
       const imageChanged = newImagesKey !== null && newImagesKey !== this.lastImagesKey;
+      const audioChanged = newAudioKey !== null && newAudioKey !== this.lastAudioKey;
       const isFirstTurn = this.turnCount === 0;
 
-      if (isFirstTurn || imageChanged) {
-        return await this.runStartPath(userMessage, opts.images, newImagesKey, imageChanged, isFirstTurn, mergedConfig);
+      if (isFirstTurn || imageChanged || audioChanged) {
+        return await this.runStartPath(
+          userMessage,
+          opts.images,
+          opts.audio,
+          imageChanged || audioChanged,
+          isFirstTurn,
+          mergedConfig,
+        );
       }
 
-      // Delta continue: text-only, images always null. The server
-      // cache already holds all prior turns (including any images
-      // from an earlier restart), so we only need to ship the new
-      // user string.
-      const result = await this.model.chatSessionContinue(userMessage, null, mergedConfig);
+      // Delta continue: text-only, images/audio always null. The server
+      // cache already holds all prior turns (including any media from an
+      // earlier restart), so we only need to ship the new user string.
+      let result: ChatResult;
+      try {
+        result = await this.model.chatSessionContinue(userMessage, null, null, mergedConfig);
+      } catch (err) {
+        if (!isMediaHeldRestartError(err)) {
+          throw err;
+        }
+        // The native session holds media KV (gemma4 after an image/audio
+        // turn) and refused the text delta. Transparently replay the full
+        // conversation through the cold start path. The earlier media turn
+        // already lives in `this.history`, so the start path re-renders it;
+        // the trailing-media keys keep `lastImagesKey`/`lastAudioKey`
+        // consistent across the replay. The delta path has NOT pushed
+        // `userMessage` yet, so `runStartPath` pushing it adds no duplicate.
+        return await this.runStartPath(userMessage, undefined, undefined, true, false, mergedConfig);
+      }
       this.history.push({ role: 'user', content: userMessage });
       this.history.push(buildAssistantMessage(result.text, result.toolCalls));
       this.turnCount++;
@@ -626,21 +717,22 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     try {
       const mergedConfig = this.mergeConfig(opts.config);
       const newImagesKey = computeImagesKey(opts.images);
-      // Only an explicit NEW image set can trigger a restart. Omitting
-      // `images` (newImagesKey === null) is interpreted as "keep the
-      // current image cache state" — the server-side cache already
-      // holds any prior image context, so a text-only follow-up like
-      // "what about the top-right?" can stay on the cheap delta path
-      // even after an image turn.
+      const newAudioKey = computeAudioKey(opts.audio);
+      // Only an explicit NEW image/audio set can trigger a restart. Omitting
+      // `images`/`audio` (key === null) is interpreted as "keep the current
+      // media cache state" — the server-side cache already holds any prior
+      // media context, so a text-only follow-up like "what about the
+      // top-right?" can stay on the cheap delta path even after a media turn.
       const imageChanged = newImagesKey !== null && newImagesKey !== this.lastImagesKey;
+      const audioChanged = newAudioKey !== null && newAudioKey !== this.lastAudioKey;
       const isFirstTurn = this.turnCount === 0;
 
-      if (isFirstTurn || imageChanged) {
+      if (isFirstTurn || imageChanged || audioChanged) {
         yield* this.runStartStreamPath(
           userMessage,
           opts.images,
-          newImagesKey,
-          imageChanged,
+          opts.audio,
+          imageChanged || audioChanged,
           isFirstTurn,
           mergedConfig,
           opts.signal,
@@ -651,20 +743,60 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // Delta continue stream: text-only.
       let sawFinal = false;
       let accumulated = '';
+      let accumulatedVisible = '';
       let finalRaw: string | null = null;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
+      // Set when the media-held rejection re-routes this turn through the
+      // cold start stream. The replay path owns the history push, turnCount
+      // increment, and media-key rehydration, so the commit `finally` below
+      // must NOT also fire.
+      let delegated = false;
       try {
-        for await (const event of this.model.chatStreamSessionContinue(userMessage, null, mergedConfig, opts.signal)) {
-          if (event.done) {
-            if (event.finishReason !== 'error') {
-              sawFinal = true;
-              finalRaw = event.text;
-              finalToolCalls = event.toolCalls;
+        try {
+          for await (const event of this.model.chatStreamSessionContinue(
+            userMessage,
+            null,
+            null,
+            mergedConfig,
+            opts.signal,
+          )) {
+            if (event.done) {
+              if (event.finishReason !== 'error') {
+                sawFinal = true;
+                finalRaw = event.text;
+                finalToolCalls = event.toolCalls;
+              }
+            } else {
+              accumulated += event.text;
+              if (event.isReasoning !== true) {
+                accumulatedVisible += event.text;
+              }
             }
-          } else {
-            accumulated += event.text;
+            yield event;
           }
-          yield event;
+        } catch (err) {
+          // The native session holds media KV (gemma4 after an image/audio
+          // turn) and refused the text delta. The streaming bridge re-throws
+          // that rejection on the first iteration, BEFORE any chunk is
+          // emitted — the native guard fires ahead of any prefill, so
+          // `!sawFinal && accumulated === ''` is guaranteed here. Replay the
+          // full conversation through the cold start stream. Any non-prefix
+          // error, or any error after tokens were already emitted, must
+          // propagate unchanged.
+          if (!isMediaHeldRestartError(err) || sawFinal || accumulated !== '') {
+            throw err;
+          }
+          delegated = true;
+          yield* this.runStartStreamPath(
+            userMessage,
+            undefined,
+            undefined,
+            true,
+            false,
+            mergedConfig,
+            opts.signal,
+          );
+          return;
         }
       } finally {
         // finally runs for normal completion, mid-stream throw,
@@ -673,10 +805,12 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // chunks alike. The delta path doesn't push to history until
         // commit, so the rollback branch is a no-op: nothing to
         // undo, and the native cache state is managed by the Rust
-        // save_cache_state path on its own.
-        if (sawFinal) {
+        // save_cache_state path on its own. When the media-held
+        // rejection delegated to the replay stream, that path already
+        // committed (or rolled back) — so this commit must stay off.
+        if (sawFinal && !delegated) {
           this.history.push({ role: 'user', content: userMessage });
-          this.history.push(buildAssistantMessage(finalRaw ?? accumulated, finalToolCalls));
+          this.history.push(buildAssistantMessage(finalRaw || accumulatedVisible, finalToolCalls));
           this.turnCount++;
           this.recordToolCallFanout(finalToolCalls);
         }
@@ -727,15 +861,61 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     try {
       const { isError, config } = opts;
       const mergedConfig = this.mergeConfig(config);
-      const result = await this.model.chatSessionContinueTool(toolCallId, content, mergedConfig, isError ?? null);
-      this.history.push({ role: 'tool', content, toolCallId, isError });
-      this.history.push(buildAssistantMessage(result.text, result.toolCalls));
-      this.turnCount++;
-      this.recordToolCallFanout(result.toolCalls);
-      return result;
+      const toolMsg: ChatMessage = { role: 'tool', content, toolCallId, isError };
+      // A cold native session (turnCount===0) has no live KV to delta
+      // against — the typical cause is an interrupted media-held replay
+      // whose rollback wiped the cache and reset the counter while
+      // leaving the unresolved tool-call flag set. Mirror `send()`'s
+      // turn-0 routing: replay the preserved history through the cold
+      // start path instead of dispatching a delta that the native side
+      // would reject with an un-prefixed "requires an initialized
+      // session" error. A normal tool result always follows a prior
+      // tool-call turn (turnCount>=1), so this never fires on the happy
+      // path.
+      if (this.turnCount === 0) {
+        return await this.replayToolResultThroughStartPath(toolMsg, mergedConfig);
+      }
+      try {
+        const result = await this.model.chatSessionContinueTool(toolCallId, content, mergedConfig, isError ?? null);
+        this.history.push({ role: 'tool', content, toolCallId, isError });
+        this.history.push(buildAssistantMessage(result.text, result.toolCalls));
+        this.turnCount++;
+        this.recordToolCallFanout(result.toolCalls);
+        return result;
+      } catch (err) {
+        if (!isMediaHeldRestartError(err)) {
+          throw err;
+        }
+        // The native session holds media KV (gemma4 after an image/audio
+        // turn) and refused the tool-result delta. Transparently replay
+        // the full conversation through the cold start path. The prior
+        // media turn already lives in `this.history`, so the start path
+        // re-renders it; the trailing-media keys keep
+        // `lastImagesKey`/`lastAudioKey` consistent across the replay.
+        // The delta path threw before pushing the tool message, so the
+        // restart core pushes it — `isError` rides on that message so the
+        // wire-format error marker is re-rendered, and a tool result
+        // always follows >=1 prior turn so `isFirstTurn` is false.
+        return await this.replayToolResultThroughStartPath(toolMsg, mergedConfig);
+      }
     } finally {
       this.inFlight = false;
     }
+  }
+
+  /**
+   * Cold-replay a tool result through the start path: re-render the
+   * full preserved history (including the prior media turn and the
+   * unresolved tool-call assistant turn) plus this tool message. Used
+   * when the native session is cold (turnCount===0 — e.g. after an
+   * interrupted media-held replay rolled the cache back) and by the
+   * media-held rejection catch. `mediaChanged=true` forces a
+   * resetCaches so the prefill always starts from a guaranteed-clean
+   * cache; `isFirstTurn=false` because a tool result always follows a
+   * prior tool-call turn.
+   */
+  private async replayToolResultThroughStartPath(toolMsg: ChatMessage, config: ChatConfig): Promise<ChatResult> {
+    return await this.runStartPathWithMessage(toolMsg, true, false, config);
   }
 
   /**
@@ -761,37 +941,83 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     try {
       const { isError, config, signal } = opts;
       const mergedConfig = this.mergeConfig(config);
+      const toolMsg: ChatMessage = { role: 'tool', content, toolCallId, isError };
+      // A cold native session (turnCount===0) has no live KV to delta
+      // against — typically the residue of an interrupted media-held
+      // replay whose rollback wiped the cache and reset the counter
+      // while leaving the unresolved tool-call flag set. Mirror
+      // `sendStream()`'s turn-0 routing: replay the preserved history
+      // through the cold start stream and return before the
+      // delta/commit machinery so the start path owns the history push,
+      // turnCount increment, and media-key rehydration. A normal tool
+      // result always follows a prior tool-call turn (turnCount>=1), so
+      // this never fires on the happy path.
+      if (this.turnCount === 0) {
+        yield* this.replayToolResultThroughStartStreamPath(toolMsg, mergedConfig, signal);
+        return;
+      }
       let sawFinal = false;
       let accumulated = '';
+      let accumulatedVisible = '';
       let finalRaw: string | null = null;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
+      // Set when the media-held rejection re-routes this tool turn
+      // through the cold start stream. The replay path owns the history
+      // push, turnCount increment, and media-key rehydration, so the
+      // commit `finally` below must NOT also fire.
+      let delegated = false;
       try {
-        for await (const event of this.model.chatStreamSessionContinueTool(
-          toolCallId,
-          content,
-          mergedConfig,
-          signal,
-          isError ?? null,
-        )) {
-          if (event.done) {
-            if (event.finishReason !== 'error') {
-              sawFinal = true;
-              finalRaw = event.text;
-              finalToolCalls = event.toolCalls;
+        try {
+          for await (const event of this.model.chatStreamSessionContinueTool(
+            toolCallId,
+            content,
+            mergedConfig,
+            signal,
+            isError ?? null,
+          )) {
+            if (event.done) {
+              if (event.finishReason !== 'error') {
+                sawFinal = true;
+                finalRaw = event.text;
+                finalToolCalls = event.toolCalls;
+              }
+            } else {
+              accumulated += event.text;
+              if (event.isReasoning !== true) {
+                accumulatedVisible += event.text;
+              }
             }
-          } else {
-            accumulated += event.text;
+            yield event;
           }
-          yield event;
+        } catch (err) {
+          // The native session holds media KV (gemma4 after an image/audio
+          // turn) and refused the tool-result delta. The streaming bridge
+          // re-throws that rejection on the first iteration, BEFORE any
+          // chunk is emitted — the native guard fires ahead of any
+          // prefill, so `!sawFinal && accumulated === ''` is guaranteed
+          // here. Replay the full conversation through the cold start
+          // stream with the pending tool message; `isError` rides on it so
+          // the wire-format error marker is re-rendered. Any non-prefix
+          // error, or any error after tokens were already emitted, must
+          // propagate unchanged.
+          if (!isMediaHeldRestartError(err) || sawFinal || accumulated !== '') {
+            throw err;
+          }
+          delegated = true;
+          yield* this.replayToolResultThroughStartStreamPath(toolMsg, mergedConfig, signal);
+          return;
         }
       } finally {
         // finally runs for normal completion, mid-stream throw,
         // caller `break` (iterator.return() short-circuits the yield),
         // and error-finish chunks alike. Tool turns never touch
-        // history until commit, so the rollback branch is a no-op.
-        if (sawFinal) {
+        // history until commit, so the rollback branch is a no-op. When
+        // the media-held rejection delegated to the replay stream, that
+        // path already committed (or rolled back), so this commit stays
+        // off.
+        if (sawFinal && !delegated) {
           this.history.push({ role: 'tool', content, toolCallId, isError });
-          this.history.push(buildAssistantMessage(finalRaw ?? accumulated, finalToolCalls));
+          this.history.push(buildAssistantMessage(finalRaw || accumulatedVisible, finalToolCalls));
           this.turnCount++;
           this.recordToolCallFanout(finalToolCalls);
         }
@@ -799,6 +1025,23 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     } finally {
       this.inFlight = false;
     }
+  }
+
+  /**
+   * Streaming counterpart of {@link replayToolResultThroughStartPath}:
+   * cold-replay a tool result through the start stream. Used by the
+   * turn-0 precheck and the media-held rejection catch in
+   * {@link sendToolResultStream}. The start stream owns the history
+   * push, turnCount increment, and media-key rehydration; callers keep
+   * `delegated`/early-return semantics so the commit `finally` stays
+   * off.
+   */
+  private async *replayToolResultThroughStartStreamPath(
+    toolMsg: ChatMessage,
+    config: ChatConfig,
+    signal: AbortSignal | undefined,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* this.runStartStreamPathWithMessage(toolMsg, true, false, config, signal);
   }
 
   /**
@@ -835,6 +1078,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     this.model.resetCaches();
     this.history = [];
     this.lastImagesKey = null;
+    this.lastAudioKey = null;
     this.turnCount = 0;
     this.unresolvedOkToolCallCount = null;
   }
@@ -908,6 +1152,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       this.history.push(buildAssistantMessage(result.text, result.toolCalls));
       this.turnCount++;
       this.lastImagesKey = this.computeTrailingImagesKey();
+      this.lastAudioKey = this.computeTrailingAudioKey();
       this.recordToolCallFanout(result.toolCalls);
       return result;
     } finally {
@@ -941,6 +1186,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const historySnapshot = this.history.slice();
       let sawFinal = false;
       let accumulated = '';
+      let accumulatedVisible = '';
       let finalRaw: string | null = null;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
       try {
@@ -953,6 +1199,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
             }
           } else {
             accumulated += event.text;
+            if (event.isReasoning !== true) {
+              accumulatedVisible += event.text;
+            }
           }
           yield event;
         }
@@ -963,9 +1212,10 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // mutated on a successful commit — on any non-success exit,
         // the primed state is left intact so the caller can retry.
         if (sawFinal) {
-          this.history.push(buildAssistantMessage(finalRaw ?? accumulated, finalToolCalls));
+          this.history.push(buildAssistantMessage(finalRaw || accumulatedVisible, finalToolCalls));
           this.turnCount++;
           this.lastImagesKey = this.computeTrailingImagesKey();
+          this.lastAudioKey = this.computeTrailingAudioKey();
           this.recordToolCallFanout(finalToolCalls);
         }
       }
@@ -1116,23 +1366,40 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   private async runStartPath(
     userMessage: string,
     images: Uint8Array[] | undefined,
-    newImagesKey: string | null,
-    imageChanged: boolean,
+    audio: Uint8Array[] | undefined,
+    mediaChanged: boolean,
+    isFirstTurn: boolean,
+    config: ChatConfig,
+  ): Promise<ChatResult> {
+    const userMsg = this.buildUserMessage(userMessage, images, audio);
+    return await this.runStartPathWithMessage(userMsg, mediaChanged, isFirstTurn, config);
+  }
+
+  /**
+   * Core of {@link runStartPath} that takes a PRE-BUILT pending
+   * `ChatMessage` (user or tool) instead of building a user message
+   * itself. The cold-restart catch in `sendToolResult()` replays the
+   * conversation through this core with a pending `{ role: 'tool', ... }`
+   * message so the tool-result turn is re-rendered against the full
+   * history without duplicating the start-path bookkeeping.
+   */
+  private async runStartPathWithMessage(
+    pendingMessage: ChatMessage,
+    mediaChanged: boolean,
     isFirstTurn: boolean,
     config: ChatConfig,
   ): Promise<ChatResult> {
     // Capture pre-state so the restart can be rolled back if the
-    // native call fails. The image-change branch resets caches BEFORE
+    // native call fails. The media-change branch resets caches BEFORE
     // we know whether the new prefill will succeed, so on failure we
-    // also have to drop turnCount + lastImagesKey to force the next
-    // call to re-route through the start path (rather than a delta
-    // continue against wiped caches).
-    const wasImageChangeRestart = imageChanged && !isFirstTurn;
+    // also have to drop turnCount + lastImagesKey/lastAudioKey to force
+    // the next call to re-route through the start path (rather than a
+    // delta continue against wiped caches).
+    const wasMediaChangeRestart = mediaChanged && !isFirstTurn;
     const historyLenBefore = this.history.length;
 
-    this.prepareStartPath(imageChanged, isFirstTurn);
-    const userMsg = this.buildUserMessage(userMessage, images);
-    this.history.push(userMsg);
+    this.prepareStartPath(mediaChanged, isFirstTurn);
+    this.history.push(pendingMessage);
     try {
       // Pass a shallow snapshot so later pushes to `this.history`
       // (e.g. the assistant reply below) don't retroactively mutate
@@ -1141,19 +1408,28 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const result = await this.model.chatSessionStart(this.history.slice(), config);
       this.history.push(buildAssistantMessage(result.text, result.toolCalls));
       this.turnCount++;
-      this.lastImagesKey = newImagesKey;
+      // The start path always re-renders the FULL preserved history, so the
+      // post-restart sticky keys are the trailing media keys of that history,
+      // not the single-turn literal args. A restart driven by a change in only
+      // one modality (e.g. an audio-only turn after an earlier image turn)
+      // would otherwise null the untouched modality's key even though that
+      // media is still live in the native cache, causing a later same-media
+      // turn to be mis-detected as a change and replayed twice.
+      this.lastImagesKey = this.computeTrailingImagesKey();
+      this.lastAudioKey = this.computeTrailingAudioKey();
       this.recordToolCallFanout(result.toolCalls);
       return result;
     } catch (err) {
       // Roll back: drop the tentative user push so history stays
       // consistent with turnCount.
       this.history.length = historyLenBefore;
-      if (wasImageChangeRestart) {
+      if (wasMediaChangeRestart) {
         // Caches were wiped by prepareStartPath() but the new prefill
         // failed. Force the next call to re-route through the start
         // path with the (preserved) prior history.
         this.turnCount = 0;
         this.lastImagesKey = null;
+        this.lastAudioKey = null;
       }
       throw err;
     }
@@ -1163,26 +1439,43 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   private async *runStartStreamPath(
     userMessage: string,
     images: Uint8Array[] | undefined,
-    newImagesKey: string | null,
-    imageChanged: boolean,
+    audio: Uint8Array[] | undefined,
+    mediaChanged: boolean,
+    isFirstTurn: boolean,
+    config: ChatConfig,
+    signal: AbortSignal | undefined,
+  ): AsyncGenerator<ChatStreamEvent> {
+    const userMsg = this.buildUserMessage(userMessage, images, audio);
+    yield* this.runStartStreamPathWithMessage(userMsg, mediaChanged, isFirstTurn, config, signal);
+  }
+
+  /**
+   * Streaming counterpart to {@link runStartPathWithMessage}: replays
+   * through the cold start stream from a PRE-BUILT pending
+   * `ChatMessage`. The cold-restart catch in `sendToolResultStream()`
+   * delegates here with a pending `{ role: 'tool', ... }` message.
+   */
+  private async *runStartStreamPathWithMessage(
+    pendingMessage: ChatMessage,
+    mediaChanged: boolean,
     isFirstTurn: boolean,
     config: ChatConfig,
     signal: AbortSignal | undefined,
   ): AsyncGenerator<ChatStreamEvent> {
     // Capture pre-state so any non-successful exit can roll back.
     // See `runStartPath` for the full rationale.
-    const wasImageChangeRestart = imageChanged && !isFirstTurn;
+    const wasMediaChangeRestart = mediaChanged && !isFirstTurn;
     const historyLenBefore = this.history.length;
 
-    this.prepareStartPath(imageChanged, isFirstTurn);
-    const userMsg = this.buildUserMessage(userMessage, images);
-    // Stage the user message on the pending history BEFORE the
+    this.prepareStartPath(mediaChanged, isFirstTurn);
+    // Stage the pending message on the pending history BEFORE the
     // stream starts — the native call reads it synchronously via
     // `model.chatStreamSessionStart(history, config)`.
-    this.history.push(userMsg);
+    this.history.push(pendingMessage);
 
     let sawFinal = false;
     let accumulated = '';
+    let accumulatedVisible = '';
     let finalRaw: string | null = null;
     let finalToolCalls: readonly ToolCallResult[] | undefined;
     // Snapshot the history before dispatch — see `runStartPath` for
@@ -1198,6 +1491,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           }
         } else {
           accumulated += event.text;
+          if (event.isReasoning !== true) {
+            accumulatedVisible += event.text;
+          }
         }
         yield event;
       }
@@ -1211,21 +1507,30 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // generator was wound down. Mid-stream throws still propagate
       // naturally — finally runs first, then the error continues up.
       if (sawFinal) {
-        this.history.push(buildAssistantMessage(finalRaw ?? accumulated, finalToolCalls));
+        this.history.push(buildAssistantMessage(finalRaw || accumulatedVisible, finalToolCalls));
         this.turnCount++;
-        this.lastImagesKey = newImagesKey;
+        // The start path always re-renders the FULL preserved history, so the
+        // post-restart sticky keys are the trailing media keys of that history,
+        // not the single-turn literal args. A restart driven by a change in only
+        // one modality (e.g. an audio-only turn after an earlier image turn)
+        // would otherwise null the untouched modality's key even though that
+        // media is still live in the native cache, causing a later same-media
+        // turn to be mis-detected as a change and replayed twice.
+        this.lastImagesKey = this.computeTrailingImagesKey();
+        this.lastAudioKey = this.computeTrailingAudioKey();
         this.recordToolCallFanout(finalToolCalls);
       } else {
         // Roll back: drop the tentative user push so history stays
         // consistent with turnCount.
         this.history.length = historyLenBefore;
-        if (wasImageChangeRestart) {
+        if (wasMediaChangeRestart) {
           // Caches were wiped by prepareStartPath() but the new
           // prefill never reached a successful done:true. Force the
           // next call to re-route through the start path with the
           // preserved prior history.
           this.turnCount = 0;
           this.lastImagesKey = null;
+          this.lastAudioKey = null;
         }
       }
     }
@@ -1246,8 +1551,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    *     turn.
    *   - On a fresh / reset history, re-inject the system prompt.
    */
-  private prepareStartPath(imageChanged: boolean, isFirstTurn: boolean): void {
-    if (imageChanged && !isFirstTurn) {
+  private prepareStartPath(mediaChanged: boolean, isFirstTurn: boolean): void {
+    if (mediaChanged && !isFirstTurn) {
       this.model.resetCaches();
     }
     if (this.history.length === 0 && this.system != null) {
@@ -1255,12 +1560,16 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     }
   }
 
-  /** Build a user `ChatMessage` with or without attached images. */
-  private buildUserMessage(userMessage: string, images: Uint8Array[] | undefined): ChatMessage {
-    if (images && images.length > 0) {
-      return { role: 'user', content: userMessage, images };
-    }
-    return { role: 'user', content: userMessage };
+  /** Build a user `ChatMessage` with or without attached images/audio. */
+  private buildUserMessage(
+    userMessage: string,
+    images: Uint8Array[] | undefined,
+    audio: Uint8Array[] | undefined,
+  ): ChatMessage {
+    const msg: ChatMessage = { role: 'user', content: userMessage };
+    if (images && images.length > 0) msg.images = images;
+    if (audio && audio.length > 0) msg.audio = audio;
+    return msg;
   }
 
   /**
@@ -1275,6 +1584,21 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const msg = this.history[i];
       if (msg?.role === 'user' && msg.images && msg.images.length > 0) {
         return computeImagesKey(msg.images);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Audio counterpart of {@link computeTrailingImagesKey}: walk history
+   * backward to the most recent user message carrying audio and return its
+   * FNV-1a key, so a cold replay hydrates `lastAudioKey` correctly.
+   */
+  private computeTrailingAudioKey(): string | null {
+    for (let i = this.history.length - 1; i >= 0; i--) {
+      const msg = this.history[i];
+      if (msg?.role === 'user' && msg.audio && msg.audio.length > 0) {
+        return computeAudioKey(msg.audio);
       }
     }
     return null;

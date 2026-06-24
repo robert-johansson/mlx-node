@@ -200,6 +200,7 @@ export declare class Gemma4Model {
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
   ): Promise<ChatResult>;
   /**
@@ -230,6 +231,7 @@ export declare class Gemma4Model {
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -556,6 +558,7 @@ export declare class Lfm2Model {
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
   ): Promise<ChatResult>;
   /**
@@ -586,6 +589,7 @@ export declare class Lfm2Model {
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -1105,10 +1109,19 @@ export declare class QianfanOCRModel {
    * model backends. Qianfan-OCR is a VLM but the continue path cannot
    * splice new vision features into a live KV cache — image changes
    * always require a fresh session start.
+   *
+   * `audio` exists only to keep this method's positional ABI aligned
+   * with the shared chat surface every other family exposes (the
+   * `chat_napi_surface!` macro inserts `audio` between `images` and
+   * `config`). Qianfan-OCR has no audio support, so a non-empty
+   * `audio` is rejected at the boundary with the shared no-audio
+   * error; `None` / empty is a complete no-op and audio is never
+   * threaded into the model thread.
    */
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
   ): Promise<ChatResult>;
   /**
@@ -1140,10 +1153,18 @@ export declare class QianfanOCRModel {
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /** Streaming variant of `chatSessionContinue`. */
+  /**
+   * Streaming variant of `chatSessionContinue`.
+   *
+   * `audio` mirrors the non-streaming entry point: it exists only to
+   * keep the positional ABI aligned with the shared chat surface, and
+   * a non-empty value is rejected at the boundary with the shared
+   * no-audio error. `None` / empty is a complete no-op.
+   */
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -1254,6 +1275,7 @@ export declare class Qwen35Model {
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
   ): Promise<ChatResult>;
   /**
@@ -1284,6 +1306,7 @@ export declare class Qwen35Model {
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -1389,6 +1412,7 @@ export declare class Qwen35MoeModel {
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
   ): Promise<ChatResult>;
   /**
@@ -1419,6 +1443,7 @@ export declare class Qwen35MoeModel {
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -1588,6 +1613,7 @@ export declare class Qwen3Model {
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
   ): Promise<ChatResult>;
   /**
@@ -1618,6 +1644,7 @@ export declare class Qwen3Model {
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -2360,6 +2387,8 @@ export interface ChatMessage {
   reasoningContent?: string;
   /** Image data for VLM models (encoded image bytes: PNG/JPEG, passed as Uint8Array/Buffer) */
   images?: Array<Uint8Array> | undefined;
+  /** Audio data for unified Gemma 4 (encoded audio bytes: WAV, passed as Uint8Array/Buffer) */
+  audio?: Array<Uint8Array> | undefined;
 }
 
 /** Unified chat result shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
@@ -2788,6 +2817,20 @@ export interface Gemma4Config {
   /** Head dimension for global layers. If None, uses head_dim. */
   globalHeadDim?: number;
   attentionKEqV: boolean;
+  /**
+   * True for the unified multimodal Gemma 4 checkpoint
+   * (`model_type == "gemma4_unified"` or
+   * `architectures[0] == "Gemma4UnifiedForConditionalGeneration"`).
+   * The text decoder is shared, but the unified checkpoint carries
+   * vision/audio embedder weights that must be dropped in a text-only load.
+   */
+  isUnified: boolean;
+  /**
+   * `text_config.use_bidirectional_attention` from the unified checkpoint
+   * (e.g. `"vision"`). Parsed for a stable struct surface; the text-only
+   * decode path does not consume it.
+   */
+  useBidirectionalAttention?: string;
   finalLogitSoftcapping?: number;
   perLayerInputEmbeds: boolean;
   hiddenSizePerLayerInput?: number;
@@ -2806,10 +2849,41 @@ export interface Gemma4Config {
   topKExperts?: number;
   moeIntermediateSize?: number;
   visionConfig?: Gemma4VisionConfig;
+  /**
+   * Encoder-free vision config for the unified multimodal checkpoint.
+   * `Some` only when `is_unified` and the checkpoint carries a
+   * `vision_config` sub-dict. Disjoint from `vision_config` (the SigLIP
+   * path) — the unified vision embedder is built from this instead.
+   */
+  unifiedVisionConfig?: UnifiedVisionConfig;
   imageTokenId?: number;
   boiTokenId?: number;
   eoiTokenId?: number;
   visionSoftTokensPerImage?: number;
+  /**
+   * True when the checkpoint declares an `audio_config` sub-dict. Parallels
+   * `unified_vision_config.is_some()`; gates the un-drop + load of
+   * `embed_audio` weights and the audio merge path.
+   */
+  hasAudio: boolean;
+  /**
+   * Audio placeholder token id (258881). Each `<audio>` placeholder expands to
+   * `boa + audio_token × n_frames + eoa`.
+   */
+  audioTokenId?: number;
+  /** Begin-of-audio token id (256000), emitted before the audio token run. */
+  boaTokenId?: number;
+  /**
+   * End-of-audio token id, parsed from the config's `eoa_token_index` (258883).
+   * A real appended token (like `eoi`), despite the "index" name.
+   */
+  eoaTokenId?: number;
+  /**
+   * Raw audio samples per audio token (640 = 40 ms @ 16 kHz), from
+   * `audio_config.audio_samples_per_token`. Frame size for the encoder-free
+   * pad+reshape feature extractor.
+   */
+  audioSamplesPerToken?: number;
   /**
    * GPU memory budget for paged KV cache in megabytes.
    * Only used when `use_block_paged_cache` is true.
@@ -4423,6 +4497,35 @@ export interface TrainStepResultWithOutputs {
   outputsJson?: string;
   /** Actual token counts for each completion (for accurate TUI display) */
   completionLengths: Array<number>;
+}
+
+/**
+ * Encoder-free vision configuration for the Gemma 4 unified multimodal model.
+ *
+ * Parsed from the `vision_config` sub-dict of a `gemma4_unified` checkpoint
+ * (`model_type == "gemma4_unified_vision"`). This is a different shape from the
+ * SigLIP-style [`super::vision_config::Gemma4VisionConfig`] used by the dense
+ * gemma4 family: the unified vision path has no transformer encoder, only a
+ * patch embedder (LayerNorm + Linear + 2D positional embedding) feeding the
+ * multimodal projection.
+ */
+export interface UnifiedVisionConfig {
+  /** Pixel side length of a single image patch (48 = patch_size 16 × pooling 3). */
+  modelPatchSize: number;
+  /** Embedding width inside the vision embedder (3840, == text hidden_size). */
+  mmEmbedDim: number;
+  /** Number of rows in the 2D positional-embedding table (1120). */
+  mmPosembSize: number;
+  /** Maximum soft tokens (patches) per image after resize (280). */
+  numSoftTokens: number;
+  /** Output projection width of `embed_vision` (3840, == text hidden_size). */
+  outputProjDims: number;
+  /** Pixel-grid patch size used by the resize math (16). */
+  patchSize: number;
+  /** Pooling kernel size used by the resize math (3). */
+  poolingKernelSize: number;
+  /** Epsilon for the embedder LayerNorms and the projection RMSNorm. */
+  rmsNormEps: number;
 }
 
 /** Result from document unwarping. */
