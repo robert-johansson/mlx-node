@@ -156,35 +156,49 @@ fn collect_safetensors(dirs: &[PathBuf], extra_files: &[PathBuf]) -> Vec<PathBuf
 /// Sequentially read each file on the CPU into a throwaway buffer. Best-effort:
 /// open/read errors are logged and ignored.
 fn prewarm_files(files: &[PathBuf]) {
-    use std::io::Read;
+    // This pass exists ONLY to dodge the macOS Metal command-buffer watchdog (see
+    // `prewarm_checkpoint_pages` docs): a cold mmap page-fault inside a Metal
+    // command buffer can exceed the ~5s watchdog and abort the process uncatchably.
+    // The CUDA backend has no GPU command-buffer watchdog — `Load::eval_gpu` reads
+    // weights off the eval thread via pread — so on non-macOS this would be a pure
+    // -overhead SECOND full read of the checkpoint (~25s for the 45GB
+    // Qwen3-Coder-Next on Jetson, doubling cold load time). Skip it off macOS.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = files;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Read;
 
-    if files.is_empty() {
-        return;
-    }
-    let start = std::time::Instant::now();
-    let mut buf = vec![0u8; 32 << 20];
-    let mut total: u64 = 0;
-    for p in files {
-        match fs::File::open(p) {
-            Ok(mut f) => loop {
-                match f.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => total += n as u64,
-                    Err(e) => {
-                        warn!("prewarm read error for {}: {}", p.display(), e);
-                        break;
-                    }
-                }
-            },
-            Err(e) => warn!("prewarm open error for {}: {}", p.display(), e),
+        if files.is_empty() {
+            return;
         }
+        let start = std::time::Instant::now();
+        let mut buf = vec![0u8; 32 << 20];
+        let mut total: u64 = 0;
+        for p in files {
+            match fs::File::open(p) {
+                Ok(mut f) => loop {
+                    match f.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => total += n as u64,
+                        Err(e) => {
+                            warn!("prewarm read error for {}: {}", p.display(), e);
+                            break;
+                        }
+                    }
+                },
+                Err(e) => warn!("prewarm open error for {}: {}", p.display(), e),
+            }
+        }
+        info!(
+            "Pre-warmed {} checkpoint shard(s) ({:.1} GB) into the page cache in {:.1}s",
+            files.len(),
+            total as f64 / (1u64 << 30) as f64,
+            start.elapsed().as_secs_f64(),
+        );
     }
-    info!(
-        "Pre-warmed {} checkpoint shard(s) ({:.1} GB) into the page cache in {:.1}s",
-        files.len(),
-        total as f64 / (1u64 << 30) as f64,
-        start.elapsed().as_secs_f64(),
-    );
 }
 
 /// Pre-warm the OS page cache for every checkpoint shard a loader may mmap by

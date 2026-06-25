@@ -34,6 +34,10 @@ const MODEL_REGISTRY = {
   qwen3: { load: (p: string) => Qwen3Model.load(p), kind: 'trainable' },
   qwen3_5: { load: (p: string) => Qwen35Model.load(p), kind: 'trainable' },
   qwen3_5_moe: { load: (p: string) => Qwen35MoeModel.load(p), kind: 'trainable' },
+  // Qwen3-Next (e.g. Qwen3-Coder-Next 80B-A3B): hybrid GDN + gated-attention MoE.
+  // Same native decoder as qwen3_5_moe (GatedDeltaNet de-interleaves the fused
+  // per-key-head in_proj layout for this family — see qwen3_5/gated_delta_net.rs).
+  qwen3_next: { load: (p: string) => Qwen35MoeModel.load(p), kind: 'trainable' },
   gemma4: { load: (p: string) => Gemma4Model.load(p), kind: 'loadable' },
   lfm2: { load: (p: string) => Lfm2Model.load(p), kind: 'loadable' },
   lfm2_moe: { load: (p: string) => Lfm2Model.load(p), kind: 'loadable' },

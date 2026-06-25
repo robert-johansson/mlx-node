@@ -578,10 +578,13 @@ fn apply_weights_moe_inner(
                         try_build_ql(params, &format!("{}.linear_attn.in_proj_qkvz", prefix))
                     {
                         gdn.set_quantized_in_proj_qkvz(ql);
+                        // Fused qkvz is per-key-head interleaved (qwen3_next) -> de-interleave in forward.
+                        gdn.set_fused_qkvz_layout(true);
                     } else if let Some(w) =
                         params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
                     {
                         gdn.set_in_proj_qkvz_weight(w)?;
+                        gdn.set_fused_qkvz_layout(true);
                     }
 
                     if let Some(ql) =
@@ -608,6 +611,8 @@ fn apply_weights_moe_inner(
                         params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
                     {
                         gdn.set_in_proj_qkvz_weight(w)?;
+                        // Direct fused qkvz (interleaved) -> de-interleave in forward.
+                        gdn.set_fused_qkvz_layout(true);
                     }
                     if let Some(w) =
                         params.get(&format!("{}.linear_attn.in_proj_qkv.weight", prefix))

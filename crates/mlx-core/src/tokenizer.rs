@@ -1355,7 +1355,10 @@ impl Qwen3Tokenizer {
         // treats unknown variables in `context!` as a no-op on access.
         let ctx = context! {
             messages => messages_value,
-            tools => tools_value,
+            // Pass an empty list (not `none`) when no tools are provided, so chat
+            // templates that do `tools | length` without a prior `is defined`
+            // guard (e.g. Qwen3-Coder-Next) render correctly under minijinja.
+            tools => tools_value.unwrap_or_default(),
             add_generation_prompt => add_generation_prompt,
             enable_thinking => enable_thinking.unwrap_or(true),
             preserve_thinking => true,

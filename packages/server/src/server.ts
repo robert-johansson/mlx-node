@@ -7,12 +7,14 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import { ResponseStore } from '@mlx-node/core';
+import { loadModel } from '@mlx-node/lm';
 
 import type { PublicModelEntry } from './handler.js';
 import { createHandler } from './handler.js';
 import { createIdleSweeper, DEFAULT_IDLE_CLEAR_CACHE_MS, parseIdleClearCacheEnv } from './idle-sweeper.js';
 import { ModelWorkCoordinator } from './model-work-coordinator.js';
 import { ModelRegistry } from './registry.js';
+import type { ServableModel } from './registry.js';
 
 /** Cleanup interval for expired responses (ms). */
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -142,6 +144,16 @@ export interface ServerConfig {
    * if still unresolved. Callback errors bubble up as 500s.
    */
   resolveModel?: (name: string) => Promise<void>;
+  /**
+   * Resident-daemon preload: models to load + register at startup, BEFORE the
+   * server begins listening. Each entry is loaded via `loadModel` (auto-detecting
+   * `model_type`) and registered under `name`, so the (tens-of-seconds for large
+   * checkpoints) model load is paid ONCE per process instead of per request. A
+   * preload failure rejects `createServer` (fail fast — a daemon told to host a
+   * model should not start without it). Intended for chat-capable LMs
+   * (qwen3 / qwen3.5 / qwen3_next / gemma4 / lfm2).
+   */
+  preload?: Array<{ name: string; path: string }>;
   /**
    * Optional override for `GET /v1/models` enumeration. When provided,
    * the endpoint returns this list instead of `registry.list()`.
@@ -276,6 +288,15 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     listModels: config?.listModels,
   });
   const server = httpCreateServer(handler);
+
+  // Resident-daemon preload: pay each model's load cost ONCE per process, before
+  // we accept connections, so every subsequent request hits an already-resident
+  // model (0s load). Auto-detects model_type via loadModel (e.g. qwen3_next ->
+  // Qwen35MoeModel). Fails fast: a preload error rejects createServer.
+  for (const entry of config?.preload ?? []) {
+    const model = await loadModel(entry.path);
+    registry.register(entry.name, model as unknown as ServableModel);
+  }
 
   await new Promise<void>((resolve, reject) => {
     const onError = (err: Error) => {
