@@ -93,7 +93,14 @@ pub struct MxArray {
 }
 
 impl MxArray {
-    pub(crate) fn from_handle(handle: *mut sys::mlx_array, context: &str) -> Result<Self> {
+    /// Construct an `MxArray` from a raw MLX handle.
+    ///
+    /// `pub` (not `pub(crate)`) so the `genmlx-core` superset addon — a
+    /// separate crate that links `mlx-core` as an rlib — can wrap handles
+    /// returned by its own mlx-sys FFI shims (keyed-PRNG, linalg, transforms).
+    /// This is the sole sanctioned mlx-core visibility widening for the GenMLX
+    /// graft; keep it in sync when re-basing the fork.
+    pub fn from_handle(handle: *mut sys::mlx_array, context: &str) -> Result<Self> {
         Ok(Self {
             handle: Arc::new(MxHandle(check_handle(handle, context)?)),
         })

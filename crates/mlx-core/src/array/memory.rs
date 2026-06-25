@@ -251,6 +251,26 @@ pub fn get_peak_memory() -> f64 {
     if rc != 0 { 0.0 } else { v as f64 }
 }
 
+/// Number of live GPU resource objects (the Metal simultaneous-buffer count).
+/// CUDA has no per-buffer resource analogue, so on the CUDA backend this
+/// returns `0.0`. This is an honest sentinel, not a lying stub: `0.0` means
+/// "not tracked on this backend." The CLJS membrane is explicitly designed for
+/// it — its proactive buffer-count sweep no-ops at count 0 (bean genmlx-ste5).
+/// Consumed by `genmlx-core`'s `memory_napi::get_num_resources`.
+pub fn get_num_resources() -> f64 {
+    0.0
+}
+
+/// The GPU resource limit (Metal's ~499000 simultaneous-buffer cap, at which
+/// allocations begin to fail). CUDA has no such per-buffer cap, so on the CUDA
+/// backend this returns `0.0`. Honest sentinel: the CLJS membrane falls back to
+/// its hard-coded default whenever the limit is not positive
+/// (`(if (pos? l) l 499000)`, bean genmlx-ste5). Consumed by `genmlx-core`'s
+/// `memory_napi::get_resource_limit`.
+pub fn get_resource_limit() -> f64 {
+    0.0
+}
+
 /// Reset peak memory counter to zero.
 /// Internal Rust-only function. Best-effort: silently ignores the failure
 /// return on degraded-Metal hosts (the cleanup hooks that call this don't
