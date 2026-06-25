@@ -193,6 +193,11 @@ test-output
 test-integration-output
 Cargo.lock
 *.node
+# CUDA-JIT header bundle (CCCL/CUTLASS) copied next to the addon for NVRTC at
+# runtime — ~39M, regenerable from the mlx-sys build output. Stays on disk; not
+# tracked. Re-copy from target/<arch>/release/build/mlx-sys-*/out/include if the
+# build dir hash changes (see HANDOFF.md).
+packages/include/
 /docs/superpowers/plans/*.md
 # subagent-driven-development scratch ledger + briefs/reports
 /.superpowers/
