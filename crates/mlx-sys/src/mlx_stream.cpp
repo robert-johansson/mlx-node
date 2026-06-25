@@ -314,4 +314,19 @@ size_t mlx_array_nbytes(mlx_array* handle) {
   return static_cast<uint64_t>(arr->nbytes());
 }
 
+// ---- mlx_get_wired_limit (P2, CUDA port) -----------------------------------
+// Out-param + rc shim mirroring mlx_set_wired_limit above. genmlx-core's
+// memory_napi.rs getWiredLimit calls sys::mlx_get_wired_limit(&mut v: u64) and
+// treats a nonzero rc as failure (-> 0.0). MLX 0.32.0 exposes set_wired_limit
+// but NO public getter, and CUDA has no wired-memory analogue — so we report an
+// honest sentinel of 0 ("no/unknown wired limit"), exactly how memory_napi.rs
+// interprets the failure path. Not a value we fabricate from a limit MLX hides.
+int32_t mlx_get_wired_limit(uint64_t* out_limit) {
+  if (out_limit == nullptr) {
+    return -1;
+  }
+  *out_limit = 0;
+  return 0;
+}
+
 }  // extern "C"

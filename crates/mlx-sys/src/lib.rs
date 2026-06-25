@@ -1683,3 +1683,263 @@ pub type LayerFunctionPtr = extern "C-unwind" fn(
     max_outputs: usize,
     context: *mut std::os::raw::c_void,
 ) -> usize;
+
+// ============================================================================
+// P2 (genmlx-core CUDA graft): mlx-sys FFI surface the mlx_*.cpp shims provide
+// and that genmlx-core's sys::mlx_* call sites require.
+//
+// APPEND this block to crates/mlx-sys/src/lib.rs (place it just BEFORE the final
+// `}` that closes the first top-level `unsafe extern "C-unwind" { ... }` block —
+// i.e. immediately after the `mlx_qwen3_forward_step(...)` decl ends — OR open a
+// fresh `unsafe extern "C-unwind" { ... }` block; either is correct, the linker
+// resolves all of them. This file shows it as a standalone block for clarity.)
+//
+// EXACT signature provenance: every signature below was reconciled against the
+// genmlx-core sys::mlx_* call sites (genmlx.rs / transforms.rs / memory_napi.rs)
+// and matched to the C++ shim shapes the other P2 pieces author. Pointer/double/
+// u32/usize/out-param types match the shim ABI byte-for-byte.
+//
+// DELIBERATELY OMITTED (do NOT add here — already declared in lib.rs):
+//   mlx_array_sigmoid, mlx_array_softmax, mlx_array_log_softmax, mlx_array_erf
+//   mlx_array_ndim, mlx_array_shape, mlx_eval, mlx_set_wired_limit
+//   mlx_array_{exp,log,abs,...} and all qwen35 / paged externs.
+// ============================================================================
+
+unsafe extern "C-unwind" {
+    // ------------------------------------------------------------------------
+    // Error machinery (P1 mlx_common.h trio; the definition lives in
+    // mlx_genmlx_ext.cpp). Take (and clear) the last MLX exception message the
+    // shim recorded on THIS thread, or null. Pointer valid only until the next
+    // shim call — copy immediately. (genmlx.rs take_last_native_error)
+    pub fn mlx_take_last_error() -> *const core::ffi::c_char;
+
+    // ------------------------------------------------------------------------
+    // Data accessor: fused eval + scalar extraction. `out` receives the f64
+    // value; returns false on a non-size-1 array OR a guarded MLX throw (detail
+    // then available via mlx_take_last_error). (genmlx.rs item)
+    pub fn mlx_array_item_f64(handle: *mut mlx_array, out: *mut f64) -> bool;
+
+    // ------------------------------------------------------------------------
+    // Memory: GPU-visible wired-memory limit read-back. Returns 0 on success
+    // (value via out_value), nonzero on caught exception. (memory_napi.rs
+    // get_wired_limit — companion to the already-declared mlx_set_wired_limit)
+    pub fn mlx_get_wired_limit(out_value: *mut u64) -> i32;
+
+    // ------------------------------------------------------------------------
+    // GenMLX-added unary special functions (genmlx.rs genmlx_unary_ffi! +
+    // besselI0e/besselI1e free fns). lgamma/digamma/bessel_i0e/bessel_i1e are
+    // re-implemented as COMPOSITES in mlx-sys (our 0.32.0 MLX lacks the
+    // primitives) but expose the SAME extern-C signature.
+    pub fn mlx_array_expm1(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_erfinv(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_lgamma(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_digamma(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_bessel_i0e(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_bessel_i1e(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_flatten(handle: *mut mlx_array) -> *mut mlx_array;
+
+    // GenMLX-added binary ops (genmlx.rs genmlx_binary_ffi!).
+    pub fn mlx_array_logaddexp(lhs: *mut mlx_array, rhs: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_inner(lhs: *mut mlx_array, rhs: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_outer(lhs: *mut mlx_array, rhs: *mut mlx_array) -> *mut mlx_array;
+
+    // GenMLX-added unary-with-params (genmlx.rs nan_to_num / diag / trace_).
+    pub fn mlx_array_nan_to_num(
+        handle: *mut mlx_array,
+        nan_val: f32,
+        has_posinf: bool,
+        posinf_val: f32,
+        has_neginf: bool,
+        neginf_val: f32,
+    ) -> *mut mlx_array;
+    pub fn mlx_array_diag(handle: *mut mlx_array, k: i32) -> *mut mlx_array;
+    pub fn mlx_array_trace(
+        handle: *mut mlx_array,
+        offset: i32,
+        axis1: i32,
+        axis2: i32,
+    ) -> *mut mlx_array;
+
+    // GenMLX-added reductions / search (genmlx.rs all/any/logcumsumexp/topk/
+    // searchsorted). searchsorted is a COMPOSITE in mlx-sys (0.32.0 lacks the op)
+    // but exposes the same signature.
+    pub fn mlx_array_all(
+        handle: *mut mlx_array,
+        axes: *const i32,
+        axes_len: usize,
+        keepdims: bool,
+    ) -> *mut mlx_array;
+    pub fn mlx_array_any(
+        handle: *mut mlx_array,
+        axes: *const i32,
+        axes_len: usize,
+        keepdims: bool,
+    ) -> *mut mlx_array;
+    pub fn mlx_array_topk(handle: *mut mlx_array, k: i32, axis: i32) -> *mut mlx_array;
+    pub fn mlx_array_logcumsumexp(
+        handle: *mut mlx_array,
+        axis: i32,
+        reverse: bool,
+    ) -> *mut mlx_array;
+    pub fn mlx_array_searchsorted(
+        sorted_handle: *mut mlx_array,
+        values_handle: *mut mlx_array,
+        right: bool,
+    ) -> *mut mlx_array;
+
+    // einsum (genmlx.rs einsum).
+    pub fn mlx_array_einsum(
+        subscripts: *const std::os::raw::c_char,
+        operand_handles: *const *mut mlx_array,
+        operand_count: usize,
+    ) -> *mut mlx_array;
+
+    // ------------------------------------------------------------------------
+    // Linear algebra (genmlx.rs cholesky/linalg_solve/solve_triangular/
+    // linalg_inv/tri_inv/cholesky_inv/qr/svd/eigh/eigvalsh/linalg_norm).
+    pub fn mlx_linalg_cholesky(handle: *mut mlx_array, upper: bool) -> *mut mlx_array;
+    pub fn mlx_linalg_solve(a: *mut mlx_array, b: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_linalg_solve_triangular(
+        a: *mut mlx_array,
+        b: *mut mlx_array,
+        upper: bool,
+    ) -> *mut mlx_array;
+    pub fn mlx_linalg_inv(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_linalg_tri_inv(handle: *mut mlx_array, upper: bool) -> *mut mlx_array;
+    pub fn mlx_linalg_cholesky_inv(handle: *mut mlx_array, upper: bool) -> *mut mlx_array;
+    pub fn mlx_linalg_qr(
+        handle: *mut mlx_array,
+        q_out: *mut *mut mlx_array,
+        r_out: *mut *mut mlx_array,
+    );
+    pub fn mlx_linalg_svd(
+        handle: *mut mlx_array,
+        u_out: *mut *mut mlx_array,
+        s_out: *mut *mut mlx_array,
+        vt_out: *mut *mut mlx_array,
+    );
+    pub fn mlx_linalg_eigh(
+        handle: *mut mlx_array,
+        uplo: *const std::os::raw::c_char,
+        eigvals_out: *mut *mut mlx_array,
+        eigvecs_out: *mut *mut mlx_array,
+    );
+    pub fn mlx_linalg_eigvalsh(
+        handle: *mut mlx_array,
+        uplo: *const std::os::raw::c_char,
+    ) -> *mut mlx_array;
+    pub fn mlx_linalg_norm(handle: *mut mlx_array, ord: f64) -> *mut mlx_array;
+    pub fn mlx_linalg_norm_default(handle: *mut mlx_array) -> *mut mlx_array;
+
+    // ------------------------------------------------------------------------
+    // Key-based PRNG (genmlx.rs random_key/random_split/random_split_n + the
+    // keyUniform/keyNormal/keyBernoulli/keyCategorical/keyRandint/keyGumbel/
+    // keyLaplace/keyTruncatedNormal/keyMultivariateNormal free fns). The trailing
+    // i32 `dtype` decodes our DType #[repr(i32)] (Float32=0 .. Int8=6) via
+    // `dt as i32`.
+    pub fn mlx_random_key(seed: u64) -> *mut mlx_array;
+    pub fn mlx_random_split(
+        key: *mut mlx_array,
+        k1_out: *mut *mut mlx_array,
+        k2_out: *mut *mut mlx_array,
+    );
+    pub fn mlx_random_split_n(key: *mut mlx_array, n: i32) -> *mut mlx_array;
+    pub fn mlx_random_uniform_key(
+        key: *mut mlx_array,
+        shape: *const i64,
+        ndim: usize,
+        low: f32,
+        high: f32,
+        dtype: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_random_normal_key(
+        key: *mut mlx_array,
+        shape: *const i64,
+        ndim: usize,
+        dtype: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_random_bernoulli_key(
+        key: *mut mlx_array,
+        prob: f32,
+        shape: *const i64,
+        ndim: usize,
+    ) -> *mut mlx_array;
+    pub fn mlx_random_categorical_key(
+        key: *mut mlx_array,
+        logits: *mut mlx_array,
+        axis: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_random_randint_key(
+        key: *mut mlx_array,
+        low: i32,
+        high: i32,
+        shape: *const i64,
+        ndim: usize,
+        dtype: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_random_gumbel_key(
+        key: *mut mlx_array,
+        shape: *const i64,
+        ndim: usize,
+        dtype: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_random_laplace_key(
+        key: *mut mlx_array,
+        shape: *const i64,
+        ndim: usize,
+        dtype: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_random_truncated_normal_key(
+        key: *mut mlx_array,
+        lower: *mut mlx_array,
+        upper: *mut mlx_array,
+        shape: *const i64,
+        ndim: usize,
+        dtype: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_random_multivariate_normal_key(
+        key: *mut mlx_array,
+        mean: *mut mlx_array,
+        cov: *mut mlx_array,
+        shape: *const i64,
+        ndim: usize,
+        dtype: i32,
+    ) -> *mut mlx_array;
+
+    // ------------------------------------------------------------------------
+    // vmap / compile transforms (transforms.rs mlx_vmap_apply / mlx_compile_apply).
+    // The callback fn pointer types match the `extern "C-unwind"` callbacks
+    // `vmap_callback` / `compile_callback` declared in genmlx-core/transforms.rs.
+    pub fn mlx_vmap_apply(
+        fn_ptr: extern "C-unwind" fn(
+            *const *mut mlx_array,
+            usize,
+            *mut std::ffi::c_void,
+        ) -> *mut mlx_array,
+        context: *mut std::ffi::c_void,
+        inputs: *const *mut mlx_array,
+        input_count: usize,
+        in_axes: *const i32,
+        in_axes_len: usize,
+        out_axes: *const i32,
+        out_axes_len: usize,
+        outputs: *mut *mut mlx_array,
+        max_outputs: usize,
+        num_outputs: *mut usize,
+    ) -> *mut mlx_array;
+    pub fn mlx_compile_apply(
+        fn_ptr: extern "C-unwind" fn(
+            *const *mut mlx_array,
+            usize,
+            *mut *mut mlx_array,
+            usize,
+            *mut std::ffi::c_void,
+        ) -> usize,
+        context: *mut std::ffi::c_void,
+        inputs: *const *mut mlx_array,
+        input_count: usize,
+        shapeless: bool,
+        outputs: *mut *mut mlx_array,
+        max_outputs: usize,
+    ) -> usize;
+}
