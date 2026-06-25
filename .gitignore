@@ -198,6 +198,7 @@ Cargo.lock
 # NAPI-RS ESM build artifacts (CJS versions are committed)
 packages/core/index.js
 packages/core/index.d.ts
+packages/genmlx-core/index.d.ts
 
 # TypeScript compiled output in packages (not NAPI-RS generated files)
 packages/*/src/**/*.js
