@@ -129,8 +129,22 @@ extern "C" size_t mlx_compute_gradients(LossFunctionPtr loss_fn,
   // gradients
   auto grad_fn = mlx::core::grad(loss_func, argnums);
 
-  // Call gradient function with inputs
-  std::vector<array> gradients = grad_fn(inputs);
+  // Call gradient function with inputs. Guarded to MATCH the sibling
+  // mlx_value_and_gradients (below): MLX throws std::exception for an
+  // unimplemented primitive VJP (e.g. "[Primitive::vjp] Not implemented for
+  // Cholesky" — Decision-1 / genmlx-ste5: MLX 0.32.0 lacks Cholesky/Inverse
+  // VJP, robert-fork g/h patches absent). Without this catch, mx/grad through
+  // such a primitive lets the throw escape across the FFI as an UNCATCHABLE
+  // std::terminate -> SIGABRT that aborts the whole process. value_and_grad was
+  // already guarded; this closes the mx/grad-vs-value_and_grad asymmetry across
+  // ALL unimplemented linalg VJPs (Cholesky, Inverse, SVD, Eig, Eigh, QR, LU).
+  std::vector<array> gradients;
+  try {
+    gradients = grad_fn(inputs);
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX AUTOGRAD ERROR] compute_gradients failed: " << e.what() << std::endl;
+    return 0;
+  }
 
   // Store gradient handles
   if (gradients.size() != input_count) {
