@@ -181,6 +181,71 @@ inline void mlx_trace_native_error(const char* context, const char* detail) {
   out << "\"\n";
 }
 
+// --- Native error surface for the GenMLX FFI shims (bean genmlx-ste5, CUDA
+// graft). The GenMLX shims (mlx_random/linalg/transforms.cpp + mlx_genmlx_ext
+// .cpp) wrap their bodies in the MLX_GUARD_* macros below; on an MLX exception
+// they record the message into a thread-local slot that genmlx-core reads via
+// sys::mlx_take_last_error() (genmlx.rs:40) to surface a CATCHABLE napi error
+// instead of aborting the process. The single definition of the trio lives in
+// mlx_genmlx_ext.cpp; declared extern here. Additive — no collision with our
+// existing mlx_trace_native_error tracer, which mlx_report_error also calls.
+extern "C" void mlx_record_native_error(const char* context, const char* detail);
+extern "C" const char* mlx_take_last_error();
+
+inline void mlx_report_error(const char* context, const char* detail) {
+  mlx_record_native_error(context, detail);
+  mlx_trace_native_error(context, detail);
+}
+
+// Wrap a shim body returning mlx_array*: on any MLX exception, record + return
+// nullptr (the Rust check_handle turns the null into a catchable napi error).
+#define MLX_GUARD_PTR(ctx, ...)                       \
+  try {                                               \
+    __VA_ARGS__                                       \
+  } catch (const std::exception& e) {                 \
+    mlx_report_error(ctx, e.what());                  \
+    return nullptr;                                   \
+  } catch (...) {                                     \
+    mlx_report_error(ctx, "unknown exception");       \
+    return nullptr;                                   \
+  }
+
+// Same, for a shim returning bool (false = failure).
+#define MLX_GUARD_BOOL(ctx, ...)                      \
+  try {                                               \
+    __VA_ARGS__                                       \
+  } catch (const std::exception& e) {                 \
+    mlx_report_error(ctx, e.what());                  \
+    return false;                                     \
+  } catch (...) {                                     \
+    mlx_report_error(ctx, "unknown exception");       \
+    return false;                                     \
+  }
+
+// Same, for a void shim that signals failure through nulled/zeroed out-params.
+#define MLX_GUARD_VOID(ctx, ...)                      \
+  try {                                               \
+    __VA_ARGS__                                       \
+  } catch (const std::exception& e) {                 \
+    mlx_report_error(ctx, e.what());                  \
+    return;                                           \
+  } catch (...) {                                     \
+    mlx_report_error(ctx, "unknown exception");       \
+    return;                                           \
+  }
+
+// Same, for a shim returning a count/size: `sentinel` (typically 0) = failure.
+#define MLX_GUARD_VAL(ctx, sentinel, ...)             \
+  try {                                               \
+    __VA_ARGS__                                       \
+  } catch (const std::exception& e) {                 \
+    mlx_report_error(ctx, e.what());                  \
+    return sentinel;                                  \
+  } catch (...) {                                     \
+    mlx_report_error(ctx, "unknown exception");       \
+    return sentinel;                                  \
+  }
+
 // Comparison operations
 using mlx::core::equal;
 using mlx::core::greater;
