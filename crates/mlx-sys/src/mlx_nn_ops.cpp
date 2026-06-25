@@ -1087,4 +1087,21 @@ int32_t mlx_load_safetensors(
     }
 }
 
+// ---- mlx_array_item_f64 (P2, genmlx-core CUDA port) -------------------------
+// Fused eval + size-1 scalar read for genmlx-core's `item` NAPI
+// (sys::mlx_array_item_f64). Uses this TU's CUDA-aware ensure_readable() +
+// read_scalar<double>() (force-evals on non-Apple), NOT the fork's plain
+// eval()+data<T>() which returns a device-only buffer and segfaults on CUDA.
+// Same host-read path as mlx_array_item_at_float32/int32 above.
+bool mlx_array_item_f64(mlx_array* handle, double* out) {
+  if (!handle || !out) return false;
+  MLX_GUARD_BOOL("array_item_f64",
+    auto arr = reinterpret_cast<array*>(handle);
+    if (arr->size() != 1) return false;
+    if (!ensure_readable(*arr, "array_item_f64")) return false;
+    *out = read_scalar<double>(*arr, 0);
+    return true;
+  )
+}
+
 }  // extern "C"
