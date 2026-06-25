@@ -128,6 +128,13 @@ pub struct GatedDeltaNet {
     /// (and non-quantized), `forward()` does ONE matmul + two slices instead of
     /// two separate matmuls.
     in_proj_qkvz_ba_t: Option<MxArray>,
+    /// True when in_proj came from a FUSED `in_proj_qkvz`/`in_proj_ba` tensor laid
+    /// out per-key-head interleaved (qwen3_next: 16 groups of [q|k|v|z]). Such a
+    /// layout needs a `fix_query_key_value_ordering`-style de-interleave of the
+    /// projection output in forward(). False for the separate-projection
+    /// (qwen3_5_text) path, whose concatenated weights are already contiguous
+    /// `[q_all|k_all|v_all|z_all]` and must NOT be de-interleaved.
+    fused_qkvz_layout: bool,
 }
 
 impl GatedDeltaNet {
@@ -192,7 +199,51 @@ impl GatedDeltaNet {
             conv_dim,
             conv_kernel_dim,
             in_proj_qkvz_ba_t: None,
+            fused_qkvz_layout: false,
         })
+    }
+
+    /// Mark that the in_proj weights were loaded from a FUSED, per-key-head
+    /// interleaved `in_proj_qkvz`/`in_proj_ba` (qwen3_next). When set, forward()
+    /// de-interleaves the projection output to the contiguous
+    /// `[q_all|k_all|v_all|z_all]` / `[b_all|a_all]` layout the rest of the code
+    /// expects (mirrors mlx-lm's `fix_query_key_value_ordering`).
+    pub fn set_fused_qkvz_layout(&mut self, fused: bool) {
+        self.fused_qkvz_layout = fused;
+    }
+
+    /// De-interleave a fused per-key-head `qkvz` projection output
+    /// `[B, T, nk*(q+k+v+z)]` into contiguous `[B, T, q_all|k_all|v_all|z_all]`.
+    fn deinterleave_qkvz(&self, qkvz: &MxArray, batch: i64, seq_len: i64) -> Result<MxArray> {
+        let nk = self.num_k_heads as i64;
+        let qd = self.key_head_dim as i64;
+        let kd = self.key_head_dim as i64;
+        let vd = (self.num_v_heads / self.num_k_heads) as i64 * self.value_head_dim as i64;
+        let zd = vd;
+        let group = qd + kd + vd + zd;
+        let r = qkvz.reshape(&[batch, seq_len, nk, group])?;
+        let q = r.slice_axis(3, 0, qd)?.reshape(&[batch, seq_len, nk * qd])?;
+        let k = r.slice_axis(3, qd, qd + kd)?.reshape(&[batch, seq_len, nk * kd])?;
+        let v = r
+            .slice_axis(3, qd + kd, qd + kd + vd)?
+            .reshape(&[batch, seq_len, nk * vd])?;
+        let z = r
+            .slice_axis(3, qd + kd + vd, group)?
+            .reshape(&[batch, seq_len, nk * zd])?;
+        let qk = MxArray::concatenate(&q, &k, 2)?;
+        let qkv = MxArray::concatenate(&qk, &v, 2)?;
+        MxArray::concatenate(&qkv, &z, 2)
+    }
+
+    /// De-interleave a fused per-key-head `ba` projection output
+    /// `[B, T, nk*(b+a)]` into contiguous `[B, T, b_all|a_all]`.
+    fn deinterleave_ba(&self, ba: &MxArray, batch: i64, seq_len: i64) -> Result<MxArray> {
+        let nk = self.num_k_heads as i64;
+        let bd = (self.num_v_heads / self.num_k_heads) as i64; // b and a each per group
+        let r = ba.reshape(&[batch, seq_len, nk, bd * 2])?;
+        let b = r.slice_axis(3, 0, bd)?.reshape(&[batch, seq_len, nk * bd])?;
+        let a = r.slice_axis(3, bd, bd * 2)?.reshape(&[batch, seq_len, nk * bd])?;
+        MxArray::concatenate(&b, &a, 2)
     }
 
     /// Precompute the stacked `[qkvz; ba]^T` weight once after both in_proj
@@ -269,6 +320,20 @@ impl GatedDeltaNet {
             // Unfused path: two separate matmuls.
             let qkvz = self.in_proj_qkvz.forward(x)?;
             let ba = self.in_proj_ba.forward(x)?;
+            (qkvz, ba)
+        };
+
+        // qwen3_next ships FUSED in_proj weights laid out per-key-head interleaved
+        // (16 groups of [q|k|v|z]). The flat slices below assume the contiguous
+        // [q_all|k_all|v_all|z_all] layout, so de-interleave first (matches mlx-lm's
+        // `fix_query_key_value_ordering`). The separate-projection (qwen3_5_text)
+        // path is already contiguous and skips this.
+        let (qkvz, ba) = if self.fused_qkvz_layout {
+            (
+                self.deinterleave_qkvz(&qkvz, batch, seq_len)?,
+                self.deinterleave_ba(&ba, batch, seq_len)?,
+            )
+        } else {
             (qkvz, ba)
         };
 
