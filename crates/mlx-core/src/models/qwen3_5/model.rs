@@ -329,6 +329,25 @@ pub(crate) enum Qwen35Cmd {
         config: Qwen3_5GenerationConfig,
         reply: ResponseTx<Qwen3_5GenerationResult>,
     },
+    /// Per-step UNCACHED forward → logits `[1, T, vocab]` (model dtype,
+    /// eval'd on the model thread). Does NOT touch `self.caches`. The
+    /// uncached scoring primitive GenMLX's LLM-as-GF rides on. (bean mlx-2h4l)
+    Forward {
+        input_ids: MxArray,
+        reply: ResponseTx<MxArray>,
+    },
+    /// Cached forward over `input_ids`, threading + advancing `self.caches`;
+    /// returns LAST-position logits `[1, 1, vocab]` (model dtype, eval'd).
+    /// Requires `InitCaches` first + the flat (non-paged) cache. (bean mlx-2h4l)
+    ForwardWithCache {
+        input_ids: MxArray,
+        use_cache: bool,
+        reply: ResponseTx<MxArray>,
+    },
+    /// Build fresh model-internal KV/hybrid caches (idempotent). (bean mlx-2h4l)
+    InitCaches {
+        reply: ResponseTx<()>,
+    },
     SaveModel {
         save_path: String,
         reply: ResponseTx<()>,
@@ -435,6 +454,19 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
             reply,
         } => {
             let _ = reply.send(inner.generate_sync(prompt_tokens, config));
+        }
+        Qwen35Cmd::Forward { input_ids, reply } => {
+            let _ = reply.send(inner.forward_sync(&input_ids));
+        }
+        Qwen35Cmd::ForwardWithCache {
+            input_ids,
+            use_cache,
+            reply,
+        } => {
+            let _ = reply.send(inner.forward_with_cache_sync(&input_ids, use_cache));
+        }
+        Qwen35Cmd::InitCaches { reply } => {
+            let _ = reply.send(inner.init_caches_sync());
         }
         Qwen35Cmd::SaveModel { save_path, reply } => {
             let _ = reply.send(inner.save_model_sync(&save_path));
@@ -721,6 +753,146 @@ impl Qwen35Inner {
         self.caches = None;
         self.clear_reuse_state();
         Ok(())
+    }
+
+    // ----------------------------------------------------------------------
+    // Per-step forward surface (bean mlx-2h4l, Tier 1).
+    //
+    // The native logits primitive GenMLX's LLM-as-GF synthesis rides on. The
+    // cache is MODEL-INTERNAL (`self.caches`) — matching GenMLX's native
+    // dispatch in `backend.cljs` (`.forward` / `.forwardWithCache` /
+    // `.initCaches` / `.resetCaches`), which passes no cache object and lets the
+    // model self-count its offset. Tier 2 (bean mlx-19wy) adds a branchable
+    // cache handle for token-MCMC / regenerate; deliberately NOT here.
+    // ----------------------------------------------------------------------
+
+    /// Normalize a forward input id tensor to `[1, N]` (int), validating it is
+    /// rank-1 `[N]` or rank-2 `[1, N]` and non-empty. (guards E2/E4)
+    fn normalize_forward_input(input_ids: &MxArray) -> Result<MxArray> {
+        let ndim = input_ids.ndim()?;
+        if ndim == 2 {
+            let b = input_ids.shape_at(0)?;
+            if b != 1 {
+                return Err(Error::from_reason(format!(
+                    "forward expects batch_size=1 (shape [1, N]); got batch_size={b}"
+                )));
+            }
+        } else if ndim != 1 {
+            return Err(Error::from_reason(format!(
+                "forward expects a rank-1 [N] or rank-2 [1, N] id tensor; got {ndim} dims"
+            )));
+        }
+        if input_ids.size()? == 0 {
+            return Err(Error::from_reason("forward: input_ids is empty"));
+        }
+        input_ids.reshape(&[1, -1])
+    }
+
+    /// Uncached full forward → logits `[1, T, vocab]` in model dtype, eval'd on
+    /// the model thread. Builds a fresh per-layer cache internally and NEVER
+    /// touches `self.caches`. (bean mlx-2h4l, Tier 1)
+    pub(crate) fn forward_sync(&mut self, input_ids: &MxArray) -> Result<MxArray> {
+        let input = Self::normalize_forward_input(input_ids)?;
+        let embedding_weight = self.embedding.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let mut no_cache: Option<Vec<Qwen3_5LayerCache>> = None;
+        let logits = {
+            let _ctx = StreamContext::new(Stream::new(DeviceType::Gpu));
+            forward_inner(
+                &input,
+                &embedding_weight,
+                &mut self.layers,
+                &mut no_cache,
+                &self.final_norm,
+                &self.lm_head,
+                Some(&embedding_weight_t),
+            )?
+        };
+        // Materialize on THIS (model) thread so the returned array is concrete:
+        // GenMLX composes index/softmax/sample on the JS thread and must never
+        // trigger a cross-thread eval of model-internal arrays (CUDA segfault;
+        // `array::data` gates eval on `metal_backend_available()`).
+        logits.eval();
+        Ok(logits)
+    }
+
+    /// Cached forward over `input_ids`, threading + advancing `self.caches`.
+    /// Returns LAST-position logits `[1, 1, vocab]` (model dtype, eval'd).
+    /// Requires `init_caches_sync` first and the flat (non-paged) cache.
+    /// (bean mlx-2h4l, Tier 1; `use_cache` must be `true` in Tier 1.)
+    pub(crate) fn forward_with_cache_sync(
+        &mut self,
+        input_ids: &MxArray,
+        use_cache: bool,
+    ) -> Result<MxArray> {
+        if !use_cache {
+            return Err(Error::from_reason(
+                "forwardWithCache(use_cache=false) is not supported in Tier 1; \
+                 use forward() for an uncached pass",
+            ));
+        }
+        if self.paged_adapter.is_some() {
+            return Err(Error::from_reason(
+                "forwardWithCache requires the flat cache, but the block-paged \
+                 adapter is active on this model; load with paging off (bean mlx-19wy)",
+            ));
+        }
+        if self.caches.is_none() {
+            return Err(Error::from_reason(
+                "forwardWithCache: caches are not initialized — call initCaches() \
+                 before the first forwardWithCache",
+            ));
+        }
+        let input = Self::normalize_forward_input(input_ids)?;
+        let embedding_weight = self.embedding.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        // Mirror `generate_sync`: a direct `forward_inner` for single-token
+        // decode steps (no chunk setup), and the dense chunked-prefill helper
+        // for the multi-token prompt (bounds peak memory, manages its own
+        // per-chunk StreamContext + inter-chunk cache barrier).
+        let last = if input.shape_at(1)? <= 1 {
+            let _ctx = StreamContext::new(generation_stream);
+            let logits = forward_inner(
+                &input,
+                &embedding_weight,
+                &mut self.layers,
+                &mut self.caches,
+                &self.final_norm,
+                &self.lm_head,
+                Some(&embedding_weight_t),
+            )?;
+            // `forward_inner` yields `[1, T, vocab]` with `T == 1` here; slice the
+            // last position to honor the `[1, 1, vocab]` contract (do NOT squeeze
+            // axis 1 — GenMLX indexes `logits[0][0]`).
+            let seq_len = logits.shape_at(1)?;
+            logits.slice_axis(1, seq_len - 1, seq_len)?
+        } else {
+            // DEVIATION from the MoE reference: the MoE `chunked_prefill` returns
+            // the FULL final chunk `[1, chunk_len, vocab]`, but the dense
+            // `chunked_prefill` advances the caches by all T positions and
+            // returns ONLY the last-position logits, already squeezed to
+            // `[1, vocab]` (via `project_last_logits_from_pre_norm_hidden`).
+            // Reshape back to `[1, 1, vocab]` for the frozen contract.
+            let logits = chunked_prefill(
+                &input,
+                &embedding_weight,
+                &mut self.layers,
+                &mut self.caches,
+                &self.final_norm,
+                &self.lm_head,
+                Some(&embedding_weight_t),
+                generation_stream,
+            )?;
+            logits.reshape(&[1, 1, -1])?
+        };
+        // Materialize the advanced caches on this thread so the next
+        // forwardWithCache reads concrete state (no unbounded lazy-graph growth).
+        eval_layer_caches(&self.caches)?;
+        // Return ONLY the last position as `[1, 1, vocab]` (NOT squeezed): GenMLX's
+        // forward-prefill / forward-step index `logits[0][0] -> [vocab]`.
+        last.eval();
+        Ok(last)
     }
 
     /// Clear cached token history, image key, and rope deltas.
@@ -8372,6 +8544,46 @@ impl Qwen3_5Model {
                 .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
         })?;
         Ok(promise)
+    }
+
+    // ------------------------------------------------------------------
+    // Per-step forward surface (bean mlx-2h4l, Tier 1).
+    // ------------------------------------------------------------------
+
+    /// Per-step UNCACHED forward → logits `[1, T, vocab]` (model dtype). SYNC.
+    ///
+    /// The uncached scoring primitive GenMLX's LLM-as-GF rides on
+    /// (`backend.cljs` `forward-pass`). Builds a fresh per-layer cache
+    /// internally; never touches the model's persistent caches.
+    #[napi]
+    pub fn forward(&self, input_ids: &MxArray) -> Result<MxArray> {
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::Forward {
+            input_ids: input_ids.clone(),
+            reply,
+        })
+    }
+
+    /// Cached forward over `input_ids`, advancing the model-internal caches;
+    /// returns LAST-position logits `[1, 1, vocab]` (model dtype). SYNC.
+    ///
+    /// GenMLX drives prefill (`[1, N]`) then per-token steps (`[1, 1]`) through
+    /// this (`backend.cljs` `forward-prefill` / `forward-step`), always with
+    /// `use_cache = true`. Call `initCaches()` before the first invocation and
+    /// `resetCaches()` after. Requires the flat (non-paged) cache.
+    #[napi]
+    pub fn forward_with_cache(&self, input_ids: &MxArray, use_cache: bool) -> Result<MxArray> {
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::ForwardWithCache {
+            input_ids: input_ids.clone(),
+            use_cache,
+            reply,
+        })
+    }
+
+    /// Build fresh model-internal KV/hybrid caches for a `forwardWithCache`
+    /// run. Idempotent (re-init discards any prior caches). SYNC.
+    #[napi]
+    pub fn init_caches(&self) -> Result<()> {
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::InitCaches { reply })
     }
 }
 

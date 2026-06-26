@@ -118,6 +118,27 @@ pub(crate) enum Qwen3Cmd {
         config: Option<GenerationConfig>,
         reply: ResponseTx<BatchGenerationResult>,
     },
+    /// Per-step UNCACHED forward → logits `[1, T, vocab]` (model dtype,
+    /// eval'd on the model thread). Does NOT touch the model-internal flat
+    /// KV cache (`cached_kv_*`). The uncached scoring primitive GenMLX's
+    /// LLM-as-GF synthesis rides on. (bean mlx-2h4l)
+    Forward {
+        input_ids: MxArray,
+        reply: ResponseTx<MxArray>,
+    },
+    /// Cached forward over `input_ids`, threading + advancing the
+    /// model-internal flat KV cache (`cached_kv_*`); returns LAST-position
+    /// logits `[1, 1, vocab]` (model dtype, eval'd). Requires `InitCaches`
+    /// first + the flat (non-paged) cache. (bean mlx-2h4l)
+    ForwardWithCache {
+        input_ids: MxArray,
+        use_cache: bool,
+        reply: ResponseTx<MxArray>,
+    },
+    /// Build fresh model-internal flat KV caches (idempotent). (bean mlx-2h4l)
+    InitCaches {
+        reply: ResponseTx<()>,
+    },
     /// Training-session commands, wrapping the model-neutral engine's
     /// [`TrainCmd`]. The thread loop routes these to
     /// [`crate::engine::cmd::handle_train_cmd`], which drives the
@@ -232,6 +253,19 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
             reply,
         } => {
             let _ = reply.send(inner.generate_batch_sync(prompts, group_size, config));
+        }
+        Qwen3Cmd::Forward { input_ids, reply } => {
+            let _ = reply.send(inner.forward_sync(&input_ids));
+        }
+        Qwen3Cmd::ForwardWithCache {
+            input_ids,
+            use_cache,
+            reply,
+        } => {
+            let _ = reply.send(inner.forward_with_cache_sync(&input_ids, use_cache));
+        }
+        Qwen3Cmd::InitCaches { reply } => {
+            let _ = reply.send(inner.init_caches_sync());
         }
         // --- Training commands ---
         Qwen3Cmd::Train(train_cmd) => {
@@ -448,6 +482,204 @@ impl Qwen3Inner {
             let _ = adapter.release_request();
         }
         Ok(())
+    }
+
+    // ----------------------------------------------------------------------
+    // Per-step forward surface (bean mlx-2h4l, Tier 1).
+    //
+    // The native logits primitive GenMLX's LLM-as-GF synthesis rides on. The
+    // cache is MODEL-INTERNAL (the flat `cached_kv_*` trio threaded through
+    // `Qwen3Model::forward_fused`) — matching GenMLX's native dispatch in
+    // `backend.cljs` (`.forward` / `.forwardWithCache` / `.initCaches` /
+    // `.resetCaches`), which passes no cache object and lets the model
+    // self-count its offset (`cached_cache_idx` doubles as the RoPE position).
+    // ----------------------------------------------------------------------
+
+    /// Build fresh model-internal flat KV caches for a `forwardWithCache`
+    /// run. Idempotent (re-init discards any prior caches). (bean mlx-2h4l)
+    pub(crate) fn init_caches_sync(&mut self) -> Result<()> {
+        let num_layers = self.layers.len();
+        self.cached_kv_keys = vec![None; num_layers];
+        self.cached_kv_values = vec![None; num_layers];
+        self.cached_cache_idx = 0;
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        Ok(())
+    }
+
+    /// Normalize a forward input id tensor to `[1, N]` (int), validating it is
+    /// rank-1 `[N]` or rank-2 `[1, N]` and non-empty.
+    fn normalize_forward_input(input_ids: &MxArray) -> Result<MxArray> {
+        let ndim = input_ids.ndim()?;
+        if ndim == 2 {
+            let b = input_ids.shape_at(0)?;
+            if b != 1 {
+                return Err(Error::from_reason(format!(
+                    "forward expects batch_size=1 (shape [1, N]); got batch_size={b}"
+                )));
+            }
+        } else if ndim != 1 {
+            return Err(Error::from_reason(format!(
+                "forward expects a rank-1 [N] or rank-2 [1, N] id tensor; got {ndim} dims"
+            )));
+        }
+        if input_ids.size()? == 0 {
+            return Err(Error::from_reason("forward: input_ids is empty"));
+        }
+        input_ids.reshape(&[1, -1])
+    }
+
+    /// Uncached full forward → logits `[1, T, vocab]` in model dtype, eval'd on
+    /// the model thread. Builds a fresh per-call KV cache internally and NEVER
+    /// touches the model-internal `cached_kv_*` state. (bean mlx-2h4l, Tier 1)
+    pub(crate) fn forward_sync(&mut self, input_ids: &MxArray) -> Result<MxArray> {
+        let input = Self::normalize_forward_input(input_ids)?;
+        let embedding_weight = self.embedding.get_weight();
+        let num_layers = self.layers.len();
+        // Fresh per-call cache — never touch the model-internal `cached_kv_*`.
+        let mut kv_keys: Vec<Option<MxArray>> = vec![None; num_layers];
+        let mut kv_values: Vec<Option<MxArray>> = vec![None; num_layers];
+        let mut cache_idx: i32 = 0;
+        let rope_offsets = MxArray::from_int32(&[0], &[1])?;
+        let left_padding = MxArray::from_int32(&[0], &[1])?;
+        let logits = {
+            let _ctx = StreamContext::new(Stream::new(DeviceType::Gpu));
+            Qwen3Model::forward_fused(
+                &input,
+                &embedding_weight,
+                &self.layers,
+                &self.final_norm,
+                &self.lm_head,
+                &self.config,
+                &mut kv_keys,
+                &mut kv_values,
+                &mut cache_idx,
+                &rope_offsets,
+                &left_padding,
+            )?
+        };
+        // Materialize on THIS (model) thread so the returned array is concrete:
+        // GenMLX composes index/softmax/sample on the JS thread and must never
+        // trigger a cross-thread eval of model-internal arrays (CUDA segfault).
+        logits.eval();
+        Ok(logits)
+    }
+
+    /// Cached forward over `input_ids`, threading + advancing the
+    /// model-internal flat KV cache (`cached_kv_*`). Returns LAST-position
+    /// logits `[1, 1, vocab]` (model dtype, eval'd). Requires
+    /// `init_caches_sync` first and the flat (non-paged) cache.
+    /// (bean mlx-2h4l, Tier 1; `use_cache` must be `true` in Tier 1.)
+    pub(crate) fn forward_with_cache_sync(
+        &mut self,
+        input_ids: &MxArray,
+        use_cache: bool,
+    ) -> Result<MxArray> {
+        if !use_cache {
+            return Err(Error::from_reason(
+                "forwardWithCache(use_cache=false) is not supported in Tier 1; \
+                 use forward() for an uncached pass",
+            ));
+        }
+        // NOTE (differs from Qwen35Model / Qwen35MoeModel): NO paged-adapter
+        // guard here. qwen3's forward primitive (`forward_fused`) drives the
+        // FLAT `cached_kv_*` trio, which is paged-INDEPENDENT — `generate_sync`
+        // uses it whether or not `paged_adapter` is Some (the adapter only backs
+        // chat-session prefix caching). So forwardWithCache on the flat trio is
+        // correct regardless of paging, and a default (paged-on) qwen3 load
+        // works. (The hybrid families guard because their `self.caches`
+        // FullAttention slots go vestigial under paging.)
+        let num_layers = self.layers.len();
+        if self.cached_kv_keys.len() != num_layers {
+            return Err(Error::from_reason(
+                "forwardWithCache: caches are not initialized — call initCaches() \
+                 before the first forwardWithCache",
+            ));
+        }
+        let input = Self::normalize_forward_input(input_ids)?;
+        let embedding_weight = self.embedding.get_weight();
+        let left_padding = MxArray::from_int32(&[0], &[1])?;
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let total_seq_len = input.shape_at(1)? as usize;
+
+        // Mirror `generate_sync`: a direct `forward_fused` for single-token
+        // decode steps, and a chunked prefill for the multi-token prompt
+        // (bounds peak memory with per-chunk KV evals + cache clears). The
+        // flat `cached_cache_idx` is the running token count AND the RoPE
+        // position offset for the next call, and `forward_fused` advances it,
+        // so each call seeds `rope_offsets = [cached_cache_idx]` beforehand.
+        const PREFILL_STEP_SIZE: usize = 2048;
+        let logits = if total_seq_len <= 1 {
+            let rope_offsets = MxArray::from_int32(&[self.cached_cache_idx], &[1])?;
+            let _ctx = StreamContext::new(generation_stream);
+            Qwen3Model::forward_fused(
+                &input,
+                &embedding_weight,
+                &self.layers,
+                &self.final_norm,
+                &self.lm_head,
+                &self.config,
+                &mut self.cached_kv_keys,
+                &mut self.cached_kv_values,
+                &mut self.cached_cache_idx,
+                &rope_offsets,
+                &left_padding,
+            )?
+        } else {
+            let mut offset = 0usize;
+            let mut last_chunk_logits: Option<MxArray> = None;
+            while offset < total_seq_len {
+                let chunk_end = (offset + PREFILL_STEP_SIZE).min(total_seq_len);
+                let chunk = input.slice(&[0, offset as i64], &[1, chunk_end as i64])?;
+                let rope_offsets = MxArray::from_int32(&[self.cached_cache_idx], &[1])?;
+                let chunk_logits = {
+                    let _ctx = StreamContext::new(generation_stream);
+                    Qwen3Model::forward_fused(
+                        &chunk,
+                        &embedding_weight,
+                        &self.layers,
+                        &self.final_norm,
+                        &self.lm_head,
+                        &self.config,
+                        &mut self.cached_kv_keys,
+                        &mut self.cached_kv_values,
+                        &mut self.cached_cache_idx,
+                        &rope_offsets,
+                        &left_padding,
+                    )?
+                };
+                // Per-chunk: materialize KV + flush so the lazy graph does not
+                // accumulate across a long prefill (mirrors `generate_sync`).
+                for kv_key in self.cached_kv_keys.iter().flatten() {
+                    kv_key.eval();
+                }
+                for kv_value in self.cached_kv_values.iter().flatten() {
+                    kv_value.eval();
+                }
+                synchronize_and_clear_cache();
+                last_chunk_logits = Some(chunk_logits);
+                offset = chunk_end;
+            }
+            // `total_seq_len > 1` guarantees at least one iteration.
+            last_chunk_logits.expect("multi-token prefill ran at least one chunk")
+        };
+
+        // Materialize the advanced caches on this thread so the next
+        // forwardWithCache reads concrete state. qwen3 has no
+        // `eval_layer_caches` helper — eval the flat KV arrays directly,
+        // exactly as `generate_sync` does between prefill chunks.
+        for kv_key in self.cached_kv_keys.iter().flatten() {
+            kv_key.eval();
+        }
+        for kv_value in self.cached_kv_values.iter().flatten() {
+            kv_value.eval();
+        }
+        // Return ONLY the last position as `[1, 1, vocab]` (NOT squeezed):
+        // GenMLX's forward-prefill / forward-step index `logits[0][0] -> [vocab]`.
+        let seq_len = logits.shape_at(1)?;
+        let last = logits.slice_axis(1, seq_len - 1, seq_len)?;
+        last.eval();
+        Ok(last)
     }
 
     /// Run a paged-attention prefill chunk over the layer stack.
@@ -3668,6 +3900,48 @@ impl Qwen3Model {
 
         // Delegate to tokenizer which handles both simple ChatML and Jinja2 with tools
         tokenizer.apply_chat_template(env, messages, add_generation_prompt, tools, enable_thinking)
+    }
+
+    // ------------------------------------------------------------------
+    // Per-step forward surface for GenMLX synthesis (bean mlx-2h4l, Tier 1).
+    // SYNC (send_and_block) — GenMLX composes the returned logits into a graph
+    // immediately (mx/index, log-softmax, categorical sample) with no `await`.
+    // ------------------------------------------------------------------
+
+    /// Per-step UNCACHED forward → logits `[1, T, vocab]` (model dtype). SYNC.
+    ///
+    /// The uncached scoring primitive GenMLX's LLM-as-GF rides on
+    /// (`backend.cljs` `forward-pass`). Builds a fresh per-call KV cache
+    /// internally; never touches the model's persistent flat caches.
+    #[napi]
+    pub fn forward(&self, input_ids: &MxArray) -> Result<MxArray> {
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen3Cmd::Forward {
+            input_ids: input_ids.clone(),
+            reply,
+        })
+    }
+
+    /// Cached forward over `input_ids`, advancing the model-internal flat KV
+    /// caches; returns LAST-position logits `[1, 1, vocab]` (model dtype). SYNC.
+    ///
+    /// GenMLX drives prefill (`[1, N]`) then per-token steps (`[1, 1]`) through
+    /// this (`backend.cljs` `forward-prefill` / `forward-step`), always with
+    /// `use_cache = true`. Call `initCaches()` before the first invocation and
+    /// `resetCaches()` after. Requires the flat (non-paged) cache.
+    #[napi]
+    pub fn forward_with_cache(&self, input_ids: &MxArray, use_cache: bool) -> Result<MxArray> {
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen3Cmd::ForwardWithCache {
+            input_ids: input_ids.clone(),
+            use_cache,
+            reply,
+        })
+    }
+
+    /// Build fresh model-internal flat KV caches for a `forwardWithCache`
+    /// run. Idempotent (re-init discards any prior caches). SYNC.
+    #[napi]
+    pub fn init_caches(&self) -> Result<()> {
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen3Cmd::InitCaches { reply })
     }
 }
 
