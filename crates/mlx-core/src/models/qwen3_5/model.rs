@@ -7652,7 +7652,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
                     // `snapshot_offset + accepted_steps` so the next forward
                     // overwrites the rejected drafts. No-op on full accept.
                     match &snap[idx] {
-                        super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { offset } => {
+                        super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { offset, .. } => {
                             let kv = cache.as_kv_cache_mut().ok_or_else(|| {
                                 Error::from_reason(format!(
                                     "eager MTP rollback: layer {idx} has a \
