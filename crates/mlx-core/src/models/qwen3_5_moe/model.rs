@@ -291,6 +291,14 @@ pub(crate) struct Qwen35MoeInner {
     /// `eos_token_ids` extends the tokenizer EOS with extra stop ids.
     /// Default (empty) when the checkpoint ships no `generation_config.json`.
     gen_defaults: crate::engine::ModelGenerationDefaults,
+    /// Tier-2 branchable caches (bean mlx-19wy). Each entry is an INDEPENDENT
+    /// per-layer cache vector for a forked branch, keyed by an opaque
+    /// monotonic id. Stored SEPARATELY from `self.caches` (the Tier-1
+    /// model-internal cache) so branching never perturbs the linear path.
+    branch_caches: HashMap<u32, Vec<Qwen3_5LayerCache>>,
+    /// Monotonic source of branch ids; never reused, so a disposed id cannot
+    /// alias a later branch.
+    next_branch_id: u32,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
@@ -334,6 +342,32 @@ pub(crate) enum Qwen35MoeCmd {
     /// [`crate::engine::cmd::handle_train_cmd`], which drives the
     /// [`TrainBackend`] impl on [`Qwen35MoeInner`].
     Train(TrainCmd),
+    /// Tier-2: fork a new branch from the model-internal cache or another
+    /// branch; reply with the new branch's opaque id. (bean mlx-19wy)
+    BranchCache {
+        source: BranchSource,
+        reply: ResponseTx<u32>,
+    },
+    /// Tier-2: cached forward over `input_ids` against branch `id`, advancing
+    /// THAT branch in place; reply with last-position logits `[1, 1, vocab]`.
+    /// (bean mlx-19wy)
+    ForwardBranch {
+        id: u32,
+        input_ids: MxArray,
+        reply: ResponseTx<MxArray>,
+    },
+    /// Tier-2: drop a branch, freeing its cache tensors (idempotent). (mlx-19wy)
+    DisposeBranch {
+        id: u32,
+        reply: ResponseTx<()>,
+    },
+}
+
+/// Source for a Tier-2 cache fork (bean mlx-19wy): the Tier-1 model-internal
+/// cache, or an existing branch by id.
+pub(crate) enum BranchSource {
+    Active,
+    Branch(u32),
 }
 
 impl FromChatCmd for Qwen35MoeCmd {
@@ -445,6 +479,19 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
         }
         Qwen35MoeCmd::InitCaches { reply } => {
             let _ = reply.send(inner.init_caches_sync());
+        }
+        Qwen35MoeCmd::BranchCache { source, reply } => {
+            let _ = reply.send(inner.branch_cache_sync(source));
+        }
+        Qwen35MoeCmd::ForwardBranch {
+            id,
+            input_ids,
+            reply,
+        } => {
+            let _ = reply.send(inner.forward_branch_sync(id, &input_ids));
+        }
+        Qwen35MoeCmd::DisposeBranch { id, reply } => {
+            let _ = reply.send(inner.dispose_branch_sync(id));
         }
         Qwen35MoeCmd::SaveModel { save_path, reply } => {
             let _ = reply.send(inner.save_model_sync(&save_path));
@@ -650,6 +697,8 @@ impl Qwen35MoeInner {
             training_state: None,
             turn_is_streaming: Cell::new(false),
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
+            branch_caches: HashMap::new(),
+            next_branch_id: 0,
         })
     }
 
@@ -819,6 +868,151 @@ impl Qwen35MoeInner {
         let last = logits.slice_axis(1, seq_len - 1, seq_len)?;
         last.eval();
         Ok(last)
+    }
+
+    // ----------------------------------------------------------------------
+    // Tier-2 branchable cache (bean mlx-19wy). A branch is an INDEPENDENT
+    // per-layer cache vector forked from a source (the Tier-1 `self.caches` or
+    // another branch). `branch_cache_sync` pays an O(prefix) deep copy ONCE;
+    // each `forward_branch_sync` advances that branch's caches in place
+    // (O(1)/step), exactly like Tier-1 `forward_with_cache_sync`. This is the
+    // substrate for GenMLX branching inference (regenerate / token-MCMC / SMC).
+    // ----------------------------------------------------------------------
+
+    /// Build a fresh, empty per-layer cache vector matching this model's
+    /// linear / full-attention layout (same as `init_caches_sync`).
+    fn fresh_layer_caches(&self) -> Vec<Qwen3_5LayerCache> {
+        (0..self.config.num_layers as usize)
+            .map(|i| {
+                if self.config.is_linear_layer(i) {
+                    Qwen3_5LayerCache::new_linear()
+                } else {
+                    Qwen3_5LayerCache::new_full_attention()
+                }
+            })
+            .collect()
+    }
+
+    /// Fork `source` into the `fresh` (empty) cache vector via an isolated
+    /// deep copy (`snapshot_fork_all` materializes K/V + GDN state before the
+    /// source can advance), returning the independent branch.
+    fn fork_layer_caches(
+        source: &[Qwen3_5LayerCache],
+        mut fresh: Vec<Qwen3_5LayerCache>,
+    ) -> Result<Vec<Qwen3_5LayerCache>> {
+        let snaps = super::layer_cache::snapshot_fork_all(source)?;
+        super::layer_cache::restore_all(&mut fresh, &snaps)?;
+        Ok(fresh)
+    }
+
+    /// Fork a new branch from the Tier-1 model-internal cache (`self.caches`)
+    /// or from an existing branch; returns the new branch's opaque id. The
+    /// fork is isolated — advancing the source afterwards does not affect it.
+    /// Requires the flat (non-paged) cache, same as Tier-1 `forwardWithCache`.
+    pub(crate) fn branch_cache_sync(&mut self, source: BranchSource) -> Result<u32> {
+        if self.paged_adapter.is_some() {
+            return Err(Error::from_reason(
+                "branchCache requires the flat cache, but the block-paged adapter is \
+                 active on this model; load with paging off (bean mlx-19wy)",
+            ));
+        }
+        let fresh = self.fresh_layer_caches();
+        let forked = match source {
+            BranchSource::Active => {
+                let src = self.caches.as_ref().ok_or_else(|| {
+                    Error::from_reason(
+                        "branchCache(active): model-internal caches are not initialized — \
+                         call initCaches() then forwardWithCache to build a prefix before \
+                         branching",
+                    )
+                })?;
+                Self::fork_layer_caches(src, fresh)?
+            }
+            BranchSource::Branch(parent) => {
+                let src = self.branch_caches.get(&parent).ok_or_else(|| {
+                    Error::from_reason(format!("branchCache: parent branch {parent} not found"))
+                })?;
+                Self::fork_layer_caches(src, fresh)?
+            }
+        };
+        let id = self.next_branch_id;
+        self.next_branch_id = self
+            .next_branch_id
+            .checked_add(1)
+            .ok_or_else(|| Error::from_reason("branchCache: branch id space exhausted"))?;
+        self.branch_caches.insert(id, forked);
+        Ok(id)
+    }
+
+    /// Cached forward over `input_ids` against branch `id`, advancing THAT
+    /// branch's cache in place; returns LAST-position logits `[1, 1, vocab]`
+    /// (model dtype, eval'd). O(1)/step like Tier-1 `forwardWithCache`.
+    pub(crate) fn forward_branch_sync(&mut self, id: u32, input_ids: &MxArray) -> Result<MxArray> {
+        let input = Self::normalize_forward_input(input_ids)?;
+        let embedding_weight = self.embedding.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let fa_idx = self.fa_idx;
+        // Move the branch's caches out so we can pass `&mut Option<Vec<..>>` to
+        // forward_inner/chunked_prefill (the same signature as `self.caches`);
+        // the advanced caches are put back below. Moving the Vec is cheap (it
+        // moves handles, not tensors).
+        let mut branch = Some(self.branch_caches.remove(&id).ok_or_else(|| {
+            Error::from_reason(format!("forwardBranch: branch {id} not found"))
+        })?);
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let forward_result = if input.shape_at(1)? <= 1 {
+            let _ctx = StreamContext::new(generation_stream);
+            forward_inner(
+                &input,
+                &embedding_weight,
+                &mut self.layers,
+                &mut branch,
+                &self.final_norm,
+                &self.lm_head,
+                fa_idx,
+                Some(&embedding_weight_t),
+            )
+        } else {
+            chunked_prefill(
+                &input,
+                &embedding_weight,
+                &mut self.layers,
+                &mut branch,
+                &self.final_norm,
+                &self.lm_head,
+                fa_idx,
+                Some(&embedding_weight_t),
+                generation_stream,
+            )
+        };
+        // Always put the branch back (even on error) so a failed forward does
+        // not silently drop a live branch.
+        let logits = match forward_result {
+            Ok(l) => l,
+            Err(e) => {
+                if let Some(b) = branch.take() {
+                    self.branch_caches.insert(id, b);
+                }
+                return Err(e);
+            }
+        };
+        // Materialize the advanced branch caches on this thread (concrete state
+        // for the next step; no unbounded lazy-graph growth), then restore.
+        let eval_result = eval_layer_caches(&branch);
+        if let Some(b) = branch.take() {
+            self.branch_caches.insert(id, b);
+        }
+        eval_result?;
+        let seq_len = logits.shape_at(1)?;
+        let last = logits.slice_axis(1, seq_len - 1, seq_len)?;
+        last.eval();
+        Ok(last)
+    }
+
+    /// Drop branch `id`, freeing its cache tensors. Idempotent (no-op if absent).
+    pub(crate) fn dispose_branch_sync(&mut self, id: u32) -> Result<()> {
+        self.branch_caches.remove(&id);
+        Ok(())
     }
 
     /// Clear cached token history, image key, and rope deltas.
@@ -7609,6 +7803,56 @@ impl Qwen3_5MoeModel {
     #[napi]
     pub fn init_caches(&self) -> Result<()> {
         crate::model_thread::send_and_block(&self.thread, |reply| Qwen35MoeCmd::InitCaches {
+            reply,
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // Tier-2 branchable cache surface for GenMLX branching inference
+    // (regenerate / token-MCMC / SMC) — bean mlx-19wy. SYNC (send_and_block).
+    // The opaque numeric branch id IS the handle; GenMLX holds it and passes
+    // it back to forwardBranch/disposeBranch. branch forks once (O(prefix));
+    // each forwardBranch step is O(1) in-place, like Tier-1 forwardWithCache.
+    // ------------------------------------------------------------------
+
+    /// Fork a branch from the model-internal cache (after `initCaches()` +
+    /// `forwardWithCache(prefix)`) into an INDEPENDENT branch; returns the
+    /// branch's opaque id. SYNC. (bean mlx-19wy)
+    #[napi]
+    pub fn branch_cache(&self) -> Result<u32> {
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35MoeCmd::BranchCache {
+            source: BranchSource::Active,
+            reply,
+        })
+    }
+
+    /// Fork a NEW branch from an existing branch `id` (sub-branch). SYNC.
+    /// (bean mlx-19wy)
+    #[napi]
+    pub fn branch_from(&self, id: u32) -> Result<u32> {
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35MoeCmd::BranchCache {
+            source: BranchSource::Branch(id),
+            reply,
+        })
+    }
+
+    /// Cached forward against branch `id`, advancing it in place; returns
+    /// last-position logits `[1, 1, vocab]` (model dtype). SYNC. (bean mlx-19wy)
+    #[napi]
+    pub fn forward_branch(&self, id: u32, input_ids: &MxArray) -> Result<MxArray> {
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35MoeCmd::ForwardBranch {
+            id,
+            input_ids: input_ids.clone(),
+            reply,
+        })
+    }
+
+    /// Drop branch `id`, freeing its cache tensors. Idempotent. SYNC.
+    /// (bean mlx-19wy)
+    #[napi]
+    pub fn dispose_branch(&self, id: u32) -> Result<()> {
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35MoeCmd::DisposeBranch {
+            id,
             reply,
         })
     }
