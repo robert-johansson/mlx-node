@@ -209,6 +209,10 @@ impl Qwen3_5LayerCache {
                 );
                 Ok(Qwen3_5LayerSnapshot::FullAttention {
                     offset: c.get_offset(),
+                    // Cheap rewind snapshot: no tensor copy, buffer shared with
+                    // the live cache. Use `snapshot_fork` for an isolated copy.
+                    keys: None,
+                    values: None,
                 })
             }
             Self::Linear(c) => {
@@ -225,6 +229,67 @@ impl Qwen3_5LayerCache {
                     recurrent_state,
                 })
             }
+        }
+    }
+
+    /// Capture an **isolated fork** restore point for branching inference.
+    ///
+    /// Unlike [`Self::snapshot`] (a cheap offset-only rewind on a single
+    /// timeline), this deep-copies the full-attention cache so the resulting
+    /// snapshot survives the parent advancing — the basis for Tier-2 branching
+    /// (GFI-regenerate / token-MCMC / SMC).
+    ///
+    /// * **FullAttention**: copies the valid `keys`/`values[0:offset]` region
+    ///   via `copy()` and **`eval()`s it immediately**, materializing the copy
+    ///   against the *current* buffer contents BEFORE the parent's next
+    ///   `update_and_fetch` writes into the shared pre-allocated buffer in
+    ///   place (`slice_assign_axis_inplace`). Without the eager `eval()` the
+    ///   lazy copy would observe the parent's later in-place write — silent
+    ///   cross-branch corruption.
+    /// * **Linear / GDN**: identical to [`Self::snapshot`] — the conv +
+    ///   recurrent state are already deep-copied there (fixed-size,
+    ///   replace-not-mutate), so a fork needs nothing extra.
+    ///
+    /// N branches may restore from one fork snapshot: each clones the immutable
+    /// snapshot handle (cheap) and grows into its own buffer on first write, so
+    /// the deep copy is paid once, not per branch.
+    ///
+    /// Same flat-path-only / paged-KV caveat as [`Self::snapshot`] applies.
+    pub(crate) fn snapshot_fork(&self) -> Result<Qwen3_5LayerSnapshot> {
+        match self {
+            Self::FullAttention(c) => {
+                let offset = c.get_offset();
+                debug_assert!(
+                    c.keys_ref().is_some() || offset > 0,
+                    "Qwen3_5LayerCache::snapshot_fork: FullAttention cache has empty K/V \
+                     buffer and offset=0 — likely the paged-KV path is active and this \
+                     fork would silently capture nothing. See the Paged-KV caveat."
+                );
+                // Deep-copy the valid [0:offset] region and materialize it NOW.
+                let keys = match c.keys_ref() {
+                    Some(k) if offset > 0 => {
+                        let copy = k.slice_axis(2, 0, offset as i64)?.copy()?;
+                        copy.eval();
+                        Some(copy)
+                    }
+                    _ => None,
+                };
+                let values = match c.values_ref() {
+                    Some(v) if offset > 0 => {
+                        let copy = v.slice_axis(2, 0, offset as i64)?.copy()?;
+                        copy.eval();
+                        Some(copy)
+                    }
+                    _ => None,
+                };
+                Ok(Qwen3_5LayerSnapshot::FullAttention {
+                    offset,
+                    keys,
+                    values,
+                })
+            }
+            // Linear snapshot already deep-copies — a fork needs nothing more.
+            Self::Linear(_) => self.snapshot(),
         }
     }
 
@@ -247,18 +312,49 @@ impl Qwen3_5LayerCache {
     #[allow(dead_code)] // Wired in by W6 speculative-decode loop.
     pub(crate) fn restore(&mut self, snap: &Qwen3_5LayerSnapshot) -> Result<()> {
         match (self, snap) {
-            (Self::FullAttention(c), Qwen3_5LayerSnapshot::FullAttention { offset }) => {
-                let snap_offset = *offset;
-                let cur_offset = c.get_offset();
-                if snap_offset > cur_offset {
-                    return Err(Error::from_reason(format!(
-                        "Qwen3_5LayerCache::restore: snapshot offset {snap_offset} \
-                         exceeds current cache offset {cur_offset}; KVCache::trim cannot \
-                         grow the cache via restore (would silently no-op)",
-                    )));
+            (
+                Self::FullAttention(c),
+                Qwen3_5LayerSnapshot::FullAttention {
+                    offset,
+                    keys,
+                    values,
+                },
+            ) => {
+                match (keys, values) {
+                    // Fork restore: install the independent deep-copied buffers.
+                    // The branch is fully isolated and restore may target any
+                    // offset (we replace the buffers wholesale rather than
+                    // rewinding in place). `clone()` is a cheap handle clone of
+                    // the immutable snapshot array; the cache grows into its own
+                    // buffer on its next write, leaving the snapshot intact for
+                    // other branches.
+                    (Some(k), Some(v)) => {
+                        c.set_keys(k.clone());
+                        c.set_values(v.clone());
+                        c.set_offset(*offset);
+                        Ok(())
+                    }
+                    // Rewind restore (cheap path): trim the shared buffer. Keep
+                    // the grow-guard so a stale snapshot from a longer-running
+                    // cache can't silently no-op against a shorter one.
+                    (None, None) => {
+                        let snap_offset = *offset;
+                        let cur_offset = c.get_offset();
+                        if snap_offset > cur_offset {
+                            return Err(Error::from_reason(format!(
+                                "Qwen3_5LayerCache::restore: snapshot offset {snap_offset} \
+                                 exceeds current cache offset {cur_offset}; KVCache::trim cannot \
+                                 grow the cache via restore (would silently no-op)",
+                            )));
+                        }
+                        c.trim(snap_offset);
+                        Ok(())
+                    }
+                    _ => Err(Error::from_reason(
+                        "Qwen3_5LayerCache::restore: FullAttention snapshot has exactly one of \
+                         keys/values set; expected both (fork) or neither (rewind)",
+                    )),
                 }
-                c.trim(snap_offset);
-                Ok(())
             }
             (
                 Self::Linear(c),
@@ -296,10 +392,25 @@ impl Qwen3_5LayerCache {
 /// restore (`rollback_after_verify` equivalent) if the verifier rejects.
 #[allow(dead_code)] // Wired in by W6 speculative-decode loop.
 pub(crate) enum Qwen3_5LayerSnapshot {
-    /// Logical token offset of the full-attention KV cache. The underlying
-    /// pre-allocated buffer is shared with the live cache and is rewound by
-    /// trimming the offset on restore — zero tensor copy.
-    FullAttention { offset: i32 },
+    /// Full-attention KV restore point, in one of two modes:
+    ///
+    /// * **Rewind (cheap)** — `keys`/`values` are `None`. Captures only the
+    ///   logical `offset`; the underlying pre-allocated buffer is shared with
+    ///   the live cache and rewound by trimming the offset on restore — zero
+    ///   tensor copy. Produced by [`Qwen3_5LayerCache::snapshot`]; used by the
+    ///   MTP / speculative-decode rollback, which rolls back on a single
+    ///   timeline.
+    /// * **Fork (isolated)** — `keys`/`values` hold an independent deep copy of
+    ///   the valid `[0:offset]` region (materialized via `copy()` + `eval()`
+    ///   before the parent advances). Restoring installs those buffers, so the
+    ///   branch is fully isolated from the parent's subsequent in-place KV
+    ///   writes. Produced by [`Qwen3_5LayerCache::snapshot_fork`]; this is the
+    ///   Tier-2 branching path (regenerate / token-MCMC / SMC).
+    FullAttention {
+        offset: i32,
+        keys: Option<MxArray>,
+        values: Option<MxArray>,
+    },
     /// Deep-cloned conv + recurrent state for a GatedDeltaNet layer.
     Linear {
         conv_state: Option<MxArray>,
@@ -311,6 +422,17 @@ pub(crate) enum Qwen3_5LayerSnapshot {
 #[allow(dead_code)] // Wired in by W6 speculative-decode loop.
 pub(crate) fn snapshot_all(caches: &[Qwen3_5LayerCache]) -> Result<Vec<Qwen3_5LayerSnapshot>> {
     caches.iter().map(|c| c.snapshot()).collect()
+}
+
+/// Capture an **isolated fork** of every layer's cache in one shot (Tier-2
+/// branching). Deep-copies the full-attention K/V so the fork survives the
+/// parent advancing; see [`Qwen3_5LayerCache::snapshot_fork`]. Restore with
+/// [`restore_all`] (it dispatches on the snapshot's fork-vs-rewind shape).
+#[allow(dead_code)] // Wired in by the Tier-2 CacheHandle (P1).
+pub(crate) fn snapshot_fork_all(
+    caches: &[Qwen3_5LayerCache],
+) -> Result<Vec<Qwen3_5LayerSnapshot>> {
+    caches.iter().map(|c| c.snapshot_fork()).collect()
 }
 
 /// Snapshot every layer for the eager-MTP rollback, paged-backend aware.
@@ -332,9 +454,13 @@ pub(crate) fn snapshot_all_mtp(
     caches
         .iter()
         .map(|c| match c {
-            Qwen3_5LayerCache::FullAttention(_) if paged => {
-                Ok(Qwen3_5LayerSnapshot::FullAttention { offset: 0 })
-            }
+            Qwen3_5LayerCache::FullAttention(_) if paged => Ok(
+                Qwen3_5LayerSnapshot::FullAttention {
+                    offset: 0,
+                    keys: None,
+                    values: None,
+                },
+            ),
             _ => c.snapshot(),
         })
         .collect()
@@ -452,7 +578,7 @@ mod tests {
         // Snapshot at offset=4, then write 3 more entries.
         let snap = cache.snapshot().expect("snapshot");
         match &snap {
-            Qwen3_5LayerSnapshot::FullAttention { offset } => assert_eq!(*offset, 4),
+            Qwen3_5LayerSnapshot::FullAttention { offset, .. } => assert_eq!(*offset, 4),
             _ => panic!("expected FullAttention snapshot"),
         }
 
@@ -483,6 +609,94 @@ mod tests {
         assert_eq!(kv.get_offset(), 6);
         assert_eq!(vec_of(&rk), vec![1.0, 2.0, 3.0, 4.0, 100.0, 200.0]);
         assert_eq!(vec_of(&rv), vec![10.0, 20.0, 30.0, 40.0, 1000.0, 2000.0]);
+    }
+
+    /// Tier-2 fork prove-or-kill (mechanism level): a `snapshot_fork` of the
+    /// full-attention cache must be a fully ISOLATED deep copy, so that
+    /// (a) it can be restored into a FRESH cache (the offset-only rewind
+    /// snapshot cannot — it would error on grow-via-restore), (b) the parent
+    /// OVERWRITING the captured region in place does not corrupt the branch
+    /// (the eager `eval()` contract), and (c) parent and branch diverge
+    /// independently.
+    #[test]
+    fn snapshot_fork_isolates_branch_from_parent_overwrite() {
+        // Prime a full-attention cache to offset=4 with recognizable data.
+        let mut parent = Qwen3_5LayerCache::new_full_attention();
+        {
+            let Qwen3_5LayerCache::FullAttention(kv) = &mut parent else {
+                unreachable!()
+            };
+            let k = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]).unwrap();
+            let v = MxArray::from_float32(&[10.0, 20.0, 30.0, 40.0], &[1, 1, 4, 1]).unwrap();
+            let (rk, _) = kv.update_and_fetch(&k, &v).unwrap();
+            if !try_eval_or_skip(&rk, "snapshot_fork_isolates::prime") {
+                return;
+            }
+            assert_eq!(kv.get_offset(), 4);
+        }
+
+        // Fork (deep copy + eager eval) at offset=4.
+        let snap = parent.snapshot_fork().expect("snapshot_fork");
+        match &snap {
+            Qwen3_5LayerSnapshot::FullAttention {
+                offset,
+                keys,
+                values,
+            } => {
+                assert_eq!(*offset, 4);
+                assert!(
+                    keys.is_some() && values.is_some(),
+                    "snapshot_fork must deep-copy K/V (got offset-only snapshot)",
+                );
+            }
+            _ => panic!("expected FullAttention fork snapshot"),
+        }
+
+        // Parent OVERWRITES the captured region in place: rewind to 0 and write
+        // 4 fresh values into indices [0:4]. A lazy (un-eval'd) fork copy would
+        // now observe this overwrite — the eager eval() in snapshot_fork must
+        // have already materialized the pre-overwrite data.
+        {
+            let Qwen3_5LayerCache::FullAttention(kv) = &mut parent else {
+                unreachable!()
+            };
+            kv.trim(0);
+            let k2 = MxArray::from_float32(&[91.0, 92.0, 93.0, 94.0], &[1, 1, 4, 1]).unwrap();
+            let v2 = MxArray::from_float32(&[910.0, 920.0, 930.0, 940.0], &[1, 1, 4, 1]).unwrap();
+            kv.update_and_fetch(&k2, &v2).unwrap();
+            assert_eq!(kv.get_offset(), 4);
+        }
+
+        // Restore the fork into a FRESH, independent cache. The offset-only
+        // rewind snapshot could not do this (snap offset 4 > fresh offset 0 →
+        // grow-via-restore error); the deep-copy fork installs the buffers.
+        let mut branch = Qwen3_5LayerCache::new_full_attention();
+        branch
+            .restore(&snap)
+            .expect("fork restore into a fresh cache must succeed");
+
+        // The branch must hold the ORIGINAL prefix [1,2,3,4], NOT the parent's
+        // overwrite [91,92,93,94] — proving isolation + the eager-eval contract.
+        // Continue with a divergent token to confirm it grows from the prefix.
+        let Qwen3_5LayerCache::FullAttention(bkv) = &mut branch else {
+            unreachable!()
+        };
+        assert_eq!(bkv.get_offset(), 4);
+        let k3 = MxArray::from_float32(&[7.0], &[1, 1, 1, 1]).unwrap();
+        let v3 = MxArray::from_float32(&[70.0], &[1, 1, 1, 1]).unwrap();
+        let (bk, bv) = bkv.update_and_fetch(&k3, &v3).unwrap();
+        assert_eq!(bkv.get_offset(), 5);
+        assert_eq!(vec_of(&bk), vec![1.0, 2.0, 3.0, 4.0, 7.0]);
+        assert_eq!(vec_of(&bv), vec![10.0, 20.0, 30.0, 40.0, 70.0]);
+
+        // And the parent kept its own divergent continuation, fully independent.
+        let Qwen3_5LayerCache::FullAttention(pkv) = &mut parent else {
+            unreachable!()
+        };
+        let k4 = MxArray::from_float32(&[5.0], &[1, 1, 1, 1]).unwrap();
+        let v4 = MxArray::from_float32(&[50.0], &[1, 1, 1, 1]).unwrap();
+        let (pk, _) = pkv.update_and_fetch(&k4, &v4).unwrap();
+        assert_eq!(vec_of(&pk), vec![91.0, 92.0, 93.0, 94.0, 5.0]);
     }
 
     #[test]
@@ -583,7 +797,11 @@ mod tests {
         // Construct snapshots directly (rather than via `snapshot()`) so we
         // don't trip the Paged-KV `debug_assert!` on empty FullAttention
         // caches — the assertion is irrelevant to variant-mismatch testing.
-        let full_snap = Qwen3_5LayerSnapshot::FullAttention { offset: 0 };
+        let full_snap = Qwen3_5LayerSnapshot::FullAttention {
+            offset: 0,
+            keys: None,
+            values: None,
+        };
         let mut linear = Qwen3_5LayerCache::new_linear();
         let err = linear
             .restore(&full_snap)
@@ -679,7 +897,7 @@ mod tests {
         let snaps = snapshot_all_mtp(&caches, true).expect("paged snapshot must not panic");
         assert_eq!(snaps.len(), 2);
         assert!(
-            matches!(snaps[0], Qwen3_5LayerSnapshot::FullAttention { offset: 0 }),
+            matches!(snaps[0], Qwen3_5LayerSnapshot::FullAttention { offset: 0, .. }),
             "paged FullAttention shell must snapshot as an offset-0 placeholder",
         );
         assert!(
@@ -777,7 +995,11 @@ mod tests {
         }
         assert_eq!(kv.get_offset(), 4);
 
-        let bogus_snap = Qwen3_5LayerSnapshot::FullAttention { offset: 10 };
+        let bogus_snap = Qwen3_5LayerSnapshot::FullAttention {
+            offset: 10,
+            keys: None,
+            values: None,
+        };
         let err = cache
             .restore(&bogus_snap)
             .expect_err("must reject snapshot offset > current offset");
