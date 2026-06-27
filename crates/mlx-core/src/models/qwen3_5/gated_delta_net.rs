@@ -549,8 +549,10 @@ impl GatedDeltaNet {
         self.dt_bias = w.clone();
     }
     pub fn set_a_log(&mut self, w: &MxArray) -> Result<()> {
-        // Cast A_log to model dtype (bf16) to avoid f32→bf16 promotion overhead.
-        // The precision difference is negligible for inference.
+        // Store A_log in model dtype (bf16). NOTE (mlx-ogvd): do NOT keep this f32 — the
+        // fused compute_g (mlx_gated_delta.cpp) is a *compiled* fn traced for bf16 inputs and
+        // ALREADY upcasts A_log to f32 internally (exp(-exp(A_log.f32)*softplus(...))), so an
+        // f32 a_log here breaks the compiled graph's dtype for negligible gain.
         self.a_log = w.astype(self.dt_bias.dtype()?)?;
         Ok(())
     }
