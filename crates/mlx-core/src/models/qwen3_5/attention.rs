@@ -187,7 +187,11 @@ impl Qwen3_5Attention {
         let queries = self.q_norm.forward(&queries)?;
         let keys = self.k_norm.forward(&keys)?;
 
-        // Apply RoPE: either M-RoPE (VLM) or standard scalar offset (text-only)
+        // RoPE: the M-RoPE (VLM) branch below does its own [B,T,H,D]->[B,H,T,D]->rotate dance.
+        // The text-only scalar RoPE must rotate on [B,H,T,D] (axis -2 = SEQUENCE), so it is
+        // DEFERRED to AFTER the transpose below — applying it here on [B,T,H,D] would rotate the
+        // HEADS axis and scramble positions. (mlx-cft4)
+        let use_mrope = position_ids.is_some() && self.mrope.is_some();
         let (queries, keys) = if let (Some(pos_ids), Some(mrope)) = (position_ids, &self.mrope) {
             // M-RoPE: compute cos/sin from 3D position IDs [3, B, T].
             // Qwen3.5-VL uses the INTERLEAVED (stride-3) per-frequency axis
@@ -208,10 +212,6 @@ impl Qwen3_5Attention {
             let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
             (q_out, k_out)
         } else {
-            // Standard scalar offset RoPE (text-only path, existing behavior)
-            let offset = cache.as_ref().map_or(0, |c| c.get_offset());
-            let queries = self.rope.forward(&queries, Some(offset))?;
-            let keys = self.rope.forward(&keys, Some(offset))?;
             (queries, keys)
         };
 
@@ -219,6 +219,18 @@ impl Qwen3_5Attention {
         let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
         let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
         let values = values.transpose(Some(&[0, 2, 1, 3]))?;
+
+        // Text-only scalar-offset RoPE, now on [B,H,T,D] (axis -2 = sequence) — matches the oracle
+        // which transposes THEN applies rotary. (mlx-cft4)
+        let (queries, keys) = if use_mrope {
+            (queries, keys)
+        } else {
+            let offset = cache.as_ref().map_or(0, |c| c.get_offset());
+            (
+                self.rope.forward(&queries, Some(offset))?,
+                self.rope.forward(&keys, Some(offset))?,
+            )
+        };
 
         // Update KV cache (expects [B, H, T, D])
         let (keys, values) = if let Some(c) = cache {
@@ -339,6 +351,9 @@ impl Qwen3_5Attention {
         // rotate -> [B,T,H,D]) so the rotation is bf16-bit-identical to flat;
         // the `None` (text-only) arm matches the flat path's scalar-offset
         // behaviour.
+        // M-RoPE rotates inside apply_to_qk; the text-only scalar RoPE must rotate on [B,H,T,D]
+        // (axis -2 = sequence), so DEFER it until after the transpose below. (mlx-cft4)
+        let use_mrope = position_ids.is_some() && self.mrope.is_some();
         let (queries, keys) = if let (Some(pos_ids), Some(mrope)) = (position_ids, &self.mrope) {
             // Qwen3.5-VL uses the INTERLEAVED (stride-3) per-frequency axis
             // selector, NOT PaddleOCR-VL's contiguous-chunk (sectioned) one.
@@ -356,16 +371,8 @@ impl Qwen3_5Attention {
             let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
             (q_out, k_out)
         } else {
-            // Scalar-offset RoPE. `rope_position_offset` decouples the
-            // rotation position from the physical KV slot: a turn that
-            // warm-continues an image prefill rotates at the compressed
-            // M-RoPE position (physical slot + a negative cross-turn delta)
-            // while K/V still writes at the physical slot below. Text turns
-            // pass `rope_position_offset == first_logical_position as i32`,
-            // so this stays byte-identical to the prior behaviour.
-            let rope_offset = rope_position_offset;
-            let queries = self.rope.forward(&queries, Some(rope_offset))?;
-            let keys = self.rope.forward(&keys, Some(rope_offset))?;
+            // Text-only scalar RoPE is DEFERRED to AFTER the transpose below (axis -2 =
+            // SEQUENCE), where it uses upstream's `rope_position_offset`. (mlx-cft4)
             (queries, keys)
         };
 
@@ -373,6 +380,19 @@ impl Qwen3_5Attention {
         let queries_bhtd = queries.transpose(Some(&[0, 2, 1, 3]))?;
         let keys_bhtd = keys.transpose(Some(&[0, 2, 1, 3]))?;
         let values_bhtd = values.transpose(Some(&[0, 2, 1, 3]))?;
+
+        // Text-only scalar-offset RoPE, now on [B,H,T,D] (axis -2 = sequence). Uses upstream's
+        // rope_position_offset (== first_logical_position for text turns; the compressed M-RoPE
+        // position for warm-continued image prefills). (mlx-cft4)
+        let (queries_bhtd, keys_bhtd) = if use_mrope {
+            (queries_bhtd, keys_bhtd)
+        } else {
+            let rope_offset = rope_position_offset;
+            (
+                self.rope.forward(&queries_bhtd, Some(rope_offset))?,
+                self.rope.forward(&keys_bhtd, Some(rope_offset))?,
+            )
+        };
 
         // Paged-pool layout: `[num_tokens, num_kv_heads, head_dim]`.
         // [B, H_kv, T, D] -> [B, T, H_kv, D] -> [B*T, H_kv, D].
