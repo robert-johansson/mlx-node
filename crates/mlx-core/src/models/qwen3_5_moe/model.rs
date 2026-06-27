@@ -361,6 +361,16 @@ pub(crate) enum Qwen35MoeCmd {
         id: u32,
         reply: ResponseTx<()>,
     },
+    /// flat-VLM-prefill: native-preprocess `images`, merge vision features into
+    /// inputs_embeds, and run the decoder over them advancing the flat
+    /// `self.caches`; reply with last-position logits `[1, 1, vocab]`. Requires the
+    /// flat (non-paged) cache. `tokens` = chat-rendered prompt with one
+    /// IMAGE_TOKEN_ID per image. (flat-VLM-prefill)
+    VlmPrefillFlat {
+        tokens: Vec<u32>,
+        images: Vec<Vec<u8>>,
+        reply: ResponseTx<MxArray>,
+    },
 }
 
 /// Source for a Tier-2 cache fork (bean mlx-19wy): the Tier-1 model-internal
@@ -492,6 +502,13 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
         }
         Qwen35MoeCmd::DisposeBranch { id, reply } => {
             let _ = reply.send(inner.dispose_branch_sync(id));
+        }
+        Qwen35MoeCmd::VlmPrefillFlat {
+            tokens,
+            images,
+            reply,
+        } => {
+            let _ = reply.send(inner.vlm_prefill_flat_sync(tokens, &images));
         }
         Qwen35MoeCmd::SaveModel { save_path, reply } => {
             let _ = reply.send(inner.save_model_sync(&save_path));
@@ -864,6 +881,105 @@ impl Qwen35MoeInner {
         eval_layer_caches(&self.caches)?;
         // Return ONLY the last position as `[1, 1, vocab]` (NOT squeezed): GenMLX's
         // forward-prefill / forward-step index `logits[0][0] -> [vocab]`.
+        let seq_len = logits.shape_at(1)?;
+        let last = logits.slice_axis(1, seq_len - 1, seq_len)?;
+        last.eval();
+        Ok(last)
+    }
+
+    /// Image-conditioned FLAT prefill (flat-VLM-prefill). Native-preprocesses the
+    /// raw image bytes (`process_many` → grid), expands the one IMAGE_TOKEN_ID per
+    /// image into its grid placeholder run, merges vision features into
+    /// `inputs_embeds` (`vlm_prepare_vision_features`), and runs the decoder over
+    /// them ADVANCING the flat model-internal caches (`self.caches`) — the SAME
+    /// caches `branch_cache_sync` forks. Returns LAST-position logits
+    /// `[1, 1, vocab]`. After this, `branchCache()`/`forwardBranch()` work
+    /// unchanged on an image-conditioned prefix. Requires the flat (non-paged)
+    /// cache; rebuilds `self.caches` internally (no `initCaches` needed first).
+    /// `tokens` = chat-rendered prompt containing one IMAGE_TOKEN_ID per image.
+    pub(crate) fn vlm_prefill_flat_sync(
+        &mut self,
+        tokens: Vec<u32>,
+        images: &[Vec<u8>],
+    ) -> Result<MxArray> {
+        if self.paged_adapter.is_some() {
+            return Err(Error::from_reason(
+                "vlmPrefillFlat requires the flat cache, but the block-paged adapter \
+                 is active; load with paging off (bean mlx-19wy / flat-VLM-prefill)",
+            ));
+        }
+        if tokens.is_empty() {
+            return Err(Error::from_reason("vlmPrefillFlat: empty prompt"));
+        }
+        let (vision_encoder, img_proc) =
+            match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
+                (Some(enc), Some(proc)) => (enc, proc),
+                _ => {
+                    return Err(Error::from_reason(
+                        "vlmPrefillFlat requested but vision encoder/processor not loaded",
+                    ));
+                }
+            };
+
+        // === VLM image processing: expand placeholders + merge features ===
+        // (mirrors vision_paged_turn_sync_core:1850-1878 but targets the FLAT cache)
+        let sms = self.spatial_merge_size.unwrap_or(2);
+        let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
+        let processed = img_proc.process_many(&image_refs)?;
+        let per_image_token_counts =
+            compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
+        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
+        let image_cache_key = compute_image_cache_key(images);
+
+        let embed = self.embedding.clone();
+        let embedding_weight = embed.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let input_ids =
+            MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
+        let _wired_ctx =
+            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
+
+        let merge = vlm_prepare_vision_features(
+            &input_ids,
+            image_cache_key,
+            &processed,
+            &vision_encoder,
+            sms,
+            &embedding_weight,
+            generation_stream,
+            &self.vision_cache,
+        )?;
+
+        // Fresh flat per-layer caches + reset reuse bookkeeping (mirror 1900-1905).
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        self.cached_rope_deltas = None;
+        self.flat_mtp_caches_desynced = false;
+        self.caches = Some(fresh_moe_layer_caches(&self.config));
+        let fa_idx = self.fa_idx;
+
+        // === FLAT PREFILL over the merged embeds (writes self.caches) ===
+        let logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            forward_inner_embeds(
+                &merge.inputs_embeds,
+                &merge.position_ids,
+                &embedding_weight,
+                &mut self.layers,
+                &mut self.caches,
+                &self.final_norm,
+                &self.lm_head,
+                fa_idx,
+                Some(&embedding_weight_t),
+            )?
+        };
+        // Materialize the advanced flat caches so branchCache/forwardWithCache read
+        // concrete state (mirror forward_with_cache_sync:864).
+        eval_layer_caches(&self.caches)?;
+        // Return ONLY the last position as `[1, 1, vocab]` (GenMLX unwraps [0][0]).
         let seq_len = logits.shape_at(1)?;
         let last = logits.slice_axis(1, seq_len - 1, seq_len)?;
         last.eval();
@@ -7856,6 +7972,28 @@ impl Qwen3_5MoeModel {
             reply,
         })
     }
+
+    /// Image-conditioned FLAT prefill (flat-VLM-prefill). `tokens` = chat-rendered
+    /// prompt with one IMAGE_TOKEN_ID per image; `images` = raw encoded bytes
+    /// (PNG/JPEG) per image. Native-preprocesses + merges vision features into
+    /// inputs_embeds and runs the decoder over them, advancing the flat
+    /// model-internal caches. Returns last-position logits `[1, 1, vocab]`. After
+    /// this, `branchCache()`/`forwardBranch()` work unchanged on the image-
+    /// conditioned prefix. Requires the flat (non-paged) cache. SYNC.
+    #[napi]
+    pub fn vlm_prefill_flat(
+        &self,
+        tokens: Uint32Array,
+        images: Vec<Uint8Array>,
+    ) -> Result<MxArray> {
+        let tokens: Vec<u32> = tokens.to_vec();
+        let images: Vec<Vec<u8>> = images.into_iter().map(|b| b.to_vec()).collect();
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35MoeCmd::VlmPrefillFlat {
+            tokens: tokens.clone(),
+            images: images.clone(),
+            reply,
+        })
+    }
 }
 
 crate::models::chat_napi::chat_napi_surface! {
@@ -8052,6 +8190,60 @@ fn forward_inner(
         };
         let cache = caches.as_mut().map(|c| &mut c[i]);
         h = layers[i].forward(&h, mask, cache, None, true)?;
+    }
+
+    let h = final_norm.forward(&h)?;
+    match lm_head {
+        Some(head) => head.forward(&h),
+        None => match embedding_weight_t {
+            Some(wt) => h.matmul(wt),
+            None => {
+                let wt = embedding_weight.transpose(Some(&[1, 0]))?;
+                h.matmul(&wt)
+            }
+        },
+    }
+}
+
+/// Flat VLM prefill forward: identical to `forward_inner` but consumes
+/// pre-merged `inputs_embeds` (vision features already scattered into the text
+/// embeddings by `vlm_prepare_vision_features`) instead of `input_ids`, and
+/// threads M-RoPE `position_ids` to the full-attention layers. Writes the flat
+/// per-layer `caches` so that, after this runs, `branch_cache_sync` /
+/// `forward_branch_sync` fork/advance an image-conditioned prefix with ZERO
+/// changes. Linear/GDN layers ignore mask+positions (matches the paged VLM
+/// prefill). (flat-VLM-prefill)
+#[allow(clippy::too_many_arguments)]
+fn forward_inner_embeds(
+    inputs_embeds: &MxArray,
+    position_ids: &MxArray,
+    embedding_weight: &MxArray,
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    _fa_idx: usize,
+    embedding_weight_t: Option<&MxArray>,
+) -> Result<MxArray> {
+    let mut h = inputs_embeds.clone();
+
+    // Full-attention layers: mask = None so the FUSED CAUSAL KERNEL
+    // (scaled_dot_product_attention_causal) handles masking internally for the
+    // multi-token prefill — exactly mirroring the paged VLM prefill, and crucially
+    // avoiding the explicit O(N^2) mask, which the text path only ever exercises at
+    // <= PREFILL_STEP_SIZE (2048) chunks. A VLM image expands to many thousands of
+    // vision tokens in ONE shot, where the explicit mask is an untested regime.
+    // M-RoPE positions are threaded via `pos` (3-row [3,1,T]); Linear/GDN layers
+    // ignore both mask and positions.
+    let num_layers = layers.len();
+    for i in 0..num_layers {
+        let pos = if layers[i].is_linear() {
+            None
+        } else {
+            Some(position_ids)
+        };
+        let cache = caches.as_mut().map(|c| &mut c[i]);
+        h = layers[i].forward(&h, None, cache, pos, true)?;
     }
 
     let h = final_norm.forward(&h)?;
