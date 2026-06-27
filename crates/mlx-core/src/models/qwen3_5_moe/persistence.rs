@@ -578,13 +578,16 @@ fn apply_weights_moe_inner(
                         try_build_ql(params, &format!("{}.linear_attn.in_proj_qkvz", prefix))
                     {
                         gdn.set_quantized_in_proj_qkvz(ql);
-                        // Fused qkvz is per-key-head interleaved (qwen3_next) -> de-interleave in forward.
-                        gdn.set_fused_qkvz_layout(true);
+                        // mlx-cft4: qwen3_5_moe ships SEPARATE in_proj_qkv/z (0 native fused) which the
+                        // loader merges into a CONTIGUOUS [q_all|k_all|v_all|z_all] tensor — NOT the
+                        // qwen3_next per-key-head interleaved layout. De-interleaving it scrambles q/k/v/z.
+                        gdn.set_fused_qkvz_layout(false);
                     } else if let Some(w) =
                         params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
                     {
                         gdn.set_in_proj_qkvz_weight(w)?;
-                        gdn.set_fused_qkvz_layout(true);
+                        // mlx-cft4: merged-contiguous qkvz (not interleaved) -> do NOT de-interleave.
+                        gdn.set_fused_qkvz_layout(false);
                     }
 
                     if let Some(ql) =
@@ -611,8 +614,8 @@ fn apply_weights_moe_inner(
                         params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
                     {
                         gdn.set_in_proj_qkvz_weight(w)?;
-                        // Direct fused qkvz (interleaved) -> de-interleave in forward.
-                        gdn.set_fused_qkvz_layout(true);
+                        // mlx-cft4: qwen3_5_moe merged-contiguous qkvz (not interleaved) -> do NOT de-interleave.
+                        gdn.set_fused_qkvz_layout(false);
                     }
                     if let Some(w) =
                         params.get(&format!("{}.linear_attn.in_proj_qkv.weight", prefix))
