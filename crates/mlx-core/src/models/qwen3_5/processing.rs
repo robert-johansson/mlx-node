@@ -14,8 +14,12 @@ use napi::bindgen_prelude::*;
 /// Qwen3.5-VL image processor configuration
 fn qwen35_vl_processor_config() -> ImageProcessorConfig {
     ImageProcessorConfig {
-        min_pixels: 147384,
-        max_pixels: 2822400,
+        // From the checkpoint's preprocessor_config.json (size.shortest_edge /
+        // size.longest_edge). Were hardcoded to 147384 / 2822400, which downscaled
+        // images to a too-low resolution (~2664 vs the reference ~7440 vision
+        // tokens). bean mlx-insk.
+        min_pixels: 65536,
+        max_pixels: 16777216,
         patch_size: 16,
         temporal_patch_size: 2, // Qwen3.5-VL uses temporal_patch_size=2
         merge_size: 2,

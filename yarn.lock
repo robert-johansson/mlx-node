@@ -204,6 +204,12 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@genmlx/core@workspace:packages/genmlx-core":
+  version: 0.0.0-use.local
+  resolution: "@genmlx/core@workspace:packages/genmlx-core"
+  languageName: unknown
+  linkType: soft
+
 "@huggingface/blake3-jit@npm:0.0.2":
   version: 0.0.2
   resolution: "@huggingface/blake3-jit@npm:0.0.2"

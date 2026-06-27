@@ -29,11 +29,14 @@ impl PatchEmbedding {
     /// * `in_channels` - Number of input channels (3 for RGB)
     /// * `embed_dim` - Embedding dimension
     /// * `weight` - Convolution weights [embed_dim, patch_size, patch_size, in_channels]
-    pub fn new(patch_size: u32, weight: &MxArray) -> Result<Self> {
+    /// * `bias` - Optional convolution bias [embed_dim]. Qwen3-VL's patch-embed
+    ///   `nn.Conv3d(..., bias=True)` HAS a bias; dropping it shifts every patch
+    ///   embedding by a per-channel constant -> garbage features (bean mlx-insk).
+    pub fn new(patch_size: u32, weight: &MxArray, bias: Option<&MxArray>) -> Result<Self> {
         // Create conv layer with stride = kernel_size = patch_size
         let conv = Conv2d::new(
             weight,
-            None,
+            bias,
             Some(vec![patch_size, patch_size]), // stride
             Some(vec![0, 0]),                   // padding
             None,                               // dilation
@@ -75,6 +78,11 @@ impl PatchEmbedding {
     /// Get the convolution weight
     pub fn weight(&self) -> MxArray {
         self.patch_conv.weight()
+    }
+
+    /// Get the convolution bias if present
+    pub fn bias(&self) -> Option<MxArray> {
+        self.patch_conv.bias()
     }
 }
 
@@ -181,7 +189,7 @@ mod tests {
         )
         .unwrap();
 
-        let patch_embed = PatchEmbedding::new(patch_size, &weight).unwrap();
+        let patch_embed = PatchEmbedding::new(patch_size, &weight, None).unwrap();
 
         // Input: [1, 8, 8, 3] -> [1, 4, 16] (2x2 patches, 16 dim)
         let input_data: Vec<f32> = (0..(8 * 8 * 3) as usize)

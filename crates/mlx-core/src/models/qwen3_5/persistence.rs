@@ -2014,18 +2014,39 @@ pub(crate) fn load_vision_weights(
     // 5D Conv3d [out, kD, kH, kW, in] formats. For Conv3d, extract
     // temporal slice 0 for our Conv2d PatchEmbedding.
     if let Some(pe_weight) = get_opt("patch_embed.proj.weight") {
+        // The Conv3d/Conv2d patch-embed HAS a per-channel bias (`bias=True` in
+        // Python). It is per-output-channel (NOT temporal), so it is loaded
+        // as-is and applied once after the im2col matmul. Dropping it shifted
+        // every patch embedding by a per-channel constant -> garbage features
+        // (bean mlx-insk; localized via the patch_embed stage dump: pure
+        // per-channel offset, ||bias||~11 at the small-image scale).
+        let pe_bias = get_opt("patch_embed.proj.bias");
         let ndim = pe_weight.ndim()?;
         if ndim == 5 {
-            // Conv3d [out, kD, kH, kW, in] → take slice [:, 0, :, :, :]
+            // Conv3d [out, kD=temporal, kH, kW, in]. For IMAGES the frame is
+            // duplicated across the temporal axis (temporal_patch_size=2), so the
+            // Conv3d over the duplicated input [f, f] equals (W[:,0]+W[:,1]) · f.
+            // SUM the temporal slices into the equivalent Conv2d weight. (Previously
+            // this took only temporal slice 0 (`W[:,0]`), silently dropping `W[:,1]`
+            // -> wrong-but-finite patch embeddings on EVERY platform; the network was
+            // trained with both temporal slices mixed. bean mlx-insk.)
             let out_c = pe_weight.shape_at(0)?;
+            let kd = pe_weight.shape_at(1)?;
             let kh = pe_weight.shape_at(2)?;
             let kw = pe_weight.shape_at(3)?;
             let in_c = pe_weight.shape_at(4)?;
-            let slice0 = pe_weight.slice(&[0, 0, 0, 0, 0], &[out_c, 1, kh, kw, in_c])?;
-            let conv2d_weight = slice0.squeeze(Some(&[1]))?;
-            encoder.set_patch_embed(&conv2d_weight)?;
+            let mut conv2d_weight = pe_weight
+                .slice(&[0, 0, 0, 0, 0], &[out_c, 1, kh, kw, in_c])?
+                .squeeze(Some(&[1]))?;
+            for t in 1..kd {
+                let wt = pe_weight
+                    .slice(&[0, t, 0, 0, 0], &[out_c, t + 1, kh, kw, in_c])?
+                    .squeeze(Some(&[1]))?;
+                conv2d_weight = conv2d_weight.add(&wt)?;
+            }
+            encoder.set_patch_embed(&conv2d_weight, pe_bias)?;
         } else {
-            encoder.set_patch_embed(pe_weight)?;
+            encoder.set_patch_embed(pe_weight, pe_bias)?;
         }
     }
 

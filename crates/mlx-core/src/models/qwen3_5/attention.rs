@@ -7,7 +7,7 @@ use crate::array::mask::create_causal_mask;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
-use crate::models::paddleocr_vl::language::{MultimodalRoPE, apply_multimodal_rotary_pos_emb};
+use crate::models::paddleocr_vl::language::MultimodalRoPE;
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
@@ -185,24 +185,11 @@ impl Qwen3_5Attention {
         let queries = self.q_norm.forward(&queries)?;
         let keys = self.k_norm.forward(&keys)?;
 
-        // Apply RoPE: either M-RoPE (VLM) or standard scalar offset (text-only)
+        // Apply RoPE: either M-RoPE (VLM) or standard scalar offset (text-only).
+        // apply_to_qk handles BOTH mRoPE layouts internally (interleaved Qwen3.5 vs
+        // chunked PaddleOCR) and the [B,T,H,D]->[B,H,T,D]->rotate->[B,T,H,D] dance.
         let (queries, keys) = if let (Some(pos_ids), Some(mrope)) = (position_ids, &self.mrope) {
-            // M-RoPE: compute cos/sin from 3D position IDs [3, B, T]
-            let (cos, sin) = mrope.forward(&queries, pos_ids)?;
-            // Transpose to [B, H, T, D] for apply_multimodal_rotary_pos_emb
-            let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
-            let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
-            let (q_out, k_out) = apply_multimodal_rotary_pos_emb(
-                &q_t,
-                &k_t,
-                &cos,
-                &sin,
-                mrope.mrope_section_arr().to_vec(),
-            )?;
-            // Transpose back to [B, T, H, D]
-            let q_out = q_out.transpose(Some(&[0, 2, 1, 3]))?;
-            let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
-            (q_out, k_out)
+            mrope.apply_to_qk(&queries, &keys, pos_ids)?
         } else {
             // Standard scalar offset RoPE (text-only path, existing behavior)
             let offset = cache.as_ref().map_or(0, |c| c.get_offset());
@@ -335,19 +322,8 @@ impl Qwen3_5Attention {
         // the `None` (text-only) arm matches the flat path's scalar-offset
         // behaviour.
         let (queries, keys) = if let (Some(pos_ids), Some(mrope)) = (position_ids, &self.mrope) {
-            let (cos, sin) = mrope.forward(&queries, pos_ids)?;
-            let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
-            let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
-            let (q_out, k_out) = apply_multimodal_rotary_pos_emb(
-                &q_t,
-                &k_t,
-                &cos,
-                &sin,
-                mrope.mrope_section_arr().to_vec(),
-            )?;
-            let q_out = q_out.transpose(Some(&[0, 2, 1, 3]))?;
-            let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
-            (q_out, k_out)
+            // Handles both interleaved (Qwen3.5) and chunked (PaddleOCR) layouts.
+            mrope.apply_to_qk(&queries, &keys, pos_ids)?
         } else {
             let rope_offset = first_logical_position as i32;
             let queries = self.rope.forward(&queries, Some(rope_offset))?;
@@ -624,6 +600,7 @@ impl Qwen3_5Attention {
             max_position_embeddings,
             Some(rope_theta),
             mrope_section,
+            true, // Qwen3.5-VL uses the INTERLEAVED mRoPE layout (mrope_interleaved=True)
         )?);
         Ok(())
     }

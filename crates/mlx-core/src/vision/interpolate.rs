@@ -63,23 +63,22 @@ fn bilinear_interpolate_gpu(
     shape: &[i64],
 ) -> Result<MxArray> {
     // Compute source coordinates for each output position
-    // Using align_corners=false style: (i + 0.5) * h_in / new_height - 0.5
+    // Using align_corners=true style: i * (h_in - 1) / (new_height - 1)
 
     // Create output coordinate grids
     let y_out = MxArray::arange(0.0, new_height as f64, Some(1.0), Some(DType::Float32))?; // [new_h]
     let x_out = MxArray::arange(0.0, new_width as f64, Some(1.0), Some(DType::Float32))?; // [new_w]
 
-    // Compute source coordinates using align_corners=false formula
-    // y_src = (y_out + 0.5) * h_in / new_height - 0.5
-    let y_src = y_out
-        .add_scalar(0.5)?
-        .mul_scalar(h_in as f64 / new_height as f64)?
-        .sub_scalar(0.5)?; // [new_h]
+    // Compute source coordinates using align_corners=TRUE formula:
+    //   y_src = y_out * (h_in - 1) / (new_height - 1)
+    // Matches Python fast_pos_embed_interpolate's linspace(0, h_in-1, new_h)
+    // pos-embed grid sampling (vision.py:309-310). The Rust port previously used
+    // align_corners=false, perturbing every interpolated pos embed -> divergent
+    // pos_added stage (bean mlx-insk). (.max(1) guards new_dim==1 against
+    // divide-by-zero -> maps every output coord to source 0, correct here.)
+    let y_src = y_out.mul_scalar((h_in - 1) as f64 / ((new_height - 1).max(1)) as f64)?; // [new_h]
 
-    let x_src = x_out
-        .add_scalar(0.5)?
-        .mul_scalar(w_in as f64 / new_width as f64)?
-        .sub_scalar(0.5)?; // [new_w]
+    let x_src = x_out.mul_scalar((w_in - 1) as f64 / ((new_width - 1).max(1)) as f64)?; // [new_w]
 
     // Compute floor indices (unclamped for now)
     let y0_f_raw = y_src.floor()?; // [new_h]
@@ -225,9 +224,9 @@ fn bilinear_interpolate_cpu(image: &MxArray, new_height: i64, new_width: i64) ->
     let row_positions: Vec<f32> = if new_height == 1 {
         vec![0.0f32]
     } else {
-        // align_corners=false style: (i + 0.5) * h_in / new_height - 0.5
+        // align_corners=true style: i * (h_in - 1) / (new_height - 1)
         (0..new_height)
-            .map(|i| (i as f32 + 0.5) * h_in as f32 / new_height as f32 - 0.5)
+            .map(|i| i as f32 * (h_in - 1) as f32 / (new_height - 1) as f32)
             .collect()
     };
 
@@ -235,7 +234,7 @@ fn bilinear_interpolate_cpu(image: &MxArray, new_height: i64, new_width: i64) ->
         vec![0.0f32]
     } else {
         (0..new_width)
-            .map(|i| (i as f32 + 0.5) * w_in as f32 / new_width as f32 - 0.5)
+            .map(|i| i as f32 * (w_in - 1) as f32 / (new_width - 1) as f32)
             .collect()
     };
 

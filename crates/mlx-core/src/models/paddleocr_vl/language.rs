@@ -28,6 +28,17 @@ pub struct MultimodalRoPE {
     inv_freq_dim: i64,
     /// Attention scaling factor
     attention_scaling: f32,
+    /// Frequency-layout style. PaddleOCR/GLM4V use the CHUNKED/sectioned layout
+    /// (contiguous head_dim blocks per axis, applied at Q/K time). Qwen3.5-VL uses
+    /// the INTERLEAVED layout (`mrope_interleaved=True`): each frequency slot i
+    /// picks its position axis by an interleaved selector (≈ i%3), the cos/sin are
+    /// combined into a single per-token table in `forward_interleaved`, then applied
+    /// with the standard half-split `rotate_half`. Text never exercises this (its 3
+    /// axes are equal), so the two layouts were indistinguishable until VLM. bean mlx-insk.
+    interleaved: bool,
+    /// Interleaved per-frequency axis selector [half_dim] (int32, values in {0,1,2}).
+    /// Only built when `interleaved`; None for the chunked path.
+    selector: Option<Arc<MxArray>>,
 }
 
 impl MultimodalRoPE {
@@ -43,6 +54,7 @@ impl MultimodalRoPE {
         _max_position_embeddings: i32,
         base: Option<f64>,
         mrope_section: Vec<i32>,
+        interleaved: bool,
     ) -> Result<Self> {
         let base = base.unwrap_or(500000.0) as f32;
 
@@ -80,11 +92,35 @@ impl MultimodalRoPE {
         // Already float32, so no astype needed.
         let inv_freq = MxArray::from_float32(&inv_freq_data, &[1, 1, inv_freq_dim, 1])?;
 
+        // Interleaved layout: precompute the per-frequency axis selector [half_dim].
+        // Mirrors Python rope_utils._interleaved_position_selector(mrope_section, freq_dim):
+        //   selector = [0; freq_dim]                       (axis 0 = temporal default)
+        //   for (axis, offset) in [(1,1),(2,2)]:
+        //       for idx in (offset..min(section[axis]*3, freq_dim)).step_by(3): selector[idx]=axis
+        // For section [11,11,10], freq_dim 32 this is exactly i%3 (t,h,w,t,h,w,...).
+        let selector = if interleaved {
+            let n = half_dim as usize;
+            let mut sel = vec![0i32; n];
+            for (axis, offset) in [(1usize, 1usize), (2usize, 2usize)] {
+                let limit = std::cmp::min((mrope_section_arr[axis] * 3) as usize, n);
+                let mut idx = offset;
+                while idx < limit {
+                    sel[idx] = axis as i32;
+                    idx += 3;
+                }
+            }
+            Some(Arc::new(MxArray::from_int32(&sel, &[inv_freq_dim])?))
+        } else {
+            None
+        };
+
         Ok(Self {
             mrope_section: mrope_section_arr,
             inv_freq: Arc::new(inv_freq),
             inv_freq_dim,
             attention_scaling: 1.0,
+            interleaved,
+            selector,
         })
     }
 
@@ -146,6 +182,88 @@ impl MultimodalRoPE {
         };
 
         Ok((cos, sin))
+    }
+
+    /// Whether this RoPE uses the interleaved (Qwen3.5-VL) frequency layout.
+    pub fn is_interleaved(&self) -> bool {
+        self.interleaved
+    }
+
+    /// INTERLEAVED M-RoPE cos/sin from 3D position IDs.
+    ///
+    /// Mirrors Python `MRoPERotaryEmbedding.__call__` (style="interleaved"):
+    ///   selected = take(position_ids, selector, axis=0).transpose(1,2,0)  -> [B, T, half]
+    ///   freqs    = selected * inv_freq                                    -> [B, T, half]
+    ///   emb      = concat([freqs, freqs], -1)                             -> [B, T, dim]
+    ///   cos, sin = cos(emb), sin(emb)
+    /// The per-frequency axis selection happens HERE (not at apply time), so the
+    /// returned cos/sin are already combined per token; apply uses standard rotate_half.
+    pub fn forward_interleaved(
+        &self,
+        x: &MxArray,
+        position_ids: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        let target_dtype = x.dtype()?;
+        let selector = self
+            .selector
+            .as_ref()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "interleaved selector not built"))?;
+
+        // position_ids: [3, B, T] -> select axis per frequency -> [half, B, T] -> [B, T, half]
+        let selected = position_ids.take(&**selector, 0)?;
+        let selected = selected.transpose(Some(&[1, 2, 0]))?;
+        let selected = selected.astype(crate::array::DType::Float32)?;
+
+        // inv_freq stored as [1,1,half,1]; reshape to [half] to multiply [B,T,half]
+        let inv_freq_1d = self.inv_freq.reshape(&[self.inv_freq_dim])?;
+        let freqs = selected.mul(&inv_freq_1d)?; // [B, T, half]
+
+        let emb = MxArray::concatenate_many(vec![&freqs, &freqs], Some(-1))?; // [B, T, dim]
+
+        let (cos, sin) = if (self.attention_scaling - 1.0).abs() < 1e-8 {
+            (emb.cos()?, emb.sin()?)
+        } else {
+            (
+                emb.cos()?.mul_scalar(self.attention_scaling as f64)?,
+                emb.sin()?.mul_scalar(self.attention_scaling as f64)?,
+            )
+        };
+        let cos = if target_dtype == crate::array::DType::Float32 {
+            cos
+        } else {
+            cos.astype(target_dtype)?
+        };
+        let sin = if target_dtype == crate::array::DType::Float32 {
+            sin
+        } else {
+            sin.astype(target_dtype)?
+        };
+        Ok((cos, sin)) // each [B, T, dim]
+    }
+
+    /// Apply M-RoPE to queries/keys given the `[B, T, H, head_dim]` layout, returning
+    /// the rotated tensors in the SAME layout. Branches on the frequency layout style
+    /// (interleaved Qwen3.5 vs chunked/sectioned PaddleOCR). Centralises the transpose
+    /// dance so both attention call sites stay identical.
+    pub fn apply_to_qk(
+        &self,
+        queries: &MxArray,
+        keys: &MxArray,
+        position_ids: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?; // [B, H, T, D]
+        let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
+        let (q_out, k_out) = if self.interleaved {
+            let (cos, sin) = self.forward_interleaved(queries, position_ids)?;
+            apply_interleaved_rotary_pos_emb(&q_t, &k_t, &cos, &sin)?
+        } else {
+            let (cos, sin) = self.forward(queries, position_ids)?;
+            apply_multimodal_rotary_pos_emb(&q_t, &k_t, &cos, &sin, self.mrope_section.to_vec())?
+        };
+        Ok((
+            q_out.transpose(Some(&[0, 2, 1, 3]))?,
+            k_out.transpose(Some(&[0, 2, 1, 3]))?,
+        ))
     }
 
     /// Get raw inv_freq pointer for C++ forward pass
@@ -286,6 +404,54 @@ pub fn apply_multimodal_rotary_pos_emb(
     };
 
     Ok((q_out, k_out))
+}
+
+/// Apply INTERLEAVED M-RoPE (Qwen3.5-VL `mrope_interleaved=True`) to Q and K.
+///
+/// `cos`/`sin` are the COMBINED per-token tables `[B, T, rotary_dim]` produced by
+/// `MultimodalRoPE::forward_interleaved` (the per-frequency axis selection already
+/// happened there). This applies the standard half-split rotation to the first
+/// `rotary_dim` channels and passes the remainder through unchanged (partial rotary:
+/// head_dim 256, rotary_dim 64). Mirrors Python
+/// `rope_utils._apply_interleaved_rotary_pos_emb_axis1`. bean mlx-insk.
+pub fn apply_interleaved_rotary_pos_emb(
+    q: &MxArray,
+    k: &MxArray,
+    cos: &MxArray,
+    sin: &MxArray,
+) -> Result<(MxArray, MxArray)> {
+    // q,k: [B, H, T, head_dim]; cos,sin: [B, T, rotary_dim]
+    let cos_shape = cos.shape()?;
+    let batch = cos_shape[0];
+    let seq = cos_shape[1];
+    let rotary_dim = cos_shape[2];
+
+    // Expand to [B, 1, T, rotary_dim] to broadcast across heads.
+    let cos = cos.reshape(&[batch, 1, seq, rotary_dim])?;
+    let sin = sin.reshape(&[batch, 1, seq, rotary_dim])?;
+
+    let q_dim = q.shape_at(3)?;
+    let q_ndim = 4usize;
+
+    let q_rot = q.slice_axis(3, 0, rotary_dim)?;
+    let k_rot = k.slice_axis(3, 0, rotary_dim)?;
+
+    let q_rotated = rotate_half(&q_rot, q_ndim, rotary_dim)?;
+    let k_rotated = rotate_half(&k_rot, q_ndim, rotary_dim)?;
+
+    let q_embed = q_rot.mul(&cos)?.add(&q_rotated.mul(&sin)?)?;
+    let k_embed = k_rot.mul(&cos)?.add(&k_rotated.mul(&sin)?)?;
+
+    if rotary_dim < q_dim {
+        let q_pass = q.slice_axis(3, rotary_dim, q_dim)?;
+        let k_pass = k.slice_axis(3, rotary_dim, q_dim)?;
+        Ok((
+            MxArray::concatenate_many(vec![&q_embed, &q_pass], Some(-1))?,
+            MxArray::concatenate_many(vec![&k_embed, &k_pass], Some(-1))?,
+        ))
+    } else {
+        Ok((q_embed, k_embed))
+    }
 }
 
 /// PaddleOCR Attention with mRoPE (internal)
@@ -438,6 +604,7 @@ impl ERNIELanguageModel {
             config.max_position_embeddings,
             Some(config.rope_theta),
             config.mrope_section.clone(),
+            false, // PaddleOCR-VL uses the chunked/sectioned mRoPE layout
         )?;
 
         Ok(Self {
@@ -865,7 +1032,7 @@ mod tests {
     #[test]
     fn test_mrope_forward_output_shapes() {
         // Test MultimodalRoPE forward pass produces correct shapes
-        let mrope = MultimodalRoPE::new(128, 131072, Some(500000.0), vec![16, 24, 24]).unwrap();
+        let mrope = MultimodalRoPE::new(128, 131072, Some(500000.0), vec![16, 24, 24], false).unwrap();
 
         let x = MxArray::zeros(&[1, 4, 128], Some(DType::Float32)).unwrap();
         let position_ids = MxArray::zeros(&[3, 1, 4], Some(DType::Float32)).unwrap();
@@ -881,14 +1048,14 @@ mod tests {
     #[test]
     fn test_mrope_invalid_section_length() {
         // mRoPE section must have exactly 3 elements
-        let result = MultimodalRoPE::new(128, 131072, Some(500000.0), vec![16, 24]);
+        let result = MultimodalRoPE::new(128, 131072, Some(500000.0), vec![16, 24], false);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_mrope_getter() {
         // Test mRoPE section getter
-        let mrope = MultimodalRoPE::new(128, 131072, Some(500000.0), vec![16, 24, 24]).unwrap();
+        let mrope = MultimodalRoPE::new(128, 131072, Some(500000.0), vec![16, 24, 24], false).unwrap();
         assert_eq!(mrope.mrope_section_arr(), &[16, 24, 24]);
     }
 

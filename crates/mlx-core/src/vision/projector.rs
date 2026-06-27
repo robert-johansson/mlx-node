@@ -145,9 +145,11 @@ impl SpatialProjector {
             let merged_dim = merge * merge * dim;
             let x_flat = x_transposed.reshape(&[merged_patches, merged_dim])?;
 
-            // Apply MLP: linear_1 -> GELU -> linear_2
+            // Apply MLP: linear_1 -> GELU (exact erf) -> linear_2
+            // Python PatchMerger uses nn.GELU() = exact erf (vision.py:115),
+            // NOT the tanh approximation used by the vision-block MLP. bean mlx-insk.
             let hidden = self.linear_1.forward(&x_flat)?;
-            let activated = Activations::gelu(&hidden)?;
+            let activated = Activations::gelu_exact(&hidden)?;
             let output = self.linear_2.forward(&activated)?;
 
             processed_features.push(output);

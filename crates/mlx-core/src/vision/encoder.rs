@@ -220,10 +220,39 @@ impl VisionAttention {
         let input_dtype = x.dtype()?;
         let attention_mask = Self::build_attention_mask(cu_seqlens, seq_len, input_dtype)?;
 
-        // Use fused scaled dot-product attention (Metal kernel)
-        // mask shape [1, seq_len, seq_len] broadcasts to [1, num_heads, seq_len, seq_len]
-        let output =
-            scaled_dot_product_attention(&q, &k, &v, self.scale as f64, Some(&attention_mask))?;
+        // Use fused scaled dot-product attention.
+        // mask shape [1, seq_len, seq_len] broadcasts to [1, num_heads, seq_len, seq_len].
+        //
+        // HEAD_DIM PADDING (bean mlx-insk): the CUDA fused SDPA only supports
+        // head_dim in {64, 80, 128}; the vision head_dim=72 is NOT native and the
+        // CUDA kernel mishandles it (wrong-but-finite output -> garbage VLM
+        // features). Mirror Python mlx-vlm's `ensure_fused_sdpa`: pad q/k/v on the
+        // last axis to the next supported size with ZEROS (the padded dims
+        // contribute 0 to Q·K, so the scale stays 1/sqrt(72)), run SDPA, then slice
+        // the output back to head_dim. (Metal tolerates 72; this keeps both paths
+        // correct.)
+        let hd = self.head_dim as i64;
+        let padded_hd: i64 = if hd <= 64 {
+            64
+        } else if hd <= 80 {
+            80
+        } else if hd <= 128 {
+            128
+        } else {
+            hd
+        };
+        let output = if padded_hd != hd {
+            let pad = padded_hd - hd;
+            let zshape = [1, self.num_heads as i64, seq_len, pad];
+            let qp = MxArray::concatenate(&q, &MxArray::zeros(&zshape, Some(q.dtype()?))?, 3)?;
+            let kp = MxArray::concatenate(&k, &MxArray::zeros(&zshape, Some(k.dtype()?))?, 3)?;
+            let vp = MxArray::concatenate(&v, &MxArray::zeros(&zshape, Some(v.dtype()?))?, 3)?;
+            let out =
+                scaled_dot_product_attention(&qp, &kp, &vp, self.scale as f64, Some(&attention_mask))?;
+            out.slice_axis(3, 0, hd)?
+        } else {
+            scaled_dot_product_attention(&q, &k, &v, self.scale as f64, Some(&attention_mask))?
+        };
 
         // Transpose back: [1, num_heads, seq_len, head_dim] -> [1, seq_len, num_heads, head_dim]
         let output = output.transpose(Some(&[0, 2, 1, 3]))?;
