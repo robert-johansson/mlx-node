@@ -26,7 +26,14 @@ impl RMSNormGated {
         let handle = unsafe { sys::mlx_fast_rms_norm(x.handle.0, self.weight.handle.0, self.eps) };
         let normed = MxArray::from_handle(handle, "rms_norm_gated")?;
         match gate {
-            Some(g) => Activations::swiglu(g, &normed),
+            // mlx-ogvd: precise SwiGLU — silu(gate)*normed in f32 then cast back to input dtype,
+            // matching mlx_lm _precise_swiglu (oracle). Activations::swiglu alone runs in bf16.
+            Some(g) => {
+                let dt = x.dtype()?;
+                let g32 = g.astype(crate::array::DType::Float32)?;
+                let n32 = normed.astype(crate::array::DType::Float32)?;
+                Activations::swiglu(&g32, &n32)?.astype(dt)
+            }
             None => Ok(normed),
         }
     }

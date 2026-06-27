@@ -89,7 +89,8 @@ pub fn topk_from_logits(
         RoutingMode::Qwen35 { renormalize_topk } => {
             // Softmax over all experts, then top-k of probs, with
             // optional renormalization.
-            let routing_weights = Activations::softmax(logits, Some(-1))?;
+            // mlx-ogvd: precise (f32) softmax over 256 experts, matching mlx_vlm softmax(precise=True).
+            let routing_weights = Activations::softmax_precise(logits, Some(-1))?;
             let top_indices_full = routing_weights.argpartition(-top_k, Some(-1))?;
             let top_indices =
                 top_indices_full.slice_axis(1, num_experts_i64 - top_k_i64, num_experts_i64)?;
