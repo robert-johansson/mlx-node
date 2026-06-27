@@ -245,6 +245,12 @@ fn main() {
         .define("MLX_BUILD_EXAMPLES", "OFF")
         .define("MLX_BUILD_BENCHMARKS", "OFF")
         .define("MLX_BUILD_PYTHON_BINDINGS", "OFF")
+        // JACCL = MLX's macOS Thunderbolt-RDMA distributed backend (upstream
+        // #2808+). Unused for embedded single-node inference, and its standalone
+        // install() escapes to /usr/local on macOS SDK >= 26.2 (the binding
+        // already falls back to no_jaccl.cpp when the deployment target is unset).
+        // Force off everywhere — no-op on Linux/CUDA, where it is never built.
+        .define("MLX_BUILD_JACCL", "OFF")
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("MLX_BUILD_METAL", if build_metal { "ON" } else { "OFF" });
 
