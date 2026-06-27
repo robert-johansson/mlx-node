@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -43,7 +43,7 @@ use super::switch_glu::SwitchGLU;
 fn sanitize_weights(
     mut params: HashMap<String, MxArray>,
     config: &Qwen3_5MoeConfig,
-) -> Result<HashMap<String, MxArray>> {
+) -> Result<(HashMap<String, MxArray>, HashSet<String>)> {
     let mut result: HashMap<String, MxArray> = HashMap::new();
 
     let has_mtp_weights = params.keys().any(|k| k.contains("mtp."));
@@ -394,13 +394,13 @@ fn sanitize_weights(
         }
     }
 
-    crate::models::qwen3_5::persistence::merge_split_projections(&mut result)?;
+    let merged_qkvz = crate::models::qwen3_5::persistence::merge_split_projections(&mut result)?;
 
     // For FP8 source checkpoints, keep dequantized bf16 weights as-is.
     // Re-quantizing (FP8→bf16→4bit or →MXFP8) compounds quantization error
     // and produces gibberish. mlx-lm also keeps FP8-dequanted weights as bf16.
 
-    Ok(result)
+    Ok((result, merged_qkvz))
 }
 
 pub(crate) fn try_build_quantized_switch_linear(
@@ -471,6 +471,9 @@ fn apply_weights_moe_inner(
     inner: &mut Qwen35MoeInner,
     params: &HashMap<String, MxArray>,
     config: &Qwen3_5MoeConfig,
+    // linear_attn prefixes whose in_proj_qkvz was merge-synthesized (contiguous) vs native
+    // (interleaved) — picks fused_qkvz_layout per layer so 35B (merged) and 80B (native) both load. (mlx-cft4)
+    merged_qkvz: &HashSet<String>,
     quant_bits: i32,
     quant_group_size: i32,
     top_level_mode: Option<PerLayerMode>,
@@ -569,6 +572,10 @@ fn apply_weights_moe_inner(
     // Layers — direct access, no lock
     for (i, layer) in inner.layers.iter_mut().enumerate() {
         let prefix = format!("layers.{}", i);
+        // mlx-cft4: a merge-synthesized in_proj_qkvz is CONTIGUOUS (no de-interleave); a NATIVE
+        // one is per-key-head INTERLEAVED (de-interleave). 80B qwen3_next ships native => true;
+        // 35B qwen3_5_moe merges separate in_proj_qkv/z => false. A single constant breaks one.
+        let qkvz_is_merged = merged_qkvz.contains(&format!("{}.linear_attn", prefix));
 
         // Attention weights
         match &mut layer.attn {
@@ -578,16 +585,12 @@ fn apply_weights_moe_inner(
                         try_build_ql(params, &format!("{}.linear_attn.in_proj_qkvz", prefix))
                     {
                         gdn.set_quantized_in_proj_qkvz(ql);
-                        // mlx-cft4: qwen3_5_moe ships SEPARATE in_proj_qkv/z (0 native fused) which the
-                        // loader merges into a CONTIGUOUS [q_all|k_all|v_all|z_all] tensor — NOT the
-                        // qwen3_next per-key-head interleaved layout. De-interleaving it scrambles q/k/v/z.
-                        gdn.set_fused_qkvz_layout(false);
+                        gdn.set_fused_qkvz_layout(!qkvz_is_merged);
                     } else if let Some(w) =
                         params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
                     {
                         gdn.set_in_proj_qkvz_weight(w)?;
-                        // mlx-cft4: merged-contiguous qkvz (not interleaved) -> do NOT de-interleave.
-                        gdn.set_fused_qkvz_layout(false);
+                        gdn.set_fused_qkvz_layout(!qkvz_is_merged);
                     }
 
                     if let Some(ql) =
@@ -614,8 +617,7 @@ fn apply_weights_moe_inner(
                         params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
                     {
                         gdn.set_in_proj_qkvz_weight(w)?;
-                        // mlx-cft4: qwen3_5_moe merged-contiguous qkvz (not interleaved) -> do NOT de-interleave.
-                        gdn.set_fused_qkvz_layout(false);
+                        gdn.set_fused_qkvz_layout(!qkvz_is_merged);
                     }
                     if let Some(w) =
                         params.get(&format!("{}.linear_attn.in_proj_qkv.weight", prefix))
@@ -1151,7 +1153,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     };
 
                     // Sanitize weights
-                    let params = sanitize_weights(text_raw_params, &config)?;
+                    let (params, merged_qkvz) = sanitize_weights(text_raw_params, &config)?;
                     let quantized = is_quantized_checkpoint(&params);
                     info!(
                         "Sanitized to {} parameters (quantized={})",
@@ -1236,6 +1238,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                         &mut inner,
                         &params,
                         &config,
+                        &merged_qkvz,
                         quant_bits,
                         quant_group_size,
                         top_level_mode,

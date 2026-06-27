@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,7 +50,15 @@ use super::vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 /// mlx-vlm/mlx-lm store separate in_proj_qkv, in_proj_z, in_proj_a, in_proj_b,
 /// but our model expects merged in_proj_qkvz and in_proj_ba.
 /// Concatenates .weight, .scales, and .biases along axis 0.
-pub(crate) fn merge_split_projections(result: &mut HashMap<String, MxArray>) -> Result<()> {
+pub(crate) fn merge_split_projections(
+    result: &mut HashMap<String, MxArray>,
+) -> Result<HashSet<String>> {
+    // Track the linear_attn prefixes whose in_proj_qkvz we SYNTHESIZE here from separate
+    // in_proj_qkv + in_proj_z (-> a CONTIGUOUS [q|k|v|z] tensor). A native (un-merged)
+    // in_proj_qkvz — e.g. qwen3_next — is per-key-head INTERLEAVED instead. The loader uses
+    // this set to choose fused_qkvz_layout: merged => contiguous => false (no de-interleave),
+    // native => interleaved => true (de-interleave). One checkpoint family needs each. (mlx-cft4)
+    let mut merged_qkvz: HashSet<String> = HashSet::new();
     // Merge in_proj_qkv + in_proj_z → in_proj_qkvz
     let split_qkv_keys: Vec<String> = result
         .keys()
@@ -69,6 +77,7 @@ pub(crate) fn merge_split_projections(result: &mut HashMap<String, MxArray>) -> 
         let z_w = result.remove(&z_weight_key).unwrap();
         let combined_w = MxArray::concatenate(&qkv_w, &z_w, 0)?;
         result.insert(format!("{}.in_proj_qkvz.weight", prefix), combined_w);
+        merged_qkvz.insert(prefix.to_string());
 
         for suffix in &["scales", "biases"] {
             let qkv_k = format!("{}.in_proj_qkv.{}", prefix, suffix);
@@ -109,7 +118,7 @@ pub(crate) fn merge_split_projections(result: &mut HashMap<String, MxArray>) -> 
         }
     }
 
-    Ok(())
+    Ok(merged_qkvz)
 }
 
 /// 5. Norm weight +1.0 adjustment (when unsanitized weights detected)
