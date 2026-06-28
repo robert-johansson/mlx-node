@@ -1587,16 +1587,21 @@ impl Qwen35Inner {
             );
         }
 
-        // The flat fallback below is text-only. A dense image turn requires the
-        // block-paged backend; reaching here with images means the model was
-        // loaded without a paged adapter (use_block_paged_cache=false, non-Metal
-        // build, or a sym8 checkpoint).
+        // No paged adapter + images: route to the flat (non-paged) vision core
+        // (bean genmlx-9v44). This is the CUDA/Linux and paging-off path — the
+        // paged-vision core above handles the Metal/paged case. The flat core
+        // itself errors clearly if the vision encoder/processor is not loaded
+        // (e.g. a text-only checkpoint reaching here with images).
         if has_images {
-            return Err(Error::from_reason(
-                "qwen3.5 dense image turns require the block-paged KV backend; the model was \
-                 loaded without a paged adapter (use_block_paged_cache=false, non-Metal build, \
-                 or sym8 checkpoint)",
-            ));
+            return self.vision_flat_whole_turn_core(
+                tokens,
+                images,
+                tokenizer,
+                eos_token_id,
+                p,
+                report_perf,
+                thinking,
+            );
         }
 
         let embedding_weight = self.embedding.get_weight();
@@ -3295,6 +3300,257 @@ impl Qwen35Inner {
             }
             let _ = self.reset_caches_sync();
         }
+
+        let performance = if report_perf {
+            compute_performance_metrics(
+                generation_start,
+                first_token_instant,
+                expanded_tokens.len(),
+                generated_tokens.len(),
+            )
+        } else {
+            None
+        };
+
+        let mut result = finalize_chat_result(
+            &tokenizer,
+            &generated_tokens,
+            finish_reason,
+            think_end_id,
+            think_end_str.as_deref(),
+            performance,
+            p.include_reasoning,
+            thinking_enabled,
+            prompt_token_count,
+            reasoning_tracker.reasoning_token_count(),
+        )?;
+        result.cached_tokens = 0;
+        Ok(result)
+    }
+
+    /// Flat (non-paged) image-bearing whole-turn core — the CUDA/Linux and
+    /// paging-off path for dense qwen3.5 VLM image turns (bean genmlx-9v44).
+    ///
+    /// Reached from `vision_mtp_whole_turn_core` ONLY when `paged_adapter` is
+    /// `None` (non-Metal build, or `use_block_paged_cache=false`). Mirrors
+    /// [`Self::vision_paged_turn_sync_core`] exactly — same vision merge
+    /// (`vlm_prepare_vision_features`), same plain-AR decode spine, MTP weights
+    /// ignored — but writes the flat `self.caches` instead of the paged pool.
+    ///
+    /// M-RoPE: prefill rotates over `merge.position_ids` (3-row), and each
+    /// decode token rotates at its image-compressed position
+    /// `physical_position + merge.rope_deltas`, supplied as a `[3,1,1]`
+    /// position-ids tensor (3 equal rows == scalar RoPE at that position) — the
+    /// flat analogue of the paged decode's `paged_rope_offset`.
+    ///
+    /// NON-CONTINUABLE: resets caches on the way out (`reset_caches_sync`) so a
+    /// follow-up text continue is cleanly rejected rather than cold-prefilling
+    /// image-placeholder ids. Sync whole-turn only (streaming image turns are
+    /// tracked in genmlx-djno).
+    #[allow(clippy::too_many_arguments)]
+    fn vision_flat_whole_turn_core(
+        &mut self,
+        tokens: Vec<u32>,
+        images: &[Vec<u8>],
+        tokenizer: Arc<Qwen3Tokenizer>,
+        eos_token_id: u32,
+        p: engine::ChatParams,
+        report_perf: bool,
+        thinking: ThinkingSetup,
+    ) -> Result<ChatResult> {
+        if tokens.is_empty() {
+            return Err(Error::from_reason("Empty prompt"));
+        }
+        if self.paged_adapter.is_some() {
+            return Err(Error::from_reason(
+                "vision_flat_whole_turn_core requires the flat cache, but the \
+                 block-paged adapter is active",
+            ));
+        }
+
+        let (vision_encoder, img_proc) =
+            match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
+                (Some(enc), Some(proc)) => (enc, proc),
+                _ => {
+                    return Err(Error::from_reason(
+                        "VLM prefill requested but vision encoder/processor not loaded",
+                    ));
+                }
+            };
+
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
+        let thinking_enabled = thinking.enabled;
+        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+
+        let generation_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut first_token_instant: Option<std::time::Instant> = None;
+        let sampling_config = p.sampling_config;
+
+        // === VLM image processing: expand placeholders + merge features ===
+        let sms = self.spatial_merge_size.unwrap_or(2);
+        let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
+        let processed = img_proc.process_many(&image_refs)?;
+        let per_image_token_counts =
+            compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
+        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
+        let image_cache_key = compute_image_cache_key(images);
+        let prompt_token_count = expanded_tokens.len() as u32;
+
+        let embed = self.embedding.clone();
+        let embedding_weight = embed.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
+        let _wired_ctx =
+            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
+
+        let merge = vlm_prepare_vision_features(
+            &input_ids,
+            image_cache_key,
+            &processed,
+            &vision_encoder,
+            sms,
+            &embedding_weight,
+            generation_stream,
+            &self.vision_cache,
+        )?;
+        let rope_deltas = merge.rope_deltas;
+
+        // Fresh flat per-layer caches (GDN linear slots + empty full-attention).
+        let new_caches = (0..self.config.num_layers as usize)
+            .map(|i| {
+                if self.config.is_linear_layer(i) {
+                    Qwen3_5LayerCache::new_linear()
+                } else {
+                    Qwen3_5LayerCache::new_full_attention()
+                }
+            })
+            .collect();
+        self.caches = Some(new_caches);
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        self.cached_rope_deltas = Some(rope_deltas as i32);
+        self.flat_mtp_caches_desynced = false;
+
+        let forward_result = (|| -> Result<(Vec<u32>, String)> {
+            // === PREFILL over merged embeds with 3-row M-RoPE ===
+            let last_logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                let hidden = forward_pre_norm_embeds_mrope(
+                    &merge.inputs_embeds,
+                    &merge.position_ids,
+                    &mut self.layers,
+                    &mut self.caches,
+                )?;
+                project_last_logits_from_pre_norm_hidden(
+                    &hidden,
+                    &self.final_norm,
+                    &self.lm_head,
+                    &embedding_weight,
+                    Some(&embedding_weight_t),
+                )?
+            };
+            eval_layer_caches(&self.caches)?;
+
+            let mut token_history: Vec<u32> = expanded_tokens.clone();
+            let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
+            let mut y = sample(&last_logits, sampling_config)?;
+            y.eval();
+
+            crate::array::synchronize_and_clear_cache();
+            if report_perf {
+                first_token_instant = Some(std::time::Instant::now());
+            }
+
+            // === DECODE LOOP (autoregressive, image-compressed M-RoPE) ===
+            let max_new_tokens = p.max_new_tokens;
+            let mut generated_tokens: Vec<u32> =
+                Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
+            let mut finish_reason = String::from("length");
+
+            for step in 0..max_new_tokens {
+                let token_id = y.item_at_int32(0)? as u32;
+                generated_tokens.push(token_id);
+                token_history.push(token_id);
+                reasoning_tracker.observe_token(token_id);
+
+                if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
+                    finish_reason = String::from("stop");
+                    break;
+                }
+                if let Some(reason) = crate::sampling::check_repetition_cutoff(
+                    &generated_tokens,
+                    p.max_consecutive_tokens,
+                    p.max_ngram_repeats,
+                    p.ngram_size,
+                ) {
+                    finish_reason = reason.to_string();
+                    break;
+                }
+                if step + 1 >= max_new_tokens {
+                    break;
+                }
+
+                // Decode `token_id` rotates at the image-compressed position
+                // (physical slot + rope_deltas), supplied as a [3,1,1] M-RoPE
+                // position with 3 equal rows == scalar RoPE at that position.
+                let physical_position = expanded_tokens.len() as i64 + step as i64;
+                let rope_pos = (physical_position + rope_deltas) as i32;
+                let position_ids =
+                    MxArray::from_int32(&[rope_pos, rope_pos, rope_pos], &[3, 1, 1])?;
+                let token_arr = MxArray::from_uint32(&[token_id], &[1, 1])?;
+
+                let next_logits = {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    forward_token_mrope(
+                        &token_arr,
+                        &position_ids,
+                        &embedding_weight,
+                        &mut self.layers,
+                        &mut self.caches,
+                        &self.final_norm,
+                        &self.lm_head,
+                        Some(&embedding_weight_t),
+                    )?
+                    .squeeze(Some(&[1]))?
+                };
+
+                if reasoning_tracker.should_force_think_end() {
+                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
+                    y = MxArray::from_int32(&[forced_id], &[1])?;
+                    y.eval();
+                    continue;
+                }
+                let next_logits = apply_all_penalties(next_logits, &token_history, &p)?;
+
+                y = sample(&next_logits, sampling_config)?;
+                y.eval();
+
+                crate::array::maybe_clear_cache_for_paged_step(step);
+            }
+
+            Ok((generated_tokens, finish_reason))
+        })();
+
+        let (generated_tokens, finish_reason) = match forward_result {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = self.reset_caches_sync();
+                return Err(e);
+            }
+        };
+
+        // NON-continuable: reset to a pristine non-live state so a follow-up
+        // text continue is rejected rather than cold-prefilling image-placeholder
+        // ids. (Multi-turn image continuation is a follow-up; see genmlx-9v44.)
+        let _ = self.reset_caches_sync();
 
         let performance = if report_perf {
             compute_performance_metrics(
@@ -8951,6 +9207,59 @@ fn forward_pre_norm_inner(
     }
 
     Ok(h)
+}
+
+/// Flat prefill over PRE-MERGED vision embeddings with explicit 3-row M-RoPE
+/// position ids — the non-paged VLM arm (bean genmlx-9v44).
+///
+/// Mirrors [`forward_pre_norm_inner`] but (a) consumes `inputs_embeds`
+/// (`[1, seq, hidden]`, image features already scattered in by
+/// `vlm_prepare_vision_features`) instead of token ids, and (b) threads
+/// `position_ids` (`[3, 1, seq]`, i32) to every layer so full-attention layers
+/// rotate via M-RoPE; GDN/linear layers ignore it. Returns the FULL
+/// per-position pre-norm hidden so the caller slices the last token before
+/// `final_norm` (matches `forward_pre_norm_inner`).
+fn forward_pre_norm_embeds_mrope(
+    inputs_embeds: &MxArray,
+    position_ids: &MxArray,
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+) -> Result<MxArray> {
+    let mut h = inputs_embeds.clone();
+    let num_layers = layers.len();
+    for i in 0..num_layers {
+        let cache = caches.as_mut().map(|c| &mut c[i]);
+        h = layers[i].forward(&h, None, cache, Some(position_ids), true)?;
+    }
+    Ok(h)
+}
+
+/// Single-token flat decode step that rotates the query at an EXPLICIT M-RoPE
+/// position (`position_ids` is `[3, 1, 1]`; 3 equal rows == scalar RoPE at that
+/// position). The flat analogue of `run_paged_decode_step`'s
+/// `paged_rope_offset`: generated tokens continue at the image-compressed
+/// positions the prefill keys were written with. Returns logits
+/// `[1, 1, vocab]` (caller squeezes the time axis).
+#[allow(clippy::too_many_arguments)]
+fn forward_token_mrope(
+    input_ids: &MxArray,
+    position_ids: &MxArray,
+    embedding_weight: &MxArray,
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embedding_weight_t: Option<&MxArray>,
+) -> Result<MxArray> {
+    let embedding = Embedding::from_weight(embedding_weight)?;
+    let mut h = embedding.forward(input_ids)?;
+    let num_layers = layers.len();
+    for i in 0..num_layers {
+        let cache = caches.as_mut().map(|c| &mut c[i]);
+        h = layers[i].forward(&h, None, cache, Some(position_ids), true)?;
+    }
+    let h = final_norm.forward(&h)?;
+    project_logits_from_hidden(&h, lm_head, embedding_weight, embedding_weight_t)
 }
 
 /// Tape-recording variant of [`forward_pre_norm_inner`] for the eager MTP
