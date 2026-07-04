@@ -337,8 +337,10 @@ impl Qwen3_5MoeMTPModule {
                 PerLayerMode::Affine => {
                     try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
                 }
-                // Unreachable: `apply_weights_moe_inner` rejects sym8
-                // checkpoints before the MTP load runs.
+                // Unreachable: `apply_weights_moe_inner` disables the MTP
+                // head load for sym8 checkpoints (`mtp_weights_loaded =
+                // false`, warn) before this `apply_weights` can run, so no
+                // sym8 PLQ ever reaches these builders.
                 PerLayerMode::Sym8 => None,
             }
         };
@@ -463,6 +465,10 @@ impl Qwen3_5MoeMTPModule {
             if let Some(w) = params.get(&format!("{}.self_attn.o_proj.bias", prefix)) {
                 attn.set_o_proj_bias(Some(w))?;
             }
+            // Precompute the block-ordered q_proj weight so forward()/
+            // forward_paged() split queries/gate without a strided
+            // reshape-copy. No-op for quantized q_proj.
+            attn.finalize_q_gate_block()?;
 
             // MLP — dense MLP, MoE switch_mlp + router gate +
             // shared_expert, or already-quantized (no-op). Mirrors the
