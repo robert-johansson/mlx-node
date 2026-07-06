@@ -306,11 +306,23 @@ fn main() {
     } else if target_os == "linux" {
         // Linux/CUDA build. The MLX submodule's CMake auto-detects the GPU
         // architecture, but on a GPU-less / headless configure host the
-        // detection query is empty and FATALs. Pass the arch explicitly for
-        // determinism (`121a` is what MLX auto-detected on the GB10 host;
-        // override via MLX_CUDA_ARCHITECTURES). Release build type so the
+        // detection query is empty and FATALs. Pass the archs explicitly for
+        // determinism; override via MLX_CUDA_ARCHITECTURES. The default
+        // covers ALL the CUDA devices this project runs on: sm_110 (Thor),
+        // sm_120 (RTX PRO 6000 Blackwell), sm_121 (GB10 / DGX Spark). The
+        // old default was `121a` alone — the arch MLX auto-detected on the
+        // GB10 donor host — whose `a`-suffixed (arch-locked,
+        // non-JIT-retargetable) cubins/PTX made every PRECOMPILED kernel
+        // unloadable on any OTHER device: "no kernel image is available
+        // for execution on the device" on the first RandomBits / copy
+        // launch. It went unnoticed for months because the genmlx membrane
+        // uses the CPU-stream PRNG and inference rides cuBLAS + NVRTC-JIT
+        // kernels compiled at runtime for the real device; the GRPO
+        // engine's random weight init was the first consumer of a
+        // precompiled GPU kernel (genmlx-isws). Release build type so the
         // benchmark numbers are not skewed by an unoptimized default.
-        let cuda_archs = env::var("MLX_CUDA_ARCHITECTURES").unwrap_or_else(|_| "121a".into());
+        let cuda_archs = env::var("MLX_CUDA_ARCHITECTURES")
+            .unwrap_or_else(|_| "110a;120a;121a".into());
         cfg.define("MLX_BUILD_CUDA", "ON")
             .define("MLX_BUILD_METAL", "OFF")
             .define("MLX_BUILD_CPU", "ON")
