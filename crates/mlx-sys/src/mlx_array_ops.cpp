@@ -1,41 +1,64 @@
+// Base array-op shims.
+//
+// Every shim body is wrapped in an MLX_GUARD_* macro (mlx_common.h): an MLX
+// C++ exception (shape validation, dtype errors, allocation pressure) is
+// recorded into the thread-local error slot and the sentinel (nullptr/false/
+// void) is returned, so the Rust side surfaces a CATCHABLE napi error via
+// check_handle + mlx_take_last_error instead of the throw unwinding across
+// the extern "C" frame and aborting the process ("Rust cannot catch foreign
+// exceptions" / SIGTRAP). The genmlx-8w48 sweep covered the GenMLX shims
+// (mlx_random/linalg/transforms/genmlx_ext); this file is the BASE-op sweep
+// (genmlx-x76x — an unguarded mlx_array_matmul escalated a shape error in the
+// GRPO training forward to a process abort).
+
 #include "mlx_common.h"
 
 extern "C" {
 
 void mlx_seed(uint64_t seed) {
+  MLX_GUARD_VOID("seed",
   mlx::core::random::seed(seed);
+  )
 }
 
 mlx_array* mlx_array_from_int32(const int32_t* data,
                                 const int64_t* shape,
                                 size_t ndim) {
+  MLX_GUARD_PTR("array_from_int32",
   Shape target_shape = make_shape(shape, ndim);
   auto arr = new mlx::core::array(data, target_shape, mlx::core::int32);
   return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 mlx_array* mlx_array_from_int64(const int64_t* data,
                                 const int64_t* shape,
                                 size_t ndim) {
+  MLX_GUARD_PTR("array_from_int64",
   Shape target_shape = make_shape(shape, ndim);
   auto arr = new mlx::core::array(data, target_shape, mlx::core::int64);
   return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 mlx_array* mlx_array_from_uint32(const uint32_t* data,
                                  const int64_t* shape,
                                  size_t ndim) {
+  MLX_GUARD_PTR("array_from_uint32",
   Shape target_shape = make_shape(shape, ndim);
   auto arr = new array(data, target_shape, mlx::core::uint32);
   return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 mlx_array* mlx_array_from_float32(const float* data,
                                   const int64_t* shape,
                                   size_t ndim) {
+  MLX_GUARD_PTR("array_from_float32",
   Shape target_shape = make_shape(shape, ndim);
   auto arr = new array(data, target_shape, mlx::core::float32);
   return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 // Create array from bfloat16 raw bytes (uint16 representation)
@@ -43,12 +66,14 @@ mlx_array* mlx_array_from_float32(const float* data,
 mlx_array* mlx_array_from_bfloat16(const uint16_t* data,
                                    const int64_t* shape,
                                    size_t ndim) {
+  MLX_GUARD_PTR("array_from_bfloat16",
   Shape target_shape = make_shape(shape, ndim);
   // bfloat16_t has the same memory layout as uint16_t (just the bits_ field)
   // so we can safely reinterpret_cast
   auto bf16_data = reinterpret_cast<const mlx::core::bfloat16_t*>(data);
   auto arr = new array(bf16_data, target_shape, mlx::core::bfloat16);
   return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 // Create array from float16 raw bytes (uint16 representation)
@@ -56,11 +81,13 @@ mlx_array* mlx_array_from_bfloat16(const uint16_t* data,
 mlx_array* mlx_array_from_float16(const uint16_t* data,
                                   const int64_t* shape,
                                   size_t ndim) {
+  MLX_GUARD_PTR("array_from_float16",
   Shape target_shape = make_shape(shape, ndim);
   // float16_t has the same memory layout as uint16_t
   auto f16_data = reinterpret_cast<const mlx::core::float16_t*>(data);
   auto arr = new array(f16_data, target_shape, mlx::core::float16);
   return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 // Create array from uint8 raw bytes
@@ -68,14 +95,11 @@ mlx_array* mlx_array_from_float16(const uint16_t* data,
 mlx_array* mlx_array_from_uint8(const uint8_t* data,
                                 const int64_t* shape,
                                 size_t ndim) {
-  try {
-    Shape target_shape = make_shape(shape, ndim);
-    auto arr = new array(data, target_shape, mlx::core::uint8);
-    return reinterpret_cast<mlx_array*>(arr);
-  } catch (const std::exception& e) {
-    std::cerr << "[MLX] mlx_array_from_uint8: " << e.what() << std::endl;
-    return nullptr;
-  }
+  MLX_GUARD_PTR("array_from_uint8",
+  Shape target_shape = make_shape(shape, ndim);
+  auto arr = new array(data, target_shape, mlx::core::uint8);
+  return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 // Create array from int8 raw bytes (bit-reinterpret, no numeric conversion)
@@ -83,14 +107,11 @@ mlx_array* mlx_array_from_uint8(const uint8_t* data,
 mlx_array* mlx_array_from_int8(const int8_t* data,
                                const int64_t* shape,
                                size_t ndim) {
-  try {
-    Shape target_shape = make_shape(shape, ndim);
-    auto arr = new array(data, target_shape, mlx::core::int8);
-    return reinterpret_cast<mlx_array*>(arr);
-  } catch (const std::exception& e) {
-    std::cerr << "[MLX] mlx_array_from_int8: " << e.what() << std::endl;
-    return nullptr;
-  }
+  MLX_GUARD_PTR("array_from_int8",
+  Shape target_shape = make_shape(shape, ndim);
+  auto arr = new array(data, target_shape, mlx::core::int8);
+  return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 // Convert FP8 E4M3 array to target dtype using MLX's from_fp8
@@ -98,47 +119,54 @@ mlx_array* mlx_array_from_int8(const int8_t* data,
 // target_dtype: 0=float32, 2=float16, 3=bfloat16
 mlx_array* mlx_from_fp8(mlx_array* handle, int32_t target_dtype) {
   if (!handle) {
-    std::cerr << "[MLX] mlx_from_fp8: null handle" << std::endl;
+    mlx_report_error("from_fp8", "null handle");
     return nullptr;
   }
-  try {
-    auto& arr = *reinterpret_cast<array*>(handle);
-    auto dtype = to_mlx_dtype(target_dtype);
-    auto result = mlx::core::from_fp8(arr, dtype);
-    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
-  } catch (const std::exception& e) {
-    std::cerr << "[MLX] mlx_from_fp8: " << e.what() << std::endl;
-    return nullptr;
-  }
+  MLX_GUARD_PTR("from_fp8",
+  auto& arr = *reinterpret_cast<array*>(handle);
+  auto dtype = to_mlx_dtype(target_dtype);
+  auto result = mlx::core::from_fp8(arr, dtype);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_scalar_float(double value) {
+  MLX_GUARD_PTR("array_scalar_float",
   auto arr = new array(static_cast<float>(value));
   return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 // Create a scalar with a specific dtype (no AsType node) — matches Python's array(val, dtype)
 mlx_array* mlx_array_scalar_float_dtype(double value, int32_t dtype) {
+  MLX_GUARD_PTR("array_scalar_float_dtype",
   auto dt = to_mlx_dtype(dtype);
   auto arr = new array(static_cast<float>(value), dt);
   return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 mlx_array* mlx_array_scalar_int(int32_t value) {
+  MLX_GUARD_PTR("array_scalar_int",
   auto arr = new array(value);
   return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 mlx_array* mlx_array_zeros(const int64_t* shape, size_t ndim, int32_t dtype) {
+  MLX_GUARD_PTR("array_zeros",
   Shape target_shape = make_shape(shape, ndim);
   auto arr = new array(zeros(target_shape, to_mlx_dtype(dtype)));
   return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 mlx_array* mlx_array_ones(const int64_t* shape, size_t ndim, int32_t dtype) {
+  MLX_GUARD_PTR("array_ones",
   Shape target_shape = make_shape(shape, ndim);
   auto arr = new array(ones(target_shape, to_mlx_dtype(dtype)));
   return reinterpret_cast<mlx_array*>(arr);
+  )
 }
 
 mlx_array* mlx_array_full(const int64_t* shape,
@@ -146,110 +174,137 @@ mlx_array* mlx_array_full(const int64_t* shape,
                           mlx_array* value_handle,
                           int32_t dtype,
                           bool has_dtype) {
+  MLX_GUARD_PTR("array_full",
   auto value = reinterpret_cast<array*>(value_handle);
   Shape target_shape = make_shape(shape, ndim);
   array result =
       has_dtype ? full(std::move(target_shape), *value, to_mlx_dtype(dtype))
                 : full(std::move(target_shape), *value);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_reshape(mlx_array* handle,
                              const int64_t* shape,
                              size_t ndim) {
+  MLX_GUARD_PTR("array_reshape",
   auto arr = reinterpret_cast<mlx::core::array*>(handle);
   Shape target_shape = make_shape(shape, ndim);
   array result = reshape(*arr, std::move(target_shape));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_astype(mlx_array* handle, int32_t dtype) {
+  MLX_GUARD_PTR("array_astype",
   auto arr = reinterpret_cast<array*>(handle);
   array result = astype(*arr, to_mlx_dtype(dtype));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_copy(mlx_array* handle) {
+  MLX_GUARD_PTR("array_copy",
   auto arr = reinterpret_cast<array*>(handle);
   array result = copy(*arr);
   // Keep lazy - let caller decide when to evaluate (matches Python MLX behavior)
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_log_softmax(mlx_array* handle, int32_t axis) {
+  MLX_GUARD_PTR("array_log_softmax",
   auto arr = reinterpret_cast<array*>(handle);
   std::vector<int> axes{axis};
   array lse = logsumexp(*arr, axes, true);
   array result = *arr - lse;
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_logsumexp(mlx_array* handle,
                                const int32_t* axes,
                                size_t axes_len,
                                bool keepdims) {
+  MLX_GUARD_PTR("array_logsumexp",
   auto arr = reinterpret_cast<array*>(handle);
   array result = (axes_len == 0)
                      ? logsumexp(*arr, keepdims)
                      : logsumexp(*arr, make_axes(axes, axes_len), keepdims);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_softmax(mlx_array* handle, int32_t axis) {
+  MLX_GUARD_PTR("array_softmax",
   auto arr = reinterpret_cast<array*>(handle);
   array result = softmax(*arr, axis);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_softmax_precise(mlx_array* handle, int32_t axis) {
+  MLX_GUARD_PTR("array_softmax_precise",
   auto arr = reinterpret_cast<array*>(handle);
   array result = softmax(*arr, axis, /*precise=*/true);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_sigmoid(mlx_array* handle) {
+  MLX_GUARD_PTR("array_sigmoid",
   auto arr = reinterpret_cast<array*>(handle);
   array result = sigmoid(*arr);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_exp(mlx_array* handle) {
+  MLX_GUARD_PTR("array_exp",
   auto arr = reinterpret_cast<array*>(handle);
   array result = exp(*arr);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_log(mlx_array* handle) {
+  MLX_GUARD_PTR("array_log",
   auto arr = reinterpret_cast<array*>(handle);
   array result = log(*arr);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_sum(mlx_array* handle,
                          const int32_t* axes,
                          size_t axes_len,
                          bool keepdims) {
+  MLX_GUARD_PTR("array_sum",
   auto arr = reinterpret_cast<array*>(handle);
   array result = (axes_len == 0)
                      ? sum(*arr, keepdims)
                      : sum(*arr, make_axes(axes, axes_len), keepdims);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_mean(mlx_array* handle,
                           const int32_t* axes,
                           size_t axes_len,
                           bool keepdims) {
+  MLX_GUARD_PTR("array_mean",
   auto arr = reinterpret_cast<array*>(handle);
   array result = (axes_len == 0)
                      ? mean(*arr, keepdims)
                      : mean(*arr, make_axes(axes, axes_len), keepdims);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_stack(mlx_array* const* handles,
                            size_t len,
                            int32_t axis) {
+  MLX_GUARD_PTR("array_stack",
   std::vector<array> inputs;
   inputs.reserve(len);
   for (size_t i = 0; i < len; ++i) {
@@ -258,9 +313,11 @@ mlx_array* mlx_array_stack(mlx_array* const* handles,
   }
   array result = stack(inputs, axis);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_clip(mlx_array* handle, double lo, double hi) {
+  MLX_GUARD_PTR("array_clip",
   auto arr = reinterpret_cast<array*>(handle);
   std::optional<array> lower;
   std::optional<array> upper;
@@ -273,86 +330,108 @@ mlx_array* mlx_array_clip(mlx_array* handle, double lo, double hi) {
   }
   array result = clip(*arr, lower, upper);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_minimum(mlx_array* lhs, mlx_array* rhs) {
+  MLX_GUARD_PTR("array_minimum",
   auto a = reinterpret_cast<array*>(lhs);
   auto b = reinterpret_cast<array*>(rhs);
   array result = minimum(*a, *b);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_maximum(mlx_array* lhs, mlx_array* rhs) {
+  MLX_GUARD_PTR("array_maximum",
   auto a = reinterpret_cast<array*>(lhs);
   auto b = reinterpret_cast<array*>(rhs);
   array result = maximum(*a, *b);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_add(mlx_array* lhs, mlx_array* rhs) {
+  MLX_GUARD_PTR("array_add",
   auto a = reinterpret_cast<array*>(lhs);
   auto b = reinterpret_cast<array*>(rhs);
   array result = *a + *b;
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_sub(mlx_array* lhs, mlx_array* rhs) {
+  MLX_GUARD_PTR("array_sub",
   auto a = reinterpret_cast<array*>(lhs);
   auto b = reinterpret_cast<array*>(rhs);
   array result = *a - *b;
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_mul(mlx_array* lhs, mlx_array* rhs) {
+  MLX_GUARD_PTR("array_mul",
   auto a = reinterpret_cast<array*>(lhs);
   auto b = reinterpret_cast<array*>(rhs);
   array result = *a * *b;
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_div(mlx_array* lhs, mlx_array* rhs) {
+  MLX_GUARD_PTR("array_div",
   auto a = reinterpret_cast<array*>(lhs);
   auto b = reinterpret_cast<array*>(rhs);
   array result = *a / *b;
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_add_scalar(mlx_array* handle, double value) {
+  MLX_GUARD_PTR("array_add_scalar",
   auto arr = reinterpret_cast<array*>(handle);
   // Create scalar directly in target dtype (no AsType node) — matches Python's to_array()
   auto dt = mlx::core::issubdtype(arr->dtype(), mlx::core::floating) ? arr->dtype() : mlx::core::float32;
   array scalar(static_cast<float>(value), dt);
   array result = *arr + scalar;
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_mul_scalar(mlx_array* handle, double value) {
+  MLX_GUARD_PTR("array_mul_scalar",
   auto arr = reinterpret_cast<array*>(handle);
   auto dt = mlx::core::issubdtype(arr->dtype(), mlx::core::floating) ? arr->dtype() : mlx::core::float32;
   array scalar(static_cast<float>(value), dt);
   array result = *arr * scalar;
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_sub_scalar(mlx_array* handle, double value) {
+  MLX_GUARD_PTR("array_sub_scalar",
   auto arr = reinterpret_cast<array*>(handle);
   auto dt = mlx::core::issubdtype(arr->dtype(), mlx::core::floating) ? arr->dtype() : mlx::core::float32;
   array scalar(static_cast<float>(value), dt);
   array result = *arr - scalar;
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_div_scalar(mlx_array* handle, double value) {
+  MLX_GUARD_PTR("array_div_scalar",
   auto arr = reinterpret_cast<array*>(handle);
   auto dt = mlx::core::issubdtype(arr->dtype(), mlx::core::floating) ? arr->dtype() : mlx::core::float32;
   array scalar(static_cast<float>(value), dt);
   array result = *arr / scalar;
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_take(mlx_array* handle,
                           mlx_array* indices_handle,
                           int32_t axis) {
+  MLX_GUARD_PTR("array_take",
   auto arr = reinterpret_cast<array*>(handle);
   auto idx = reinterpret_cast<array*>(indices_handle);
   if (!arr || !idx) {
@@ -360,11 +439,13 @@ mlx_array* mlx_array_take(mlx_array* handle,
   }
   array result = take(*arr, *idx, axis);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_take_along_axis(mlx_array* handle,
                                      mlx_array* indices_handle,
                                      int32_t axis) {
+  MLX_GUARD_PTR("array_take_along_axis",
   auto arr = reinterpret_cast<array*>(handle);
   auto idx = reinterpret_cast<array*>(indices_handle);
   if (!arr || !idx) {
@@ -372,6 +453,7 @@ mlx_array* mlx_array_take_along_axis(mlx_array* handle,
   }
   array result = take_along_axis(*arr, *idx, axis);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 // Put values into array at specified indices along an axis
@@ -380,6 +462,7 @@ mlx_array* mlx_array_put_along_axis(mlx_array* handle,
                                      mlx_array* indices_handle,
                                      mlx_array* values_handle,
                                      int32_t axis) {
+  MLX_GUARD_PTR("array_put_along_axis",
   auto arr = reinterpret_cast<array*>(handle);
   auto indices = reinterpret_cast<array*>(indices_handle);
   auto values = reinterpret_cast<array*>(values_handle);
@@ -389,15 +472,18 @@ mlx_array* mlx_array_put_along_axis(mlx_array* handle,
 
   array result = mlx::core::put_along_axis(*arr, *indices, *values, axis);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_arange(double start,
                             double stop,
                             double step,
                             int32_t dtype) {
+  MLX_GUARD_PTR("array_arange",
   double actual_step = (std::abs(step) < 1e-12) ? 1.0 : step;
   array result = arange(start, stop, actual_step, to_mlx_dtype(dtype));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_linspace(double start,
@@ -405,9 +491,11 @@ mlx_array* mlx_array_linspace(double start,
                               int32_t num,
                               int32_t dtype,
                               bool has_dtype) {
+  MLX_GUARD_PTR("array_linspace",
   array result = has_dtype ? linspace(start, stop, num, to_mlx_dtype(dtype))
                            : linspace(start, stop, num);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_eye(int32_t n,
@@ -415,19 +503,23 @@ mlx_array* mlx_array_eye(int32_t n,
                          int32_t k,
                          int32_t dtype,
                          bool has_dtype) {
+  MLX_GUARD_PTR("array_eye",
   array result = has_dtype ? eye(n, m, k, to_mlx_dtype(dtype)) : eye(n, m, k);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_slice(mlx_array* handle,
                            const int64_t* starts,
                            const int64_t* stops,
                            size_t ndim) {
+  MLX_GUARD_PTR("array_slice",
   auto arr = reinterpret_cast<array*>(handle);
   Shape start_shape = make_shape(starts, ndim);
   Shape stop_shape = make_shape(stops, ndim);
   array result = slice(*arr, std::move(start_shape), std::move(stop_shape));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 // Optimized slice assignment along a single axis - no allocation for shape access
@@ -437,6 +529,7 @@ mlx_array* mlx_array_slice_assign_axis(mlx_array* src_handle,
                                         size_t axis,
                                         int64_t start,
                                         int64_t end) {
+  MLX_GUARD_PTR("array_slice_assign_axis",
   auto src = reinterpret_cast<array*>(src_handle);
   auto update = reinterpret_cast<array*>(update_handle);
 
@@ -454,6 +547,7 @@ mlx_array* mlx_array_slice_assign_axis(mlx_array* src_handle,
   // Perform slice update and return new array
   array result = slice_update(*src, *update, std::move(start_shape), std::move(stop_shape));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 // Optimized in-place slice assignment along a single axis - no allocation
@@ -463,6 +557,7 @@ void mlx_array_slice_assign_axis_inplace(mlx_array* src_handle,
                                           size_t axis,
                                           int64_t start,
                                           int64_t end) {
+  MLX_GUARD_VOID("array_slice_assign_axis_inplace",
   auto src = reinterpret_cast<array*>(src_handle);
   auto update = reinterpret_cast<array*>(update_handle);
 
@@ -480,6 +575,7 @@ void mlx_array_slice_assign_axis_inplace(mlx_array* src_handle,
   // Perform slice update and modify src in-place
   array result = slice_update(*src, *update, std::move(start_shape), std::move(stop_shape));
   src->overwrite_descriptor(result);
+  )
 }
 
 // Optimized slice along a single axis - no allocation for shape access
@@ -488,6 +584,7 @@ mlx_array* mlx_array_slice_axis(mlx_array* src_handle,
                                  size_t axis,
                                  int64_t start,
                                  int64_t end) {
+  MLX_GUARD_PTR("array_slice_axis",
   auto src = reinterpret_cast<array*>(src_handle);
 
   // Access shape directly without allocation
@@ -504,11 +601,13 @@ mlx_array* mlx_array_slice_axis(mlx_array* src_handle,
   // Perform slice and return new array
   array result = slice(*src, std::move(start_shape), std::move(stop_shape));
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_concatenate(mlx_array* const* handles,
                                  size_t len,
                                  int32_t axis) {
+  MLX_GUARD_PTR("array_concatenate",
   std::vector<array> inputs;
   inputs.reserve(len);
   for (size_t i = 0; i < len; ++i) {
@@ -517,44 +616,55 @@ mlx_array* mlx_array_concatenate(mlx_array* const* handles,
   }
   array result = concatenate(std::move(inputs), axis);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_sort(mlx_array* handle, int32_t axis, bool has_axis) {
+  MLX_GUARD_PTR("array_sort",
   auto arr = reinterpret_cast<array*>(handle);
   array result = has_axis ? sort(*arr, axis) : sort(*arr);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_argsort(mlx_array* handle, int32_t axis, bool has_axis) {
+  MLX_GUARD_PTR("array_argsort",
   auto arr = reinterpret_cast<array*>(handle);
   array result = has_axis ? argsort(*arr, axis) : argsort(*arr);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_partition(mlx_array* handle,
                                int32_t kth,
                                int32_t axis,
                                bool has_axis) {
+  MLX_GUARD_PTR("array_partition",
   auto arr = reinterpret_cast<array*>(handle);
   array result = has_axis ? partition(*arr, kth, axis) : partition(*arr, kth);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_argpartition(mlx_array* handle,
                                   int32_t kth,
                                   int32_t axis,
                                   bool has_axis) {
+  MLX_GUARD_PTR("array_argpartition",
   auto arr = reinterpret_cast<array*>(handle);
   array result =
       has_axis ? argpartition(*arr, kth, axis) : argpartition(*arr, kth);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 mlx_array* mlx_array_matmul(mlx_array* lhs, mlx_array* rhs) {
+  MLX_GUARD_PTR("array_matmul",
   auto a = reinterpret_cast<array*>(lhs);
   auto b = reinterpret_cast<array*>(rhs);
   array result = matmul(*a, *b);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 // Extract uint8 data from a uint8 array (used for MXFP8 scales in SafeTensors writer)
@@ -566,25 +676,22 @@ bool mlx_array_to_uint8(mlx_array* handle, uint8_t* out, size_t len) {
   if (!arr) {
     return false;
   }
-  try {
-    auto flat = flatten(*arr);
-    flat.eval();
+  MLX_GUARD_BOOL("array_to_uint8",
+  auto flat = flatten(*arr);
+  flat.eval();
 
-    if (flat.size() != len) {
-      return false;
-    }
-
-    if (flat.dtype() != mlx::core::uint8) {
-      return false;
-    }
-
-    const auto* data = flat.data<uint8_t>();
-    std::memcpy(out, data, len * sizeof(uint8_t));
-    return true;
-  } catch (const std::exception& e) {
-    std::cerr << "[MLX] mlx_array_to_uint8: " << e.what() << std::endl;
+  if (flat.size() != len) {
     return false;
   }
+
+  if (flat.dtype() != mlx::core::uint8) {
+    return false;
+  }
+
+  const auto* data = flat.data<uint8_t>();
+  std::memcpy(out, data, len * sizeof(uint8_t));
+  return true;
+  )
 }
 
 // Extract int8 data from an int8 array (used for sym8 weights in SafeTensors writer)
@@ -596,36 +703,35 @@ bool mlx_array_to_int8(mlx_array* handle, int8_t* out, size_t len) {
   if (!arr) {
     return false;
   }
-  try {
-    auto flat = flatten(*arr);
-    flat.eval();
+  MLX_GUARD_BOOL("array_to_int8",
+  auto flat = flatten(*arr);
+  flat.eval();
 
-    if (flat.size() != len) {
-      return false;
-    }
-
-    if (flat.dtype() != mlx::core::int8) {
-      return false;
-    }
-
-    const auto* data = flat.data<int8_t>();
-    std::memcpy(out, data, len * sizeof(int8_t));
-    return true;
-  } catch (const std::exception& e) {
-    std::cerr << "[MLX] mlx_array_to_int8: " << e.what() << std::endl;
+  if (flat.size() != len) {
     return false;
   }
+
+  if (flat.dtype() != mlx::core::int8) {
+    return false;
+  }
+
+  const auto* data = flat.data<int8_t>();
+  std::memcpy(out, data, len * sizeof(int8_t));
+  return true;
+  )
 }
 
 // Compute D = beta * C + alpha * (A @ B)
 // This is a fused operation that's more efficient than separate matmul and add
 mlx_array* mlx_array_addmm(mlx_array* c_handle, mlx_array* a_handle, mlx_array* b_handle,
                            float alpha, float beta) {
+  MLX_GUARD_PTR("array_addmm",
   auto c = reinterpret_cast<array*>(c_handle);
   auto a = reinterpret_cast<array*>(a_handle);
   auto b = reinterpret_cast<array*>(b_handle);
   array result = addmm(*c, *a, *b, alpha, beta);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
 }
 
 }  // extern "C"

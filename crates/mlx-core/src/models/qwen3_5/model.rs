@@ -5656,6 +5656,16 @@ impl Qwen35Inner {
                 "Training state already initialized. A single model thread can host only one active training run.",
             ));
         }
+        // Quantized checkpoints train on dequantized dense master weights
+        // (genmlx-x76x); dense checkpoints pass through untouched.
+        let converted = self.dequantize_for_training()?;
+        if converted > 0 {
+            info!(
+                "Dequantized {} quantized modules to dense bf16 for training \
+                 (the model stays dense after training; saves emit dense weights)",
+                converted
+            );
+        }
         let optimizer = if config.optimizer_type.as_deref().unwrap_or("adamw") == "adamw" {
             Some(crate::optimizers::AdamW::new(
                 config.learning_rate,
@@ -6817,6 +6827,50 @@ impl Qwen35Inner {
         }
 
         Ok(())
+    }
+
+    /// Convert every quantized module to dense for training (genmlx-x76x).
+    ///
+    /// The GRPO/SFT functional forward and `apply_gradients_inner` are defined
+    /// over dense `[out, in]` weights; a quantized checkpoint (e.g. the 4-bit
+    /// affine qwen3.5 releases) would otherwise feed packed uint32 tensors
+    /// into plain matmuls — a hard shape error at layer 0's in_proj_qkvz.
+    /// Called once from `init_training_sync_impl`; after it, training holds
+    /// dense bf16 master weights end-to-end (sampling included — updates reach
+    /// generation through the same dense setters the bf16 path uses), and the
+    /// model STAYS dense for the rest of its life (saves emit dense bf16).
+    ///
+    /// `nn::Embedding` and `nn::Linear` (lm_head) already self-convert on
+    /// `set_weight`, but eagerly converting them here avoids re-dequantizing
+    /// the full table inside every training step's autograd graph.
+    ///
+    /// Returns the number of modules converted (0 for a dense checkpoint).
+    fn dequantize_for_training(&mut self) -> Result<u32> {
+        use super::decoder_layer::AttentionType;
+
+        let mut n = 0;
+        if self.embedding.is_packed_quantized() {
+            let dense = self.embedding.get_weight();
+            self.embedding.load_weight(&dense)?;
+            n += 1;
+        }
+        for layer in self.layers.iter_mut() {
+            match &mut layer.attn {
+                AttentionType::Linear(gdn) => n += gdn.dequantize_to_standard()?,
+                AttentionType::Full(attn) => n += attn.dequantize_to_standard()?,
+            }
+            if layer.mlp.dequantize_to_standard()? {
+                n += 1;
+            }
+        }
+        if let Some(ref mut lm_head) = self.lm_head
+            && lm_head.is_quantized()
+        {
+            let dense = lm_head.get_weight();
+            lm_head.set_weight(&dense)?;
+            n += 1;
+        }
+        Ok(n)
     }
 
     /// Extract all trainable parameters from the model.

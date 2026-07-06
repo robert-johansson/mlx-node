@@ -48,6 +48,22 @@ impl MLP {
         })
     }
 
+    /// Build an MLP directly from three pre-loaded dense weights
+    /// (`gate`/`up`: `[intermediate, hidden]`, `down`: `[hidden, intermediate]`),
+    /// finalizing the E39 stacked fast path like the persistence loaders do.
+    /// Used when converting a quantized MLP to dense for training.
+    pub fn from_weights(gate_w: &MxArray, up_w: &MxArray, down_w: &MxArray) -> Result<Self> {
+        let mut mlp = Self {
+            gate_proj: Linear::from_weights(gate_w, None)?,
+            up_proj: Linear::from_weights(up_w, None)?,
+            down_proj: Linear::from_weights(down_w, None)?,
+            gate_up_proj_wt: None,
+            down_proj_wt: None,
+        };
+        mlp.finalize_gate_up()?;
+        Ok(mlp)
+    }
+
     /// E39: precompute the stacked `[gate; up]^T` weight and the transposed
     /// `down_proj^T` weight once after all three projection weights are loaded.
     /// Forward will then use `mlx_swiglu_mlp_forward_stacked`, which does ONE

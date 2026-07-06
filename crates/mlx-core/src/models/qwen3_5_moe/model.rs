@@ -5119,6 +5119,39 @@ impl Qwen35MoeInner {
                 "Training state already initialized. A single model thread can host only one active training run.",
             ));
         }
+        // Quantized MoE checkpoints cannot train yet: the functional forward
+        // and gradient write-back are defined over dense weights, and
+        // expert-level dequantize-for-training is not implemented for this
+        // family (the qwen3.5 DENSE family converts automatically at init —
+        // genmlx-x76x). Fail loudly here instead of aborting at the first
+        // packed-weight matmul inside the training forward.
+        {
+            use super::decoder_layer::{AttentionType, MLPType};
+            let quantized = self.embedding.is_packed_quantized()
+                || self
+                    .lm_head
+                    .as_ref()
+                    .is_some_and(|lm| lm.is_quantized())
+                || self.layers.iter().any(|layer| {
+                    let attn_q = match &layer.attn {
+                        AttentionType::Linear(gdn) => gdn.is_quantized(),
+                        AttentionType::Full(attn) => attn.is_quantized(),
+                    };
+                    let mlp_q = match &layer.mlp {
+                        MLPType::Dense(mlp) => mlp.is_quantized(),
+                        MLPType::MoE(moe) => moe.is_quantized(),
+                    };
+                    attn_q || mlp_q
+                });
+            if quantized {
+                return Err(napi::Error::from_reason(
+                    "Training a QUANTIZED Qwen3.5-MoE checkpoint is not supported yet: \
+                     the training forward requires dense weights, and expert-level \
+                     dequantize-for-training is not implemented for the MoE family. \
+                     Use a dense (bf16) checkpoint.",
+                ));
+            }
+        }
         let optimizer = if config.optimizer_type.as_deref().unwrap_or("adamw") == "adamw" {
             Some(crate::optimizers::AdamW::new(
                 config.learning_rate,

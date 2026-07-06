@@ -731,9 +731,20 @@ export declare class MxArray {
   divScalar(value: number): MxArray;
   matmul(other: MxArray): MxArray;
   /**
-   * Fused matrix multiply-add: D = beta * C + alpha * (self @ B)
-   * where self is A. More efficient than separate matmul and add operations.
-   * Default: alpha=1.0, beta=1.0, giving D = C + (self @ B)
+   * Matrix multiply-add: D = beta * C + alpha * (self @ B), where self is A.
+   * Default: alpha=1.0, beta=1.0, giving D = C + (self @ B).
+   *
+   * Computed explicitly (matmul, optional alpha scale, then add beta*C)
+   * rather than via the fused `mlx::core::addmm` primitive. The fused
+   * primitive is correct on a well-formed metallib, but this project's local
+   * release build is known to non-deterministically miscompile fused GEMM
+   * kernels (see the metallib-corruption notes), which manifested as the
+   * fused addmm dropping `beta*C` and corrupting every biased linear — most
+   * visibly the vision tower (`qkv`, `proj`, `fc1`, `fc2`, merger all carry a
+   * bias; bias-free LM/MoE linears pass a zero `C` and were unaffected). The
+   * explicit form keeps the `C` term robust to that build hazard; the
+   * `nn::linear` unit tests assert it applies a non-zero `C`, so they double
+   * as a canary if a future build corrupts the matmul kernel too.
    */
   addmm(c: MxArray, b: MxArray, alpha?: number | undefined | null, beta?: number | undefined | null): MxArray;
   abs(): MxArray;
@@ -1244,6 +1255,29 @@ export declare class Qwen35Model {
    */
   saveModel(savePath: string): Promise<undefined>;
   /**
+   * Per-step UNCACHED forward → logits `[1, T, vocab]` (model dtype). SYNC.
+   *
+   * The uncached scoring primitive GenMLX's LLM-as-GF rides on
+   * (`backend.cljs` `forward-pass`). Builds a fresh per-layer cache
+   * internally; never touches the model's persistent caches.
+   */
+  forward(inputIds: MxArray): MxArray;
+  /**
+   * Cached forward over `input_ids`, advancing the model-internal caches;
+   * returns LAST-position logits `[1, 1, vocab]` (model dtype). SYNC.
+   *
+   * GenMLX drives prefill (`[1, N]`) then per-token steps (`[1, 1]`) through
+   * this (`backend.cljs` `forward-prefill` / `forward-step`), always with
+   * `use_cache = true`. Call `initCaches()` before the first invocation and
+   * `resetCaches()` after. Requires the flat (non-paged) cache.
+   */
+  forwardWithCache(inputIds: MxArray, useCache: boolean): MxArray;
+  /**
+   * Build fresh model-internal KV/hybrid caches for a `forwardWithCache`
+   * run. Idempotent (re-init discards any prior caches). SYNC.
+   */
+  initCaches(): void;
+  /**
    * Reset all caches and clear cached token history. Exposed
    * so tests and session-management code can start from a
    * known clean state between turns.
@@ -1380,6 +1414,60 @@ export declare class Qwen35MoeModel {
    * Dispatches to model thread.
    */
   saveModel(savePath: string): Promise<undefined>;
+  /**
+   * Per-step UNCACHED forward → logits `[1, T, vocab]` (model dtype). SYNC.
+   *
+   * The uncached scoring primitive GenMLX's LLM-as-GF rides on
+   * (`backend.cljs` `forward-pass`). Builds a fresh per-layer cache
+   * internally; never touches the model's persistent caches.
+   */
+  forward(inputIds: MxArray): MxArray;
+  /**
+   * Cached forward over `input_ids`, advancing the model-internal caches;
+   * returns LAST-position logits `[1, 1, vocab]` (model dtype). SYNC.
+   *
+   * GenMLX drives prefill (`[1, N]`) then per-token steps (`[1, 1]`) through
+   * this (`backend.cljs` `forward-prefill` / `forward-step`), always with
+   * `use_cache = true`. Call `initCaches()` before the first invocation and
+   * `resetCaches()` after. Requires the flat (non-paged) cache.
+   */
+  forwardWithCache(inputIds: MxArray, useCache: boolean): MxArray;
+  /**
+   * Build fresh model-internal KV/hybrid caches for a `forwardWithCache`
+   * run. Idempotent (re-init discards any prior caches). SYNC.
+   */
+  initCaches(): void;
+  /**
+   * Fork a branch from the model-internal cache (after `initCaches()` +
+   * `forwardWithCache(prefix)`) into an INDEPENDENT branch; returns the
+   * branch's opaque id. SYNC. (bean mlx-19wy)
+   */
+  branchCache(): number;
+  /**
+   * Fork a NEW branch from an existing branch `id` (sub-branch). SYNC.
+   * (bean mlx-19wy)
+   */
+  branchFrom(id: number): number;
+  /**
+   * Cached forward against branch `id`, advancing it in place; returns
+   * last-position logits `[1, 1, vocab]` (model dtype). SYNC. (bean mlx-19wy)
+   */
+  forwardBranch(id: number, inputIds: MxArray): MxArray;
+  /**
+   * Drop branch `id`, freeing its cache tensors. Idempotent. SYNC.
+   * (bean mlx-19wy)
+   */
+  disposeBranch(id: number): void;
+  /**
+   * Image-conditioned FLAT prefill (flat-VLM-prefill). `tokens` = chat-rendered
+   * prompt with one IMAGE_TOKEN_ID per image; `images` = raw encoded bytes
+   * (PNG/JPEG) per image. Native-preprocesses + merges vision features into
+   * inputs_embeds and runs the decoder over them, advancing the flat
+   * model-internal caches. Returns last-position logits `[1, 1, vocab]`. After
+   * this, `branchCache()`/`forwardBranch()` work unchanged on the image-
+   * conditioned prefix. Requires the flat (non-paged) cache. SYNC.
+   */
+  vlmPrefillFlat(tokens: Uint32Array, images: Array<Uint8Array>): MxArray;
   /**
    * Reset all caches and clear cached token history. Exposed
    * so tests and session-management code can start from a
@@ -1581,6 +1669,29 @@ export declare class Qwen3Model {
     tools?: Array<ToolDefinition> | undefined | null,
     enableThinking?: boolean | undefined | null,
   ): Promise<Uint32Array>;
+  /**
+   * Per-step UNCACHED forward → logits `[1, T, vocab]` (model dtype). SYNC.
+   *
+   * The uncached scoring primitive GenMLX's LLM-as-GF rides on
+   * (`backend.cljs` `forward-pass`). Builds a fresh per-call KV cache
+   * internally; never touches the model's persistent flat caches.
+   */
+  forward(inputIds: MxArray): MxArray;
+  /**
+   * Cached forward over `input_ids`, advancing the model-internal flat KV
+   * caches; returns LAST-position logits `[1, 1, vocab]` (model dtype). SYNC.
+   *
+   * GenMLX drives prefill (`[1, N]`) then per-token steps (`[1, 1]`) through
+   * this (`backend.cljs` `forward-prefill` / `forward-step`), always with
+   * `use_cache = true`. Call `initCaches()` before the first invocation and
+   * `resetCaches()` after. Requires the flat (non-paged) cache.
+   */
+  forwardWithCache(inputIds: MxArray, useCache: boolean): MxArray;
+  /**
+   * Build fresh model-internal flat KV caches for a `forwardWithCache`
+   * run. Idempotent (re-init discards any prior caches). SYNC.
+   */
+  initCaches(): void;
   /**
    * Reset all caches and clear cached token history. Exposed
    * so tests and session-management code can start from a

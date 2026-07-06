@@ -571,6 +571,38 @@ impl GatedDeltaNet {
         self.out_proj.set_quantized(ql);
     }
 
+    /// Whether any of the in_proj_qkvz/in_proj_ba/out_proj projections hold
+    /// quantized weights.
+    pub fn is_quantized(&self) -> bool {
+        self.in_proj_qkvz.is_quantized()
+            || self.in_proj_ba.is_quantized()
+            || self.out_proj.is_quantized()
+    }
+
+    /// Convert any quantized in_proj_qkvz/in_proj_ba/out_proj to a dense
+    /// `Standard` linear for training (genmlx-x76x). Returns the number of
+    /// conversions. Dequantization preserves row order, so the merged
+    /// projections keep their contiguous-or-interleaved qkvz/ba layout.
+    /// The fused stacked cache is dropped rather than rebuilt: `forward`
+    /// falls back to the unfused two-matmul path (same math), and
+    /// `set_in_proj_*_weight` during training would invalidate it anyway.
+    pub fn dequantize_to_standard(&mut self) -> Result<u32> {
+        let mut n = 0;
+        for proj in [
+            &mut self.in_proj_qkvz,
+            &mut self.in_proj_ba,
+            &mut self.out_proj,
+        ] {
+            if proj.dequantize_to_standard()? {
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.in_proj_qkvz_ba_t = None;
+        }
+        Ok(n)
+    }
+
     // ========== Weight getters (for training parameter extraction) ==========
 
     pub fn get_in_proj_qkvz_weight(&self) -> MxArray {

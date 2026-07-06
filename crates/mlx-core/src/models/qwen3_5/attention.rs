@@ -743,4 +743,21 @@ impl Qwen3_5Attention {
             || self.v_proj.is_quantized()
             || self.o_proj.is_quantized()
     }
+
+    /// Convert any quantized q/k/v/o projection to a dense `Standard` linear
+    /// for training (genmlx-x76x). Returns the number of conversions.
+    pub fn dequantize_to_standard(&mut self) -> Result<u32> {
+        let mut n = 0;
+        for proj in [
+            &mut self.q_proj,
+            &mut self.k_proj,
+            &mut self.v_proj,
+            &mut self.o_proj,
+        ] {
+            if proj.dequantize_to_standard()? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
 }

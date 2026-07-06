@@ -85,6 +85,28 @@ impl LinearProj {
         }
     }
 
+    /// Replace a `Quantized` backend with a `Standard(Linear)` holding the
+    /// dequantized dense weight (and any additive bias). Returns whether a
+    /// conversion happened; a `Standard` projection is a no-op.
+    ///
+    /// This is the training-side counterpart of `nn::Linear::set_weight` /
+    /// `nn::Embedding::load_weight` clearing their quantized backends: the
+    /// GRPO/SFT functional forward and `apply_gradients` both require dense
+    /// weights (a packed uint32 tensor fed to a plain matmul is a shape error
+    /// — genmlx-x76x), so `init_training_sync` converts the whole model once
+    /// up front rather than dequantizing per step inside the autograd graph.
+    pub fn dequantize_to_standard(&mut self) -> Result<bool> {
+        match self {
+            LinearProj::Standard(_) => Ok(false),
+            LinearProj::Quantized(ql) => {
+                let dense = ql.dequantize_dense()?;
+                let linear = Linear::from_weights(&dense, ql.get_linear_bias())?;
+                *self = LinearProj::Standard(linear);
+                Ok(true)
+            }
+        }
+    }
+
     /// Whether this projection holds a quantized backend.
     ///
     /// Used by the dense/bf16-only `save_model_sync` MTP path to refuse
@@ -185,6 +207,40 @@ impl MLPVariant {
             MLPVariant::Standard(mlp) => mlp.set_down_proj_weight(w),
             MLPVariant::Quantized { .. } => {
                 Err(Error::from_reason("Cannot set weight on quantized MLP"))
+            }
+        }
+    }
+
+    /// Replace a `Quantized` MLP with a `Standard(MLP)` built from the three
+    /// dequantized dense weights. Returns whether a conversion happened.
+    /// See [`LinearProj::dequantize_to_standard`] for why (genmlx-x76x).
+    ///
+    /// Errors on an additive linear bias: `MLP` has no bias slots (qwen3.5
+    /// MLPs are bias-free), and silently dropping one would corrupt the model.
+    pub fn dequantize_to_standard(&mut self) -> Result<bool> {
+        match self {
+            MLPVariant::Standard(_) => Ok(false),
+            MLPVariant::Quantized {
+                gate_proj,
+                up_proj,
+                down_proj,
+            } => {
+                if gate_proj.get_linear_bias().is_some()
+                    || up_proj.get_linear_bias().is_some()
+                    || down_proj.get_linear_bias().is_some()
+                {
+                    return Err(Error::from_reason(
+                        "dequantize_to_standard: quantized MLP carries an additive bias, \
+                         which the dense MLP cannot hold",
+                    ));
+                }
+                let mlp = MLP::from_weights(
+                    &gate_proj.dequantize_dense()?,
+                    &up_proj.dequantize_dense()?,
+                    &down_proj.dequantize_dense()?,
+                )?;
+                *self = MLPVariant::Standard(mlp);
+                Ok(true)
             }
         }
     }
@@ -596,6 +652,51 @@ impl QuantizedLinear {
         self.biases.as_ref()
     }
 
+    /// The additive linear bias (NOT the quantization biases), if present.
+    pub fn get_linear_bias(&self) -> Option<&MxArray> {
+        self.bias.as_ref()
+    }
+
+    /// Dequantize the packed weight to the dense `[out, in]` tensor forward
+    /// semantics are defined over (`quantized_matmul(x, w, ...) ==
+    /// matmul(x, dequantize(w, ...).T)`). Row order is preserved, so merged
+    /// projections (qkvz/ba) keep their contiguous-or-interleaved layout.
+    ///
+    /// affine/mxfp8/mxfp4/nvfp4 route through `mlx_dequantize` with the stored
+    /// mode (out dtype = the scales dtype for affine, i.e. the model dtype);
+    /// sym8 is `w_i8[N,K] * s_w[N,1]` cast to bf16 (there is no affine pack).
+    pub fn dequantize_dense(&self) -> Result<MxArray> {
+        if self.mode == SYM8_MODE {
+            let s_w = self.s_w.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "dequantize_dense: sym8 QuantizedLinear missing s_w scale operand",
+                )
+            })?;
+            let n = s_w.shape_at(0)?;
+            let w_f = self.weight.astype(crate::array::DType::Float32)?;
+            let dense = w_f.mul(&s_w.reshape(&[n, 1])?)?;
+            return dense.astype(crate::array::DType::BFloat16);
+        }
+        let mode_c = CString::new(self.mode.as_str())
+            .map_err(|e| Error::from_reason(format!("Invalid mode string: {}", e)))?;
+        let biases_ptr = self
+            .biases
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |b| b.handle.0);
+        let handle = unsafe {
+            sys::mlx_dequantize(
+                self.weight.handle.0,
+                self.scales.handle.0,
+                biases_ptr,
+                self.group_size,
+                self.bits,
+                -1, // input (scales) dtype — bf16 for affine checkpoints
+                mode_c.as_ptr(),
+            )
+        };
+        MxArray::from_handle(handle, "quantized_linear_dequantize")
+    }
+
     /// Quantization mode discriminator string ("affine", "mxfp8", "mxfp4",
     /// "nvfp4", or "sym8").
     pub fn mode(&self) -> &str {
@@ -855,5 +956,148 @@ mod sym8_tests {
             MxArray::from_float32(&short_scales, &[n - 1]).unwrap(),
         );
         assert!(try_build_sym8_quantized_linear(&p, "l").is_err());
+    }
+}
+
+#[cfg(test)]
+mod dequantize_to_standard_tests {
+    use super::*;
+
+    /// Affine-quantize a dense f32 weight via `mlx_quantize`, returning
+    /// `(packed_weight, scales, biases)`. Mirrors the helper in
+    /// `nn::embedding` tests.
+    fn quantize_affine(weight: &MxArray, group_size: i32, bits: i32) -> (MxArray, MxArray, MxArray) {
+        let mut out_q: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut out_s: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut out_b: *mut sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            sys::mlx_quantize(
+                weight.as_raw_ptr(),
+                group_size,
+                bits,
+                c"affine".as_ptr(),
+                &mut out_q,
+                &mut out_s,
+                &mut out_b,
+            )
+        };
+        assert!(ok, "mlx_quantize affine failed");
+        assert!(!out_b.is_null(), "affine quantize must return biases");
+        (
+            MxArray::from_handle(out_q, "q").expect("q"),
+            MxArray::from_handle(out_s, "s").expect("s"),
+            MxArray::from_handle(out_b, "b").expect("b"),
+        )
+    }
+
+    fn to_vec(arr: &MxArray) -> Vec<f32> {
+        arr.astype(crate::array::DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec()
+    }
+
+    /// genmlx-x76x: converting a Quantized projection to Standard must
+    /// preserve forward semantics — `quantized_matmul(x, w, s, b, T)` and
+    /// `x @ dequantize(w, s, b).T` are the same math.
+    #[test]
+    fn linear_proj_conversion_preserves_forward() {
+        let (out_f, in_f) = (8i64, 64i64);
+        let w_data: Vec<f32> = (0..out_f * in_f)
+            .map(|i| ((i as f32 * 0.317).sin()) * 0.1)
+            .collect();
+        let weight = MxArray::from_float32(&w_data, &[out_f, in_f]).unwrap();
+        let (q, s, b) = quantize_affine(&weight, 32, 4);
+
+        let mut proj = LinearProj::Quantized(QuantizedLinear::new(
+            q,
+            s,
+            Some(b),
+            None,
+            32,
+            4,
+            "affine".to_string(),
+        ));
+
+        let x_data: Vec<f32> = (0..2 * in_f).map(|i| ((i as f32 * 0.113).cos()) * 0.5).collect();
+        let x = MxArray::from_float32(&x_data, &[2, in_f]).unwrap();
+
+        let y_quant = to_vec(&proj.forward(&x).unwrap());
+
+        assert!(proj.dequantize_to_standard().unwrap());
+        assert!(!proj.is_quantized());
+        // Idempotent on a Standard projection.
+        assert!(!proj.dequantize_to_standard().unwrap());
+
+        let y_dense = to_vec(&proj.forward(&x).unwrap());
+        assert_eq!(y_quant.len(), y_dense.len());
+        for (i, (a, c)) in y_quant.iter().zip(y_dense.iter()).enumerate() {
+            assert!(
+                (a - c).abs() <= 1e-3 + 1e-2 * c.abs(),
+                "forward diverged at {i}: quantized={a} dense={c}"
+            );
+        }
+    }
+
+    /// The dense weight round-trips shape and stays within the 4-bit
+    /// quantization error of the original.
+    #[test]
+    fn dequantize_dense_shape_and_error_bound() {
+        let (out_f, in_f) = (6i64, 32i64);
+        let w_data: Vec<f32> = (0..out_f * in_f).map(|i| (i as f32 * 0.071).sin()).collect();
+        let weight = MxArray::from_float32(&w_data, &[out_f, in_f]).unwrap();
+        let (q, s, b) = quantize_affine(&weight, 32, 4);
+        let ql = QuantizedLinear::new(q, s, Some(b), None, 32, 4, "affine".to_string());
+
+        let dense = ql.dequantize_dense().unwrap();
+        assert_eq!(dense.shape_at(0).unwrap(), out_f);
+        assert_eq!(dense.shape_at(1).unwrap(), in_f);
+        let dv = to_vec(&dense);
+        // 4-bit affine over group 32: max |err| <= half a quantization step;
+        // the weights span ~[-1, 1] so a generous 0.2 bound catches layout
+        // bugs (transposed/packed reads) without flaking on rounding.
+        for (i, (orig, deq)) in w_data.iter().zip(dv.iter()).enumerate() {
+            assert!(
+                (orig - deq).abs() < 0.2,
+                "dequantized weight diverged at {i}: orig={orig} deq={deq}"
+            );
+        }
+    }
+
+    /// A quantized MLP converts to a dense Standard MLP with matching forward.
+    #[test]
+    fn mlp_variant_conversion_preserves_forward() {
+        let (hidden, inter) = (32i64, 48i64);
+        let mk = |seed: f32, rows: i64, cols: i64| {
+            let data: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i as f32 * seed).sin()) * 0.1)
+                .collect();
+            MxArray::from_float32(&data, &[rows, cols]).unwrap()
+        };
+        let build = |w: &MxArray| {
+            let (q, s, b) = quantize_affine(w, 32, 4);
+            QuantizedLinear::new(q, s, Some(b), None, 32, 4, "affine".to_string())
+        };
+        let mut mlp = MLPVariant::Quantized {
+            gate_proj: build(&mk(0.211, inter, hidden)),
+            up_proj: build(&mk(0.157, inter, hidden)),
+            down_proj: build(&mk(0.359, hidden, inter)),
+        };
+
+        let x_data: Vec<f32> = (0..2 * hidden).map(|i| ((i as f32 * 0.093).cos()) * 0.5).collect();
+        let x = MxArray::from_float32(&x_data, &[2, hidden]).unwrap();
+
+        let y_quant = to_vec(&mlp.forward(&x).unwrap());
+        assert!(mlp.dequantize_to_standard().unwrap());
+        assert!(!mlp.is_quantized());
+        let y_dense = to_vec(&mlp.forward(&x).unwrap());
+
+        for (i, (a, c)) in y_quant.iter().zip(y_dense.iter()).enumerate() {
+            assert!(
+                (a - c).abs() <= 1e-3 + 1e-2 * c.abs(),
+                "MLP forward diverged at {i}: quantized={a} dense={c}"
+            );
+        }
     }
 }
