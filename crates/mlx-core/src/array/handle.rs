@@ -6,10 +6,25 @@ pub(crate) fn check_handle(
     context: &str,
 ) -> Result<*mut sys::mlx_array> {
     if handle.is_null() {
-        Err(Error::from_reason(format!(
-            "null handle returned: {}",
-            context
-        )))
+        // A null handle means a C++ shim caught an MLX exception
+        // (MLX_GUARD_PTR) and recorded e.what() in the thread-local error
+        // slot before returning the null sentinel. Surface that detail —
+        // every export routes through here, and without it the entire
+        // guarded-throw class (eager validation, Metal buffer pressure)
+        // degrades to an undiagnosable "null handle returned: <ctx>"
+        // (genmlx-ne1q; previously only `item` consumed the slot).
+        let msg = {
+            let p = unsafe { sys::mlx_take_last_error() };
+            if p.is_null() {
+                format!("null handle returned: {}", context)
+            } else {
+                // Copy immediately — the pointer is only valid until the
+                // next shim call.
+                let detail = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
+                format!("MLX error in {}: {}", context, detail)
+            }
+        };
+        Err(Error::from_reason(msg))
     } else {
         Ok(handle)
     }
