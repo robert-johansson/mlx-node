@@ -781,6 +781,19 @@ pub fn random_key(seed: f64) -> Result<MxArray> {
     MxArray::from_handle(handle, "random_key")
 }
 
+/// Seed MLX's PROCESS-GLOBAL RNG (`mlx::core::random::seed`).
+///
+/// GenMLX's inference PRNG is keyed (`randomKey`/`randomSplit` + `key*`
+/// samplers) and is NOT affected by this. The global stream is what the
+/// native training engine's sampler consumes during GRPO generation, so
+/// seeding it makes paired training runs share their sampling randomness
+/// (common-random-numbers experiments — genmlx-at2q).
+#[napi(js_name = "seedGlobalRng")]
+pub fn seed_global_rng(seed: f64) -> Result<()> {
+    unsafe { mlx_sys::mlx_seed(seed as u64) };
+    Ok(())
+}
+
 #[napi(js_name = "randomSplit")]
 pub fn random_split(key: &MxArray) -> Result<Vec<MxArray>> {
     let mut k1: *mut mlx_sys::mlx_array = std::ptr::null_mut();
