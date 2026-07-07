@@ -29,7 +29,7 @@ use super::mlp::GemmaMLP;
 use super::quantized_linear::LinearProj;
 
 /// Draft architecture name required in the checkpoint's `architectures` list.
-const DSPARK_ARCHITECTURE: &str = "Gemma4DSparkModel";
+pub(crate) const DSPARK_ARCHITECTURE: &str = "Gemma4DSparkModel";
 
 // Greedy-vs-sampled detection for draft sampling uses the ENGINE's
 // `sampling::is_greedy_temperature` predicate — the same predicate the
@@ -1103,12 +1103,13 @@ impl DsparkDraftModel {
 }
 
 /// Remove `key` from `tensors`, recording it in `missing` when absent.
+/// Shared by the DSpark and assistant draft loaders.
 ///
-/// A present tensor must be bf16 — the v1 checkpoint contract is bf16-only,
-/// and an exact-key f32/f16 file would otherwise push the whole forward into
-/// an unsupported dtype regime (f32 stays confined to runtime readbacks:
-/// sampling distributions and confidence probabilities).
-fn take_tensor(
+/// A present tensor must be bf16 — the draft checkpoint contract is
+/// bf16-only, and an exact-key f32/f16 file would otherwise push the whole
+/// forward into an unsupported dtype regime (f32 stays confined to runtime
+/// readbacks: sampling distributions and confidence probabilities).
+pub(crate) fn take_tensor(
     tensors: &mut HashMap<String, MxArray>,
     key: &str,
     missing: &mut Vec<String>,
@@ -1120,23 +1121,30 @@ fn take_tensor(
     let dtype = tensor.dtype()?;
     if dtype != DType::BFloat16 {
         return Err(Error::from_reason(format!(
-            "DSpark draft tensor {key} must be bf16, got {dtype:?} (only bf16 checkpoints are supported)"
+            "Gemma4 draft tensor {key} must be bf16, got {dtype:?} (only bf16 checkpoints are supported)"
         )));
     }
     Ok(Some(tensor))
 }
 
-fn apply_norm_weight(norm: &mut RMSNorm, w: &MxArray, dims: i64, name: &str) -> Result<()> {
+/// Shape-checked RMSNorm weight install, shared by the DSpark and assistant
+/// draft loaders.
+pub(crate) fn apply_norm_weight(
+    norm: &mut RMSNorm,
+    w: &MxArray,
+    dims: i64,
+    name: &str,
+) -> Result<()> {
     if w.ndim()? != 1 || w.shape_at(0)? != dims {
         return Err(Error::from_reason(format!(
-            "DSpark {name} weight must be [{dims}], got {:?}",
+            "Gemma4 draft {name} weight must be [{dims}], got {:?}",
             w.shape()?.as_ref()
         )));
     }
     norm.set_weight(w)
 }
 
-fn check_2d_shape(w: &MxArray, rows: i64, cols: i64, name: &str) -> Result<()> {
+pub(crate) fn check_2d_shape(w: &MxArray, rows: i64, cols: i64, name: &str) -> Result<()> {
     if w.ndim()? != 2 || w.shape_at(0)? != rows || w.shape_at(1)? != cols {
         return Err(Error::from_reason(format!(
             "DSpark {name} must be [{rows}, {cols}], got {:?}",
@@ -1149,7 +1157,7 @@ fn check_2d_shape(w: &MxArray, rows: i64, cols: i64, name: &str) -> Result<()> {
 /// Inverse-CDF draw from a dense probability row (mirrors the sparse-slice
 /// sampler in `sampling.rs`, but over the full vocab row that
 /// `sampling_distribution` returns).
-fn sample_index_from_probs<R: Rng + ?Sized>(probs: &[f32], rng: &mut R) -> Result<i32> {
+pub(crate) fn sample_index_from_probs<R: Rng + ?Sized>(probs: &[f32], rng: &mut R) -> Result<i32> {
     let total: f64 = probs
         .iter()
         .filter(|p| p.is_finite() && **p > 0.0)

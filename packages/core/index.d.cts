@@ -167,15 +167,15 @@ export declare class Gemma4Model {
   hasBlockPagedCache(): boolean;
   modelId(): number;
   /**
-   * Whether a DSpark draft model is loaded on this instance (via
-   * `Gemma4LoadOptions::draft_model_path`), enabling the speculative-
-   * decode whole-turn path.
+   * Whether a draft model — DSpark or Google assistant — is loaded on
+   * this instance (via `Gemma4LoadOptions::draft_model_path`), enabling
+   * the speculative-decode whole-turn path.
    *
    * Note: this only reports draft availability. Whether speculative
    * decoding actually runs on a given call also requires the per-request
    * `enableMtp` flag. Named `hasMtpWeights` for parity with the Qwen3.5
-   * surface, but it reports an external DSpark draft model, not
-   * in-checkpoint MTP heads. Stubs from `new(config)` always return
+   * surface, but it reports an external draft model (either variant),
+   * not in-checkpoint MTP heads. Stubs from `new(config)` always return
    * `false`.
    */
   hasMtpWeights(): boolean;
@@ -2357,13 +2357,28 @@ export interface ChatConfig {
    */
   enableMtp?: boolean | undefined;
   /**
-   * MTP: number of draft tokens per speculative cycle. Clamped to `[1, 5]`
-   * by the verify FFI contract. Default: 1.
+   * MTP: number of draft tokens per speculative cycle.
    *
+   * On Qwen3.5 native MTP heads it is clamped to `[1, 5]` by the verify
+   * FFI contract, and when unset native code currently pins depth 1.
    * When `mtpAdaptiveDepth` is `true`, this value is used as the
    * throughput-policy seed and the expected-value policy's max depth.
    * Adaptive depth is opt-in; set `mtpAdaptiveDepth: true` explicitly to
    * enable it.
+   *
+   * Gemma4 external drafts (`draftModelPath`) resolve the field per draft
+   * variant instead (`gemma4/model.rs` `resolve_params`, always from the
+   * RAW config value — the engine's central `[1, 5]` clamp is an MTP-head
+   * contract that does not apply to external drafts):
+   * - DSpark: an unset `mtpDepth` runs full draft blocks (the draft
+   *   checkpoint's block size — 7 tokens on `dspark_gemma4_12b_block7`),
+   *   and an explicit `mtpDepth` acts as a CAP on that block (clamped to
+   *   `[1, blockSize]`).
+   * - Assistant (Google `gemma-4-*-it-assistant`): an unset `mtpDepth`
+   *   drafts 3 tokens per cycle (`ASSISTANT_DEFAULT_DEPTH`), and an
+   *   explicit `mtpDepth` clamps to `[1, 8]` (`ASSISTANT_MAX_DEPTH`).
+   *
+   * `mtpAdaptiveDepth` is ignored for both Gemma4 external-draft variants.
    */
   mtpDepth?: number | undefined;
   /**
@@ -2946,10 +2961,11 @@ export interface Gemma4Config {
 /** Optional load-time settings for [`Gemma4Model::load`]. */
 export interface Gemma4LoadOptions {
   /**
-   * Directory of a DSpark draft checkpoint (config.json +
-   * model.safetensors) to load alongside the target model for
-   * speculative decoding. DSpark runs only on the flat KV-cache path:
-   * setting this while the model config explicitly enables
+   * Directory of a draft checkpoint (config.json + safetensors) to load
+   * alongside the target model for speculative decoding — either a
+   * DSpark draft or a Google assistant draft; the kind is probed from
+   * the draft config.json. Draft decoding runs only on the flat KV-cache
+   * path: setting this while the model config explicitly enables
    * `use_block_paged_cache` is a hard load error, and an unset
    * `use_block_paged_cache` is forced to `false`.
    */
