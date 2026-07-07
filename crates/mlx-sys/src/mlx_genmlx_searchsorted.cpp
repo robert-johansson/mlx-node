@@ -44,8 +44,15 @@ mlx_array* mlx_array_searchsorted(mlx_array* sorted_handle,
   auto sorted = reinterpret_cast<array*>(sorted_handle);
   auto values = reinterpret_cast<array*>(values_handle);
 
+  // N-D values (genmlx-fqqx): the [N,1]x[1,M] broadcast trick is 1-D-only —
+  // a [2,2] values array became [2,1,2] and could not broadcast against
+  // [1,M]. Flatten first, reshape the index result back at the end
+  // (numpy/mlx searchsorted preserves the values shape).
+  const Shape values_shape = values->shape();
+  array values_flat = reshape(*values, {-1});
+
   // values[:, None] -> [N, 1] ; sorted[None, :] -> [1, M].
-  array values_col = expand_dims(*values, 1);  // values varies along axis 0
+  array values_col = expand_dims(values_flat, 1); // values varies along axis 0
   array sorted_row = expand_dims(*sorted, 0);  // sorted varies along axis 1
 
   // Predicate broadcasts to [N, M]; sum over the sorted axis (1) -> [N].
@@ -58,6 +65,9 @@ mlx_array* mlx_array_searchsorted(mlx_array* sorted_handle,
   // result is a valid gather/take index array (see header note above).
   array counts = sum(mask, /*axis=*/1, /*keepdims=*/false);
   array result = astype(counts, mlx::core::int32);
+  if (values_shape.size() != 1) {
+    result = reshape(result, values_shape);
+  }
 
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
   )
