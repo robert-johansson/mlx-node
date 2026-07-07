@@ -232,6 +232,12 @@ use crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER;
 /// and training state. Training commands are routed via `TrainingDispatch`.
 pub(crate) struct Qwen35MoeInner {
     pub(crate) config: Qwen3_5MoeConfig,
+    /// One long-lived GPU stream reused by every generation/forward call on
+    /// this model. Streams can never be freed (no mlx_stream_free), so a
+    /// per-call Stream::new leaked one Metal stream+thread per completion and
+    /// per-call latency grew across generateBatch calls (genmlx-d3yn). On
+    /// CUDA, Stream::new already collapses to the default stream.
+    pub(crate) generation_stream: Stream,
     pub(crate) embedding: Embedding,
     pub(crate) layers: Vec<DecoderLayer>,
     pub(crate) final_norm: RMSNorm,
@@ -687,6 +693,7 @@ impl Qwen35MoeInner {
 
         Ok(Self {
             config,
+            generation_stream: Stream::new(DeviceType::Gpu),
             embedding,
             layers,
             final_norm,
@@ -796,7 +803,7 @@ impl Qwen35MoeInner {
         let fa_idx = self.fa_idx;
         let mut no_cache: Option<Vec<Qwen3_5LayerCache>> = None;
         let logits = {
-            let _ctx = StreamContext::new(Stream::new(DeviceType::Gpu));
+            let _ctx = StreamContext::new(self.generation_stream);
             forward_inner(
                 &input,
                 &embedding_weight,
@@ -847,7 +854,7 @@ impl Qwen35MoeInner {
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         let fa_idx = self.fa_idx;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         // Mirror `generate_sync`: chunked prefill for the multi-token prompt
         // (bounds peak memory, manages its own per-chunk StreamContext), and a
         // direct `forward_inner` for single-token decode steps (no chunk setup).
@@ -937,7 +944,7 @@ impl Qwen35MoeInner {
         let input_ids =
             MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -1075,7 +1082,7 @@ impl Qwen35MoeInner {
         let mut branch = Some(self.branch_caches.remove(&id).ok_or_else(|| {
             Error::from_reason(format!("forwardBranch: branch {id} not found"))
         })?);
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let forward_result = if input.shape_at(1)? <= 1 {
             let _ctx = StreamContext::new(generation_stream);
             forward_inner(
@@ -1724,7 +1731,7 @@ impl Qwen35MoeInner {
         let mut token_history: Vec<u32> = expanded_tokens.clone();
 
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -1977,7 +1984,7 @@ impl Qwen35MoeInner {
         let embedding_weight = embed.get_weight();
         let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -2289,7 +2296,7 @@ impl Qwen35MoeInner {
         let embedding_weight = embed.get_weight();
         let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -3797,7 +3804,7 @@ impl Qwen35MoeInner {
         let mut streamed_text_len: usize = 0;
 
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -4161,7 +4168,7 @@ impl Qwen35MoeInner {
 
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -4439,7 +4446,7 @@ impl Qwen35MoeInner {
 
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -4738,7 +4745,7 @@ impl Qwen35MoeInner {
 
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let fa_idx = self.fa_idx;
 
         // Prefill. Chunked to bound peak GPU memory for long prompts —
@@ -5338,7 +5345,7 @@ impl Qwen35MoeInner {
 
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let fa_idx = self.fa_idx;
 
         // Use fresh caches for training (not shared inference caches)

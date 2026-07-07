@@ -244,6 +244,12 @@ fn compute_paged_prefix_block_hash(
 /// and training state. Training commands are routed via `TrainingDispatch`.
 pub(crate) struct Qwen35Inner {
     pub(crate) config: Qwen3_5Config,
+    /// One long-lived GPU stream reused by every generation/forward call on
+    /// this model. Streams can never be freed (no mlx_stream_free), so a
+    /// per-call Stream::new leaked one Metal stream+thread per completion and
+    /// per-call latency grew across generateBatch calls (genmlx-d3yn). On
+    /// CUDA, Stream::new already collapses to the default stream.
+    pub(crate) generation_stream: Stream,
     pub(crate) embedding: Embedding,
     pub(crate) layers: Vec<DecoderLayer>,
     pub(crate) final_norm: RMSNorm,
@@ -700,6 +706,7 @@ impl Qwen35Inner {
 
         Ok(Self {
             config,
+            generation_stream: Stream::new(DeviceType::Gpu),
             embedding,
             layers,
             final_norm,
@@ -797,7 +804,7 @@ impl Qwen35Inner {
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         let mut no_cache: Option<Vec<Qwen3_5LayerCache>> = None;
         let logits = {
-            let _ctx = StreamContext::new(Stream::new(DeviceType::Gpu));
+            let _ctx = StreamContext::new(self.generation_stream);
             forward_inner(
                 &input,
                 &embedding_weight,
@@ -846,7 +853,7 @@ impl Qwen35Inner {
         let input = Self::normalize_forward_input(input_ids)?;
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         // Mirror `generate_sync`: a direct `forward_inner` for single-token
         // decode steps (no chunk setup), and the dense chunked-prefill helper
         // for the multi-token prompt (bounds peak memory, manages its own
@@ -1716,7 +1723,7 @@ impl Qwen35Inner {
         let eos_id = eos_token_id;
 
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -1943,7 +1950,7 @@ impl Qwen35Inner {
 
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -2866,7 +2873,7 @@ impl Qwen35Inner {
             profiler.snapshot_memory_before();
 
             let eos_id = eos_token_id;
-            let generation_stream = crate::stream::Stream::new(crate::stream::DeviceType::Gpu);
+            let generation_stream = self.generation_stream;
             let model_size_bytes = self.config.estimate_memory_bytes() as usize;
             let _wired_ctx =
                 crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -3064,7 +3071,7 @@ impl Qwen35Inner {
         let embedding_weight = embed.get_weight();
         let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -3406,7 +3413,7 @@ impl Qwen35Inner {
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -3645,7 +3652,7 @@ impl Qwen35Inner {
         let embedding_weight = embed.get_weight();
         let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -4436,7 +4443,7 @@ impl Qwen35Inner {
             profiler.snapshot_memory_before();
 
             let eos_id = eos_token_id;
-            let generation_stream = crate::stream::Stream::new(crate::stream::DeviceType::Gpu);
+            let generation_stream = self.generation_stream;
             let model_size_bytes = self.config.estimate_memory_bytes() as usize;
             let _wired_ctx =
                 crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -4688,7 +4695,7 @@ impl Qwen35Inner {
 
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -5236,7 +5243,7 @@ impl Qwen35Inner {
         let mut streamed_text_len: usize = 0;
 
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -5544,7 +5551,7 @@ impl Qwen35Inner {
 
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
 
         // Prefill
         let prompt = prompt_tokens.reshape(&[1, -1])?;
@@ -5853,7 +5860,7 @@ impl Qwen35Inner {
 
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
 
         // Use fresh caches for training (not shared inference caches)
         let mut training_caches: Option<Vec<Qwen3_5LayerCache>> = Some(
@@ -10770,7 +10777,7 @@ mod paged_construction_tests {
         } else {
             chunk_size
         };
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = inner.generation_stream;
         let mut offset = 0;
         while total_len - offset > chunk_size {
             let chunk = prompt.slice_axis(1, offset, offset + chunk_size)?;
@@ -10826,7 +10833,7 @@ mod paged_construction_tests {
             &inner.final_norm,
             &inner.lm_head,
             Some(embedding_weight_t),
-            Stream::new(DeviceType::Gpu),
+            inner.generation_stream,
             chunk_size,
         )
     }

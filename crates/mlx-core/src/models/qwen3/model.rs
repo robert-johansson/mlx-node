@@ -41,6 +41,12 @@ use crate::engine;
 /// and training state. Training commands are routed via `TrainingDispatch`.
 pub(crate) struct Qwen3Inner {
     pub(crate) config: Qwen3Config,
+    /// One long-lived GPU stream reused by every generation/forward call on
+    /// this model. Streams can never be freed (no mlx_stream_free), so a
+    /// per-call Stream::new leaked one Metal stream+thread per completion and
+    /// per-call latency grew across generateBatch calls (genmlx-d3yn). On
+    /// CUDA, Stream::new already collapses to the default stream.
+    pub(crate) generation_stream: Stream,
     pub(crate) embedding: Embedding,
     pub(crate) layers: Vec<TransformerBlock>,
     pub(crate) final_norm: RMSNorm,
@@ -423,6 +429,7 @@ impl Qwen3Inner {
 
         Ok(Self {
             config,
+            generation_stream: Stream::new(DeviceType::Gpu),
             embedding,
             layers,
             final_norm,
@@ -543,7 +550,7 @@ impl Qwen3Inner {
         let rope_offsets = MxArray::from_int32(&[0], &[1])?;
         let left_padding = MxArray::from_int32(&[0], &[1])?;
         let logits = {
-            let _ctx = StreamContext::new(Stream::new(DeviceType::Gpu));
+            let _ctx = StreamContext::new(self.generation_stream);
             Qwen3Model::forward_fused(
                 &input,
                 &embedding_weight,
@@ -599,7 +606,7 @@ impl Qwen3Inner {
         let input = Self::normalize_forward_input(input_ids)?;
         let embedding_weight = self.embedding.get_weight();
         let left_padding = MxArray::from_int32(&[0], &[1])?;
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
         let total_seq_len = input.shape_at(1)? as usize;
 
         // Mirror `generate_sync`: a direct `forward_fused` for single-token
@@ -1065,7 +1072,7 @@ impl Qwen3Inner {
         let lm_head = &self.lm_head;
         let model_config = &self.config;
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
 
         let num_layers = layers.len();
         let mut kv_keys: Vec<Option<MxArray>> = vec![None; num_layers];
@@ -1788,7 +1795,7 @@ impl Qwen3Inner {
         let lm_head = &self.lm_head;
         let model_config = &self.config;
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
+        let generation_stream = self.generation_stream;
 
         let num_layers = layers.len();
         let mut kv_keys: Vec<Option<MxArray>> = vec![None; num_layers];

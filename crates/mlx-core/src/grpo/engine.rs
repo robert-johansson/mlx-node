@@ -765,6 +765,9 @@ impl GRPOTrainingEngine {
     #[napi]
     pub async fn generate_batch(&self, prompts: Vec<Vec<ChatMessage>>) -> Result<Vec<String>> {
         let result = self.generate_batch_for_training(prompts).await?;
+        // Inference-only path: drop the just-cached generation MxArrays — no
+        // train step is coming to consume (and clear) them.
+        self.dispatch_clear_generation_cache().await?;
         Ok(result.completion_texts)
     }
 
@@ -1635,6 +1638,18 @@ impl GRPOTrainingEngine {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.dispatch
             .send_train(TrainCmd::BumpSkippedStep { reply: tx })?;
+        rx.await
+            .map_err(|_| Error::from_reason("Model thread exited"))?
+    }
+
+    /// Send ClearGenerationCache and await completion. Inference-only
+    /// `generate_batch` calls this so the model thread does not retain the
+    /// batch's token/logprob MxArrays for a train step that never comes
+    /// (genmlx-d3yn best-of-K hygiene).
+    async fn dispatch_clear_generation_cache(&self) -> Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.dispatch
+            .send_train(TrainCmd::ClearGenerationCache { reply: tx })?;
         rx.await
             .map_err(|_| Error::from_reason("Model thread exited"))?
     }

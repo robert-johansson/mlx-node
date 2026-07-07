@@ -164,6 +164,7 @@ pub(crate) enum TrainCmd {
     /// skip paths). Clears cached generation MxArrays; returns the new
     /// step.
     BumpSkippedStep { reply: ResponseTx<i64> },
+    ClearGenerationCache { reply: ResponseTx<()> },
     /// Restore the training step counter (resume from checkpoint). Does
     /// not touch optimizer state.
     SetTrainingStep { step: i64, reply: ResponseTx<()> },
@@ -348,6 +349,15 @@ pub(crate) fn handle_train_cmd<B: TrainBackend>(inner: &mut B, cmd: TrainCmd) {
                 ))
             };
             let _ = reply.send(result);
+        }
+        TrainCmd::ClearGenerationCache { reply } => {
+            // Inference-only generateBatch retains one batch of prompt/completion
+            // MxArrays for a train step that never comes; drop them (genmlx-d3yn).
+            // No training state = nothing retained = success.
+            if let Some(ts) = inner.training_state_mut() {
+                ts.clear_generation_cache();
+            }
+            let _ = reply.send(Ok(()));
         }
         TrainCmd::SetTrainingStep { step, reply } => {
             let result = if let Some(ts) = inner.training_state_mut() {
