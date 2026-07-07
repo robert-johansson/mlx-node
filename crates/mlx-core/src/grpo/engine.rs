@@ -174,6 +174,18 @@ pub struct GRPOEngineConfig {
     pub adamw_eps: Option<f64>,
     /// Weight decay for AdamW (default: 0.01)
     pub weight_decay: Option<f64>,
+
+    /// Seed for the model thread's MLX RNG, applied once at InitTraining
+    /// (default: None = leave the thread's time-based stream untouched).
+    ///
+    /// MLX's global PRNG state is THREAD-LOCAL in this fork, and training
+    /// generation samples on the model thread — so a caller-side
+    /// `random::seed` cannot make training runs reproducible. InitTraining
+    /// executes on the model thread, which makes this the one honest place
+    /// to seed: two trainers built over identically-initialized models with
+    /// the same seed (and config) generate the same completions —
+    /// common-random-numbers paired training experiments (genmlx-at2q).
+    pub seed: Option<i64>,
 }
 
 impl Default for GRPOEngineConfig {
@@ -209,6 +221,7 @@ impl Default for GRPOEngineConfig {
             adamw_beta2: Some(0.999),
             adamw_eps: Some(1e-8),
             weight_decay: Some(0.01),
+            seed: None,
         }
     }
 }

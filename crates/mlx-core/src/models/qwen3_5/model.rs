@@ -5656,6 +5656,12 @@ impl Qwen35Inner {
                 "Training state already initialized. A single model thread can host only one active training run.",
             ));
         }
+        // MLX's PRNG state is thread-local; this runs ON the model thread, so
+        // it is the one place a config seed can make training generation
+        // reproducible (genmlx-at2q).
+        if let Some(seed) = config.seed {
+            unsafe { mlx_sys::mlx_seed(seed as u64) };
+        }
         // Quantized checkpoints train on dequantized dense master weights
         // (genmlx-x76x); dense checkpoints pass through untouched.
         let converted = self.dequantize_for_training()?;

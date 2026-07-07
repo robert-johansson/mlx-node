@@ -1442,6 +1442,11 @@ impl Qwen3Inner {
                 "Training state already initialized. A single model thread can host only one active training run.",
             ));
         }
+        // MLX's PRNG state is thread-local; this runs ON the model thread
+        // (genmlx-at2q — see GRPOEngineConfig::seed).
+        if let Some(seed) = config.seed {
+            unsafe { mlx_sys::mlx_seed(seed as u64) };
+        }
         let optimizer = if config.optimizer_type.as_deref().unwrap_or("adamw") == "adamw" {
             Some(crate::optimizers::AdamW::new(
                 config.learning_rate,

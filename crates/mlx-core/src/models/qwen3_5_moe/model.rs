@@ -5119,6 +5119,11 @@ impl Qwen35MoeInner {
                 "Training state already initialized. A single model thread can host only one active training run.",
             ));
         }
+        // MLX's PRNG state is thread-local; this runs ON the model thread
+        // (genmlx-at2q — see GRPOEngineConfig::seed).
+        if let Some(seed) = config.seed {
+            unsafe { mlx_sys::mlx_seed(seed as u64) };
+        }
         // Quantized MoE checkpoints cannot train yet: the functional forward
         // and gradient write-back are defined over dense weights, and
         // expert-level dequantize-for-training is not implemented for this

@@ -781,13 +781,15 @@ pub fn random_key(seed: f64) -> Result<MxArray> {
     MxArray::from_handle(handle, "random_key")
 }
 
-/// Seed MLX's PROCESS-GLOBAL RNG (`mlx::core::random::seed`).
+/// Seed the CALLING THREAD's MLX default RNG (`mlx::core::random::seed`).
 ///
-/// GenMLX's inference PRNG is keyed (`randomKey`/`randomSplit` + `key*`
-/// samplers) and is NOT affected by this. The global stream is what the
-/// native training engine's sampler consumes during GRPO generation, so
-/// seeding it makes paired training runs share their sampling randomness
-/// (common-random-numbers experiments — genmlx-at2q).
+/// MLX's default `KeySequence` is `thread_local` in this fork, so this seeds
+/// only the napi thread's stream — unkeyed draws made from JS (e.g.
+/// `MxArray.categorical`) become reproducible. It does NOT reach a model
+/// thread: the training engine samples there, so reproducible GRPO
+/// generation goes through `GrpoEngineConfig.seed` (applied at InitTraining
+/// on the model thread — genmlx-at2q). GenMLX's inference PRNG is keyed
+/// (`randomKey`/`randomSplit` + `key*` samplers) and unaffected by either.
 #[napi(js_name = "seedGlobalRng")]
 pub fn seed_global_rng(seed: f64) -> Result<()> {
     unsafe { mlx_sys::mlx_seed(seed as u64) };

@@ -773,6 +773,7 @@ impl SftTrainingEngine {
             adamw_beta1: Some(0.9),
             adamw_beta2: Some(0.999),
             adamw_eps: Some(1e-8),
+            seed: None,
         }
     }
 }
