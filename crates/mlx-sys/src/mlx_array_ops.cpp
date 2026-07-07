@@ -475,6 +475,26 @@ mlx_array* mlx_array_put_along_axis(mlx_array* handle,
   )
 }
 
+// Add values into the array at the given indices along an axis. The
+// scatter-add analogue of put_along_axis: duplicate indices ACCUMULATE
+// instead of overwriting (histogram/bincount-shaped workloads).
+mlx_array* mlx_array_scatter_add_axis(mlx_array* handle,
+                                      mlx_array* indices_handle,
+                                      mlx_array* values_handle,
+                                      int32_t axis) {
+  MLX_GUARD_PTR("array_scatter_add_axis",
+  auto arr = reinterpret_cast<array*>(handle);
+  auto indices = reinterpret_cast<array*>(indices_handle);
+  auto values = reinterpret_cast<array*>(values_handle);
+  if (!arr || !indices || !values) {
+    return 0;
+  }
+
+  array result = mlx::core::scatter_add_axis(*arr, *indices, *values, axis);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  )
+}
+
 mlx_array* mlx_array_arange(double start,
                             double stop,
                             double step,

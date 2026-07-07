@@ -1131,3 +1131,81 @@ pub fn compute_gradients(
     let input_refs: Vec<&MxArray> = inputs.iter().copied().collect();
     mlx_core::autograd::compute_gradients(input_refs, loss_closure)
 }
+
+// --- Scatter / convolution exports (genmlx-lgbx) ---
+// The FFI shims predate these exports: mlx_conv2d and mlx_array_put_along_axis
+// existed for internal model code only; mlx_array_scatter_add_axis is new.
+
+/// Put `values` into `a` at `indices` along `axis` (scatter with overwrite).
+/// Matches mlx.core.put_along_axis; duplicate indices overwrite in undefined
+/// order, so only write-identical or unique-index patterns are deterministic.
+#[napi(js_name = "putAlongAxis")]
+pub fn put_along_axis(
+    a: &MxArray,
+    indices: &MxArray,
+    values: &MxArray,
+    axis: i32,
+) -> Result<MxArray> {
+    let handle = unsafe {
+        sys::mlx_array_put_along_axis(
+            a.as_raw_ptr(),
+            indices.as_raw_ptr(),
+            values.as_raw_ptr(),
+            axis,
+        )
+    };
+    MxArray::from_handle(handle, "put_along_axis")
+}
+
+/// Add `values` into `a` at `indices` along `axis`; duplicate indices
+/// ACCUMULATE (mlx.core scatter_add_axis). The histogram/bincount primitive.
+#[napi(js_name = "scatterAdd")]
+pub fn scatter_add(
+    a: &MxArray,
+    indices: &MxArray,
+    values: &MxArray,
+    axis: i32,
+) -> Result<MxArray> {
+    let handle = unsafe {
+        sys::mlx_array_scatter_add_axis(
+            a.as_raw_ptr(),
+            indices.as_raw_ptr(),
+            values.as_raw_ptr(),
+            axis,
+        )
+    };
+    MxArray::from_handle(handle, "scatter_add")
+}
+
+/// 2D convolution, matching mlx.core.conv2d: input [N,H,W,C_in] (NHWC),
+/// weight [C_out,kh,kw,C_in]. Cross-correlation semantics (no kernel flip),
+/// so correlation searches use it directly. Defaults: stride 1, padding 0,
+/// dilation 1, groups 1.
+#[napi(js_name = "conv2d")]
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d(
+    input: &MxArray,
+    weight: &MxArray,
+    stride_h: Option<i32>,
+    stride_w: Option<i32>,
+    padding_h: Option<i32>,
+    padding_w: Option<i32>,
+    dilation_h: Option<i32>,
+    dilation_w: Option<i32>,
+    groups: Option<i32>,
+) -> Result<MxArray> {
+    let handle = unsafe {
+        sys::mlx_conv2d(
+            input.as_raw_ptr(),
+            weight.as_raw_ptr(),
+            stride_h.unwrap_or(1),
+            stride_w.unwrap_or(1),
+            padding_h.unwrap_or(0),
+            padding_w.unwrap_or(0),
+            dilation_h.unwrap_or(1),
+            dilation_w.unwrap_or(1),
+            groups.unwrap_or(1),
+        )
+    };
+    MxArray::from_handle(handle, "conv2d")
+}

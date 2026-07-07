@@ -204,6 +204,12 @@ unsafe extern "C-unwind" {
         values: *mut mlx_array,
         axis: i32,
     ) -> *mut mlx_array;
+    pub fn mlx_array_scatter_add_axis(
+        handle: *mut mlx_array,
+        indices: *mut mlx_array,
+        values: *mut mlx_array,
+        axis: i32,
+    ) -> *mut mlx_array;
     pub fn mlx_array_arange(start: f64, stop: f64, step: f64, dtype: i32) -> *mut mlx_array;
     pub fn mlx_array_linspace(
         start: f64,
