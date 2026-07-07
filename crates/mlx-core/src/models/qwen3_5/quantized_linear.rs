@@ -1068,12 +1068,20 @@ mod dequantize_to_standard_tests {
     /// A quantized MLP converts to a dense Standard MLP with matching forward.
     #[test]
     fn mlp_variant_conversion_preserves_forward() {
-        let (hidden, inter) = (32i64, 48i64);
+        let (hidden, inter) = (32i64, 64i64);
+        // bf16 weights end-to-end — real checkpoints quantize bf16 tensors, so
+        // their scales (and thus the dequantized dense weights) are bf16; an
+        // f32 synthetic here would hand the dense MLP mixed dtypes, which the
+        // fused E39 stacked-swiglu kernel rejects (and that shim is unguarded
+        // — genmlx-tsji — so the throw would abort the test process).
         let mk = |seed: f32, rows: i64, cols: i64| {
             let data: Vec<f32> = (0..rows * cols)
                 .map(|i| ((i as f32 * seed).sin()) * 0.1)
                 .collect();
-            MxArray::from_float32(&data, &[rows, cols]).unwrap()
+            MxArray::from_float32(&data, &[rows, cols])
+                .unwrap()
+                .astype(crate::array::DType::BFloat16)
+                .unwrap()
         };
         let build = |w: &MxArray| {
             let (q, s, b) = quantize_affine(w, 32, 4);
@@ -1085,17 +1093,32 @@ mod dequantize_to_standard_tests {
             down_proj: build(&mk(0.359, hidden, inter)),
         };
 
+        // bf16 input — the production dtype; the dense path's fused E39
+        // stacked-swiglu kernel throws on f32 (and that shim is unguarded —
+        // genmlx-tsji), while every real forward feeds bf16 activations.
         let x_data: Vec<f32> = (0..2 * hidden).map(|i| ((i as f32 * 0.093).cos()) * 0.5).collect();
-        let x = MxArray::from_float32(&x_data, &[2, hidden]).unwrap();
+        let x = MxArray::from_float32(&x_data, &[2, hidden])
+            .unwrap()
+            .astype(crate::array::DType::BFloat16)
+            .unwrap();
 
+        // Route the dense forward through the LEGACY (unfused) MLP path: the
+        // E39 stacked-swiglu C++ kernel requires the model-thread CUDA
+        // context setup that cargo-test threads on Thor lack (the
+        // genmlx-gr51 environment class), and its shim is unguarded
+        // (genmlx-tsji) so the throw would abort the test runner. The
+        // conversion math under test is identical on both paths.
+        unsafe { std::env::set_var("MLX_DISABLE_E39_STACKED_MLP", "1") };
         let y_quant = to_vec(&mlp.forward(&x).unwrap());
         assert!(mlp.dequantize_to_standard().unwrap());
         assert!(!mlp.is_quantized());
         let y_dense = to_vec(&mlp.forward(&x).unwrap());
+        unsafe { std::env::remove_var("MLX_DISABLE_E39_STACKED_MLP") };
 
         for (i, (a, c)) in y_quant.iter().zip(y_dense.iter()).enumerate() {
+            // bf16 rounding widens the band vs the f32 linear test above
             assert!(
-                (a - c).abs() <= 1e-3 + 1e-2 * c.abs(),
+                (a - c).abs() <= 5e-3 + 2e-2 * c.abs(),
                 "MLP forward diverged at {i}: quantized={a} dense={c}"
             );
         }
