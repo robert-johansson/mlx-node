@@ -3413,6 +3413,19 @@ export interface GrpoEngineConfig {
   adamwEps?: number;
   /** Weight decay for AdamW (default: 0.01) */
   weightDecay?: number;
+  /**
+   * Seed for the model thread's MLX RNG, applied once at InitTraining
+   * (default: None = leave the thread's time-based stream untouched).
+   *
+   * MLX's global PRNG state is THREAD-LOCAL in this fork, and training
+   * generation samples on the model thread — so a caller-side
+   * `random::seed` cannot make training runs reproducible. InitTraining
+   * executes on the model thread, which makes this the one honest place
+   * to seed: two trainers built over identically-initialized models with
+   * the same seed (and config) generate the same completions —
+   * common-random-numbers paired training experiments (genmlx-at2q).
+   */
+  seed?: number;
 }
 
 /** Configuration for GRPO loss computation */
