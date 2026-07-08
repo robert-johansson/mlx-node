@@ -1565,8 +1565,12 @@ pub struct ConversionOptions {
     pub imatrix_path: Option<String>,
 
     /// Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
-    /// When true, applies after the recipe predicate: any 8-bit affine decision
-    /// becomes mxfp8, any 4-bit decision becomes mxfp4. Requires `quant_mode = "affine"`.
+    /// When true, applies after the recipe predicate: eligible 8-bit affine
+    /// decisions become mxfp8 and 4-bit become mxfp4. Kept affine (not upgraded):
+    /// affine-only loaders (lm_head, embed_tokens, router.proj,
+    /// embedding_projection) at their recipe bits, MoE router gates (8-bit affine),
+    /// and the recipe-pinned attention/GDN projections (o_proj / out_proj /
+    /// in_proj_a / in_proj_b, 8-bit affine). Requires `quant_mode = "affine"`.
     /// Forces `group_size = 32` for upgraded layers.
     pub quant_mxfp: Option<bool>,
 
@@ -3425,6 +3429,38 @@ fn is_affine_only_key(key: &str) -> bool {
         || key.contains("embedding_projection")
 }
 
+/// Check if a key is one of the four attention/GDN projections that the
+/// `unsloth` / `qwen3_5` recipes deliberately pin to 8-bit **affine**
+/// (`self_attn.o_proj`, `linear_attn.out_proj`, `linear_attn.in_proj_a`,
+/// `linear_attn.in_proj_b`).
+///
+/// These are quantized (not left bf16) so that AR (M=1) and MTP-verify (M>=2)
+/// both route through the M-invariant `quantized_matmul` / `qmv` kernel, giving
+/// T=0 MTP<->AR bit-exactness: a bf16 `matmul` dispatches `gemv` at M=1 but a
+/// split-K `steel_matmul` at M>=2, whose different reduction order flips argmax
+/// on near-ties. 8-bit *affine* specifically keeps the worst-KLD tensor
+/// (`out_proj`, KLD ~6.0) and `o_proj` (~1.5) near bf16 — MXFP8's E8M0
+/// power-of-two scales have ~10x the round-trip error of affine 8-bit (the same
+/// reason router gates are protected).
+///
+/// Used by `apply_mxfp_upgrade` ONLY, to skip the 8-bit -> mxfp8 upgrade. It
+/// must NOT be added to `is_affine_only_key`: that helper is also consulted by
+/// the uniform / no-recipe path (`quantize_weights_inner`), and listing these
+/// keys there would wrongly stop a uniform `--q-mode mxfp8` from upgrading
+/// `o_proj`. The nvfp4 path needs no equivalent guard — `apply_nvfp4_upgrade`
+/// has no 8-bit arm, so it already passes these `Custom { bits: 8, .. }`
+/// decisions through unchanged.
+///
+/// Mirrors the exact substrings the recipes match (`build_qwen35_recipe` /
+/// `build_unsloth_recipe`) so it covers precisely the pinned keys and does NOT
+/// catch `q/k/v_proj`, `in_proj_qkv`, or `in_proj_z` (6-bit, must upgrade).
+fn is_bitexact_affine_proj(key: &str) -> bool {
+    key.contains("self_attn.o_proj")
+        || key.contains("linear_attn.out_proj")
+        || key.contains("linear_attn.in_proj_a.")
+        || key.contains("linear_attn.in_proj_b.")
+}
+
 // ── Per-Layer Quantization Recipes ──────────────────────────────────────────
 
 /// Per-weight quantization decision returned by recipe predicates.
@@ -3892,6 +3928,14 @@ pub(crate) fn build_privacy_filter_predicate(
 ///   top-K expert selection and produces gibberish output. Python mlx-lm's
 ///   `quant_predicate` in `qwen3_5.py` hardcodes these gates to
 ///   `{group_size: 64, bits: 8}` affine for exactly this reason.
+/// - Recipe-pinned attention/GDN projections (`self_attn.o_proj`,
+///   `linear_attn.out_proj`, `linear_attn.in_proj_a`, `linear_attn.in_proj_b`):
+///   the `unsloth` / `qwen3_5` recipes pin these to 8-bit affine so AR (M=1)
+///   and MTP-verify (M>=2) both route through the M-invariant `qmv` kernel for
+///   T=0 MTP<->AR bit-exactness. Like the router gates their loader IS
+///   mode-aware, but MXFP8's E8M0 power-of-two scales have ~10x the round-trip
+///   error of affine 8-bit, pushing the worst-KLD `out_proj` (~6.0) and
+///   `o_proj` (~1.5) off bf16. See `is_bitexact_affine_proj`.
 ///
 /// MXFP tensors at any of these keys would be silently misinterpreted at
 /// load time or destroy routing precision. Supporting MXFP on these keys
@@ -3909,14 +3953,32 @@ pub(crate) fn apply_mxfp_upgrade(
         if is_affine_only_key(key) {
             return original;
         }
-        // Router gates and shared_expert_gate: ALWAYS force 8-bit affine,
-        // regardless of what the inner predicate returned. MXFP8's coarse
-        // E8M0 scales destroy top-K routing precision. We do not preserve
-        // `Skip` here either: a recipe that wants to keep gates at full
-        // precision would not have a meaningful interaction with `--q-mxfp`
-        // since the loader has no path to load an unquantized gate when
-        // every other weight is quantized. Forcing affine 8-bit matches
-        // Python mlx-lm's `quant_predicate` in `qwen3_5.py`.
+        // Recipe-pinned 8-bit affine attention/GDN projections
+        // (o_proj / out_proj / in_proj_a / in_proj_b). The unsloth / qwen3_5
+        // recipes emit Custom{8, gs64, affine} here so AR (M=1) and MTP-verify
+        // (M>=2) both route through the M-invariant qmv kernel for T=0
+        // MTP<->AR bit-exactness, and 8-bit *affine* (not mxfp8's coarse E8M0
+        // scales) keeps the worst-KLD out_proj near bf16. Preserve THAT pinned
+        // decision from the mxfp8 upgrade — but ONLY when the recipe actually
+        // pinned it to 8-bit affine. `apply_mxfp_upgrade` wraps every recipe,
+        // and generic `mixed_*` recipes give these keys low-bit decisions
+        // (e.g. mixed_4_6 -> 4-bit affine o_proj) that must still upgrade
+        // normally (4-bit -> mxfp4); gating on the pinned decision — not the
+        // key alone — keeps those working. A `Skip` (MTP-layer keys) falls
+        // through to the main match's `Skip => Skip` arm, so it is still kept.
+        if is_bitexact_affine_proj(key)
+            && matches!(&original, QuantDecision::Custom { bits: 8, mode, .. } if mode == "affine")
+        {
+            return original;
+        }
+        // Router gates and shared_expert_gate: force 8-bit affine (group_size
+        // 64), but PRESERVE an explicit `Skip` from the inner predicate. MXFP8's
+        // coarse E8M0 scales destroy top-K routing precision, so any non-Skip
+        // gate decision (Default or Custom) is rewritten to affine 8-bit —
+        // matching Python mlx-lm's `quant_predicate` in `qwen3_5.py`
+        // (`{group_size: 64, bits: 8}`). A recipe that returns `Skip` for a gate
+        // (keep it dense/bf16) is honored as-is. Mirrors the Skip-preserving
+        // gate branch in `apply_nvfp4_upgrade`.
         if is_router_gate(key) {
             match original {
                 QuantDecision::Skip => return QuantDecision::Skip,
@@ -5060,8 +5122,8 @@ fn quantize_weights_inner(
 ///
 /// Returns the per-layer override map produced by `quantize_weights_inner`.
 /// The no-recipe path still emits non-default entries for special keys —
-/// e.g. router gates are upgraded to mxfp8 under a global MXFP mode, and
-/// `lm_head` / `router.proj` are forced back to affine — so callers MUST
+/// e.g. router gates are forced to 8-bit affine (regardless of the top-level
+/// MXFP mode), like `lm_head` / `router.proj` — so callers MUST
 /// thread the returned map into `config.json["quantization"]` for the
 /// loader to dispatch correctly.
 fn quantize_weights(
@@ -6490,6 +6552,120 @@ mod tests {
                 mode: "mxfp8".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_preserves_bitexact_affine_projections() {
+        // The unsloth / qwen3_5 recipes pin o_proj / out_proj / in_proj_a /
+        // in_proj_b to 8-bit affine so AR (M=1) and MTP-verify (M>=2) both route
+        // through the M-invariant qmv kernel (T=0 MTP<->AR bit-exactness), and
+        // 8-bit *affine* keeps the worst-KLD out_proj near bf16. `--q-mxfp` must
+        // NOT degrade these to mxfp8. q_proj / gate_proj prove the guard is not
+        // over-broad and still upgrade normally.
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> = Box::new(|key: &str| {
+            if key.contains("self_attn.o_proj")
+                || key.contains("linear_attn.out_proj")
+                || key.contains("linear_attn.in_proj_a.")
+                || key.contains("linear_attn.in_proj_b.")
+            {
+                // MTP-layer o_proj is left bf16 by the recipe (Skip).
+                if key.contains("mtp") {
+                    QuantDecision::Skip
+                } else {
+                    QuantDecision::Custom {
+                        bits: 8,
+                        group_size: 64,
+                        mode: "affine".to_string(),
+                    }
+                }
+            } else if key.contains("q_proj") {
+                QuantDecision::Custom {
+                    bits: 6,
+                    group_size: 64,
+                    mode: "affine".to_string(),
+                }
+            } else {
+                QuantDecision::Default
+            }
+        });
+        let wrapped = apply_mxfp_upgrade(inner, 4);
+
+        // The four recipe-pinned projections stay Custom{8, 64, affine}.
+        for key in [
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.linear_attn.out_proj.weight",
+            "model.layers.0.linear_attn.in_proj_a.weight",
+            "model.layers.0.linear_attn.in_proj_b.weight",
+        ] {
+            assert_eq!(
+                wrapped(key),
+                QuantDecision::Custom {
+                    bits: 8,
+                    group_size: 64,
+                    mode: "affine".to_string(),
+                },
+                "{key} must stay 8-bit affine, not upgrade to mxfp8"
+            );
+        }
+
+        // An MTP-layer o_proj the recipe Skips stays Skip (not force-quantized).
+        assert_eq!(
+            wrapped("model.mtp.layers.0.self_attn.o_proj.weight"),
+            QuantDecision::Skip,
+            "MTP o_proj Skip must be preserved"
+        );
+
+        // Control: the guard is not over-broad. q_proj (6-bit) passes through
+        // unchanged and gate_proj (Default, default_bits=4) upgrades to mxfp4.
+        assert_eq!(
+            wrapped("model.layers.0.self_attn.q_proj.weight"),
+            QuantDecision::Custom {
+                bits: 6,
+                group_size: 64,
+                mode: "affine".to_string(),
+            },
+            "q_proj must not be caught by the o_proj guard"
+        );
+        assert_eq!(
+            wrapped("model.layers.0.mlp.gate_proj.weight"),
+            QuantDecision::Custom {
+                bits: 4,
+                group_size: 32,
+                mode: "mxfp4".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_promotes_non_pinned_low_bit_projections() {
+        // The bitexact guard must protect ONLY the recipe-PINNED 8-bit affine
+        // decision (qwen3_5 / unsloth). Under a generic `mixed_*` recipe these
+        // same keys get low-bit decisions (e.g. mixed_4_6 -> 4-bit affine
+        // o_proj) which must still upgrade to mxfp4 — otherwise --q-mxfp is a
+        // silent no-op for them on mixed recipes.
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+            Box::new(|_key: &str| QuantDecision::Custom {
+                bits: 4,
+                group_size: 64,
+                mode: "affine".to_string(),
+            });
+        let wrapped = apply_mxfp_upgrade(inner, 4);
+        for key in [
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.linear_attn.out_proj.weight",
+            "model.layers.0.linear_attn.in_proj_a.weight",
+            "model.layers.0.linear_attn.in_proj_b.weight",
+        ] {
+            assert_eq!(
+                wrapped(key),
+                QuantDecision::Custom {
+                    bits: 4,
+                    group_size: 32,
+                    mode: "mxfp4".to_string(),
+                },
+                "{key}: non-pinned 4-bit affine (mixed_* recipe) must upgrade to mxfp4"
+            );
+        }
     }
 
     #[test]
