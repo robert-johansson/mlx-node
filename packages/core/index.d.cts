@@ -2287,6 +2287,36 @@ export declare const enum BuiltinRewardType {
   JsonSchema = 'JsonSchema',
 }
 
+/**
+ * Data-free static FP8 activation-amax calibration over RAW-text PREFILL
+ * (NVIDIA modelopt `MaxCalibrator` parity), end to end in native code.
+ *
+ * Reuses the SAME loader the inference session uses
+ * ([`persistence::load_with_thread`]) — the model is only usable on its
+ * dedicated model thread — then:
+ *   1. arms the process-global [`ActivationAmaxCollector`] (AFTER load, so no
+ *      load-time eval is recorded);
+ *   2. dispatches [`Qwen35Cmd::CalibratePrefillRaw`], which on the model thread
+ *      tokenizes each `text` WITHOUT the chat template, truncates to
+ *      `calib_seq` tokens, and runs PREFILL ONLY (no generation) so every
+ *      mxfp8 attn/GDN projection's activation tap fires over realistic
+ *      raw-text activations, resetting caches between rows;
+ *   3. disarms the collector, then — ONLY if the full loop succeeded — drains
+ *      the per-tensor amax and ATOMICALLY writes it into
+ *      `<model_path>/config.json` (temp file + `rename`).
+ *
+ * On ANY error before the final write, the partial amax is discarded and
+ * `config.json` is left UNTOUCHED (a failed calibration must not mutate the
+ * live model in place). Returns the number of projections calibrated (the
+ * count of collected amax entries); 0 means the model exercised no
+ * activation-fp8 sites (not an nvidia-recipe checkpoint).
+ */
+export declare function calibrateActivationAmaxRaw(
+  modelPath: string,
+  texts: Array<string>,
+  calibSeq: number,
+): Promise<number>;
+
 /** Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
 export interface ChatConfig {
   maxNewTokens?: number | undefined;

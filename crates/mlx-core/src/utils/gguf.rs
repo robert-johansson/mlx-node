@@ -1283,6 +1283,33 @@ pub async fn convert_gguf_to_safetensors(
         )));
     }
 
+    // The nvidia recipe is documented + validated only for qwen3_5 /
+    // qwen3_5_moe and is a data-free port with a fixed format map. Reject an
+    // unsupported model type + the flags that would silently alter or
+    // contradict the map BEFORE the imatrix AWQ pre-scaling (below) can rewrite
+    // weights and BEFORE the recipe predicate is built/wrapped with
+    // `apply_mxfp_upgrade`. Shares one validator with the safetensors entry
+    // point (`convert_model_inner`) so both paths reject the same combinations
+    // with identical messages.
+    //
+    // The GGUF path has no HF `model_type` in scope here: `GgufConversionOptions`
+    // carries none, the CLI never forwards `--model-type` to it, and the arch is
+    // only inferred from GGUF metadata later (as e.g. `qwen3`, never the exact
+    // `qwen3_5`/`qwen3_5_moe`). Passing `None` therefore rejects nvidia-on-GGUF
+    // via the model-type gate — the correct outcome, since the recipe is a
+    // faithful full-precision→mxfp port and re-quantizing an already-lossy GGUF
+    // was never a supported path.
+    if options.quant_recipe.as_deref() == Some("nvidia") {
+        crate::convert::validate_nvidia_recipe_options(
+            None,
+            options.imatrix_path.as_deref(),
+            options.quant_mxfp.unwrap_or(false),
+            options.quant_bits,
+            options.quant_group_size,
+        )
+        .map_err(Error::from_reason)?;
+    }
+
     // Serialize all conversions process-wide before touching MLX's default
     // device + stream. Then route every MLX op through CPU for the duration
     // of this call. See `crate::convert::convert_mutex` and

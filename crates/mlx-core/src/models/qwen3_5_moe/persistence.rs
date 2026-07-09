@@ -16,7 +16,8 @@ use crate::engine::persistence::{
 use crate::models::mtp_drafter::{DrafterBodyVariant, MTP_MOE_LAYER_LINEAR_SUFFIXES};
 use crate::models::quant_dispatch::{
     default_per_layer_quant, effective_plq_for, ensure_dense_weight_floating,
-    ensure_int8_storage_resolves_sym8, has_sym8_mode, parse_quant_block, resolve_default_mode,
+    ensure_int8_storage_resolves_sym8, has_sym8_mode, normalize_per_layer_key, parse_quant_block,
+    resolve_default_mode,
 };
 use crate::models::qwen3_5::persistence::{
     MTP_LAYER_LINEAR_SUFFIXES, augment_mtplx_mtp_quantization_with_suffixes, load_vision_weights,
@@ -522,7 +523,11 @@ fn apply_weights_moe_inner(
         // int8 STORAGE with non-sym8 metadata = config drift — fail loud
         // before the int8 tensor can flow into the affine/mxfp builders.
         ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "qwen3_5_moe")?;
-        Ok(match plq.mode {
+        // Result<Option<..>>: `Ok(None)` = "prefix not quantized, fall back
+        // to the dense-weight branch"; `Err` = fail-loud (a malformed sym8
+        // layer must never silently fall back, see
+        // `try_build_sym8_quantized_linear`).
+        let built = match plq.mode {
             PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
             PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
@@ -530,7 +535,31 @@ fn apply_weights_moe_inner(
                 try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
             }
             PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
-        })
+        };
+        // Thread the per-tensor FP8 activation scale from the resolved
+        // per-layer quant record onto the built projection — mirrors the dense
+        // qwen3_5 loader. Only calibrated mxfp8 attention/GDN overrides carry a
+        // `Some` amax in config (nvidia recipe activation-fp8 sites); every
+        // other layer stays `None`, so forward behaviour is unchanged here.
+        // Also thread the normalized config key so the activation-amax
+        // calibration tap can bucket recorded `max|activation|` by projection —
+        // but ONLY on the recipe's activation-fp8 sites (attn q/k/v/o, merged
+        // GDN in_proj_qkvz, GDN out_proj). A non-site mxfp8 projection (e.g. a
+        // uniform-mxfp8 or hand-edited checkpoint's FFN/lm_head/MoE gate) gets
+        // `None` so the tap skips it and calibration never fake-quants a
+        // non-attn/GDN site.
+        let nk = normalize_per_layer_key(prefix);
+        let is_site = crate::calibration::activation_amax::is_activation_fp8_site(&nk);
+        let amax_key = is_site.then_some(nk);
+        // Gate the CONSUMED activation amax under the SAME predicate as the
+        // recorded `amax_key` — mirrors the dense qwen3_5 loader.
+        // `QuantizedLinear::forward` fake-quants whenever `input_amax > 0 &&
+        // mode == MXFP8_MODE`, so a stale / hand-edited / future-recipe config
+        // with `input_amax` on a NON-attn/GDN mxfp8 projection must NOT thread
+        // it — else it would fake-quant a non-site's activations, violating
+        // "activation FP8 only on attn/GDN sites".
+        let input_amax = if is_site { plq.input_amax } else { None };
+        Ok(built.map(move |ql| ql.with_input_amax(input_amax).with_amax_key(amax_key)))
     };
 
     let try_build_qsl = |params: &HashMap<String, MxArray>,
@@ -2019,6 +2048,7 @@ mod tests {
                 bits,
                 group_size,
                 mode: PerLayerMode::Affine,
+                input_amax: None,
             },
         );
 
@@ -2184,6 +2214,199 @@ mod tests {
             AttentionType::Linear(_) => {
                 panic!("tiny_sym8_moe_cfg (full_attention_interval=1) must assign Full attention")
             }
+        }
+    }
+
+    /// RED-first regression guard for the MoE activation-fp8 plumbing gap: the
+    /// MoE loader's `try_build_ql` must thread the resolved
+    /// `PerLayerQuant::input_amax` onto the built attention `QuantizedLinear`,
+    /// exactly like the dense qwen3_5 loader (`persistence.rs` ~:970). Before
+    /// the fix `try_build_ql` returned the raw builder result (amax dropped),
+    /// so a MoE (agentworld-style) nvidia checkpoint with a calibrated
+    /// per-tensor `input_amax` on `self_attn.q_proj` silently loaded it as
+    /// `None`. Drives the real `apply_weights_moe_inner` loader seam (which
+    /// installs q_proj via `try_build_ql` + `set_quantized_q_proj`) and reads
+    /// the amax back off the loaded attention block. This assertion is RED on
+    /// the unfixed closure (observes `None`) and GREEN once the amax is
+    /// threaded (observes `Some(AMAX)`).
+    #[test]
+    fn mxfp8_attention_q_proj_threads_input_amax_through_moe_loader() {
+        const AMAX: f32 = 37.5;
+        let config = tiny_sym8_moe_cfg();
+        let mut inner =
+            Qwen35MoeInner::new(config.clone()).expect("Qwen35MoeInner::new must succeed");
+
+        // Minimal in-memory mxfp8 q_proj group: packed fp8 weight (Uint8) +
+        // E8M0 Uint8 scales. `try_build_mxfp8_quantized_linear` only clones
+        // weight/scales into a QuantizedLinear (no load-time eval/kernel), so
+        // arbitrary bytes and the [64,64] / [64,2] shapes are load-inert.
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "embedding.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 8 * 64], &[8, 64]).expect("embedding"),
+        );
+        params.insert(
+            "final_norm.weight".to_string(),
+            MxArray::from_float32(&vec![1.0f32; 64], &[64]).expect("final_norm"),
+        );
+        params.insert(
+            "layers.0.self_attn.q_proj.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 64 * 64], &[64, 64])
+                .expect("q_proj weight")
+                .astype(DType::Uint8)
+                .expect("astype uint8 weight"),
+        );
+        params.insert(
+            "layers.0.self_attn.q_proj.scales".to_string(),
+            MxArray::from_float32(&vec![1.0f32; 64 * 2], &[64, 2])
+                .expect("q_proj scales")
+                .astype(DType::Uint8)
+                .expect("astype uint8 scales"),
+        );
+        // Satisfies the loader's per-layer has_mlp completeness gate.
+        params.insert(
+            "layers.0.mlp.gate.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 4 * 64], &[4, 64]).expect("gate"),
+        );
+
+        // The calibrated activation-fp8 override that must survive the load.
+        let mut per_layer_quant = HashMap::new();
+        per_layer_quant.insert(
+            "layers.0.self_attn.q_proj".to_string(),
+            PerLayerQuant {
+                bits: 8,
+                group_size: 32,
+                mode: PerLayerMode::Mxfp8,
+                input_amax: Some(AMAX),
+            },
+        );
+
+        apply_weights_moe_inner(
+            &mut inner,
+            &params,
+            &config,
+            4,
+            32,
+            None,
+            &per_layer_quant,
+            /* has_vision */ false,
+        )
+        .expect("mxfp8 q_proj MoE checkpoint must load");
+
+        match &inner.layers[0].attn {
+            AttentionType::Full(attn) => {
+                assert_eq!(
+                    attn.q_proj_input_amax(),
+                    Some(AMAX),
+                    "MoE loader must thread PerLayerQuant::input_amax onto the built q_proj \
+                     QuantizedLinear (was dropped before the try_build_ql fix)"
+                );
+            }
+            AttentionType::Linear(_) => {
+                panic!("tiny_sym8_moe_cfg (full_attention_interval=1) must assign Full attention")
+            }
+        }
+    }
+
+    /// RED-first NEGATIVE sibling to
+    /// `mxfp8_attention_q_proj_threads_input_amax_through_moe_loader`: the MoE
+    /// `try_build_ql` closure gated the recorded `amax_key` behind
+    /// `is_activation_fp8_site` but threaded the CONSUMED `input_amax`
+    /// UNCONDITIONALLY. A stale / hand-edited / future-recipe config that puts
+    /// `input_amax` on a NON-activation-site mxfp8 projection (here `lm_head`)
+    /// would carry it into `QuantizedLinear::forward` FP8 fake-quant — violating
+    /// "activation FP8 only on attn/GDN sites". After the symmetric-gate fix a
+    /// non-site drops `input_amax` to `None`.
+    ///
+    /// `lm_head` normalizes to `"lm_head"` (NOT a site) yet installs through the
+    /// exact closure under test (`inner.lm_head = LinearProj::Quantized(ql)`):
+    /// pre-fix this observes `Some(2.0)` (RED), post-fix `None` (GREEN).
+    #[test]
+    fn mxfp8_non_site_lm_head_drops_input_amax_through_moe_loader() {
+        use super::super::quantized_linear::{LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE};
+        let config = tiny_sym8_moe_cfg();
+        let mut inner =
+            Qwen35MoeInner::new(config.clone()).expect("Qwen35MoeInner::new must succeed");
+
+        let u8 = |v: f32, shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![v; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::Uint8)
+                .expect("astype uint8")
+        };
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "embedding.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 8 * 64], &[8, 64]).expect("embedding"),
+        );
+        params.insert(
+            "final_norm.weight".to_string(),
+            MxArray::from_float32(&vec![1.0f32; 64], &[64]).expect("final_norm"),
+        );
+        // Attention q_proj + router gate keep the loader's completeness gate
+        // satisfied (mirrors the positive sibling); q_proj carries NO input_amax.
+        params.insert(
+            "layers.0.self_attn.q_proj.weight".to_string(),
+            u8(0.0, &[64, 64]),
+        );
+        params.insert(
+            "layers.0.self_attn.q_proj.scales".to_string(),
+            u8(1.0, &[64, 2]),
+        );
+        params.insert(
+            "layers.0.mlp.gate.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 4 * 64], &[4, 64]).expect("gate"),
+        );
+        // The non-activation-site projection under test: mxfp8 lm_head carrying
+        // a stale per-tensor activation amax that must NOT survive the load.
+        params.insert("lm_head.weight".to_string(), u8(0.0, &[8, 64]));
+        params.insert("lm_head.scales".to_string(), u8(1.0, &[8, 2]));
+
+        let mut per_layer_quant = HashMap::new();
+        per_layer_quant.insert(
+            "layers.0.self_attn.q_proj".to_string(),
+            PerLayerQuant {
+                bits: MXFP8_BITS,
+                group_size: MXFP8_GROUP_SIZE,
+                mode: PerLayerMode::Mxfp8,
+                input_amax: None,
+            },
+        );
+        per_layer_quant.insert(
+            "lm_head".to_string(),
+            PerLayerQuant {
+                bits: MXFP8_BITS,
+                group_size: MXFP8_GROUP_SIZE,
+                mode: PerLayerMode::Mxfp8,
+                input_amax: Some(2.0),
+            },
+        );
+
+        apply_weights_moe_inner(
+            &mut inner,
+            &params,
+            &config,
+            4,
+            32,
+            None,
+            &per_layer_quant,
+            /* has_vision */ false,
+        )
+        .expect("mxfp8 lm_head MoE checkpoint must load");
+
+        assert!(
+            matches!(inner.lm_head, Some(LinearProj::Quantized(_))),
+            "mxfp8 lm_head must install as LinearProj::Quantized"
+        );
+        if let Some(LinearProj::Quantized(ref ql)) = inner.lm_head {
+            assert_eq!(
+                ql.input_amax(),
+                None,
+                "MoE loader must DROP input_amax on a non-activation-fp8-site mxfp8 projection \
+                 (lm_head); it was threaded unconditionally before the try_build_ql gate fix"
+            );
         }
     }
 
