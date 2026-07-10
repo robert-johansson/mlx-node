@@ -2195,6 +2195,17 @@ impl Qwen3Inner {
             });
         }
 
+        // Evaluate ALL gradients in ONE pass first: per-tensor grad.eval() in
+        // the loop below pins the ENTIRE backward graph (incl. the gradient-
+        // checkpointing recomputes) until the LAST gradient evaluates —
+        // ~110 GB on a 9B, defeating checkpointing's memory guarantee
+        // (genmlx-li1p). A single batched eval lets MLX free intermediates
+        // layer-by-layer as the backward is consumed.
+        {
+            let grad_refs: Vec<&MxArray> = gradients.values().collect();
+            MxArray::eval_arrays(&grad_refs)?;
+        }
+
         // Validate ALL gradients — skip entire step if ANY has NaN/Inf
         for (name, grad) in gradients.iter() {
             grad.eval();
@@ -2506,6 +2517,17 @@ impl Qwen3Inner {
                 total_tokens: 0,
                 step: ts.step,
             });
+        }
+
+        // Evaluate ALL gradients in ONE pass first: per-tensor grad.eval() in
+        // the loop below pins the ENTIRE backward graph (incl. the gradient-
+        // checkpointing recomputes) until the LAST gradient evaluates —
+        // ~110 GB on a 9B, defeating checkpointing's memory guarantee
+        // (genmlx-li1p). A single batched eval lets MLX free intermediates
+        // layer-by-layer as the backward is consumed.
+        {
+            let grad_refs: Vec<&MxArray> = gradients.values().collect();
+            MxArray::eval_arrays(&grad_refs)?;
         }
 
         // Validate ALL gradients — skip entire step if ANY has NaN/Inf
