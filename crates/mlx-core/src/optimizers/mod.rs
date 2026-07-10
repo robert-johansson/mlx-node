@@ -205,6 +205,78 @@ impl GradientUtils {
 
         Ok(result)
     }
+
+    /// Fused, CONSUMING value+norm clip (genmlx-muw6).
+    ///
+    /// Takes ownership of the gradient map so each raw gradient's buffer is
+    /// released as soon as its clipped replacement materializes: after the
+    /// per-tensor `clip` node is built, the raw array's only reference is
+    /// that node, and the batched eval frees (or donates) it tensor-by-tensor.
+    /// The borrowed pipeline (`clip` loop + `clip_grad_norm` over `&MxArray`)
+    /// kept THREE full gradient sets alive to end of caller scope — ~6 B/param
+    /// of the measured ~10.5 B/param GRPO train-step working set. This variant
+    /// peaks at ~one gradient set plus one tensor in flight.
+    pub fn clip_grad_value_and_norm_consuming(
+        gradients: HashMap<String, MxArray>,
+        clip_value: Option<f64>,
+        max_norm: Option<f64>,
+    ) -> Result<HashMap<String, MxArray>> {
+        if gradients.is_empty() || (clip_value.is_none() && max_norm.is_none()) {
+            return Ok(gradients);
+        }
+
+        // Phase 1: value-clip, consuming the raw map. Each raw grad is dropped
+        // as its clip node is built; the batched eval then releases raw buffers
+        // tensor-by-tensor as outputs materialize.
+        let clipped: Vec<(String, MxArray)> = match clip_value {
+            Some(v) => {
+                let mut out: Vec<(String, MxArray)> = Vec::with_capacity(gradients.len());
+                for (name, grad) in gradients {
+                    let c = grad.clip(Some(-v), Some(v))?;
+                    out.push((name, c));
+                }
+                let refs: Vec<&MxArray> = out.iter().map(|(_, a)| a).collect();
+                MxArray::eval_arrays(&refs)?;
+                out
+            }
+            None => gradients.into_iter().collect(),
+        };
+
+        let Some(max_norm) = max_norm else {
+            return Ok(clipped.into_iter().collect());
+        };
+
+        // Phase 2: global L2 norm scale — a scalar reduction chain over the
+        // materialized clipped grads. Evaluated eagerly so phase-3 outputs
+        // don't retain the whole reduction graph.
+        let mut total_squared: Option<MxArray> = None;
+        for (_, grad) in clipped.iter() {
+            let sum = grad.square()?.sum(None, None)?;
+            total_squared = Some(match total_squared {
+                None => sum,
+                Some(acc) => acc.add(&sum)?,
+            });
+        }
+        let total_norm = total_squared.unwrap().sqrt()?;
+        let max_norm_arr = MxArray::full(&[], napi::Either::A(max_norm), None)?;
+        let eps_arr = MxArray::full(&[], napi::Either::A(1e-6), None)?;
+        let one_arr = MxArray::full(&[], napi::Either::A(1.0), None)?;
+        let scale = max_norm_arr
+            .div(&total_norm.add(&eps_arr)?)?
+            .minimum(&one_arr)?;
+        scale.eval();
+
+        // Phase 3: scale, consuming the value-clipped set the same way.
+        let mut scaled: Vec<(String, MxArray)> = Vec::with_capacity(clipped.len());
+        for (name, grad) in clipped {
+            let s = grad.mul(&scale)?;
+            scaled.push((name, s));
+        }
+        let refs: Vec<&MxArray> = scaled.iter().map(|(_, a)| a).collect();
+        MxArray::eval_arrays(&refs)?;
+
+        Ok(scaled.into_iter().collect())
+    }
 }
 
 /// Learning rate schedulers

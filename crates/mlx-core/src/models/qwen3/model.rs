@@ -2264,25 +2264,29 @@ impl Qwen3Inner {
             }
         }
 
-        // Element-wise gradient clipping
-        let grad_clip_val = gradient_clip_value.unwrap_or(1.0);
-        let mut clamped_gradients: HashMap<String, MxArray> = HashMap::new();
-        for (name, grad) in gradients.iter() {
-            let clamped = grad.clip(Some(-grad_clip_val), Some(grad_clip_val))?;
-            clamped.eval();
-            clamped_gradients.insert(name.clone(), clamped);
-        }
+        tracing::debug!(
+            "GRPO mem after grad eval+validate: active={:.1} GB peak={:.1} GB",
+            get_active_memory() / 1e9,
+            get_peak_memory() / 1e9
+        );
 
-        // Gradient norm clipping
-        let clipped_gradients = if let Some(max_norm) = gradient_clip_norm {
-            let grad_refs: HashMap<String, &MxArray> = clamped_gradients
-                .iter()
-                .map(|(k, v)| (k.clone(), v))
-                .collect();
-            GradientUtils::clip_grad_norm(grad_refs, max_norm)?
-        } else {
-            clamped_gradients
-        };
+        // Fused CONSUMING value+norm clip (genmlx-muw6): raw gradient buffers
+        // are released tensor-by-tensor as the clipped replacements
+        // materialize, instead of three full gradient sets (raw + clamped +
+        // norm-scaled) living to end of scope — that pileup was ~6 B/param of
+        // the measured ~10.5 B/param train-step working set.
+        let grad_clip_val = gradient_clip_value.unwrap_or(1.0);
+        let clipped_gradients = GradientUtils::clip_grad_value_and_norm_consuming(
+            gradients,
+            Some(grad_clip_val),
+            gradient_clip_norm,
+        )?;
+
+        tracing::debug!(
+            "GRPO mem after clip: active={:.1} GB peak={:.1} GB",
+            get_active_memory() / 1e9,
+            get_peak_memory() / 1e9
+        );
 
         // Accumulate gradients
         let ts = self.training_state.as_mut().unwrap();
@@ -2350,9 +2354,7 @@ impl Qwen3Inner {
                     })
                     .collect::<Result<HashMap<_, _>>>()?;
 
-                let delta_refs: HashMap<String, &MxArray> =
-                    delta_map.iter().map(|(k, v)| (k.clone(), v)).collect();
-                self.apply_gradients_inner(delta_refs, 1.0, &params)?;
+                self.apply_gradients_inner(delta_map, 1.0, &params)?;
 
                 debug!(
                     "Applied AdamW update (step={})",
@@ -2361,9 +2363,7 @@ impl Qwen3Inner {
             } else {
                 // SGD path
                 let lr = learning_rate / grad_acc_steps as f64;
-                let grads_refs: HashMap<String, &MxArray> =
-                    grads.iter().map(|(k, v)| (k.clone(), v)).collect();
-                self.apply_gradients_inner(grads_refs, lr, &params)?;
+                self.apply_gradients_inner(grads, lr, &params)?;
                 debug!("Applied SGD gradients with lr: {}", lr);
             }
 
@@ -2582,29 +2582,14 @@ impl Qwen3Inner {
             }
         }
 
-        // Element-wise gradient clipping (if configured)
-        let clipped_gradients = if let Some(clip_val) = config.gradient_clip_value {
-            let mut clamped: HashMap<String, MxArray> = HashMap::new();
-            for (name, grad) in gradients.iter() {
-                let c = grad.clip(Some(-clip_val), Some(clip_val))?;
-                c.eval();
-                clamped.insert(name.clone(), c);
-            }
-            clamped
-        } else {
-            gradients.clone()
-        };
-
-        // Gradient norm clipping (if configured)
-        let final_gradients = if let Some(clip_norm) = config.gradient_clip_norm {
-            let grad_refs: HashMap<String, &MxArray> = clipped_gradients
-                .iter()
-                .map(|(k, v)| (k.clone(), v))
-                .collect();
-            GradientUtils::clip_grad_norm(grad_refs, clip_norm)?
-        } else {
-            clipped_gradients
-        };
+        // Fused CONSUMING value+norm clip (genmlx-muw6): raw gradient buffers
+        // released tensor-by-tensor instead of three sets living to end of
+        // scope. See the GRPO step for the working-set accounting.
+        let final_gradients = GradientUtils::clip_grad_value_and_norm_consuming(
+            gradients,
+            config.gradient_clip_value,
+            config.gradient_clip_norm,
+        )?;
 
         // Accumulate gradients
         let ts = self.training_state.as_mut().unwrap();
@@ -2675,9 +2660,7 @@ impl Qwen3Inner {
                     })
                     .collect::<Result<HashMap<_, _>>>()?;
 
-                let delta_refs: HashMap<String, &MxArray> =
-                    delta_map.iter().map(|(k, v)| (k.clone(), v)).collect();
-                self.apply_gradients_inner(delta_refs, 1.0, &params)?;
+                self.apply_gradients_inner(delta_map, 1.0, &params)?;
 
                 debug!(
                     "SFT: Applied AdamW update (step={})",
@@ -2708,11 +2691,7 @@ impl Qwen3Inner {
                     grads
                 };
 
-                let grads_refs: HashMap<String, &MxArray> = grads_with_decay
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v))
-                    .collect();
-                self.apply_gradients_inner(grads_refs, lr, &params)?;
+                self.apply_gradients_inner(grads_with_decay, lr, &params)?;
                 debug!("SFT: Applied SGD gradients with lr: {}", lr);
             }
 
@@ -2798,12 +2777,12 @@ impl Qwen3Inner {
     /// Direct field access on Qwen3Inner — no locks needed.
     fn apply_gradients_inner(
         &mut self,
-        gradients: HashMap<String, &MxArray>,
+        gradients: HashMap<String, MxArray>,
         learning_rate: f64,
         current_params: &HashMap<String, MxArray>,
     ) -> Result<()> {
         let updated_params =
-            crate::training_model::compute_sgd_updates(&gradients, learning_rate, current_params)?;
+            crate::training_model::compute_sgd_updates(gradients, learning_rate, current_params)?;
 
         // Apply updated parameters directly to model fields
         for (name, updated_param) in updated_params.iter() {

@@ -120,15 +120,37 @@ impl TrainingDispatch {
 /// Shared helper used by all model implementations to avoid duplicating the
 /// update logic. Returns a map of parameter name → updated array with all
 /// values already eval'd.
+///
+/// CONSUMES the gradient map in fixed-size chunks (genmlx-muw6): each chunk's
+/// updates are built lazily, evaluated in one batch, and the chunk's gradient
+/// buffers dropped before the next chunk starts — so the peak working set is
+/// old params + updated params + ONE CHUNK of gradients, not a third full
+/// param-sized set. On a 9B that is the difference between a ~56 GB and a
+/// ~38 GB steady-state train-step peak.
 pub(crate) fn compute_sgd_updates(
-    gradients: &HashMap<String, &MxArray>,
+    gradients: HashMap<String, MxArray>,
     learning_rate: f64,
     current_params: &HashMap<String, MxArray>,
 ) -> Result<HashMap<String, MxArray>> {
+    const CHUNK: usize = 8;
     let lr_scalar_f32 = MxArray::full(&[], Either::A(learning_rate), None)?;
-    let mut updated_params: HashMap<String, MxArray> = HashMap::new();
+    let mut updated_params: HashMap<String, MxArray> =
+        HashMap::with_capacity(gradients.len());
+    let mut pending: Vec<(String, MxArray)> = Vec::with_capacity(CHUNK);
 
-    for (name, grad) in gradients.iter() {
+    fn flush(
+        pending: &mut Vec<(String, MxArray)>,
+        updated: &mut HashMap<String, MxArray>,
+    ) -> Result<()> {
+        let refs: Vec<&MxArray> = pending.iter().map(|(_, a)| a).collect();
+        MxArray::eval_arrays(&refs)?;
+        for (name, arr) in pending.drain(..) {
+            updated.insert(name, arr);
+        }
+        Ok(())
+    }
+
+    for (name, grad) in gradients {
         let param = current_params.get(name.as_str()).ok_or_else(|| {
             Error::new(
                 Status::GenericFailure,
@@ -137,20 +159,21 @@ pub(crate) fn compute_sgd_updates(
         })?;
         let param_dtype = param.dtype()?;
         let lr_scalar = lr_scalar_f32.astype(param_dtype)?;
-        let scaled_grad = lr_scalar.mul(grad)?;
+        let scaled_grad = lr_scalar.mul(&grad)?;
         let updated_param = param.sub(&scaled_grad)?;
         let updated_param = if updated_param.dtype()? != param_dtype {
             updated_param.astype(param_dtype)?
         } else {
             updated_param
         };
-        updated_params.insert(name.clone(), updated_param);
+        pending.push((name, updated_param));
+        // `grad` and `scaled_grad` drop here; their buffers free when the
+        // pending chunk evaluates and detaches its inputs.
+        if pending.len() >= CHUNK {
+            flush(&mut pending, &mut updated_params)?;
+        }
     }
-
-    // Batch eval all updated parameters
-    for param in updated_params.values() {
-        param.eval();
-    }
+    flush(&mut pending, &mut updated_params)?;
 
     Ok(updated_params)
 }
