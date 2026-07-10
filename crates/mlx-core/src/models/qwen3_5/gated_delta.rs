@@ -568,12 +568,6 @@ fn gated_delta_chunked_ops(
         .reshape(&[b, c, BT, hv])?
         .transpose(Some(&[0, 1, 3, 2]))?;
 
-    // Cumulative decay within each chunk.
-    let gcum = g_log.cumsum(3)?; // inclusive prefix sum -> [B,C,Hv,BT]
-    let decay_self = gcum.exp()?; // exp(gcum[i])
-    // decay_mat[i,j] = exp(gcum[i]-gcum[j]); upper-tri may overflow but is always masked to 0.
-    let decay_mat = gcum.expand_dims(4)?.sub(&gcum.expand_dims(3)?)?.exp()?; // [B,C,Hv,BT,BT]
-
     // Positional triangular masks (BT x BT).
     let idx = MxArray::arange(0.0, BT as f64, None, Some(f32))?;
     let idx_i = idx.reshape(&[BT, 1])?;
@@ -581,6 +575,22 @@ fn gated_delta_chunked_ops(
     let strict_lower = idx_j.less(&idx_i)?; // j < i
     let incl_lower = idx_j.less_equal(&idx_i)?; // j <= i
     let zeros_bb = MxArray::zeros(&[BT, BT], Some(f32))?;
+
+    // Cumulative decay within each chunk.
+    let gcum = g_log.cumsum(3)?; // inclusive prefix sum -> [B,C,Hv,BT]
+    let decay_self = gcum.exp()?; // exp(gcum[i])
+    // decay_mat[i,j] = exp(gcum[i]-gcum[j]), consumed only at causal (j<=i)
+    // entries, where the diff is <= 0 (g_log <= 0 makes gcum non-increasing).
+    // The upper-tri diffs are POSITIVE and overflow exp to inf. The VALUE is
+    // always masked to 0 downstream, but under autograd exp's VJP multiplies
+    // by its own (inf) output while the where_-masked upstream grad is 0 —
+    // 0 * inf = NaN, which the broadcast reduction sums into gcum's gradient
+    // and poisons every parameter (genmlx-li1p: this skipped every GRPO step
+    // on real checkpoints). Mask the DIFF to 0 BEFORE exp: masked entries
+    // become exp(0)=1 (finite, never consumed) and where_'s exact-selection
+    // VJP zeroes their gradient. Consumed entries are bit-identical.
+    let gdiff = gcum.expand_dims(4)?.sub(&gcum.expand_dims(3)?)?; // [B,C,Hv,BT,BT]
+    let decay_mat = incl_lower.where_(&gdiff, &zeros_bb)?.exp()?;
 
     // WY system matrix A[i,j] = (j<i) * beta_i * (k_i . k_j) * decay_mat[i,j].
     let kk = k.matmul(&k.transpose(Some(&[0, 1, 2, 4, 3]))?)?;

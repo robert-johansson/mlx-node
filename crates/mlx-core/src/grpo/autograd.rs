@@ -282,10 +282,15 @@ pub(crate) fn compute_loss_and_gradients_autograd(
                 &mut ckpt_ctx.borrow_mut(),
             )?;
 
-            // Extract completion hidden states: [B, prompt_len:, :]
+            // Extract the hidden states that PREDICT the completion tokens.
+            // hidden[j] predicts input[j+1], so completion token i (at absolute
+            // position prompt_len+i) is predicted by hidden[prompt_len-1+i]:
+            // window [prompt_len-1, total_seq_len-1). Slicing from prompt_len
+            // scored each token under the distribution that had already seen it
+            // (genmlx-li1p off-by-one).
             let completion_hidden = hidden_states.slice(
-                &[0, prompt_len, 0],
-                &[batch_size, total_seq_len, config_clone.hidden_size() as i64],
+                &[0, prompt_len - 1, 0],
+                &[batch_size, total_seq_len - 1, config_clone.hidden_size() as i64],
             )?;
 
             // Get LM head weight
@@ -319,10 +324,12 @@ pub(crate) fn compute_loss_and_gradients_autograd(
                 &mut ckpt_ctx.borrow_mut(),
             )?;
 
-            // Get logits for completion tokens only
+            // Get the logits that PREDICT the completion tokens: window
+            // [prompt_len-1, total_seq_len-1), see the chunked path above
+            // (genmlx-li1p off-by-one).
             let completion_logits = logits.slice(
-                &[0, prompt_len, 0],
-                &[batch_size, total_seq_len, config_clone.vocab_size() as i64],
+                &[0, prompt_len - 1, 0],
+                &[batch_size, total_seq_len - 1, config_clone.vocab_size() as i64],
             )?;
 
             // Memory-efficient log-softmax using logsumexp decomposition
@@ -488,11 +495,13 @@ fn compute_loss_and_gradients_chunked_autograd(
                     &mut ckpt_ctx.borrow_mut(),
                 )?;
 
+                // Predicting window [prompt_len-1, total-1): hidden[j] predicts
+                // input[j+1] (genmlx-li1p off-by-one).
                 let completion_hidden = hidden_states.slice(
-                    &[0, chunk_prompt_len, 0],
+                    &[0, chunk_prompt_len - 1, 0],
                     &[
                         chunk_batch,
-                        chunk_total_seq,
+                        chunk_total_seq - 1,
                         config_clone.hidden_size() as i64,
                     ],
                 )?;
@@ -524,11 +533,12 @@ fn compute_loss_and_gradients_chunked_autograd(
                     &mut ckpt_ctx.borrow_mut(),
                 )?;
 
+                // Predicting window [prompt_len-1, total-1) (genmlx-li1p).
                 let completion_logits = logits.slice(
-                    &[0, chunk_prompt_len, 0],
+                    &[0, chunk_prompt_len - 1, 0],
                     &[
                         chunk_batch,
-                        chunk_total_seq,
+                        chunk_total_seq - 1,
                         config_clone.vocab_size() as i64,
                     ],
                 )?;
@@ -649,9 +659,11 @@ fn compute_reference_logprobs(
             false,
             &mut ckpt,
         )?;
+        // Predicting window [prompt_len-1, total-1): hidden[j] predicts
+        // input[j+1] (genmlx-li1p off-by-one).
         let completion_hidden = hidden_states.slice(
-            &[0, prompt_len, 0],
-            &[batch_size, total_seq_len, model_type.hidden_size() as i64],
+            &[0, prompt_len - 1, 0],
+            &[batch_size, total_seq_len - 1, model_type.hidden_size() as i64],
         )?;
         let lm_head_weight = if model_type.tie_word_embeddings() {
             reference_params
@@ -678,9 +690,10 @@ fn compute_reference_logprobs(
             false,
             &mut ckpt,
         )?;
+        // Predicting window [prompt_len-1, total-1) (genmlx-li1p).
         let completion_logits = logits.slice(
-            &[0, prompt_len, 0],
-            &[batch_size, total_seq_len, model_type.vocab_size() as i64],
+            &[0, prompt_len - 1, 0],
+            &[batch_size, total_seq_len - 1, model_type.vocab_size() as i64],
         )?;
         efficient_selective_log_softmax(
             &completion_logits,

@@ -5919,6 +5919,11 @@ impl Qwen35Inner {
                 .slice_axis(1, seq_len - 1, seq_len)?
                 .squeeze(Some(&[0, 1]))?
         };
+        // RAW (pre-penalty) policy logits for this position — the row the cached
+        // GRPO old-logprob is computed from (genmlx-li1p): the training recompute
+        // teacher-forces the UNPENALIZED policy, so the cached value must be the
+        // unpenalized log p(sampled token) for step-0 importance ratios of 1.
+        let mut raw_logits = last_logits.clone();
 
         if repetition_penalty != 1.0 && !input_tokens.is_empty() {
             last_logits = apply_repetition_penalty(
@@ -5946,8 +5951,12 @@ impl Qwen35Inner {
         }
 
         let (mut token, mut logprobs) = if return_logprobs {
-            let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
-            (tok, Some(lp))
+            // The sampler's echoed array is its raw INPUT row (post-penalty,
+            // unnormalized) — useless as a logprob source. Carry the raw
+            // pre-penalty row instead; the sampled token's log-prob is
+            // computed at the extraction site below (genmlx-li1p).
+            let (tok, _echo) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
+            (tok, Some(raw_logits.clone()))
         } else {
             (sample(&last_logits, Some(sampling_config))?, None)
         };
@@ -5963,8 +5972,16 @@ impl Qwen35Inner {
             let token_value = token.item_at_int32(0)? as u32;
             generated_tokens.push(token_value);
             if return_logprobs && let Some(ref lp) = logprobs {
+                // `lp` is the RAW policy logits row this token was drawn
+                // against. Cache log p(tok) = logits[tok] − logsumexp(logits)
+                // — the normalized policy log-prob GRPO's old_logprobs need.
+                // (Was: item_at(0) of the post-penalty row — the unnormalized
+                // logit of vocab id 0, genmlx-li1p.)
                 lp.eval();
-                let lp_value = lp.item_at_float32(0)?;
+                let lse = lp.logsumexp(None, Some(false))?;
+                lse.eval();
+                let lp_value =
+                    lp.item_at_float32(token_value as usize)? - lse.item_at_float32(0)?;
                 generated_logprobs.push(lp_value);
             }
             if let Some(eos) = eos_token_id
@@ -5994,6 +6011,8 @@ impl Qwen35Inner {
             )?;
             let next_last_logits = next_logits.slice_axis(1, 0, 1)?.squeeze(Some(&[0, 1]))?;
             last_logits = next_last_logits;
+            // Snapshot the raw policy row before penalties (genmlx-li1p).
+            raw_logits = last_logits.clone();
             if repetition_penalty != 1.0 || presence_penalty != 0.0 || frequency_penalty != 0.0 {
                 let context_tokens: Vec<u32> = input_tokens
                     .iter()
@@ -6026,8 +6045,9 @@ impl Qwen35Inner {
                 }
             }
             let (next_tok, next_lp) = if return_logprobs {
-                let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
-                (tok, Some(lp))
+                // Carry the raw pre-penalty row (see the prefill site, genmlx-li1p).
+                let (tok, _echo) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
+                (tok, Some(raw_logits.clone()))
             } else {
                 (sample(&last_logits, Some(sampling_config))?, None)
             };
