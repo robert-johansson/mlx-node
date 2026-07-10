@@ -1804,10 +1804,10 @@ mlx_array* mlx_paged_attention_forward(
 
     return reinterpret_cast<mlx_array*>(new array(std::move(out)));
   } catch (const std::exception& e) {
-    mlx_trace_native_error("paged_attention_forward", e.what());
+    mlx_report_error("paged_attention_forward", e.what());
     return nullptr;
   } catch (...) {
-    mlx_trace_native_error("paged_attention_forward", "unknown exception");
+    mlx_report_error("paged_attention_forward", "unknown exception");
     return nullptr;
   }
 }

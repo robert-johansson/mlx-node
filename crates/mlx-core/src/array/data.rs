@@ -84,9 +84,24 @@ impl MxArray {
                 "native_error context=eval_arrays count={}",
                 handles.len()
             ));
+            // The eval shim records e.what() in the thread-local error slot
+            // before returning false (genmlx-uhtp) — surface it so an
+            // eval-time native failure (e.g. an NVRTC kernel-compile error)
+            // doesn't degrade to an undiagnosable generic message.
+            let detail = {
+                let p = unsafe { sys::mlx_take_last_error() };
+                if p.is_null() {
+                    "see MLX_INFERENCE_TRACE_FILE".to_string()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(p) }
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            };
             Err(Error::from_reason(format!(
-                "MLX eval failed while materializing {} arrays; see MLX_INFERENCE_TRACE_FILE",
-                handles.len()
+                "MLX eval failed while materializing {} arrays: {}",
+                handles.len(),
+                detail
             )))
         }
     }
