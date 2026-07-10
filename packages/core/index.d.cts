@@ -1469,6 +1469,12 @@ export declare class Qwen35MoeModel {
    */
   vlmPrefillFlat(tokens: Uint32Array, images: Array<Uint8Array>): MxArray;
   /**
+   * Debug tap (genmlx-w3og): preprocessing + vision tower + merger only;
+   * returns the vision features `[merged, out_hidden]`. Parity oracle for
+   * the GenMLX-owned CLJS vision tower.
+   */
+  vlmVisionFeatures(images: Array<Uint8Array>): MxArray;
+  /**
    * Reset all caches and clear cached token history. Exposed
    * so tests and session-management code can start from a
    * known clean state between turns.
