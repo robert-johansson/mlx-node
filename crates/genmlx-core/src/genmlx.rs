@@ -1285,3 +1285,20 @@ pub fn dequantize(
     };
     MxArray::from_handle(handle, "dequantize")
 }
+
+/// Native qwen3.5-VL image preprocessing for the GenMLX-owned CLJS vision
+/// tower (genmlx-w3og): decode (PNG/JPEG) + smart-resize (CatmullRom, factor
+/// patch*merge) + rescale/normalize + patchify. Returns
+/// `[pixel_values, grid_thw]`: `[num_patches, 3, ps, ps]` f32 patches in
+/// (ph, pw) row-major order and `[n_images, 3]` (t, h, w) grid. Byte-exact
+/// with the native VLM path (`Qwen35VLImageProcessor::new(None)` — the same
+/// default config the model loader installs), so tower parity isolates CLJS
+/// differences to the tower itself. Preprocessing stays native by design —
+/// it is image I/O, the vision analogue of tokenization.
+#[napi(js_name = "qwen35VlmPreprocess")]
+pub fn qwen35_vlm_preprocess(images: Vec<Uint8Array>) -> Result<Vec<MxArray>> {
+    let proc = mlx_core::models::qwen3_5::processing::Qwen35VLImageProcessor::new(None);
+    let refs: Vec<&[u8]> = images.iter().map(|b| b.as_ref()).collect();
+    let processed = proc.process_many(&refs)?;
+    Ok(vec![processed.pixel_values(), processed.grid_thw()])
+}

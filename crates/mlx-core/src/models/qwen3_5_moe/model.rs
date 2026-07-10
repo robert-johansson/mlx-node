@@ -377,6 +377,13 @@ pub(crate) enum Qwen35MoeCmd {
         images: Vec<Vec<u8>>,
         reply: ResponseTx<MxArray>,
     },
+    /// Debug tap (genmlx-w3og): run ONLY preprocessing + the vision encoder
+    /// (tower + merger) and reply with the vision features `[merged, out_hidden]`.
+    /// The parity oracle for the GenMLX-owned CLJS vision tower.
+    VlmVisionFeatures {
+        images: Vec<Vec<u8>>,
+        reply: ResponseTx<MxArray>,
+    },
 }
 
 /// Source for a Tier-2 cache fork (bean mlx-19wy): the Tier-1 model-internal
@@ -515,6 +522,9 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
             reply,
         } => {
             let _ = reply.send(inner.vlm_prefill_flat_sync(tokens, &images));
+        }
+        Qwen35MoeCmd::VlmVisionFeatures { images, reply } => {
+            let _ = reply.send(inner.vlm_vision_features_sync(&images));
         }
         Qwen35MoeCmd::SaveModel { save_path, reply } => {
             let _ = reply.send(inner.save_model_sync(&save_path));
@@ -923,6 +933,31 @@ impl Qwen35MoeInner {
     /// unchanged on an image-conditioned prefix. Requires the flat (non-paged)
     /// cache; rebuilds `self.caches` internally (no `initCaches` needed first).
     /// `tokens` = chat-rendered prompt containing one IMAGE_TOKEN_ID per image.
+    /// Debug tap (genmlx-w3og): preprocessing + vision encoder ONLY — the
+    /// parity oracle for the GenMLX-owned CLJS vision tower. Mirrors the
+    /// feature-computation step of `vlm_prefill_flat_sync` (cache bypassed:
+    /// this is a test surface, not a serving path).
+    pub(crate) fn vlm_vision_features_sync(&mut self, images: &[Vec<u8>]) -> Result<MxArray> {
+        let (vision_encoder, img_proc) =
+            match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
+                (Some(enc), Some(proc)) => (enc, proc),
+                _ => {
+                    return Err(Error::from_reason(
+                        "vlmVisionFeatures requested but vision encoder/processor not loaded",
+                    ));
+                }
+            };
+        let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
+        let processed = img_proc.process_many(&image_refs)?;
+        let grid = processed.grid_thw();
+        let pv = processed.pixel_values();
+        let pv_shape = pv.shape()?;
+        let pv_5d = pv.reshape(&[1, pv_shape[0], pv_shape[1], pv_shape[2], pv_shape[3]])?;
+        let generation_stream = self.generation_stream;
+        let _stream_ctx = StreamContext::new(generation_stream);
+        vision_encoder.forward(&pv_5d, &grid)
+    }
+
     pub(crate) fn vlm_prefill_flat_sync(
         &mut self,
         tokens: Vec<u32>,
@@ -8669,6 +8704,20 @@ impl Qwen3_5MoeModel {
             tokens: tokens.clone(),
             images: images.clone(),
             reply,
+        })
+    }
+
+    /// Debug tap (genmlx-w3og): preprocessing + vision tower + merger only;
+    /// returns the vision features `[merged, out_hidden]`. Parity oracle for
+    /// the GenMLX-owned CLJS vision tower.
+    #[napi]
+    pub fn vlm_vision_features(&self, images: Vec<Uint8Array>) -> Result<MxArray> {
+        let images: Vec<Vec<u8>> = images.into_iter().map(|b| b.to_vec()).collect();
+        crate::model_thread::send_and_block(&self.thread, |reply| {
+            Qwen35MoeCmd::VlmVisionFeatures {
+                images: images.clone(),
+                reply,
+            }
         })
     }
 }
