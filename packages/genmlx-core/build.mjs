@@ -15,7 +15,7 @@
 // docs/cuda-port-runbook.md §3c.
 
 import { spawnSync } from 'node:child_process';
-import { readdir, stat, copyFile } from 'node:fs/promises';
+import { readdir, stat, copyFile, cp, rm } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -40,15 +40,69 @@ const args = [
 const r = spawnSync(napiBin, args, { stdio: 'inherit', cwd: repoRoot });
 if (r.status !== 0) process.exit(r.status ?? 1);
 
-// Metallibs are a macOS/Metal concern only. On Linux/CUDA, skip — MLX has no
-// metallib there and loads CUDA kernels at runtime.
+// Metallibs are a macOS/Metal concern only. On Linux/CUDA, colocate the CUDA
+// JIT headers instead: MLX's NVRTC JIT resolves cute/cutlass/cccl includes via
+// `current_binary_dir()/../include` (jit_module.cpp include_path_args), i.e.
+// packages/include for this statically-linked addon. The mlx-sys cmake build
+// installs that header tree into its OUT_DIR; without this copy every
+// cute-dependent kernel (gather_qmm / qmm_naive / qmm_sm80...) dies at NVRTC
+// with `cannot open source file "cute/numeric/numeric_types.hpp"` on a cold
+// PTX cache (genmlx-q5uq).
 if (process.platform !== 'darwin') {
-  console.log(
-    '[genmlx-core] non-darwin platform: skipping metallib colocation (CUDA needs no metallib).',
-  );
+  await colocateJitHeaders();
   process.exit(0);
 }
 await colocateMetallibs();
+
+// Copy the newest mlx-sys OUT_DIR include tree (mlx/, cute/, cutlass/, cccl/)
+// to packages/include, where include_path_args() probes for it. Handles both
+// build layouts: target/release/build/ and target/<arch>/release/build/.
+async function colocateJitHeaders() {
+  const targetDir = join(repoRoot, 'target');
+  const candidates = [];
+  const scanBuildDir = async (buildDir) => {
+    let dirs;
+    try {
+      dirs = await readdir(buildDir);
+    } catch {
+      return;
+    }
+    for (const d of dirs) {
+      if (!d.startsWith('mlx-sys-')) continue;
+      const inc = join(buildDir, d, 'out', 'include');
+      try {
+        const [cute, st] = [await stat(join(inc, 'cute')), await stat(inc)];
+        if (cute.isDirectory()) candidates.push({ inc, mtime: st.mtimeMs });
+      } catch {
+        // no installed headers in this OUT_DIR; keep looking
+      }
+    }
+  };
+  await scanBuildDir(join(targetDir, 'release', 'build'));
+  let archDirs = [];
+  try {
+    archDirs = await readdir(targetDir);
+  } catch {
+    // no target dir at all — nothing to scan
+  }
+  for (const arch of archDirs) {
+    await scanBuildDir(join(targetDir, arch, 'release', 'build'));
+  }
+  if (candidates.length === 0) {
+    throw new Error(
+      '[genmlx-core] no mlx-sys OUT_DIR include tree with cute/ found under ' +
+        'target/{,<arch>/}release/build/mlx-sys-*/out/include — the CUDA JIT ' +
+        'would fail on cute-dependent kernels (gather_qmm). Did the mlx-sys ' +
+        'cmake install step run?',
+    );
+  }
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  const src = candidates[0].inc;
+  const dst = join(repoRoot, 'packages', 'include');
+  await rm(dst, { recursive: true, force: true });
+  await cp(src, dst, { recursive: true });
+  console.log(`[genmlx-core] colocated CUDA JIT headers ${src} -> ${dst}`);
+}
 
 // Find + copy mlx.metallib + paged_attn.metallib next to index.node. Both are
 // required on darwin (MLX/paged-attn load them via dladdr next to the binary).

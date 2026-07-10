@@ -1209,3 +1209,79 @@ pub fn conv2d(
     };
     MxArray::from_handle(handle, "conv2d")
 }
+
+/// Quantized gather-matmul (the MoE expert primitive, mlx.core.gather_qmm).
+/// Multiplies `x` against expert slices of the PACKED quantized tensor `w`
+/// `[E, out, in_packed]` (+ `scales`/`biases` `[E, out, groups]`), selecting
+/// experts per row via `rhs_indices` (and rows of x via `lhs_indices`).
+/// Defaults match mlx.core: transpose=true, group_size=64, bits=4,
+/// mode="affine", sorted_indices=false. `sorted_indices` is a performance
+/// hint that the indices are ascending (contiguous expert blocks); results
+/// are correct either way (verified by the gather-qmm oracle test).
+#[napi(js_name = "gatherQmm")]
+#[allow(clippy::too_many_arguments)]
+pub fn gather_qmm(
+    x: &MxArray,
+    w: &MxArray,
+    scales: &MxArray,
+    biases: Option<&MxArray>,
+    lhs_indices: Option<&MxArray>,
+    rhs_indices: Option<&MxArray>,
+    transpose: Option<bool>,
+    group_size: Option<i32>,
+    bits: Option<i32>,
+    mode: Option<String>,
+    sorted_indices: Option<bool>,
+) -> Result<MxArray> {
+    let mode_c = std::ffi::CString::new(mode.unwrap_or_else(|| "affine".to_string()))
+        .map_err(|e| Error::from_reason(format!("gather_qmm: invalid mode string: {e}")))?;
+    let handle = unsafe {
+        sys::mlx_gather_qmm(
+            x.as_raw_ptr(),
+            w.as_raw_ptr(),
+            scales.as_raw_ptr(),
+            biases.map_or(std::ptr::null_mut(), |a| a.as_raw_ptr()),
+            lhs_indices.map_or(std::ptr::null_mut(), |a| a.as_raw_ptr()),
+            rhs_indices.map_or(std::ptr::null_mut(), |a| a.as_raw_ptr()),
+            transpose.unwrap_or(true),
+            group_size.unwrap_or(64),
+            bits.unwrap_or(4),
+            mode_c.as_ptr(),
+            sorted_indices.unwrap_or(false),
+        )
+    };
+    MxArray::from_handle(handle, "gather_qmm")
+}
+
+/// Dequantize a packed-quantized tensor (mlx.core.dequantize): `w` u32-packed
+/// `[.., out, in/(32/bits)]` with `scales`/`biases` `[.., out, in/group_size]`
+/// back to full precision (scales' dtype unless `out_dtype` >= 0: 0=float32,
+/// 5=bfloat16, 6=float16). Handles ALL bit widths including the odd ones
+/// (3/5/6) whose values straddle u32 words — the ones the pure
+/// floor-divide/remainder unpack in CLJS cannot express. Defaults match
+/// mlx.core: group_size=64, bits=4, mode="affine".
+#[napi(js_name = "dequantize")]
+pub fn dequantize(
+    w: &MxArray,
+    scales: &MxArray,
+    biases: Option<&MxArray>,
+    group_size: Option<i32>,
+    bits: Option<i32>,
+    mode: Option<String>,
+    out_dtype: Option<i32>,
+) -> Result<MxArray> {
+    let mode_c = std::ffi::CString::new(mode.unwrap_or_else(|| "affine".to_string()))
+        .map_err(|e| Error::from_reason(format!("dequantize: invalid mode string: {e}")))?;
+    let handle = unsafe {
+        sys::mlx_dequantize(
+            w.as_raw_ptr(),
+            scales.as_raw_ptr(),
+            biases.map_or(std::ptr::null_mut(), |a| a.as_raw_ptr()),
+            group_size.unwrap_or(64),
+            bits.unwrap_or(4),
+            out_dtype.unwrap_or(-1),
+            mode_c.as_ptr(),
+        )
+    };
+    MxArray::from_handle(handle, "dequantize")
+}
