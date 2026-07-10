@@ -665,6 +665,58 @@ pub fn gated_delta_scan(
     gated_delta_chunked_ops(q, k, v, g_log, beta, state)
 }
 
+/// Public seam for the fused single-token (T=1) gated-delta decode step:
+/// GenMLX's owned CLJS forward drives this once per GDN layer per decode
+/// step through the `gatedDeltaStep` NAPI export in genmlx-core
+/// (genmlx-t2cz) — collapsing the ~30-lazy-op CLJS host recurrence into ONE
+/// membrane crossing. Same math as one iteration of [`gated_delta_ops`]
+/// (the correctness reference the CLJS `gdn-recur-steps` mirrors).
+///
+/// `g_log` is the LOG-SPACE decay gate (matching [`gated_delta_scan`]'s
+/// contract); `exp` is applied here, inside the graph. Inputs are promoted
+/// to f32 for the recurrence; `y` is cast back to `v`'s dtype and `state'`
+/// to `state`'s dtype (identity casts are free when already f32).
+///
+/// Shapes: q/k `[B,1,Hv,Dk]` (GQA-expanded), v `[B,1,Hv,Dv]`, g_log/beta
+/// `[B,1,Hv]`, state `[B,Hv,Dv,Dk]`. Returns `(y [B,1,Hv,Dv], state')`.
+pub fn gated_delta_decode_step(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    g_log: &MxArray,
+    beta: &MxArray,
+    state: &MxArray,
+) -> Result<(MxArray, MxArray)> {
+    let out_dtype = v.dtype()?;
+    let state_dtype = state.dtype()?;
+    use crate::array::DType;
+    let f32 = DType::Float32;
+    let q = q.astype(f32)?;
+    let k = k.astype(f32)?;
+    let v = v.astype(f32)?;
+    let g = g_log.astype(f32)?.exp()?;
+    let beta = beta.astype(f32)?;
+    let s0 = state.astype(f32)?;
+    let batch = q.shape_at(0)?;
+    let num_v_heads = v.shape_at(2)?;
+    let k_dim = q.shape_at(3)?;
+    let v_dim = v.shape_at(3)?;
+    let (y, s1) = gated_delta_step(
+        &q,
+        &k,
+        &v,
+        &g,
+        &beta,
+        &s0,
+        None,
+        batch,
+        num_v_heads,
+        k_dim,
+        v_dim,
+    )?;
+    Ok((y.astype(out_dtype)?, s1.astype(state_dtype)?))
+}
+
 /// Gated delta recurrence update.
 ///
 /// Uses a custom Metal kernel when available (GPU, Metal, Dk divisible by 32),

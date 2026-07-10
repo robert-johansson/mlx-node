@@ -1316,6 +1316,75 @@ pub fn gated_delta_scan(
     Ok(vec![y, new_state])
 }
 
+/// Fused single-token (T=1) gated-delta (GDN) decode step — the per-step
+/// companion to `gatedDeltaScan` (genmlx-t2cz). Collapses the owned
+/// forward's ~30-lazy-op CLJS host recurrence into ONE membrane crossing
+/// per GDN layer per decode step. Same math as one iteration of the
+/// per-step ops reference (`gated_delta_ops` / CLJS `gdn-recur-steps`).
+/// Shapes: q/k `[B,1,Hv,Dk]` (GQA-expanded + RMS-norm-scaled), v
+/// `[B,1,Hv,Dv]`, g_log/beta `[B,1,Hv]`, state `[B,Hv,Dv,Dk]`. `g_log` is
+/// the LOG-SPACE decay gate (same contract as the scan; exp is applied
+/// inside the graph). Inputs are promoted to f32 for the recurrence; y
+/// comes back in v's dtype, state' in state's dtype. Deterministic ops.
+/// Returns `[y, state']` as a two-element array. Lazy — builds graph,
+/// evals nothing.
+#[napi(js_name = "gatedDeltaStep")]
+pub fn gated_delta_step(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    g_log: &MxArray,
+    beta: &MxArray,
+    state: &MxArray,
+) -> Result<Vec<MxArray>> {
+    let err = |m: String| Error::from_reason(format!("gated_delta_step: {m}"));
+    for (name, a, want) in [
+        ("q", q, 4u32),
+        ("k", k, 4),
+        ("v", v, 4),
+        ("g_log", g_log, 3),
+        ("beta", beta, 3),
+        ("state", state, 4),
+    ] {
+        let nd = a.ndim()?;
+        if nd != want {
+            return Err(err(format!("{name} must have ndim {want}, got {nd}")));
+        }
+    }
+    let (b, t, hv, dk) = (
+        q.shape_at(0)?,
+        q.shape_at(1)?,
+        q.shape_at(2)?,
+        q.shape_at(3)?,
+    );
+    if t != 1 {
+        return Err(err(format!(
+            "T must be 1 (the decode step; use gatedDeltaScan for T>1 blocks), got {t}"
+        )));
+    }
+    let dv = v.shape_at(3)?;
+    let check = |name: &str, a: &MxArray, want: &[i64]| -> Result<()> {
+        for (axis, &w) in want.iter().enumerate() {
+            let got = a.shape_at(axis as u32)?;
+            if got != w {
+                return Err(err(format!(
+                    "{name} axis {axis} must be {w} (from q/v), got {got}"
+                )));
+            }
+        }
+        Ok(())
+    };
+    check("k", k, &[b, t, hv, dk])?;
+    check("v", v, &[b, t, hv, dv])?;
+    check("g_log", g_log, &[b, t, hv])?;
+    check("beta", beta, &[b, t, hv])?;
+    check("state", state, &[b, hv, dv, dk])?;
+    let (y, new_state) = mlx_core::models::qwen3_5::gated_delta::gated_delta_decode_step(
+        q, k, v, g_log, beta, state,
+    )?;
+    Ok(vec![y, new_state])
+}
+
 /// Dequantize a packed-quantized tensor (mlx.core.dequantize): `w` u32-packed
 /// `[.., out, in/(32/bits)]` with `scales`/`biases` `[.., out, in/group_size]`
 /// back to full precision (scales' dtype unless `out_dtype` >= 0: 0=float32,
