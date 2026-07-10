@@ -648,6 +648,23 @@ fn gated_delta_chunked_ops(
     Ok((o.astype(out_dtype)?, s_cur.astype(state_dtype)?))
 }
 
+/// Public seam for the chunk-parallel gated-delta recurrence: GenMLX's owned
+/// CLJS forward drives this per prefill chunk through the `gatedDeltaScan`
+/// NAPI export in genmlx-core (genmlx-ps8a). Thin passthrough to
+/// [`gated_delta_chunked_ops`]; the shape contract and the LOG-SPACE `g_log`
+/// requirement (NOT `log(g)` — see that function's NaN note) are documented
+/// there and validated by the NAPI wrapper.
+pub fn gated_delta_scan(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    g_log: &MxArray,
+    beta: &MxArray,
+    state: &MxArray,
+) -> Result<(MxArray, MxArray)> {
+    gated_delta_chunked_ops(q, k, v, g_log, beta, state)
+}
+
 /// Gated delta recurrence update.
 ///
 /// Uses a custom Metal kernel when available (GPU, Metal, Dk divisible by 32),

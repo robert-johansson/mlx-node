@@ -1253,6 +1253,69 @@ pub fn gather_qmm(
     MxArray::from_handle(handle, "gather_qmm")
 }
 
+/// Chunk-parallel gated-delta (GDN) recurrence over a whole token block —
+/// the fused GDN-prefill primitive (genmlx-ps8a). Plumbs mlx-core's
+/// `gated_delta_chunked_ops` (BT=64 WY/solve_tril form), the same algorithm
+/// the native CUDA prefill path runs by default. Shapes: q/k `[B,T,Hv,Dk]`
+/// (already GQA-expanded + RMS-norm-scaled), v `[B,T,Hv,Dv]`, g_log/beta
+/// `[B,T,Hv]`, state `[B,Hv,Dv,Dk]`. `g_log` MUST be the log-space decay
+/// gate computed directly (`-exp(A_log) * softplus(a + dt_bias)`) — NOT
+/// `log(g)`: strong decay underflows exp-space `g` to 0 and `log(0) = -inf`
+/// turns the in-chunk decay-diff into `inf - inf = NaN`. Accumulation is
+/// f32; y/state' are cast back to the input dtypes. Deterministic ops (no
+/// gather_mm). Returns `[y, state']` as a two-element array. Lazy — builds
+/// graph, evals nothing.
+#[napi(js_name = "gatedDeltaScan")]
+pub fn gated_delta_scan(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    g_log: &MxArray,
+    beta: &MxArray,
+    state: &MxArray,
+) -> Result<Vec<MxArray>> {
+    let err = |m: String| Error::from_reason(format!("gated_delta_scan: {m}"));
+    for (name, a, want) in [
+        ("q", q, 4u32),
+        ("k", k, 4),
+        ("v", v, 4),
+        ("g_log", g_log, 3),
+        ("beta", beta, 3),
+        ("state", state, 4),
+    ] {
+        let nd = a.ndim()?;
+        if nd != want {
+            return Err(err(format!("{name} must have ndim {want}, got {nd}")));
+        }
+    }
+    let (b, t, hv, dk) = (
+        q.shape_at(0)?,
+        q.shape_at(1)?,
+        q.shape_at(2)?,
+        q.shape_at(3)?,
+    );
+    let dv = v.shape_at(3)?;
+    let check = |name: &str, a: &MxArray, want: &[i64]| -> Result<()> {
+        for (axis, &w) in want.iter().enumerate() {
+            let got = a.shape_at(axis as u32)?;
+            if got != w {
+                return Err(err(format!(
+                    "{name} axis {axis} must be {w} (from q/v), got {got}"
+                )));
+            }
+        }
+        Ok(())
+    };
+    check("k", k, &[b, t, hv, dk])?;
+    check("v", v, &[b, t, hv, dv])?;
+    check("g_log", g_log, &[b, t, hv])?;
+    check("beta", beta, &[b, t, hv])?;
+    check("state", state, &[b, hv, dv, dk])?;
+    let (y, new_state) =
+        mlx_core::models::qwen3_5::gated_delta::gated_delta_scan(q, k, v, g_log, beta, state)?;
+    Ok(vec![y, new_state])
+}
+
 /// Dequantize a packed-quantized tensor (mlx.core.dequantize): `w` u32-packed
 /// `[.., out, in/(32/bits)]` with `scales`/`biases` `[.., out, in/group_size]`
 /// back to full precision (scales' dtype unless `out_dtype` >= 0: 0=float32,
