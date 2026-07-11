@@ -50,6 +50,7 @@ pub(crate) fn compute_sft_loss_and_gradients(
     labels: &MxArray,
     loss_config: SftLossConfig,
     use_checkpointing: bool,
+    frozen_experts: Option<&crate::models::qwen3_5_moe::quantized_linear::FrozenExperts>,
 ) -> Result<(f64, HashMap<String, MxArray>)> {
     // 1. Flatten parameters into ordered list (keep native dtype - bfloat16)
     let mut param_names: Vec<String> = model_params.keys().cloned().collect();
@@ -72,6 +73,8 @@ pub(crate) fn compute_sft_loss_and_gradients(
         let labels_clone = labels.clone();
         let config_clone = model_type.clone();
         let loss_config_clone = loss_config.clone();
+        // Frozen packed experts as captured constants (genmlx-n32r).
+        let frozen_clone = frozen_experts.cloned();
 
         // Define loss function for autograd
         let ckpt_contexts =
@@ -88,6 +91,7 @@ pub(crate) fn compute_sft_loss_and_gradients(
                 &input_ids_clone,
                 use_checkpointing,
                 &mut ckpt_ctx.borrow_mut(),
+                frozen_clone.as_ref(),
             )?;
 
             // Get shapes

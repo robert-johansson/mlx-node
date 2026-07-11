@@ -119,4 +119,24 @@ impl SwitchGLU {
     pub fn is_quantized(&self) -> bool {
         matches!(&self.gate_proj, SwitchProj::Quantized(_))
     }
+
+    /// Arc-cheap snapshot of the packed expert projections for the
+    /// frozen-experts training path (genmlx-n32r). None when the experts
+    /// are dense (the functional forward trains them directly) or when the
+    /// three projections are not uniformly quantized (never produced by the
+    /// loader; refuse rather than mix paths).
+    pub fn frozen_snapshot(&self) -> Option<super::quantized_linear::FrozenMoeLayer> {
+        match (&self.gate_proj, &self.up_proj, &self.down_proj) {
+            (
+                SwitchProj::Quantized(gate),
+                SwitchProj::Quantized(up),
+                SwitchProj::Quantized(down),
+            ) => Some(super::quantized_linear::FrozenMoeLayer {
+                gate_proj: gate.clone(),
+                up_proj: up.clone(),
+                down_proj: down.clone(),
+            }),
+            _ => None,
+        }
+    }
 }

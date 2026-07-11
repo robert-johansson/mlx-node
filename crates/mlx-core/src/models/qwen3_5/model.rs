@@ -6180,6 +6180,7 @@ impl Qwen35Inner {
             loss_config,
             use_checkpointing,
             ts.reference_params.as_ref(),
+            None, // no frozen experts outside the MoE family (genmlx-n32r)
         )?;
 
         // Check for NaN/Inf loss
@@ -6495,6 +6496,7 @@ impl Qwen35Inner {
             &labels_arr,
             loss_config,
             use_checkpointing,
+            None, // no frozen experts (genmlx-n32r)
         )?;
 
         // Check for NaN/Inf loss

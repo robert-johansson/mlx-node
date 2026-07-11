@@ -13,6 +13,7 @@ use crate::autograd;
 use crate::models::qwen3::Qwen3Config;
 use crate::models::qwen3_5::Qwen3_5Config;
 use crate::models::qwen3_5_moe::Qwen3_5MoeConfig;
+use crate::models::qwen3_5_moe::quantized_linear::{FrozenExperts, FrozenMoeLayer};
 use crate::nn::Activations;
 use crate::training_model::ModelType;
 use napi::bindgen_prelude::*;
@@ -1359,11 +1360,20 @@ fn functional_scatter_unsort(
 /// token (~16x speedup for 128 experts, top-8).
 ///
 /// `gather_mm` has full VJP support in MLX, so this is fully differentiable.
+///
+/// With `frozen` (genmlx-n32r): the expert projections are PACKED quantized
+/// tensors held outside the trainable param set; the routed experts run
+/// through gather_qmm instead. `GatherQMM::vjp` provides the x-gradient
+/// (another gather_qmm with flipped transpose), so the block stays fully
+/// differentiable w.r.t. everything upstream — only the expert weights
+/// themselves are frozen. Router, shared expert, and shared gate come from
+/// `params` and train in both arms.
 fn sparse_moe_functional(
     params: &HashMap<String, MxArray>,
     x: &MxArray,
     prefix: &str,
     config: &Qwen3_5MoeConfig,
+    frozen: Option<&FrozenMoeLayer>,
 ) -> Result<MxArray> {
     let batch = x.shape_at(0)?;
     let seq_len = x.shape_at(1)?;
@@ -1394,17 +1404,7 @@ fn sparse_moe_functional(
         scores
     };
 
-    // Expert computation using gather_mm
-    let gate_proj_w = get_param(params, prefix, "switch_mlp.gate_proj.weight")?;
-    let up_proj_w = get_param(params, prefix, "switch_mlp.up_proj.weight")?;
-    let down_proj_w = get_param(params, prefix, "switch_mlp.down_proj.weight")?;
-
-    // Transpose weights: [E, out, in] -> [E, in, out] (gather_mm convention)
-    let gate_proj_t = gate_proj_w.transpose(Some(&[0, 2, 1]))?;
-    let up_proj_t = up_proj_w.transpose(Some(&[0, 2, 1]))?;
-    let down_proj_t = down_proj_w.transpose(Some(&[0, 2, 1]))?;
-
-    // Expand x for gather_mm: [ne, D] -> [ne, 1, 1, D]
+    // Expand x for gather_mm/gather_qmm: [ne, D] -> [ne, 1, 1, D]
     let x_expanded = x_flat.reshape(&[ne, 1, 1, hidden_size])?;
 
     // stop_gradient on indices (training: don't differentiate through discrete index selection)
@@ -1413,21 +1413,52 @@ fn sparse_moe_functional(
     // Sort optimization (same threshold as stateful SwitchGLU in switch_glu.rs)
     let do_sort = top_indices.size()? >= 64;
 
-    let y = if do_sort {
-        let sorted = functional_gather_sort(&x_expanded, &top_indices)?;
-        let idx = &sorted.idx_sorted;
-        let gate_out = sorted.x_sorted.gather_mm(&gate_proj_t, idx, true)?;
-        let up_out = sorted.x_sorted.gather_mm(&up_proj_t, idx, true)?;
-        let gate_act = Activations::silu_for_autograd(&gate_out)?;
-        let activated = gate_act.mul(&up_out)?;
-        let expert_out = activated.gather_mm(&down_proj_t, idx, true)?;
-        functional_scatter_unsort(&expert_out, &sorted.inv_order, &[ne, k as i64])?
+    let y = if let Some(fz) = frozen {
+        // FROZEN QUANTIZED EXPERTS (genmlx-n32r): routed experts via
+        // gather_qmm on the packed tensors; differentiable w.r.t. x only.
+        if do_sort {
+            let sorted = functional_gather_sort(&x_expanded, &top_indices)?;
+            let idx = &sorted.idx_sorted;
+            let gate_out = fz.gate_proj.forward(&sorted.x_sorted, idx, true)?;
+            let up_out = fz.up_proj.forward(&sorted.x_sorted, idx, true)?;
+            let gate_act = Activations::silu_for_autograd(&gate_out)?;
+            let activated = gate_act.mul(&up_out)?;
+            let expert_out = fz.down_proj.forward(&activated, idx, true)?;
+            functional_scatter_unsort(&expert_out, &sorted.inv_order, &[ne, k as i64])?
+        } else {
+            let gate_out = fz.gate_proj.forward(&x_expanded, &top_indices, false)?;
+            let up_out = fz.up_proj.forward(&x_expanded, &top_indices, false)?;
+            let gate_act = Activations::silu_for_autograd(&gate_out)?;
+            let activated = gate_act.mul(&up_out)?;
+            fz.down_proj.forward(&activated, &top_indices, false)?
+        }
     } else {
-        let gate_out = x_expanded.gather_mm(&gate_proj_t, &top_indices, false)?;
-        let up_out = x_expanded.gather_mm(&up_proj_t, &top_indices, false)?;
-        let gate_act = Activations::silu_for_autograd(&gate_out)?;
-        let activated = gate_act.mul(&up_out)?;
-        activated.gather_mm(&down_proj_t, &top_indices, false)?
+        // Expert computation using gather_mm (dense trainable experts)
+        let gate_proj_w = get_param(params, prefix, "switch_mlp.gate_proj.weight")?;
+        let up_proj_w = get_param(params, prefix, "switch_mlp.up_proj.weight")?;
+        let down_proj_w = get_param(params, prefix, "switch_mlp.down_proj.weight")?;
+
+        // Transpose weights: [E, out, in] -> [E, in, out] (gather_mm convention)
+        let gate_proj_t = gate_proj_w.transpose(Some(&[0, 2, 1]))?;
+        let up_proj_t = up_proj_w.transpose(Some(&[0, 2, 1]))?;
+        let down_proj_t = down_proj_w.transpose(Some(&[0, 2, 1]))?;
+
+        if do_sort {
+            let sorted = functional_gather_sort(&x_expanded, &top_indices)?;
+            let idx = &sorted.idx_sorted;
+            let gate_out = sorted.x_sorted.gather_mm(&gate_proj_t, idx, true)?;
+            let up_out = sorted.x_sorted.gather_mm(&up_proj_t, idx, true)?;
+            let gate_act = Activations::silu_for_autograd(&gate_out)?;
+            let activated = gate_act.mul(&up_out)?;
+            let expert_out = activated.gather_mm(&down_proj_t, idx, true)?;
+            functional_scatter_unsort(&expert_out, &sorted.inv_order, &[ne, k as i64])?
+        } else {
+            let gate_out = x_expanded.gather_mm(&gate_proj_t, &top_indices, false)?;
+            let up_out = x_expanded.gather_mm(&up_proj_t, &top_indices, false)?;
+            let gate_act = Activations::silu_for_autograd(&gate_out)?;
+            let activated = gate_act.mul(&up_out)?;
+            activated.gather_mm(&down_proj_t, &top_indices, false)?
+        }
     };
 
     // Squeeze penultimate dim, weight by routing scores, sum over top-k
@@ -1459,6 +1490,7 @@ fn qwen3_5_moe_block_functional(
     config: &Qwen3_5MoeConfig,
     dense_config: &Qwen3_5Config,
     layer_idx: usize,
+    frozen_layer: Option<&FrozenMoeLayer>,
 ) -> Result<MxArray> {
     let prefix = format!("layers.{}", layer_idx);
 
@@ -1491,7 +1523,7 @@ fn qwen3_5_moe_block_functional(
 
     let mlp_out = if config.is_moe_layer(layer_idx) {
         let mlp_prefix = format!("{}.mlp", prefix);
-        sparse_moe_functional(params, &normed, &mlp_prefix, config)?
+        sparse_moe_functional(params, &normed, &mlp_prefix, config, frozen_layer)?
     } else {
         mlp_functional(
             &normed,
@@ -1527,12 +1559,17 @@ pub fn qwen3_5_moe_forward_functional(
 }
 
 /// Run a Qwen3.5 MoE block through gradient checkpointing.
+///
+/// A frozen expert layer (genmlx-n32r) is captured BY VALUE in the recompute
+/// closure — the packed tensors are constants, so the checkpoint recompute
+/// reproduces the identical graph without listing them as checkpoint inputs.
 fn qwen3_5_moe_block_checkpointed(
     params: &HashMap<String, MxArray>,
     h: &MxArray,
     config: &Qwen3_5MoeConfig,
     dense_config: &Qwen3_5Config,
     layer_idx: usize,
+    frozen_layer: Option<&FrozenMoeLayer>,
     ckpt_contexts: &mut autograd::CheckpointContexts,
 ) -> Result<MxArray> {
     let prefix = format!("layers.{}.", layer_idx);
@@ -1551,6 +1588,7 @@ fn qwen3_5_moe_block_checkpointed(
     let config_clone = config.clone();
     let dense_clone = dense_config.clone();
     let layer = layer_idx;
+    let frozen_clone = frozen_layer.cloned();
 
     let outputs = autograd::checkpoint_apply(
         inputs,
@@ -1567,6 +1605,7 @@ fn qwen3_5_moe_block_checkpointed(
                 &config_clone,
                 &dense_clone,
                 layer,
+                frozen_clone.as_ref(),
             )?;
             Ok(vec![h_out])
         },
@@ -1583,7 +1622,7 @@ pub fn qwen3_5_moe_forward_hidden_states(
     input_ids: &MxArray,
 ) -> Result<MxArray> {
     let mut ckpt = autograd::CheckpointContexts::new();
-    qwen3_5_moe_forward_hidden_states_impl(config, params, input_ids, false, &mut ckpt)
+    qwen3_5_moe_forward_hidden_states_impl(config, params, input_ids, false, &mut ckpt, None)
 }
 
 /// Qwen3.5 MoE forward with optional gradient checkpointing.
@@ -1593,6 +1632,7 @@ pub fn qwen3_5_moe_forward_hidden_states_impl(
     input_ids: &MxArray,
     use_checkpointing: bool,
     ckpt_contexts: &mut autograd::CheckpointContexts,
+    frozen_experts: Option<&FrozenExperts>,
 ) -> Result<MxArray> {
     let embed_weight = params
         .get("embedding.weight")
@@ -1601,6 +1641,7 @@ pub fn qwen3_5_moe_forward_hidden_states_impl(
 
     let dense_config = config.to_dense_config();
     for layer_idx in 0..config.num_layers as usize {
+        let frozen_layer = frozen_experts.and_then(|f| f.get(&layer_idx));
         if use_checkpointing {
             h = qwen3_5_moe_block_checkpointed(
                 params,
@@ -1608,10 +1649,18 @@ pub fn qwen3_5_moe_forward_hidden_states_impl(
                 config,
                 &dense_config,
                 layer_idx,
+                frozen_layer,
                 ckpt_contexts,
             )?;
         } else {
-            h = qwen3_5_moe_block_functional(params, &h, config, &dense_config, layer_idx)?;
+            h = qwen3_5_moe_block_functional(
+                params,
+                &h,
+                config,
+                &dense_config,
+                layer_idx,
+                frozen_layer,
+            )?;
         }
     }
 
@@ -1632,6 +1681,7 @@ pub(crate) fn forward_functional_dispatch(
     input_ids: &MxArray,
     use_checkpointing: bool,
     ckpt_contexts: &mut autograd::CheckpointContexts,
+    frozen_experts: Option<&FrozenExperts>,
 ) -> Result<MxArray> {
     let hidden_states = forward_hidden_states_dispatch(
         model_type,
@@ -1639,6 +1689,7 @@ pub(crate) fn forward_functional_dispatch(
         input_ids,
         use_checkpointing,
         ckpt_contexts,
+        frozen_experts,
     )?;
     lm_head_functional(&hidden_states, params, model_type.tie_word_embeddings())
 }
@@ -1650,6 +1701,7 @@ pub(crate) fn forward_hidden_states_dispatch(
     input_ids: &MxArray,
     use_checkpointing: bool,
     ckpt_contexts: &mut autograd::CheckpointContexts,
+    frozen_experts: Option<&FrozenExperts>,
 ) -> Result<MxArray> {
     match model_type {
         ModelType::Qwen3(config) => qwen3_forward_hidden_states_impl(
@@ -1672,6 +1724,7 @@ pub(crate) fn forward_hidden_states_dispatch(
             input_ids,
             use_checkpointing,
             ckpt_contexts,
+            frozen_experts,
         ),
     }
 }

@@ -34,6 +34,7 @@ use crate::grpo::{advantages::compute_advantages, loss as grpo_loss};
 use crate::nn::efficient_selective_log_softmax;
 use crate::param_manager;
 use crate::training_model::ModelType;
+use crate::models::qwen3_5_moe::quantized_linear::FrozenExperts;
 use crate::utils::functional;
 
 /// Compute GRPO loss with automatic differentiation using functional forward pass
@@ -72,6 +73,7 @@ pub(crate) fn compute_loss_and_gradients_autograd(
     loss_config: grpo_loss::GRPOLossConfig,
     use_checkpointing: bool,
     reference_params: Option<&HashMap<String, MxArray>>,
+    frozen_experts: Option<&FrozenExperts>,
 ) -> Result<(f64, HashMap<String, MxArray>)> {
     // KL penalty (beta > 0) needs frozen reference-model params (the base policy) to
     // compute reference logprobs for the KL-to-base term. The caller (the model train
@@ -203,6 +205,7 @@ pub(crate) fn compute_loss_and_gradients_autograd(
             &input_ids,
             &padded_completions,
             &loss_config,
+            frozen_experts,
         )?)
     } else {
         None
@@ -232,6 +235,7 @@ pub(crate) fn compute_loss_and_gradients_autograd(
             chunk_size,
             use_checkpointing,
             ref_logprobs.as_ref(),
+            frozen_experts,
         );
     }
 
@@ -246,6 +250,10 @@ pub(crate) fn compute_loss_and_gradients_autograd(
     let config_clone = model_type.clone();
     let loss_config_clone = loss_config.clone();
     let ref_logprobs_clone = ref_logprobs.clone();
+    // Frozen packed experts ride the closure as captured CONSTANTS (Arc-cheap
+    // clones) — never wrapped by value_and_grad, so no weight/scale cotangent
+    // is ever requested (genmlx-n32r).
+    let frozen_clone: Option<FrozenExperts> = frozen_experts.cloned();
 
     // 5. Define loss function for autograd
     // This closure will be called by MLX with updated parameter values
@@ -280,6 +288,7 @@ pub(crate) fn compute_loss_and_gradients_autograd(
                 &input_ids_clone,
                 use_ckpt,
                 &mut ckpt_ctx.borrow_mut(),
+                frozen_clone.as_ref(),
             )?;
 
             // Extract the hidden states that PREDICT the completion tokens.
@@ -322,6 +331,7 @@ pub(crate) fn compute_loss_and_gradients_autograd(
                 &input_ids_clone,
                 use_ckpt,
                 &mut ckpt_ctx.borrow_mut(),
+                frozen_clone.as_ref(),
             )?;
 
             // Get the logits that PREDICT the completion tokens: window
@@ -432,6 +442,7 @@ fn compute_loss_and_gradients_chunked_autograd(
     chunk_size: i64,
     use_checkpointing: bool,
     ref_logprobs: Option<&MxArray>,
+    frozen_experts: Option<&FrozenExperts>,
 ) -> Result<(f64, HashMap<String, MxArray>)> {
     let batch_size = input_ids.shape_at(0)?;
     let total_seq_len = input_ids.shape_at(1)?;
@@ -469,6 +480,8 @@ fn compute_loss_and_gradients_chunked_autograd(
         let chunk_ref_logprobs_clone = chunk_ref_logprobs.clone();
         let config_clone = model_type.clone();
         let loss_config_clone = loss_config.clone();
+        // Frozen packed experts as captured constants (genmlx-n32r).
+        let frozen_clone: Option<FrozenExperts> = frozen_experts.cloned();
         let lm_head_chunk_size = loss_config.lm_head_chunk_size;
         let use_ckpt = use_checkpointing;
         let ckpt_contexts =
@@ -493,6 +506,7 @@ fn compute_loss_and_gradients_chunked_autograd(
                     &chunk_input_ids_clone,
                     use_ckpt,
                     &mut ckpt_ctx.borrow_mut(),
+                    frozen_clone.as_ref(),
                 )?;
 
                 // Predicting window [prompt_len-1, total-1): hidden[j] predicts
@@ -531,6 +545,7 @@ fn compute_loss_and_gradients_chunked_autograd(
                     &chunk_input_ids_clone,
                     use_ckpt,
                     &mut ckpt_ctx.borrow_mut(),
+                    frozen_clone.as_ref(),
                 )?;
 
                 // Predicting window [prompt_len-1, total-1) (genmlx-li1p).
@@ -641,6 +656,7 @@ fn compute_reference_logprobs(
     input_ids: &MxArray,
     padded_completions: &MxArray,
     loss_config: &grpo_loss::GRPOLossConfig,
+    frozen_experts: Option<&FrozenExperts>,
 ) -> Result<MxArray> {
     let batch_size = input_ids.shape_at(0)?;
     let total_seq_len = input_ids.shape_at(1)?;
@@ -658,6 +674,7 @@ fn compute_reference_logprobs(
             input_ids,
             false,
             &mut ckpt,
+            frozen_experts,
         )?;
         // Predicting window [prompt_len-1, total-1): hidden[j] predicts
         // input[j+1] (genmlx-li1p off-by-one).
@@ -689,6 +706,7 @@ fn compute_reference_logprobs(
             input_ids,
             false,
             &mut ckpt,
+            frozen_experts,
         )?;
         // Predicting window [prompt_len-1, total-1) (genmlx-li1p).
         let completion_logits = logits.slice(

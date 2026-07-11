@@ -171,6 +171,38 @@ impl SparseMoeBlock {
             || self.shared_expert_gate.is_quantized()
     }
 
+    /// Dequantize the block's NON-expert projections for training
+    /// (genmlx-n32r): router gate, shared expert, and shared-expert gate
+    /// become dense trainable masters; the switch_mlp expert projections
+    /// stay packed and frozen (full expert dequantize is arithmetically
+    /// infeasible — bf16 masters + grads for ~32B expert params exceed the
+    /// box). Returns the number of converted projections.
+    pub fn dequantize_non_expert(&mut self) -> Result<u32> {
+        let mut n = 0;
+        if self.gate.dequantize_to_standard()? {
+            n += 1;
+        }
+        if self.shared_expert.dequantize_to_standard()? {
+            n += 1;
+        }
+        if self.shared_expert_gate.dequantize_to_standard()? {
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Whether the expert switch_mlp projections (specifically) are packed
+    /// quantized — the frozen-experts training path trigger (genmlx-n32r).
+    pub fn experts_quantized(&self) -> bool {
+        self.switch_mlp.is_quantized()
+    }
+
+    /// Arc-cheap snapshot of the packed expert projections for the frozen
+    /// training path; None when the experts are dense (genmlx-n32r).
+    pub fn frozen_experts_snapshot(&self) -> Option<super::quantized_linear::FrozenMoeLayer> {
+        self.switch_mlp.frozen_snapshot()
+    }
+
     // ========== Weight setters ==========
 
     pub fn set_gate_weight(&mut self, w: &MxArray) -> Result<()> {

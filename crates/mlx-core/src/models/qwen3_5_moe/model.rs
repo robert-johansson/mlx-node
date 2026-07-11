@@ -5587,20 +5587,34 @@ impl Qwen35MoeInner {
                 MLPType::MoE(moe) => {
                     // Router gate
                     params.insert(format!("{}.mlp.gate.weight", prefix), moe.get_gate_weight());
-                    // Expert weights (3D: [num_experts, out, in])
-                    let switch_mlp = moe.get_switch_mlp();
-                    params.insert(
-                        format!("{}.mlp.switch_mlp.gate_proj.weight", prefix),
-                        switch_mlp.get_gate_proj_weight(),
-                    );
-                    params.insert(
-                        format!("{}.mlp.switch_mlp.up_proj.weight", prefix),
-                        switch_mlp.get_up_proj_weight(),
-                    );
-                    params.insert(
-                        format!("{}.mlp.switch_mlp.down_proj.weight", prefix),
-                        switch_mlp.get_down_proj_weight(),
-                    );
+                    // Expert weights (3D: [num_experts, out, in]). PACKED
+                    // quantized experts are skipped: this save path is
+                    // dense/bf16-only, and emitting packed uint32 under the
+                    // dense names would corrupt the checkpoint. The experts
+                    // were FROZEN during training (genmlx-n32r) — reconstitute
+                    // by combining this save's trained non-expert weights
+                    // with the source checkpoint's expert tensors.
+                    if moe.experts_quantized() {
+                        warn!(
+                            "save_model_sync: skipping FROZEN packed experts in {} \
+                             (unchanged from the source checkpoint; genmlx-n32r)",
+                            prefix
+                        );
+                    } else {
+                        let switch_mlp = moe.get_switch_mlp();
+                        params.insert(
+                            format!("{}.mlp.switch_mlp.gate_proj.weight", prefix),
+                            switch_mlp.get_gate_proj_weight(),
+                        );
+                        params.insert(
+                            format!("{}.mlp.switch_mlp.up_proj.weight", prefix),
+                            switch_mlp.get_up_proj_weight(),
+                        );
+                        params.insert(
+                            format!("{}.mlp.switch_mlp.down_proj.weight", prefix),
+                            switch_mlp.get_down_proj_weight(),
+                        );
+                    }
                     // Shared expert
                     params.insert(
                         format!("{}.mlp.shared_expert.gate_proj.weight", prefix),
@@ -5779,37 +5793,39 @@ impl Qwen35MoeInner {
         if let Some(seed) = config.seed {
             unsafe { mlx_sys::mlx_seed(seed as u64) };
         }
-        // Quantized MoE checkpoints cannot train yet: the functional forward
-        // and gradient write-back are defined over dense weights, and
-        // expert-level dequantize-for-training is not implemented for this
-        // family (the qwen3.5 DENSE family converts automatically at init —
-        // genmlx-x76x). Fail loudly here instead of aborting at the first
-        // packed-weight matmul inside the training forward.
+        // Quantized checkpoints train on dequantized dense master weights for
+        // the NON-expert stack (attention, embedding, lm_head, router gates,
+        // shared experts, dense-MLP layers — the genmlx-x76x pattern); the
+        // switch_mlp expert projections stay PACKED and FROZEN (genmlx-n32r):
+        // the functional forward routes them through gather_qmm, and
+        // GatherQMM's x-VJP carries gradients through to every earlier
+        // trainable layer. Full expert dequantize is arithmetically
+        // infeasible (~64 GB bf16 masters + ~64 GB grads for the 35B's ~32B
+        // expert params).
         {
-            use super::decoder_layer::{AttentionType, MLPType};
-            let quantized = self.embedding.is_packed_quantized()
-                || self
-                    .lm_head
-                    .as_ref()
-                    .is_some_and(|lm| lm.is_quantized())
-                || self.layers.iter().any(|layer| {
-                    let attn_q = match &layer.attn {
-                        AttentionType::Linear(gdn) => gdn.is_quantized(),
-                        AttentionType::Full(attn) => attn.is_quantized(),
-                    };
-                    let mlp_q = match &layer.mlp {
-                        MLPType::Dense(mlp) => mlp.is_quantized(),
-                        MLPType::MoE(moe) => moe.is_quantized(),
-                    };
-                    attn_q || mlp_q
-                });
-            if quantized {
-                return Err(napi::Error::from_reason(
-                    "Training a QUANTIZED Qwen3.5-MoE checkpoint is not supported yet: \
-                     the training forward requires dense weights, and expert-level \
-                     dequantize-for-training is not implemented for the MoE family. \
-                     Use a dense (bf16) checkpoint.",
-                ));
+            use super::decoder_layer::MLPType;
+            let converted = self.dequantize_for_training()?;
+            if converted > 0 {
+                info!(
+                    "Dequantized {} non-expert quantized module(s) to dense bf16 \
+                     masters for training (genmlx-x76x / genmlx-n32r)",
+                    converted
+                );
+            }
+            let frozen_layers = self
+                .layers
+                .iter()
+                .filter(|layer| {
+                    matches!(&layer.mlp, MLPType::MoE(moe) if moe.experts_quantized())
+                })
+                .count();
+            if frozen_layers > 0 {
+                info!(
+                    "Quantized experts on {} MoE layer(s) stay FROZEN (packed, \
+                     gather_qmm forward, x-gradients only): training the \
+                     non-expert stack (genmlx-n32r)",
+                    frozen_layers
+                );
             }
         }
         let optimizer = if config.optimizer_type.as_deref().unwrap_or("adamw") == "adamw" {
@@ -6294,6 +6310,10 @@ impl Qwen35MoeInner {
                 )
             };
 
+        // FROZEN packed experts ride the autograd closure as constants; the
+        // trainable `params` set excludes them (genmlx-n32r).
+        let frozen_experts = self.frozen_experts_snapshot();
+        let ts = self.training_state.as_ref().unwrap();
         let (loss_value, gradients) = compute_loss_and_gradients_autograd(
             &model_type,
             &params,
@@ -6305,6 +6325,7 @@ impl Qwen35MoeInner {
             loss_config,
             use_checkpointing,
             ts.reference_params.as_ref(),
+            frozen_experts.as_ref(),
         )?;
 
         // Check for NaN/Inf loss
@@ -6609,7 +6630,10 @@ impl Qwen35MoeInner {
         let max_nan_gradients = config.max_nan_gradients.unwrap_or(100);
         let emergency_save_threshold = config.emergency_save_threshold.unwrap_or(5);
 
-        // Compute loss and gradients
+        // Compute loss and gradients. FROZEN packed experts ride the autograd
+        // closure as constants; the trainable `params` set excludes them
+        // (genmlx-n32r).
+        let frozen_experts = self.frozen_experts_snapshot();
         let (loss_value, gradients) = crate::sft::autograd::compute_sft_loss_and_gradients(
             &model_type,
             &params,
@@ -6617,6 +6641,7 @@ impl Qwen35MoeInner {
             &labels_arr,
             loss_config,
             use_checkpointing,
+            frozen_experts.as_ref(),
         )?;
 
         // Check for NaN/Inf loss
@@ -7014,6 +7039,63 @@ impl Qwen35MoeInner {
 
     /// Extract all trainable parameters from the model.
     /// Direct field access — no locks needed on model thread.
+    /// Dequantize every NON-expert quantized weight to a dense bf16 master
+    /// for training (genmlx-x76x pattern extended to the MoE family,
+    /// genmlx-n32r): embedding, attention (GDN/full), dense-MLP layers,
+    /// router gates, shared experts, shared-expert gates, and lm_head.
+    /// The switch_mlp expert projections are intentionally left PACKED —
+    /// they train FROZEN via the gather_qmm functional path. Returns the
+    /// number of converted modules.
+    fn dequantize_for_training(&mut self) -> Result<u32> {
+        use super::decoder_layer::{AttentionType, MLPType};
+
+        let mut n = 0;
+        if self.embedding.is_packed_quantized() {
+            let dense = self.embedding.get_weight();
+            self.embedding.load_weight(&dense)?;
+            n += 1;
+        }
+        for layer in self.layers.iter_mut() {
+            match &mut layer.attn {
+                AttentionType::Linear(gdn) => n += gdn.dequantize_to_standard()?,
+                AttentionType::Full(attn) => n += attn.dequantize_to_standard()?,
+            }
+            match &mut layer.mlp {
+                MLPType::Dense(mlp) => {
+                    if mlp.dequantize_to_standard()? {
+                        n += 1;
+                    }
+                }
+                MLPType::MoE(moe) => n += moe.dequantize_non_expert()?,
+            }
+        }
+        if let Some(ref mut lm_head) = self.lm_head
+            && lm_head.dequantize_to_standard()?
+        {
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Arc-cheap per-layer snapshot of the FROZEN packed expert projections
+    /// for the functional training forward (genmlx-n32r). None when every
+    /// MoE layer's experts are dense (they then train as ordinary params).
+    fn frozen_experts_snapshot(
+        &self,
+    ) -> Option<super::quantized_linear::FrozenExperts> {
+        use super::decoder_layer::MLPType;
+
+        let mut map = super::quantized_linear::FrozenExperts::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            if let MLPType::MoE(moe) = &layer.mlp
+                && let Some(fz) = moe.frozen_experts_snapshot()
+            {
+                map.insert(i, fz);
+            }
+        }
+        if map.is_empty() { None } else { Some(map) }
+    }
+
     fn get_parameters_sync(&self) -> Result<HashMap<String, MxArray>> {
         use super::decoder_layer::{AttentionType, MLPType};
 
@@ -7099,20 +7181,27 @@ impl Qwen35MoeInner {
                 MLPType::MoE(moe) => {
                     // Router gate
                     params.insert(format!("{}.mlp.gate.weight", prefix), moe.get_gate_weight());
-                    // Expert weights (3D: [num_experts, out, in])
-                    let switch_mlp = moe.get_switch_mlp();
-                    params.insert(
-                        format!("{}.mlp.switch_mlp.gate_proj.weight", prefix),
-                        switch_mlp.get_gate_proj_weight(),
-                    );
-                    params.insert(
-                        format!("{}.mlp.switch_mlp.up_proj.weight", prefix),
-                        switch_mlp.get_up_proj_weight(),
-                    );
-                    params.insert(
-                        format!("{}.mlp.switch_mlp.down_proj.weight", prefix),
-                        switch_mlp.get_down_proj_weight(),
-                    );
+                    // Expert weights (3D: [num_experts, out, in]). QUANTIZED
+                    // experts are excluded from the TRAINABLE set: they are
+                    // FROZEN in packed form (genmlx-n32r) — the dense-name
+                    // getter would hand the optimizer a packed uint32 tensor —
+                    // and ride the functional forward as
+                    // frozen_experts_snapshot() constants instead.
+                    if !moe.experts_quantized() {
+                        let switch_mlp = moe.get_switch_mlp();
+                        params.insert(
+                            format!("{}.mlp.switch_mlp.gate_proj.weight", prefix),
+                            switch_mlp.get_gate_proj_weight(),
+                        );
+                        params.insert(
+                            format!("{}.mlp.switch_mlp.up_proj.weight", prefix),
+                            switch_mlp.get_up_proj_weight(),
+                        );
+                        params.insert(
+                            format!("{}.mlp.switch_mlp.down_proj.weight", prefix),
+                            switch_mlp.get_down_proj_weight(),
+                        );
+                    }
                     // Shared expert
                     params.insert(
                         format!("{}.mlp.shared_expert.gate_proj.weight", prefix),

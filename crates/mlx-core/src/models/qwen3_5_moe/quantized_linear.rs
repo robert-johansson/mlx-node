@@ -21,6 +21,8 @@ pub use crate::models::qwen3_5::quantized_linear::{
 ///
 /// Like SwitchLinear but with quantized weights for ~4x memory reduction.
 /// Uses MLX's fused gather_qmm Metal kernel for efficient MoE inference.
+/// Clone is Arc-cheap (MxArray handles) — used by the frozen-experts
+/// training snapshot (genmlx-n32r).
 pub struct QuantizedSwitchLinear {
     weight: MxArray,         // Packed uint32 [num_experts, out, in_packed]
     scales: MxArray,         // Quantization scales [num_experts, out, groups]
@@ -29,6 +31,27 @@ pub struct QuantizedSwitchLinear {
     bits: i32,
     mode: String,
 }
+
+/// Frozen packed expert projections for one MoE layer (genmlx-n32r).
+///
+/// Quantized MoE checkpoints train with the ~32B of expert weights FROZEN in
+/// their packed form (full dequantize is arithmetically infeasible: bf16
+/// masters + grads alone exceed 128 GB on the 35B). The functional training
+/// forward runs the routed experts through `QuantizedSwitchLinear::forward`
+/// (gather_qmm); `GatherQMM::vjp` computes the x-gradient as another
+/// gather_qmm with flipped transpose, so gradients flow THROUGH the frozen
+/// experts to every earlier trainable layer. The packed tensors ride the
+/// autograd closure as captured constants, never as wrapped arguments, so
+/// no weight/scale cotangent is ever requested.
+#[derive(Clone)]
+pub struct FrozenMoeLayer {
+    pub gate_proj: QuantizedSwitchLinear,
+    pub up_proj: QuantizedSwitchLinear,
+    pub down_proj: QuantizedSwitchLinear,
+}
+
+/// layer_idx -> frozen packed expert projections (genmlx-n32r).
+pub type FrozenExperts = HashMap<usize, FrozenMoeLayer>;
 
 impl QuantizedSwitchLinear {
     pub fn new(
