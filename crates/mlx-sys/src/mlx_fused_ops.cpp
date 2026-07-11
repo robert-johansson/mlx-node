@@ -58,15 +58,26 @@ mlx_array* mlx_swiglu_mlp_forward_stacked(mlx_array* x_handle,
   auto w_gate_up_t = reinterpret_cast<array*>(w_gate_up_t_handle);
   auto w_down_t = reinterpret_cast<array*>(w_down_t_handle);
 
-  // x: [B, T, hidden]; w_gate_up_t: [hidden, 2*intermediate]
-  auto gate_up = matmul(*x, *w_gate_up_t);  // [B, T, 2*intermediate]
+  // x: [..., hidden]; w_gate_up_t: [hidden, 2*intermediate]
+  auto gate_up = matmul(*x, *w_gate_up_t);  // [..., 2*intermediate]
 
+  // Rank-agnostic split on the LAST axis: decoder MLPs pass 3-D
+  // [B, T, hidden], but the MoE shared expert calls with FLAT 2-D
+  // [ne, hidden] — the previous hard-coded 3-D slice threw (and aborted
+  // through the unguarded shim) for any dense-MLP MoE shared expert
+  // (genmlx-n32r).
+  int ndim = static_cast<int>(gate_up.ndim());
   int intermediate = static_cast<int>(gate_up.shape().back()) / 2;
-  int B = static_cast<int>(gate_up.shape()[0]);
-  int T = static_cast<int>(gate_up.shape()[1]);
 
-  auto gate = slice(gate_up, {0, 0, 0}, {B, T, intermediate});
-  auto up   = slice(gate_up, {0, 0, intermediate}, {B, T, 2 * intermediate});
+  mlx::core::Shape gate_start(ndim, 0);
+  mlx::core::Shape gate_stop(gate_up.shape());
+  gate_stop[ndim - 1] = intermediate;
+  auto gate = slice(gate_up, std::move(gate_start), std::move(gate_stop));
+
+  mlx::core::Shape up_start(ndim, 0);
+  up_start[ndim - 1] = intermediate;
+  mlx::core::Shape up_stop(gate_up.shape());
+  auto up = slice(gate_up, std::move(up_start), std::move(up_stop));
 
   // E40: fused swiglu via mlx::core::compile (one Metal kernel for
   // sigmoid(gate)*gate*up). Helper is from mlx_qwen35_common.h.
