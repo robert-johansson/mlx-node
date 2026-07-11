@@ -652,6 +652,7 @@ size_t mlx_array_split_multi(mlx_array* handle,
                              int32_t axis,
                              uint64_t* out_handles,
                              size_t max_outputs) {
+  MLX_GUARD_VAL("array_split_multi", 0,
   if (!handle || !out_handles) return 0;
   auto arr = reinterpret_cast<array*>(handle);
   auto splits = mlx::core::split(*arr, indices_or_sections, axis);
@@ -661,6 +662,7 @@ size_t mlx_array_split_multi(mlx_array* handle,
         reinterpret_cast<uint64_t>(new array(std::move(splits[i])));
   }
   return count;
+  )
 }
 
 // Keep the old single-output version for backwards compatibility

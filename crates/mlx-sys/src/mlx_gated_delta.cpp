@@ -186,7 +186,12 @@ bool mlx_gated_delta_kernel(
         *out_state = reinterpret_cast<mlx_array*>(new array(std::move(results[1])));
         return true;
     } catch (const std::exception& e) {
-        std::cerr << "mlx_gated_delta_kernel error: " << e.what() << std::endl;
+        mlx_report_error("gated_delta_kernel", e.what());
+        *out_y = nullptr;
+        *out_state = nullptr;
+        return false;
+    } catch (...) {
+        mlx_report_error("gated_delta_kernel", "unknown exception");
         *out_y = nullptr;
         *out_state = nullptr;
         return false;
@@ -274,7 +279,12 @@ bool mlx_gated_delta_chunked(
         *out_state = reinterpret_cast<mlx_array*>(new array(std::move(state_out)));
         return true;
     } catch (const std::exception& e) {
-        std::cerr << "mlx_gated_delta_chunked error: " << e.what() << std::endl;
+        mlx_report_error("gated_delta_chunked", e.what());
+        *out_y = nullptr;
+        *out_state = nullptr;
+        return false;
+    } catch (...) {
+        mlx_report_error("gated_delta_chunked", "unknown exception");
         *out_y = nullptr;
         *out_state = nullptr;
         return false;
@@ -344,7 +354,12 @@ bool mlx_fused_gdn_gating(
         *out_g = reinterpret_cast<mlx_array*>(new array(std::move(results[1])));
         return true;
     } catch (const std::exception& e) {
-        std::cerr << "mlx_fused_gdn_gating error: " << e.what() << std::endl;
+        mlx_report_error("fused_gdn_gating", e.what());
+        *out_beta = nullptr;
+        *out_g = nullptr;
+        return false;
+    } catch (...) {
+        mlx_report_error("fused_gdn_gating", "unknown exception");
         *out_beta = nullptr;
         *out_g = nullptr;
         return false;
@@ -396,7 +411,10 @@ mlx_array* mlx_fused_compute_g(mlx_array* a_log_ptr, mlx_array* a_ptr, mlx_array
         auto result = get_compiled_compute_g()({a_log, a, dt_bias});
         return reinterpret_cast<mlx_array*>(new array(std::move(result[0])));
     } catch (const std::exception& e) {
-        std::cerr << "[MLX] mlx_fused_compute_g: " << e.what() << std::endl;
+        mlx_report_error("fused_compute_g", e.what());
+        return nullptr;
+    } catch (...) {
+        mlx_report_error("fused_compute_g", "unknown exception");
         return nullptr;
     }
 }

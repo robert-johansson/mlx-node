@@ -14,6 +14,7 @@ mlx_array* mlx_swiglu_mlp_forward(mlx_array* x_handle,
                                    mlx_array* w_gate_handle,
                                    mlx_array* w_up_handle,
                                    mlx_array* w_down_handle) {
+  MLX_GUARD_PTR("swiglu_mlp_forward",
   auto x = reinterpret_cast<array*>(x_handle);
   auto w_gate = reinterpret_cast<array*>(w_gate_handle);
   auto w_up = reinterpret_cast<array*>(w_up_handle);
@@ -40,6 +41,7 @@ mlx_array* mlx_swiglu_mlp_forward(mlx_array* x_handle,
   auto output = matmul(gated, w_down_t);
 
   return reinterpret_cast<mlx_array*>(new array(std::move(output)));
+  )
 }
 
 // E39: Stacked SwiGLU MLP. Takes pre-stacked + pre-transposed weights computed
@@ -54,6 +56,7 @@ mlx_array* mlx_swiglu_mlp_forward(mlx_array* x_handle,
 mlx_array* mlx_swiglu_mlp_forward_stacked(mlx_array* x_handle,
                                            mlx_array* w_gate_up_t_handle,
                                            mlx_array* w_down_t_handle) {
+  MLX_GUARD_PTR("swiglu_mlp_forward_stacked",
   auto x = reinterpret_cast<array*>(x_handle);
   auto w_gate_up_t = reinterpret_cast<array*>(w_gate_up_t_handle);
   auto w_down_t = reinterpret_cast<array*>(w_down_t_handle);
@@ -86,6 +89,7 @@ mlx_array* mlx_swiglu_mlp_forward_stacked(mlx_array* x_handle,
   // down: gated @ w_down_t
   auto output = matmul(gated, *w_down_t);
   return reinterpret_cast<mlx_array*>(new array(std::move(output)));
+  )
 }
 
 // Combines: norm -> attention -> residual -> norm -> mlp -> residual
@@ -118,6 +122,7 @@ mlx_array* mlx_fused_transformer_block_forward(
     bool use_causal,
     int rope_offset) {
 
+  MLX_GUARD_PTR("fused_transformer_block_forward",
   auto x = reinterpret_cast<array*>(x_handle);
   auto input_norm_w = reinterpret_cast<array*>(input_norm_w_handle);
   auto post_attn_norm_w = reinterpret_cast<array*>(post_attn_norm_w_handle);
@@ -209,6 +214,7 @@ mlx_array* mlx_fused_transformer_block_forward(
   auto output = h + mlp_output;
 
   return reinterpret_cast<mlx_array*>(new array(std::move(output)));
+  )
 }
 // Fused Q/K/V projection with RoPE for cached attention
 // Returns Q, K, V in attention layout (B, n_heads, L, head_dim) with RoPE applied
@@ -278,7 +284,12 @@ void mlx_fused_attention_qkv(
         *k_out = reinterpret_cast<mlx_array*>(new array(std::move(keys)));
         *v_out = reinterpret_cast<mlx_array*>(new array(std::move(values)));
     } catch (const std::exception& e) {
-        std::cerr << "mlx_fused_attention_qkv error: " << e.what() << std::endl;
+        mlx_report_error("fused_attention_qkv", e.what());
+        *q_out = nullptr;
+        *k_out = nullptr;
+        *v_out = nullptr;
+    } catch (...) {
+        mlx_report_error("fused_attention_qkv", "unknown exception");
         *q_out = nullptr;
         *k_out = nullptr;
         *v_out = nullptr;
@@ -327,7 +338,10 @@ mlx_array* mlx_fused_attention_output(
 
         return reinterpret_cast<mlx_array*>(new array(std::move(output)));
     } catch (const std::exception& e) {
-        std::cerr << "mlx_fused_attention_output error: " << e.what() << std::endl;
+        mlx_report_error("fused_attention_output", e.what());
+        return nullptr;
+    } catch (...) {
+        mlx_report_error("fused_attention_output", "unknown exception");
         return nullptr;
     }
 }

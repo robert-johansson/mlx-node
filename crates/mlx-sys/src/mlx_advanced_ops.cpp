@@ -604,6 +604,17 @@ void mlx_qwen3_forward_step(
     mlx_array** out_kv_values,          // [num_layers] new value arrays
     int* out_cache_idx                  // Updated write position
 ) {
+    // Failure prologue (genmlx-52lf): null all array out-params, and echo the
+    // INCOMING cache index — the Rust caller (models/qwen3/model.rs) copies
+    // *out_cache_idx back unconditionally, so on a guarded error this keeps
+    // the Rust-visible cache_idx unchanged instead of resetting it to 0.
+    *out_logits = nullptr;
+    for (int i = 0; i < num_layers; i++) {
+        out_kv_keys[i] = nullptr;
+        out_kv_values[i] = nullptr;
+    }
+    *out_cache_idx = cache_idx_in;
+    MLX_GUARD_VOID("qwen3_forward_step",
     auto& input_ids = *reinterpret_cast<array*>(input_ids_handle);
     auto& embedding_weight = *reinterpret_cast<array*>(embedding_weight_handle);
     auto& final_norm_w = *reinterpret_cast<array*>(final_norm_weight_handle);
@@ -695,6 +706,7 @@ void mlx_qwen3_forward_step(
 
     // Output updated cache index (all layers should have same value)
     *out_cache_idx = cache_indices[0];
+    )
 }
 
 
@@ -718,6 +730,7 @@ void mlx_qwen3_forward_step(
 ///   - Metal backend is not available (buffer would not be MTLBuffer*)
 ///   - array has no data
 void* mlx_array_get_metal_buffer(mlx_array* handle) {
+    MLX_GUARD_PTR("array_get_metal_buffer",
     if (!handle) return nullptr;
 
     // Use Metal-specific availability check (not generic GPU)
@@ -736,12 +749,14 @@ void* mlx_array_get_metal_buffer(mlx_array* handle) {
     // When Metal backend is available, all MLX buffers use MTLBuffer
     // (Metal uses unified memory architecture on Apple Silicon)
     return const_cast<void*>(arr.buffer().ptr());
+    )
 }
 
 /// Get the byte offset into the Metal buffer for this array
 /// This is needed for sliced/strided arrays that share a buffer
 /// Note: offset() already returns bytes (used with char* in MLX internals)
 size_t mlx_array_get_buffer_offset(mlx_array* handle) {
+    MLX_GUARD_VAL("array_get_buffer_offset", 0,
     if (!handle) return 0;
     auto& arr = *reinterpret_cast<array*>(handle);
 
@@ -750,6 +765,7 @@ size_t mlx_array_get_buffer_offset(mlx_array* handle) {
 
     // offset() returns byte offset (see array.h line 374: char* + offset)
     return arr.data_size() > 0 ? static_cast<size_t>(arr.offset()) : 0;
+    )
 }
 
 /// Get the data size of the array in number of elements (NOT bytes)
@@ -770,7 +786,9 @@ size_t mlx_array_get_itemsize(mlx_array* handle) {
 /// Synchronize - ensure all MLX operations are complete
 /// Call this before dispatching external Metal kernels
 void mlx_metal_synchronize() {
+    MLX_GUARD_VOID("metal_synchronize",
     mlx::core::synchronize();
+    )
 }
 
 // ================================================================================
@@ -907,6 +925,17 @@ void mlx_paddleocr_vl_forward_step(
     mlx_array** out_kv_values,
     int* out_cache_idx
 ) {
+    // Failure prologue (genmlx-52lf): null all array out-params, and echo the
+    // INCOMING cache index — the Rust caller (models/paddleocr_vl/language.rs)
+    // copies *out_cache_idx back unconditionally, so on a guarded error this
+    // keeps the Rust-visible cache_idx unchanged instead of resetting it to 0.
+    *out_logits = nullptr;
+    for (int i = 0; i < num_layers; i++) {
+        out_kv_keys[i] = nullptr;
+        out_kv_values[i] = nullptr;
+    }
+    *out_cache_idx = cache_idx_in;
+    MLX_GUARD_VOID("paddleocr_vl_forward_step",
     auto& input_embeds = *reinterpret_cast<array*>(input_embeds_handle);
     auto& final_norm_w = *reinterpret_cast<array*>(final_norm_weight_handle);
     auto& lm_head_w = *reinterpret_cast<array*>(lm_head_weight_handle);
@@ -988,6 +1017,7 @@ void mlx_paddleocr_vl_forward_step(
         out_kv_values[i] = kv_values[i].has_value() ? reinterpret_cast<mlx_array*>(new array(std::move(*kv_values[i]))) : nullptr;
     }
     *out_cache_idx = cache_indices[0];
+    )
 }
 
 // Batched PaddleOCR-VL forward step: input_embeds -> mRoPE -> layers -> norm -> LM head
@@ -1012,6 +1042,17 @@ void mlx_paddleocr_vl_forward_step_batched(
     mlx_array** out_kv_values,
     int* out_cache_idx
 ) {
+    // Failure prologue (genmlx-52lf): null all array out-params, and echo the
+    // INCOMING cache index — the Rust caller (models/paddleocr_vl/language.rs)
+    // copies *out_cache_idx back unconditionally, so on a guarded error this
+    // keeps the Rust-visible cache_idx unchanged instead of resetting it to 0.
+    *out_logits = nullptr;
+    for (int i = 0; i < num_layers; i++) {
+        out_kv_keys[i] = nullptr;
+        out_kv_values[i] = nullptr;
+    }
+    *out_cache_idx = cache_idx_in;
+    MLX_GUARD_VOID("paddleocr_vl_forward_step_batched",
     auto& input_embeds = *reinterpret_cast<array*>(input_embeds_handle);
     auto& final_norm_w = *reinterpret_cast<array*>(final_norm_weight_handle);
     auto& lm_head_w = *reinterpret_cast<array*>(lm_head_weight_handle);
@@ -1091,6 +1132,7 @@ void mlx_paddleocr_vl_forward_step_batched(
         out_kv_values[i] = kv_values[i].has_value() ? reinterpret_cast<mlx_array*>(new array(std::move(*kv_values[i]))) : nullptr;
     }
     *out_cache_idx = cache_indices[0];
+    )
 }
 
 mlx_array* mlx_conv2d(
@@ -1101,6 +1143,7 @@ mlx_array* mlx_conv2d(
     int dilation_h, int dilation_w,
     int groups
 ) {
+    MLX_GUARD_PTR("conv2d",
     auto inp = reinterpret_cast<mlx::core::array*>(input);
     auto wt = reinterpret_cast<mlx::core::array*>(weight);
     mlx::core::array result = mlx::core::conv2d(
@@ -1111,6 +1154,7 @@ mlx_array* mlx_conv2d(
         groups
     );
     return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+    )
 }
 
 mlx_array* mlx_conv_transpose2d(
@@ -1121,6 +1165,7 @@ mlx_array* mlx_conv_transpose2d(
     int dilation_h, int dilation_w,
     int groups
 ) {
+    MLX_GUARD_PTR("conv_transpose2d",
     auto inp = reinterpret_cast<mlx::core::array*>(input);
     auto wt = reinterpret_cast<mlx::core::array*>(weight);
 
@@ -1138,6 +1183,7 @@ mlx_array* mlx_conv_transpose2d(
         groups
     );
     return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+    )
 }
 
 // ============================================
