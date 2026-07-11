@@ -627,6 +627,9 @@ pub fn qwen3_forward_functional(
 /// * `lm_head_weight` - LM head weight (embedding.weight or lm_head.weight), shape: [V, H]
 /// * `target_ids` - Token IDs to extract probabilities for, shape: [B, T]
 /// * `chunk_size` - Batch chunk size (default: 2)
+/// * `vocab_chunk_size` - Optional vocab-dim chunk for the per-chunk log-softmax
+///   (bounds logsumexp intermediates; the f32 upcast of each [chunk, T, V] block
+///   still materializes in full)
 /// * `tie_word_embeddings` - Whether weight needs transpose (true for tied embeddings)
 ///
 /// # Returns
@@ -636,6 +639,7 @@ pub fn chunked_lm_head_selective_logprobs(
     lm_head_weight: &MxArray,
     target_ids: &MxArray,
     chunk_size: i64,
+    vocab_chunk_size: Option<i64>,
     tie_word_embeddings: bool,
 ) -> Result<MxArray> {
     use crate::nn::efficient_selective_log_softmax;
@@ -660,7 +664,13 @@ pub fn chunked_lm_head_selective_logprobs(
             linear_functional(hidden_states, lm_head_weight, None)?
         };
         let logits_clamped = logits.clip(Some(-100.0), Some(100.0))?;
-        return efficient_selective_log_softmax(&logits_clamped, target_ids, None, None, None);
+        return efficient_selective_log_softmax(
+            &logits_clamped,
+            target_ids,
+            vocab_chunk_size,
+            None,
+            None,
+        );
     }
 
     // Transpose weight once (outside the loop)
@@ -698,7 +708,7 @@ pub fn chunked_lm_head_selective_logprobs(
         let chunk_result = efficient_selective_log_softmax(
             &chunk_logits_clamped,
             &chunk_targets,
-            None,
+            vocab_chunk_size,
             None,
             None,
         )?;
@@ -2033,7 +2043,7 @@ mod chunked_lm_head_tests {
 
         // Chunked computation with chunk_size=2
         let chunked_result =
-            chunked_lm_head_selective_logprobs(&hidden_states, &weight, &targets, 2, true).unwrap();
+            chunked_lm_head_selective_logprobs(&hidden_states, &weight, &targets, 2, None, true).unwrap();
         chunked_result.eval();
 
         // Compare
@@ -2076,6 +2086,7 @@ mod chunked_lm_head_tests {
                 &weight,
                 &targets,
                 chunk_size,
+                None,
                 true,
             )
             .unwrap();
@@ -2114,7 +2125,7 @@ mod chunked_lm_head_tests {
 
         // Chunked computation
         let chunked_result =
-            chunked_lm_head_selective_logprobs(&hidden_states, &weight, &targets, 2, false)
+            chunked_lm_head_selective_logprobs(&hidden_states, &weight, &targets, 2, None, false)
                 .unwrap();
         chunked_result.eval();
 
@@ -2151,7 +2162,7 @@ mod chunked_lm_head_tests {
 
         // Chunked with chunk_size > batch_size (should skip chunking)
         let chunked_result =
-            chunked_lm_head_selective_logprobs(&hidden_states, &weight, &targets, 4, true).unwrap();
+            chunked_lm_head_selective_logprobs(&hidden_states, &weight, &targets, 4, None, true).unwrap();
         chunked_result.eval();
 
         let full_data = full_result.to_float32().unwrap();
@@ -2175,7 +2186,7 @@ mod chunked_lm_head_tests {
         let targets = MxArray::randint(&[batch, seq], 0, vocab as i32).unwrap();
 
         let result =
-            chunked_lm_head_selective_logprobs(&hidden_states, &weight, &targets, 2, true).unwrap();
+            chunked_lm_head_selective_logprobs(&hidden_states, &weight, &targets, 2, None, true).unwrap();
         result.eval();
 
         let shape = result.shape().unwrap();
@@ -2198,7 +2209,7 @@ mod chunked_lm_head_tests {
         let targets = MxArray::randint(&[batch, seq], 0, vocab as i32).unwrap();
 
         let result =
-            chunked_lm_head_selective_logprobs(&hidden_states, &weight, &targets, 2, true).unwrap();
+            chunked_lm_head_selective_logprobs(&hidden_states, &weight, &targets, 2, None, true).unwrap();
         result.eval();
 
         let data = result.to_float32().unwrap();

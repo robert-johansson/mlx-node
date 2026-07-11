@@ -319,6 +319,7 @@ pub(crate) fn compute_loss_and_gradients_autograd(
                 lm_head_weight,
                 &padded_completions_clone,
                 chunk_size,
+                loss_config_clone.vocab_chunk_size,
                 config_clone.tie_word_embeddings(),
             )?
         } else {
@@ -535,6 +536,7 @@ fn compute_loss_and_gradients_chunked_autograd(
                     lm_head_weight,
                     &chunk_completions_clone,
                     lm_chunk,
+                    loss_config_clone.vocab_chunk_size,
                     config_clone.tie_word_embeddings(),
                 )?
             } else {
@@ -696,6 +698,7 @@ fn compute_reference_logprobs(
             lm_head_weight,
             padded_completions,
             chunk_size,
+            loss_config.vocab_chunk_size,
             model_type.tie_word_embeddings(),
         )?
     } else {
