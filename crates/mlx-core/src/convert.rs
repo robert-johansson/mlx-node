@@ -1898,26 +1898,139 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     let config_data = fs::read_to_string(&config_path)?;
     let config: serde_json::Value = serde_json::from_str(&config_data)?;
 
-    // The nvidia recipe is documented + validated only for qwen3_5 / qwen3_5_moe.
-    // Gate on the INPUT config.json's own `model_type` (ground truth) — NOT the
-    // caller-supplied --model-type: the CLI forwards an explicit `-m` verbatim
-    // (skipping config auto-detect), so `-m qwen3_5` on a real gemma4/lfm2
-    // directory would otherwise reach Qwen sanitization + the generic nvidia
-    // predicate and emit an invalid checkpoint. It is a data-free fixed-format
-    // map: no imatrix, ignores --q-mxfp (emits mxfp4/mxfp8 directly), pins
-    // bits=4/group_size=32 for its float tensors — reject flags that would
-    // silently alter or contradict the map, but allow a bare `-q --q-recipe
-    // nvidia`. The GGUF entry point (`convert_gguf_to_safetensors`) has no
-    // config.json and rejects nvidia wholesale via a `None` model_type.
+    // The nvidia recipe is documented + validated only for qwen3_5 /
+    // qwen3_5_moe / dense gemma4 / gemma4_unified. Gate on the INPUT
+    // config.json's own model shape (ground truth), NOT the caller-supplied
+    // --model-type: the CLI forwards an explicit `-m` verbatim (skipping config
+    // auto-detect), so `-m qwen3_5` on a real gemma4/lfm2 directory would
+    // otherwise reach the wrong sanitizer + the generic nvidia predicate and
+    // emit an invalid checkpoint. Three model-shape reads feed the gate:
+    //   - config_family: the config's own model_type, or a gemma4_unified alias
+    //     derived from an architecture-only unified config (no model_type but
+    //     `architectures: ["Gemma4Unified*"]`), which the CLI canonicalizes;
+    //   - requested_model_type: the --model-type the sanitizer will dispatch on
+    //     (moved into `model_type` above) — must agree with config_family;
+    //   - is_moe: `enable_moe_block` resolved via the loader's own
+    //     `get_config_bool` (nested `text_config` first, then root) — gemma4
+    //     nvidia is dense-only.
+    // It is also a data-free fixed-format map: no imatrix, ignores --q-mxfp
+    // (emits mxfp4/mxfp8 directly), pins bits=4/group_size=32 for its float
+    // tensors — reject flags that would silently alter or contradict the map,
+    // but allow a bare `-q --q-recipe nvidia`. The GGUF entry point
+    // (`convert_gguf_to_safetensors`) has no config.json and rejects nvidia
+    // wholesale via a `None` model_type.
     if quant_recipe.as_deref() == Some("nvidia") {
+        let config_family = config
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                // Architecture-only unified config: no model_type, but the
+                // architectures list identifies a gemma4_unified checkpoint.
+                config
+                    .get("architectures")
+                    .and_then(|v| v.as_array())
+                    .filter(|arches| {
+                        arches
+                            .iter()
+                            .any(|a| a.as_str().is_some_and(|s| s.starts_with("Gemma4Unified")))
+                    })
+                    .map(|_| "gemma4_unified")
+            });
+        // Resolve `enable_moe_block` EXACTLY as the gemma4 loader does
+        // (`get_config_bool`: nested `text_config` first, then root) so the
+        // gate's dense/MoE view can never disagree with how the model loads —
+        // real gemma configs carry the flag under `text_config`, not the root.
+        let is_moe = crate::engine::persistence::get_config_bool(
+            &config,
+            config.get("text_config"),
+            &["enable_moe_block"],
+            false,
+        );
         validate_nvidia_recipe_options(
-            config.get("model_type").and_then(|v| v.as_str()),
+            config_family,
+            model_type.as_deref(),
+            is_moe,
             imatrix_path.as_deref(),
             quant_mxfp,
             options.quant_bits,
             options.quant_group_size,
         )
         .map_err(Error::from_reason)?;
+    }
+
+    // Google gemma-QAT ("wNa8o8") prequantized source: weights are already
+    // per-output-channel symmetric 2/4/8-bit (quant_method == "gemma"). We repack
+    // losslessly to MLX affine (2/4-bit) + dequant the I8 modules to float, rather
+    // than re-quantizing. Detected from the config; the runtime never reads
+    // Google's native quant metadata.
+    //
+    // Split the detection by ROLE (WB-2) — a single alias-robust predicate would
+    // let a gemma4_unified QAT reach the E2B importer, which DROPS AUDIO:
+    //   - is_gemma_qat_family: the gemma FAMILY (gemma4 / gemma4_text /
+    //     gemma4_unified all collapse via `nvidia_recipe_family`). Used ONLY for
+    //     the pre-import already-quantized REJECT, so an aliased
+    //     `-m gemma4_unified` on a gemma-QAT source can't slip past that reject
+    //     into the generic quantizer.
+    //   - is_gemma_e2b_import: EXACT `model_type == "gemma4"`. The importer
+    //     hardcodes E2B's language schedule and DROPS AUDIO, so it must never run
+    //     for the unified alias (which carries audio). Honors the documented CLI
+    //     contract in packages/cli/src/commands/convert.ts (the exact-"gemma4"
+    //     gate must NOT match unified). Real E2B is model_type "gemma4",
+    //     unaffected.
+    // These guards are pure config reads (no MLX ops), evaluated BEFORE the
+    // convert mutex + `CpuConvertGuard::enter_cpu()` below, so an invalid
+    // already-quantized, unified, or non-E2B gemma-QAT source is rejected without
+    // acquiring the process-wide lock or touching MLX — keeping the rejection
+    // hermetic in headless/degraded environments (no SIGABRT from MLX init).
+    let is_gemma_qat_source = config
+        .get("quantization_config")
+        .and_then(|qc| qc.get("quant_method"))
+        .and_then(|m| m.as_str())
+        == Some("gemma");
+    let is_gemma_qat_family =
+        nvidia_recipe_family(model_type.as_deref()) == Some("gemma4") && is_gemma_qat_source;
+    let is_gemma_e2b_import = model_type.as_deref() == Some("gemma4") && is_gemma_qat_source;
+    if is_gemma_qat_family
+        && (do_quantize || quant_recipe.is_some() || imatrix_path.is_some() || quant_mtp != "off")
+    {
+        return Err(Error::from_reason(
+            "gemma-QAT checkpoints are already quantized; convert without --quantize, \
+             --q-recipe, --imatrix-path, or --q-mtp (the source is repacked losslessly \
+             to MLX affine)"
+                .to_string(),
+        ));
+    }
+    // A positively-unified gemma-QAT is unsupported by the E2B importer (which is
+    // EXACT-"gemma4" only, drops audio, and pins E2B's language schedule). With no
+    // quant flags it escapes the already-quantized family reject above AND misses
+    // `is_gemma_e2b_import` (exact match), so without this it would fall through to
+    // the generic quantizer and silently mis-repack the already-quantized weights.
+    // Reject it explicitly (still hermetic — pure config read). `is_unified` is
+    // computed from the config exactly as `models/gemma4/persistence.rs`
+    // (model_type == "gemma4_unified" || architectures[0] == unified arch).
+    if is_gemma_qat_source {
+        let is_unified = config.get("model_type").and_then(|v| v.as_str())
+            == Some("gemma4_unified")
+            || config
+                .get("architectures")
+                .and_then(|a| a.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                == Some("Gemma4UnifiedForConditionalGeneration");
+        if is_unified {
+            return Err(Error::from_reason(
+                "unified gemma QAT is not supported by the E2B prequantized importer \
+                 (it drops audio and hardcodes E2B's language schedule); convert the \
+                 E2B gemma-QAT checkpoint instead"
+                    .to_string(),
+            ));
+        }
+    }
+    // The detection gate above (model_type=gemma4 + quant_method=gemma) also matches
+    // other gemma4 QAT variants, but the importer hardcodes E2B's bit schedule.
+    // Reject a non-E2B schedule with a clear error rather than mis-repacking it.
+    if is_gemma_e2b_import {
+        crate::convert_gemma_import::validate_e2b_qat_schedule(&config)?;
     }
 
     // Serialize all conversions process-wide before touching MLX's default
@@ -1953,34 +2066,6 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
 
     if tie_word_embeddings && verbose {
         info!("Model uses tied embeddings - will skip lm_head.weight");
-    }
-
-    // Google gemma-QAT ("wNa8o8") prequantized source: weights are already
-    // per-output-channel symmetric 2/4/8-bit (quant_method == "gemma"). We repack
-    // losslessly to MLX affine (2/4-bit) + dequant the I8 modules to float, rather
-    // than re-quantizing. Detected from the config; the runtime never reads
-    // Google's native quant metadata.
-    let is_gemma_prequantized = model_type.as_deref() == Some("gemma4")
-        && config
-            .get("quantization_config")
-            .and_then(|qc| qc.get("quant_method"))
-            .and_then(|m| m.as_str())
-            == Some("gemma");
-    if is_gemma_prequantized
-        && (do_quantize || quant_recipe.is_some() || imatrix_path.is_some() || quant_mtp != "off")
-    {
-        return Err(Error::from_reason(
-            "gemma-QAT checkpoints are already quantized; convert without --quantize, \
-             --q-recipe, --imatrix-path, or --q-mtp (the source is repacked losslessly \
-             to MLX affine)"
-                .to_string(),
-        ));
-    }
-    // The detection gate above (model_type=gemma4 + quant_method=gemma) also matches
-    // other gemma4 QAT variants, but the importer hardcodes E2B's bit schedule.
-    // Reject a non-E2B schedule with a clear error rather than mis-repacking it.
-    if is_gemma_prequantized {
-        crate::convert_gemma_import::validate_e2b_qat_schedule(&config)?;
     }
 
     // Load tensors - handle both single file and sharded models
@@ -2168,7 +2253,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     }
 
     let mut gemma_pre_overrides: Option<HashMap<String, serde_json::Value>> = None;
-    let converted_tensors = if is_gemma_prequantized {
+    let converted_tensors = if is_gemma_e2b_import {
         let dtype = match target_dtype.as_str() {
             "float32" | "f32" => DType::Float32,
             "float16" | "f16" => DType::Float16,
@@ -2327,7 +2412,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             },
             None => converted_tensors,
         }
-    }; // end is_gemma_prequantized else branch
+    }; // end is_gemma_e2b_import else branch
 
     // Apply AWQ pre-scaling if imatrix provided
     let mut converted_tensors = converted_tensors;
@@ -2360,7 +2445,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // loaders that trust the top-level default for tensors without a
     // per-layer override would mis-dequantize, so derive the top-level block
     // from the importer's own override map instead.
-    if is_gemma_prequantized {
+    if is_gemma_e2b_import {
         let (bits, group_size, mode) =
             crate::convert_gemma_import::top_level_quant_metadata(&per_layer_overrides)?;
         quant_bits_effective = bits;
@@ -2702,7 +2787,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     let mut output_config = config.clone();
 
     // Inject quantization metadata if quantized
-    if do_quantize || is_gemma_prequantized {
+    if do_quantize || is_gemma_e2b_import {
         // sym8 has NO quant group (one f32 scale per output channel), so the
         // top-level group_size is written as `null` — the loader must dispatch
         // on mode=="sym8" and never read group_size for sym8 layers. Per-layer
@@ -4247,18 +4332,60 @@ pub(crate) fn validate_nvfp4_recipe(recipe: &str) -> std::result::Result<(), Str
     Ok(())
 }
 
-/// Validate `--q-recipe nvidia`: its model type and the flags passed alongside
-/// it.
+/// Collapse an exact HuggingFace `model_type` string to the nvidia recipe's
+/// coarse *family* (the unit `recipe_for` actually dispatches on), or `None`
+/// when the type is unsupported by this recipe.
+///
+/// `gemma4`, `gemma4_unified`, and `gemma4_text` all map to the single
+/// `"gemma4"` family. `recipe_for` resolves `gemma4` / `gemma4_unified` to the
+/// same `Gemma4Recipe`, and `gemma4_text` is the text-only dense alias for that
+/// same family: the loader recognizes `gemma4_text` as a plain dense gemma4 root
+/// `model_type`, and the CLI collapses a `gemma4_text` config to `--model-type
+/// gemma4` before it reaches the sanitizer. A config declaring any of the three
+/// and a `--model-type` declaring another therefore AGREE. `lfm2` / `qwen3` /
+/// `None` remain unsupported by this recipe.
+fn nvidia_recipe_family(model_type: Option<&str>) -> Option<&'static str> {
+    match model_type {
+        Some("qwen3_5") => Some("qwen3_5"),
+        Some("qwen3_5_moe") => Some("qwen3_5_moe"),
+        Some("gemma4") | Some("gemma4_unified") | Some("gemma4_text") => Some("gemma4"),
+        _ => None, // incl. lfm2, qwen3, None, etc.
+    }
+}
+
+/// Validate `--q-recipe nvidia`: the input config's model type, the requested
+/// `--model-type` family, dense-vs-MoE, and the flags passed alongside it.
 ///
 /// The nvidia recipe is a data-free port of NVIDIA modelopt's Qwen3.5/3.6
-/// *hybrid* recipe and is documented + validated ONLY for `qwen3_5` /
-/// `qwen3_5_moe`. Its per-layer map (`build_nvidia_recipe`) is a pure
+/// *hybrid* recipe. The SAME fixed mxfp4/mxfp8 class-map is now also applied to
+/// dense `gemma4` / `gemma4_unified`, whose standard attention + MLP key names
+/// fall out of the same predicate: attention `self_attn.{q,k,v,o}_proj` →
+/// mxfp8, MLP `.mlp.{gate,up,down}_proj` → mxfp4, and norms / `embed_tokens` /
+/// `vision_embedder.*` (plus the tied gemma4 head) stay bf16. This is the same
+/// data-free format map generalized to gemma4's standard attention — NOT a port
+/// of an official NVIDIA *gemma* recipe. The recipe is documented + validated
+/// for these four model types (`qwen3_5` / `qwen3_5_moe` / `gemma4` /
+/// `gemma4_unified`). Its per-layer map (`build_nvidia_recipe`) is a pure
 /// key-pattern predicate with no model-family awareness, so applying it to any
-/// other family (or to a `None`/omitted model type) would emit mxfp4/mxfp8
+/// OTHER family (or to a `None`/omitted model type) would emit mxfp4/mxfp8
 /// per-layer metadata on generic substrings (`lm_head`, `self_attn`, `.mlp.*`)
 /// that those loaders were never designed for — producing an unloadable or
-/// numerically invalid checkpoint instead of failing upfront. Reject any
-/// model type outside the supported set first.
+/// numerically invalid checkpoint instead of failing upfront.
+///
+/// The gate has three model-shape parts, checked before the flag guards:
+/// 1. **Supported family** — the INPUT config's own `config_family` must
+///    collapse (via `nvidia_recipe_family`) to one of the four supported types;
+///    reject any other family or a `None`/omitted type first.
+/// 2. **Dense-only gemma4** — `build_nvidia_recipe` maps FFN via `.mlp.` +
+///    `{gate,up,down}_proj`. A gemma4 MoE checkpoint (`enable_moe_block: true`,
+///    e.g. 26B-A4B) sanitizes its experts to `experts.switch_glu.*` keys that
+///    have NO `.mlp.` infix, so they fall through to bf16 (unlike qwen MoE,
+///    whose experts normalize to `.mlp.switch_mlp.*`). Reject gemma4 MoE.
+/// 3. **Config/`--model-type` family agreement** — the recipe sanitizes with
+///    `--model-type` (the caller's `-m`), but the gate reads the config's own
+///    type; if they name different families the wrong sanitizer runs and emits
+///    a corrupt checkpoint, so the requested family must match the config
+///    family (`gemma4`/`gemma4_unified` collapse together and agree).
 ///
 /// It also has a fixed format map: it reads no imatrix, ignores `--q-mxfp` (it
 /// emits mxfp4/mxfp8 directly), and pins bits=4/group_size=32 for its float
@@ -4275,26 +4402,63 @@ pub(crate) fn validate_nvfp4_recipe(recipe: &str) -> std::result::Result<(), Str
 /// already-lossy GGUF was never a supported path. Without the flag guards an
 /// imatrix would trigger AWQ pre-scaling and `--q-mxfp` would re-upgrade the
 /// recipe's affine-8/64 in_proj_a/in_proj_b decisions to mxfp8, breaking the
-/// intended T=0 MTP↔AR bit-exactness. `model_type` is `Some` only when the
-/// caller passed/auto-detected one; `quant_bits` / `quant_group_size` are
-/// `Some` only when the caller passed them explicitly; `None` means "use the
-/// recipe default" and always passes the flag checks.
+/// intended T=0 MTP↔AR bit-exactness. `config_family` is the input config's own
+/// type (or a call-site-resolved gemma4_unified alias), `requested_model_type`
+/// is `options.model_type` (the family the sanitizer will use); both are `Some`
+/// only when present. `quant_bits` / `quant_group_size` are `Some` only when the
+/// caller passed them explicitly; `None` means "use the recipe default" and
+/// always passes the flag checks.
 pub(crate) fn validate_nvidia_recipe_options(
-    model_type: Option<&str>,
+    config_family: Option<&str>,
+    requested_model_type: Option<&str>,
+    is_moe: bool,
     imatrix_path: Option<&str>,
     quant_mxfp: bool,
     quant_bits: Option<i32>,
     quant_group_size: Option<i32>,
 ) -> std::result::Result<(), String> {
-    if !matches!(model_type, Some("qwen3_5") | Some("qwen3_5_moe")) {
+    // 1. The INPUT config's own model_type (ground truth) must be a supported
+    //    nvidia family. Reject any other family or a None/omitted type first.
+    let Some(fam) = nvidia_recipe_family(config_family) else {
         return Err(format!(
-            "--q-recipe nvidia is only supported for model types qwen3_5 / qwen3_5_moe \
-             (got {}). It ports the Qwen3.5/3.6 hybrid modelopt recipe; other families \
-             (e.g. gemma4) need their own recipe.",
-            match model_type {
+            "--q-recipe nvidia is only supported for model types qwen3_5 / qwen3_5_moe / \
+             gemma4 / gemma4_unified (got {}). It applies a fixed data-free mxfp4/mxfp8 \
+             class-map (attention → mxfp8, MLP → mxfp4, norms/embeds/vision → bf16); other \
+             families need their own recipe.",
+            match config_family {
                 Some(mt) => format!("'{mt}'"),
                 None => "none".to_string(),
             }
+        ));
+    };
+    // 2. gemma4 nvidia is dense-only: a MoE gemma4 checkpoint's expert keys
+    //    (`experts.switch_glu.*`) have no `.mlp.` infix, so they fall through to
+    //    bf16 under `build_nvidia_recipe`. Reject upfront.
+    if fam == "gemma4" && is_moe {
+        return Err(
+            "--q-recipe nvidia supports only dense gemma4 (its fixed class-map keys FFN via \
+             `.mlp.{gate,up,down}_proj`); this checkpoint has enable_moe_block=true (MoE, e.g. \
+             26B-A4B), whose experts sanitize to `experts.switch_glu.*` keys with no `.mlp.` \
+             infix and would fall through to bf16. Not supported."
+                .to_string(),
+        );
+    }
+    // 3. The recipe sanitizes with --model-type but the gate read the config's
+    //    own type; they must name the same family or the wrong sanitizer runs.
+    let req = nvidia_recipe_family(requested_model_type);
+    if req != Some(fam) {
+        return Err(format!(
+            "--model-type {requested} selects a different model family than the input config \
+             ({config}); --q-recipe nvidia sanitizes with --model-type, so it must match the \
+             config family. Omit --model-type or pass the matching family.",
+            requested = match requested_model_type {
+                Some(mt) => format!("'{mt}'"),
+                None => "none".to_string(),
+            },
+            config = match config_family {
+                Some(mt) => format!("'{mt}'"),
+                None => "none".to_string(),
+            },
         ));
     }
     if imatrix_path.is_some() {
@@ -7353,8 +7517,12 @@ mod tests {
 
     #[test]
     fn nvidia_recipe_options_rejects_imatrix() {
+        // Matching qwen3_5 config+requested so the model-shape gate passes and
+        // the imatrix flag guard is what fires.
         let err = validate_nvidia_recipe_options(
             Some("qwen3_5"),
+            Some("qwen3_5"),
+            false,
             Some("/path/to.imatrix"),
             false,
             None,
@@ -7369,8 +7537,16 @@ mod tests {
 
     #[test]
     fn nvidia_recipe_options_rejects_mxfp() {
-        let err = validate_nvidia_recipe_options(Some("qwen3_5"), None, true, None, None)
-            .expect_err("nvidia recipe must reject --q-mxfp");
+        let err = validate_nvidia_recipe_options(
+            Some("qwen3_5"),
+            Some("qwen3_5"),
+            false,
+            None,
+            true,
+            None,
+            None,
+        )
+        .expect_err("nvidia recipe must reject --q-mxfp");
         assert!(
             err.contains("--q-mxfp is redundant"),
             "error must mention --q-mxfp redundancy, got: {err}"
@@ -7379,8 +7555,16 @@ mod tests {
 
     #[test]
     fn nvidia_recipe_options_rejects_non_default_bits() {
-        let err = validate_nvidia_recipe_options(Some("qwen3_5"), None, false, Some(8), None)
-            .expect_err("nvidia recipe must reject --q-bits != 4");
+        let err = validate_nvidia_recipe_options(
+            Some("qwen3_5"),
+            Some("qwen3_5"),
+            false,
+            None,
+            false,
+            Some(8),
+            None,
+        )
+        .expect_err("nvidia recipe must reject --q-bits != 4");
         assert!(
             err.contains("bits=4"),
             "error must mention pinned bits=4, got: {err}"
@@ -7393,8 +7577,16 @@ mod tests {
 
     #[test]
     fn nvidia_recipe_options_rejects_non_default_group_size() {
-        let err = validate_nvidia_recipe_options(Some("qwen3_5"), None, false, None, Some(64))
-            .expect_err("nvidia recipe must reject --q-group-size != 32");
+        let err = validate_nvidia_recipe_options(
+            Some("qwen3_5"),
+            Some("qwen3_5"),
+            false,
+            None,
+            false,
+            None,
+            Some(64),
+        )
+        .expect_err("nvidia recipe must reject --q-group-size != 32");
         assert!(
             err.contains("group_size=32"),
             "error must mention pinned group_size=32, got: {err}"
@@ -7407,39 +7599,173 @@ mod tests {
 
     #[test]
     fn nvidia_recipe_options_accepts_bare() {
-        validate_nvidia_recipe_options(Some("qwen3_5"), None, false, None, None)
-            .expect("bare --q-recipe nvidia (no explicit flags) must be accepted");
+        validate_nvidia_recipe_options(
+            Some("qwen3_5"),
+            Some("qwen3_5"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("bare --q-recipe nvidia (no explicit flags) must be accepted");
     }
 
     #[test]
     fn nvidia_recipe_options_accepts_explicit_matching_defaults() {
         // Explicit-but-matching bits=4 / group_size=32 contradict nothing and
         // must pass: the guard only rejects values that would alter the map.
-        validate_nvidia_recipe_options(Some("qwen3_5"), None, false, Some(4), Some(32))
-            .expect("explicit bits=4 group_size=32 must be accepted");
+        validate_nvidia_recipe_options(
+            Some("qwen3_5"),
+            Some("qwen3_5"),
+            false,
+            None,
+            false,
+            Some(4),
+            Some(32),
+        )
+        .expect("explicit bits=4 group_size=32 must be accepted");
     }
 
     #[test]
-    fn nvidia_recipe_options_accepts_qwen3_5_and_moe() {
-        // The recipe is documented + validated for exactly these two families.
-        // A bare invocation (no aux flags) on either must pass.
-        validate_nvidia_recipe_options(Some("qwen3_5"), None, false, None, None)
-            .expect("qwen3_5 must be accepted");
-        validate_nvidia_recipe_options(Some("qwen3_5_moe"), None, false, None, None)
-            .expect("qwen3_5_moe must be accepted");
+    fn nvidia_recipe_options_accepts_supported_families() {
+        // The recipe is documented + validated for exactly these four families
+        // (qwen3_5 / qwen3_5_moe + dense gemma4 / gemma4_unified, whose standard
+        // attention + MLP keys fall out of the same data-free class-map). A bare
+        // invocation (no aux flags), config family == requested family, must pass.
+        validate_nvidia_recipe_options(
+            Some("qwen3_5"),
+            Some("qwen3_5"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("qwen3_5 must be accepted");
+        validate_nvidia_recipe_options(
+            Some("qwen3_5_moe"),
+            Some("qwen3_5_moe"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("qwen3_5_moe must be accepted");
+        validate_nvidia_recipe_options(
+            Some("gemma4"),
+            Some("gemma4"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("gemma4 must be accepted");
+        validate_nvidia_recipe_options(
+            Some("gemma4_unified"),
+            Some("gemma4_unified"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("gemma4_unified must be accepted");
+        // gemma4 and gemma4_unified collapse to the same family, so a config of
+        // one and a --model-type of the other AGREE (recipe_for is identical).
+        validate_nvidia_recipe_options(
+            Some("gemma4_unified"),
+            Some("gemma4"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("gemma4_unified config + gemma4 --model-type must agree (same family)");
     }
 
     #[test]
-    fn nvidia_recipe_options_rejects_non_qwen_model_types() {
+    fn nvidia_recipe_options_accepts_gemma4_text_alias() {
+        // `gemma4_text` is the text-only dense alias of the gemma4 family: the
+        // loader recognizes it as a plain dense gemma4 root model_type and the
+        // CLI collapses a `gemma4_text` config to `--model-type gemma4` before
+        // the sanitizer runs. The gate reads the config's OWN type
+        // (gemma4_text) while the sanitizer dispatches on the collapsed
+        // `gemma4`, so a gemma4_text config with a requested gemma4 (or
+        // gemma4_unified) must be ACCEPTED, not rejected as unsupported.
+        validate_nvidia_recipe_options(
+            Some("gemma4_text"),
+            Some("gemma4"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("gemma4_text config + gemma4 --model-type must be accepted (same family)");
+        validate_nvidia_recipe_options(
+            Some("gemma4_text"),
+            Some("gemma4_unified"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("gemma4_text config + gemma4_unified --model-type must agree (same family)");
+
+        // The dense-only guard still holds: a gemma4_text config with
+        // enable_moe_block is MoE and must be rejected (its experts sanitize to
+        // `experts.switch_glu.*` keys that fall through to bf16).
+        let moe_err = validate_nvidia_recipe_options(
+            Some("gemma4_text"),
+            Some("gemma4"),
+            true,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect_err("a gemma4_text MoE checkpoint must still be rejected");
+        assert!(
+            moe_err.contains("only dense gemma4"),
+            "error must mention the dense-only gemma4 limit, got: {moe_err}"
+        );
+
+        // Family-agreement still holds: gemma4_text config + qwen3_5
+        // --model-type names a different family and must be rejected.
+        let mismatch_err = validate_nvidia_recipe_options(
+            Some("gemma4_text"),
+            Some("qwen3_5"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect_err("gemma4_text config + qwen3_5 --model-type must be rejected");
+        assert!(
+            mismatch_err.contains("different model family than the input config"),
+            "error must mention the family mismatch, got: {mismatch_err}"
+        );
+    }
+
+    #[test]
+    fn nvidia_recipe_options_rejects_unsupported_model_types() {
         // Other families' loaders were never designed for the nvidia recipe's
-        // mxfp4/mxfp8 per-layer map — reject upfront. The model-type gate fires
-        // before the aux-flag checks, so it holds even with otherwise-valid
-        // (bare) flags.
-        for mt in ["gemma4", "lfm2", "lfm2_moe", "qwen3"] {
-            let err = validate_nvidia_recipe_options(Some(mt), None, false, None, None)
-                .expect_err("nvidia recipe must reject a non-qwen3_5 model type");
+        // mxfp4/mxfp8 per-layer map — reject upfront. `qwen3` != `qwen3_5`, so it
+        // stays unsupported. The model-type gate fires before the aux-flag
+        // checks, so it holds even with otherwise-valid (bare) flags. Pass the
+        // unsupported type as BOTH config and requested.
+        for mt in ["lfm2", "lfm2_moe", "qwen3"] {
+            let err =
+                validate_nvidia_recipe_options(Some(mt), Some(mt), false, None, false, None, None)
+                    .expect_err("nvidia recipe must reject an unsupported model type");
             assert!(
-                err.contains("only supported for model types qwen3_5 / qwen3_5_moe"),
+                err.contains("only supported for model types"),
                 "error must name the supported model types, got: {err}"
             );
             assert!(
@@ -7454,15 +7780,73 @@ mod tests {
         // `None` = no `--model-type` (safetensors auto-detect fell through) or
         // the GGUF entry point (which has no HF model_type in scope). Both must
         // fail upfront rather than run the generic-substring predicate.
-        let err = validate_nvidia_recipe_options(None, None, false, None, None)
+        let err = validate_nvidia_recipe_options(None, None, false, None, false, None, None)
             .expect_err("nvidia recipe must reject an omitted model type");
         assert!(
-            err.contains("only supported for model types qwen3_5 / qwen3_5_moe"),
+            err.contains("only supported for model types"),
             "error must name the supported model types, got: {err}"
         );
         assert!(
             err.contains("got none"),
             "error must report the omitted model type as 'none', got: {err}"
+        );
+    }
+
+    #[test]
+    fn nvidia_recipe_options_rejects_gemma4_moe() {
+        // The nvidia class-map keys FFN via `.mlp.{gate,up,down}_proj`. A gemma4
+        // MoE checkpoint (enable_moe_block=true, e.g. 26B-A4B) sanitizes its
+        // experts to `experts.switch_glu.*` keys with no `.mlp.` infix, so they
+        // fall through to bf16. Reject it as dense-only (config == requested so
+        // the family gate passes and the dense-only guard is what fires).
+        let err = validate_nvidia_recipe_options(
+            Some("gemma4"),
+            Some("gemma4"),
+            true,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect_err("nvidia recipe must reject a gemma4 MoE checkpoint");
+        assert!(
+            err.contains("only dense gemma4"),
+            "error must mention the dense-only gemma4 limit, got: {err}"
+        );
+    }
+
+    #[test]
+    fn nvidia_recipe_options_rejects_family_mismatch() {
+        // The recipe sanitizes with --model-type but the gate reads the config's
+        // own type; if they name different families the wrong sanitizer runs and
+        // emits a corrupt checkpoint. Reject both directions.
+        let err = validate_nvidia_recipe_options(
+            Some("gemma4"),
+            Some("qwen3_5"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect_err("gemma4 config + qwen3_5 --model-type must be rejected");
+        assert!(
+            err.contains("different model family than the input config"),
+            "error must mention the family mismatch, got: {err}"
+        );
+        let err = validate_nvidia_recipe_options(
+            Some("qwen3_5"),
+            Some("gemma4"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect_err("qwen3_5 config + gemma4 --model-type must be rejected");
+        assert!(
+            err.contains("different model family than the input config"),
+            "error must mention the family mismatch, got: {err}"
         );
     }
 
@@ -11536,11 +11920,12 @@ mod tests {
 
     #[tokio::test]
     async fn convert_model_nvidia_recipe_rejects_real_config_model_type_despite_m_override() {
-        // Reviewer [high]: `-m qwen3_5` must NOT smuggle a real gemma4 directory
-        // past the nvidia gate. The gate reads the input config.json's actual
-        // model_type (gemma4), so the run is rejected even though --model-type
-        // claims qwen3_5. Only config.json is written — the gate must fire
-        // before weights load, so the error is the model-type reject, not a
+        // Reviewer [high]: `-m qwen3_5` must NOT smuggle a real UNSUPPORTED
+        // directory past the nvidia gate. The gate reads the input config.json's
+        // actual model_type (lfm2 — still unsupported now that gemma4 is
+        // allowed), so the run is rejected even though --model-type claims
+        // qwen3_5. Only config.json is written — the gate must fire before
+        // weights load, so the error is the model-type reject, not a
         // missing-safetensors error.
         let base = std::env::temp_dir().join(format!(
             "nvidia_gate_realconfig_{}_{}",
@@ -11556,7 +11941,7 @@ mod tests {
         std::fs::write(
             input.join("config.json"),
             serde_json::to_string_pretty(&serde_json::json!({
-                "model_type": "gemma4",
+                "model_type": "lfm2",
                 "tie_word_embeddings": false
             }))
             .unwrap(),
@@ -11580,13 +11965,271 @@ mod tests {
         })
         .await
         .err()
-        .expect("nvidia recipe must reject a real gemma4 config even with -m qwen3_5");
+        .expect("nvidia recipe must reject a real lfm2 config even with -m qwen3_5");
         assert!(
-            err.reason
-                .contains("only supported for model types qwen3_5")
-                && err.reason.contains("gemma4"),
-            "expected the nvidia model-type reject naming the real config type gemma4, got: {}",
+            err.reason.contains("only supported for model types") && err.reason.contains("lfm2"),
+            "expected the nvidia model-type reject naming the real config type lfm2, got: {}",
             err.reason
         );
+    }
+
+    #[tokio::test]
+    async fn convert_model_nvidia_recipe_rejects_gemma4_config_with_qwen_override() {
+        // Reviewer [high]: `-m qwen3_5` on a real gemma4 directory must NOT
+        // sanitize as Qwen. The gate now allows gemma4, but the sanitizer
+        // dispatches on --model-type; the family-agreement check rejects the
+        // mismatch (config gemma4_unified vs requested qwen3_5) before the wrong
+        // sanitizer runs. Only config.json is written — the gate must fire
+        // before weights load, so the error is the family-mismatch reject, not a
+        // missing-safetensors error. Restores the spirit of the gemma4-smuggle
+        // guard that ce25261a removed when it opened nvidia to gemma4.
+        let base = std::env::temp_dir().join(format!(
+            "nvidia_gate_gemma4_qwen_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model_type": "gemma4_unified",
+                "tie_word_embeddings": false
+            }))
+            .unwrap(),
+        )
+        .expect("write config.json");
+
+        let err = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("qwen3_5".to_string()), // caller's lie
+            quantize: Some(true),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: Some("affine".to_string()),
+            quant_recipe: Some("nvidia".to_string()),
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .err()
+        .expect("nvidia recipe must reject a gemma4 config sanitized with -m qwen3_5");
+        assert!(
+            err.reason
+                .contains("different model family than the input config"),
+            "expected the nvidia family-mismatch reject for gemma4 config + qwen3_5 override, got: {}",
+            err.reason
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn convert_model_nvidia_recipe_rejects_gemma4_moe_from_text_config() {
+        // Round-2 [medium]: real gemma MoE configs carry `enable_moe_block`
+        // under `text_config` (the root key is absent), and the loader resolves
+        // it nested-first (`get_config_bool`). The gate must mirror that: a
+        // gemma4 config whose enable_moe_block lives in text_config=true is MoE
+        // and must be rejected (its `experts.switch_glu.*` keys would fall
+        // through to bf16). Belt-and-braces: set the root key to false to prove
+        // nested wins. Only config.json is written — the gate fires before
+        // weights load.
+        let base = std::env::temp_dir().join(format!(
+            "nvidia_gate_gemma4_moe_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model_type": "gemma4_unified",
+                "tie_word_embeddings": false,
+                "enable_moe_block": false, // root says dense…
+                "text_config": { "enable_moe_block": true } // …nested (loader-canonical) says MoE
+            }))
+            .unwrap(),
+        )
+        .expect("write config.json");
+
+        let err = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("gemma4_unified".to_string()),
+            quantize: Some(true),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: Some("affine".to_string()),
+            quant_recipe: Some("nvidia".to_string()),
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .err()
+        .expect("nvidia recipe must reject a gemma4 MoE config (enable_moe_block in text_config)");
+        assert!(
+            err.reason.contains("only dense gemma4"),
+            "expected the nvidia dense-only reject for a text_config MoE gemma4, got: {}",
+            err.reason
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn convert_model_nvidia_recipe_rejects_gemma_qat_via_alias_override() {
+        // Round-2 [high]: a gemma-QAT source (`quant_method: "gemma"`) with an
+        // aliased `-m gemma4_unified` must NOT slip the already-quantized
+        // rejection into the generic quantizer. The FAMILY predicate
+        // `is_gemma_qat_family` (gemma4/gemma4_unified collapse via
+        // nvidia_recipe_family) still catches the alias for the reject. The
+        // config declares model_type gemma4, so the nvidia family-agreement check
+        // passes (both collapse to gemma) — the QAT gate is what must reject.
+        // Only config.json is written.
+        let base = std::env::temp_dir().join(format!(
+            "nvidia_gate_gemma_qat_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model_type": "gemma4",
+                "tie_word_embeddings": false,
+                "quantization_config": { "quant_method": "gemma" }
+            }))
+            .unwrap(),
+        )
+        .expect("write config.json");
+
+        let err = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("gemma4_unified".to_string()), // aliased override
+            quantize: Some(true),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: Some("affine".to_string()),
+            quant_recipe: Some("nvidia".to_string()),
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .err()
+        .expect("gemma-QAT source with aliased -m gemma4_unified must be rejected");
+        assert!(
+            err.reason
+                .contains("gemma-QAT checkpoints are already quantized"),
+            "expected the gemma-QAT already-quantized reject, got: {}",
+            err.reason
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn convert_model_rejects_unified_gemma_qat_before_e2b_importer() {
+        // WB-2 [high]: a gemma4_unified QAT (audio-carrying) must NOT reach the
+        // E2B prequantized importer, which is EXACT-"gemma4" only and DROPS
+        // AUDIO. This config uses the EXACT E2B language schedule, so under the
+        // pre-fix single family predicate it would PASS validate_e2b_qat_schedule
+        // and enter the importer (dropping audio). With the role split, the
+        // unified marker (model_type gemma4_unified / unified architecture) trips
+        // the explicit unified-QAT reject FIRST — hermetically, before the
+        // convert mutex + enter_cpu, so no output directory is even created.
+        let base = std::env::temp_dir().join(format!(
+            "unified_gemma_qat_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model_type": "gemma4_unified",
+                "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+                "tie_word_embeddings": false,
+                // A real (non-null) audio_config: the unified checkpoint carries
+                // audio the E2B importer would silently drop.
+                "audio_config": { "input_feat_size": 128 },
+                "quantization_config": {
+                    "quant_method": "gemma",
+                    // EXACT E2B schedule — so the pre-fix path would validate + import.
+                    "module_quant_configs": {
+                        "^lm_head$": { "num_bits": 2 },
+                        "language_model\\.embed_tokens$": { "num_bits": 2 },
+                        "language_model\\.embed_tokens_per_layer$": { "num_bits": 4 },
+                        "language_model\\.layers\\.(\\d|1[0-4])\\.mlp\\.": { "num_bits": 4 },
+                        "language_model\\.layers\\.\\d+\\.mlp\\.": { "num_bits": 2 },
+                        "language_model\\.layers\\.\\d+\\.self_attn\\.": { "num_bits": 4 }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .expect("write config.json");
+
+        let err = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("gemma4_unified".to_string()),
+            quantize: None, // NO quant flags: escapes the already-quantized family reject
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .err()
+        .expect("unified gemma-QAT must be rejected before the E2B importer");
+        assert!(
+            err.reason.contains("unified gemma QAT is not supported"),
+            "expected the unified gemma-QAT reject, got: {}",
+            err.reason
+        );
+        // Hermetic: the reject fires before create_dir_all(&output_dir), so no
+        // audio-dropped E2B output is ever produced. Under the pre-fix single
+        // predicate the output dir WOULD have been created — this discriminates.
+        assert!(
+            !output.exists(),
+            "no output directory should be created for a rejected unified gemma-QAT"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
