@@ -425,15 +425,12 @@ describe('handleCreateMessage', () => {
       expect(sessionReg.size).toBe(sizeBefore);
     });
 
-    it('returns 400 when stop_sequences is non-empty (no warm slot touched)', async () => {
-      // End-to-end: native `ChatConfig` has no `stopSequences` field, so the
-      // mapper rejects the field rather than silently dropping it. The 400
-      // must propagate via the outer try/catch in the handler, and the warm
-      // slot must remain untouched.
+    it('accepts non-empty stop_sequences instead of rejecting with 400', async () => {
+      // End-to-end: the mapper no longer rejects `stop_sequences`; it threads
+      // the stop strings out so a downstream consumer can honour them. The
+      // request must proceed normally rather than 400.
       const registry = new ModelRegistry();
       registry.register('test-model', createMockModel());
-      const sessionReg = registry.getSessionRegistry('test-model')!;
-      const sizeBefore = sessionReg.size;
       const { res, getStatus, getBody } = createMockRes();
 
       await handleCreateMessage(
@@ -447,12 +444,9 @@ describe('handleCreateMessage', () => {
         registry,
       );
 
-      expect(getStatus()).toBe(400);
+      expect(getStatus()).toBe(200);
       const parsed = JSON.parse(getBody());
-      expect(parsed.type).toBe('error');
-      expect(parsed.error.type).toBe('invalid_request_error');
-      expect(parsed.error.message).toContain('stop_sequences');
-      expect(sessionReg.size).toBe(sizeBefore);
+      expect(parsed.type).toBe('message');
     });
   });
 
@@ -2027,6 +2021,1197 @@ describe('handleCreateMessage', () => {
       );
       const combined = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
       expect(combined).toBe('\n\nhello');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Stop sequences (honoring Anthropic `stop_sequences`)
+  // -----------------------------------------------------------------------
+
+  describe('stop sequences', () => {
+    it('non-streaming: truncates text at the stop sequence and reports stop_sequence', async () => {
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: 'keep this HALT drop this',
+          rawText: 'keep this HALT drop this',
+          finishReason: 'stop',
+          numTokens: 12,
+          promptTokens: 6,
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.type).toBe('message');
+      expect(parsed.content).toHaveLength(1);
+      expect(parsed.content[0].type).toBe('text');
+      expect(parsed.content[0].text).toBe('keep this ');
+      expect(parsed.stop_reason).toBe('stop_sequence');
+      expect(parsed.stop_sequence).toBe('HALT');
+    });
+
+    it('streaming: suppresses the stop sequence + tail and reports stop_sequence', async () => {
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'keep this HALT drop this', done: false, isReasoning: false },
+        {
+          text: 'keep this HALT drop this',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 12,
+          promptTokens: 6,
+          reasoningTokens: 0,
+          rawText: 'keep this HALT drop this',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).toBe('keep this ');
+      expect(streamedText).not.toContain('HALT');
+      expect(streamedText).not.toContain('drop this');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect(msgDelta).toBeDefined();
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
+
+      const msgStop = events.find((e) => e.event === 'message_stop');
+      expect(msgStop).toBeDefined();
+    });
+
+    it('streaming: detects a stop sequence split across two deltas', async () => {
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'keep HA', done: false, isReasoning: false },
+        { text: 'LTdrop', done: false, isReasoning: false },
+        {
+          text: 'keep HALTdrop',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 10,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: 'keep HALTdrop',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).toBe('keep ');
+      expect(streamedText).not.toContain('HALT');
+      expect(streamedText).not.toContain('drop');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
+    });
+
+    it('non-streaming: leaves text and stop_reason untouched when no stop sequence matches', async () => {
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: 'keep this whole thing',
+          rawText: 'keep this whole thing',
+          finishReason: 'stop',
+          numTokens: 9,
+          promptTokens: 4,
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content[0].text).toBe('keep this whole thing');
+      expect(parsed.stop_reason).toBe('end_turn');
+      expect(parsed.stop_sequence).toBe(null);
+    });
+
+    it('streaming: leaves text and stop_reason untouched when no stop sequence matches', async () => {
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'keep ', done: false, isReasoning: false },
+        { text: 'this whole thing', done: false, isReasoning: false },
+        {
+          text: 'keep this whole thing',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 9,
+          promptTokens: 4,
+          reasoningTokens: 0,
+          rawText: 'keep this whole thing',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).toBe('keep this whole thing');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('end_turn');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe(null);
+    });
+
+    it('streaming: honors a stop sequence that lands in the visible text before a tool-call tag', async () => {
+      // Finding 1: the `tagFound` emit path used to write the visible text
+      // before a structural marker (`cleanPrefix`) straight to the wire
+      // without consulting the stop-sequence detector, so a stop string in
+      // that prefix leaked and `stop_reason` stayed `tool_use`. The model
+      // emits "keep this HALT " immediately followed by a `<tool_call>` in
+      // the SAME delta, so the tag buffer reports `tagFound` with
+      // `cleanPrefix === "keep this HALT "`.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'keep this HALT <tool_call>{"name":"get_weather"}', done: false, isReasoning: false },
+        {
+          text: '',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [{ status: 'ok', id: 'toolu_w1', name: 'get_weather', arguments: '{"location":"NYC"}' }],
+          thinking: null,
+          numTokens: 12,
+          promptTokens: 6,
+          reasoningTokens: 0,
+          rawText: 'keep this HALT <tool_call>{"name":"get_weather"}',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).toBe('keep this ');
+      expect(streamedText).not.toContain('HALT');
+      expect(streamedText).not.toContain('<tool_call>');
+
+      // The stop match wins over the tool call: `stop_reason` is
+      // `stop_sequence`, not `tool_use`.
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect(msgDelta).toBeDefined();
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
+
+      // The tool call's tag came AFTER the stop boundary, so no tool_use
+      // content block may be emitted alongside the stop_sequence terminal.
+      const toolBlock = events.find(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'tool_use',
+      );
+      expect(toolBlock).toBeUndefined();
+
+      const msgStop = events.find((e) => e.event === 'message_stop');
+      expect(msgStop).toBeDefined();
+    });
+
+    it('non-streaming: suppresses the tool_use block when a stop matched in the visible text', async () => {
+      // Non-streaming sibling of the stop-before-tool case: the visible text
+      // carries a stop string and the native result also parsed a tool call.
+      // The truncated text wins and the tool_use block must be dropped.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: 'keep this HALT drop this',
+          rawText: 'keep this HALT <tool_call>{"name":"get_weather"}</tool_call>',
+          finishReason: 'stop',
+          toolCalls: [
+            {
+              status: 'ok',
+              id: 'toolu_stop_ns',
+              name: 'get_weather',
+              arguments: '{"location":"NYC"}',
+            } as ToolCallResult,
+          ],
+          numTokens: 12,
+          promptTokens: 6,
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stop_sequences: ['HALT'],
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.stop_reason).toBe('stop_sequence');
+      expect(parsed.stop_sequence).toBe('HALT');
+      expect(parsed.content.some((b: any) => b.type === 'tool_use')).toBe(false);
+      expect(parsed.content).toEqual([{ type: 'text', text: 'keep this ' }]);
+    });
+
+    it('non-streaming: resolves a held overlapping stop at flush', async () => {
+      // BUG A: `push()` holds a complete stop ('HALT') because a longer
+      // overlapping stop ('HALTED') is still viable, so it returns
+      // `matched:null`. Without a follow-up `flush()` the held stop leaks as
+      // normal text with `stop_reason: end_turn`. The non-streaming path must
+      // push+flush like the streaming done-path.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: 'keep HALT',
+          rawText: 'keep HALT',
+          finishReason: 'stop',
+          numTokens: 6,
+          promptTokens: 3,
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stop_sequences: ['HALT', 'HALTED'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content).toHaveLength(1);
+      expect(parsed.content[0].type).toBe('text');
+      expect(parsed.content[0].text).toBe('keep ');
+      expect(parsed.stop_reason).toBe('stop_sequence');
+      expect(parsed.stop_sequence).toBe('HALT');
+    });
+
+    it('non-streaming: honors a stop sequence inside recovered suppressed-tool text', async () => {
+      // BUG B: the request disallows tools, but the native parser still
+      // produced a tool call and `result.text` is empty, so
+      // `buildAnthropicContent` emits `recoverSuppressedToolCallText(rawText)`
+      // as the visible text. The stop scan must run over THAT recovered text,
+      // not the empty `result.text` — otherwise a stop inside it leaks with
+      // `stop_reason: end_turn`.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: '',
+          rawText: 'Sure STOP <tool_call>{"name":"get_weather","arguments":{}}</tool_call>',
+          finishReason: 'stop',
+          toolCalls: [
+            {
+              status: 'ok',
+              id: 'call_x',
+              name: 'get_weather',
+              arguments: '{}',
+            } as ToolCallResult,
+          ],
+          numTokens: 12,
+          promptTokens: 6,
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stop_sequences: ['STOP'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content.some((b: any) => b.type === 'tool_use')).toBe(false);
+      const textBlock = parsed.content.find((b: any) => b.type === 'text');
+      expect(textBlock).toBeDefined();
+      expect(textBlock.text).toBe('Sure ');
+      expect(parsed.stop_reason).toBe('stop_sequence');
+      expect(parsed.stop_sequence).toBe('STOP');
+    });
+
+    it('non-streaming: keeps a trailing incomplete partial when no stop completes', async () => {
+      // Control for the flush() addition: 'keep HAL' ends in a prefix of
+      // 'HALT' but never completes it. `flush()` must release the held partial
+      // as normal text — nothing may be dropped and no false truncation may
+      // occur.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: 'keep HAL',
+          rawText: 'keep HAL',
+          finishReason: 'stop',
+          numTokens: 6,
+          promptTokens: 3,
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content[0].text).toBe('keep HAL');
+      expect(parsed.stop_reason).toBe('end_turn');
+      expect(parsed.stop_sequence).toBe(null);
+    });
+
+    it('streaming: honors a stop sequence hidden in suppressed/recovered text on a no-tools turn', async () => {
+      // Finding 1: the done-path recovery branch re-emits native final text
+      // that the tag buffer suppressed (here the visible bytes around a
+      // `<tool_call>` on a request with NO tools). A stop string living in
+      // that recovered tail was never routed through the detector, so it
+      // leaked and the terminal kept the native reason. The recovered text
+      // must run through the SAME detector before emission.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'Sure <tool_call>{"name":"x"}</tool_call> STOP now', done: false, isReasoning: false },
+        {
+          text: 'Sure  STOP now',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [{ status: 'ok', id: 'call_x', name: 'x', arguments: '{}' }],
+          thinking: null,
+          numTokens: 12,
+          promptTokens: 6,
+          reasoningTokens: 0,
+          rawText: 'Sure <tool_call>{"name":"x"}</tool_call> STOP now',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['STOP'],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).not.toContain('STOP');
+      expect(streamedText).not.toContain('now');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect(msgDelta).toBeDefined();
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('STOP');
+
+      const msgStop = events.find((e) => e.event === 'message_stop');
+      expect(msgStop).toBeDefined();
+    });
+
+    it('streaming: flushes parked pre-stop whitespace as the truncated prefix', async () => {
+      // Finding 5: when the same push that cleared a whitespace-only safe
+      // prefix also matched the stop, that whitespace was parked in
+      // `pendingLeadingWhitespace` and then dropped at done, so streaming
+      // returned no text while non-streaming returned the leading whitespace.
+      // The parked safe bytes must be flushed as the truncated prefix.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: ' HALTtail', done: false, isReasoning: false },
+        {
+          text: ' HALTtail',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 8,
+          promptTokens: 4,
+          reasoningTokens: 0,
+          rawText: ' HALTtail',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      // Exactly the safe pre-stop prefix " ", matching the non-streaming result.
+      expect(streamedText).toBe(' ');
+      expect(streamedText).not.toContain('HALT');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
+    });
+
+    it('streaming: opens an empty text block when a stop sequence consumes all visible output', async () => {
+      // Parity with the non-streaming path: when the stop matches at the very
+      // start so the visible text collapses to '', the reconstructed content
+      // must be [{type:'text', text:''}] — a text block opened and closed with
+      // no body, exactly like buildAnthropicContent. The old `body.length > 0`
+      // guard skipped the block entirely, so a client rebuilding from SSE saw
+      // `content: []` while the non-streaming sibling returned an empty block.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'STOPhello', done: false, isReasoning: false },
+        {
+          text: 'STOPhello',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 5,
+          promptTokens: 3,
+          reasoningTokens: 0,
+          rawText: 'STOPhello',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['STOP'],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+
+      // Exactly one text block, opened with empty text — the empty-collapse block.
+      const textStarts = events.filter(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'text',
+      );
+      expect(textStarts).toHaveLength(1);
+      expect((textStarts[0].data['content_block'] as any).text).toBe('');
+
+      // The stop ate everything: no visible text leaked and no empty text_delta.
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      expect(textDeltas).toHaveLength(0);
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('STOP');
+    });
+
+    it('non-streaming: returns the leading whitespace prefix when a stop matches right after it', async () => {
+      // Non-streaming counterpart of the parked-whitespace streaming case:
+      // the result text " HALTtail" truncates to " " (the safe prefix).
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: ' HALTtail',
+          rawText: ' HALTtail',
+          finishReason: 'stop',
+          numTokens: 8,
+          promptTokens: 4,
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content).toEqual([{ type: 'text', text: ' ' }]);
+      expect(parsed.stop_reason).toBe('stop_sequence');
+      expect(parsed.stop_sequence).toBe('HALT');
+    });
+
+    it('non-streaming: returns an empty text block when a stop sequence consumes all visible output', async () => {
+      // Sibling/parity anchor of the streaming empty-collapse case: the result
+      // text "STOPhello" truncates to '' and the content is a single empty text
+      // block — the target the streaming path now matches.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: 'STOPhello',
+          rawText: 'STOPhello',
+          finishReason: 'stop',
+          numTokens: 5,
+          promptTokens: 3,
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stop_sequences: ['STOP'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content).toEqual([{ type: 'text', text: '' }]);
+      expect(parsed.stop_reason).toBe('stop_sequence');
+      expect(parsed.stop_sequence).toBe('STOP');
+    });
+
+    it('streaming: releases a benign held partial when a tool-call tag interrupts it', async () => {
+      // Finding 1 (consequence 2): when the detector holds a benign partial
+      // (a prefix of a stop sequence, e.g. "H" of "HALT") and the next delta
+      // is a structural marker, the partial used to be stranded in the
+      // detector and dropped by the suppressed-terminal residue gate. The
+      // `tagFound` path now flushes the detector, releasing the partial as
+      // visible text. Here "keep H" holds "H"; the next delta is a bare
+      // `<tool_call>` (cleanPrefix === ""), and "H" can never become "HALT".
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'keep H', done: false, isReasoning: false },
+        { text: '<tool_call>{"name":"get_weather"}', done: false, isReasoning: false },
+        {
+          text: '',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [{ status: 'ok', id: 'toolu_w2', name: 'get_weather', arguments: '{"location":"NYC"}' }],
+          thinking: null,
+          numTokens: 10,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: 'keep H<tool_call>{"name":"get_weather"}',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      // The benign "H" is preserved, not dropped.
+      expect(streamedText).toBe('keep H');
+
+      // No stop matched, so the tool call drives the terminal as before.
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('tool_use');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe(null);
+    });
+
+    it('streaming: preserves order of buffered leading whitespace and a held stop-prefix before a tool-call tag', async () => {
+      // Re-review of the `tagFound` fix: a turn-leading whitespace-only delta
+      // (" ") and a stop-prefix ("H" of "HALT") arrive together as " H", then a
+      // bare `<tool_call>` follows. The detector clears the leading " " (visible)
+      // and holds "H"; the " " parks in `pendingLeadingWhitespace` because no
+      // text block is open yet. At the tag, `pendingLeadingWhitespace` is text
+      // that ALREADY passed the detector, so it must be prepended OUTSIDE the
+      // buffer. Re-pushing it would queue it after the held "H" and emit "H "
+      // (order inverted). The visible run is " H" and "H" can never become
+      // "HALT", so no stop matches and the tool call drives the terminal.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: ' H', done: false, isReasoning: false },
+        { text: '<tool_call>{"name":"get_weather"}', done: false, isReasoning: false },
+        {
+          text: '',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [{ status: 'ok', id: 'toolu_w4', name: 'get_weather', arguments: '{"location":"NYC"}' }],
+          thinking: null,
+          numTokens: 9,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: ' H<tool_call>{"name":"get_weather"}',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      // Order preserved (" H", not "H "), nothing leaked, nothing dropped.
+      expect(streamedText).toBe(' H');
+
+      // No stop matched, so the tool call drives the terminal.
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('tool_use');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe(null);
+    });
+
+    it('streaming: leaves the pre-tag visible text untouched when no stop_sequences are configured', async () => {
+      // Finding 2: with `stop_sequences` absent the detector is a pass-through,
+      // so the `tagFound` path stays byte-identical — the full visible prefix
+      // (here "keep this HALT ", stop string and all) reaches the wire and
+      // `stop_sequence` is null. Same stream as the honor test above, minus
+      // `stop_sequences`.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'keep this HALT <tool_call>{"name":"get_weather"}', done: false, isReasoning: false },
+        {
+          text: '',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [{ status: 'ok', id: 'toolu_w3', name: 'get_weather', arguments: '{"location":"NYC"}' }],
+          thinking: null,
+          numTokens: 12,
+          promptTokens: 6,
+          reasoningTokens: 0,
+          rawText: 'keep this HALT <tool_call>{"name":"get_weather"}',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).toBe('keep this HALT ');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('tool_use');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe(null);
+    });
+
+    it('streaming: detects a stop split across a held partial and recovered terminal text', async () => {
+      // Finding B: the streamed delta "HA" is held by the detector (prefix of
+      // "HALT"); the native done text "HALTtail" completes the stop. The held
+      // partial must stay in the buffer while the terminal/recovered text is
+      // scanned so "HALT" is caught across the boundary instead of leaking.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'HA', done: false, isReasoning: false },
+        {
+          text: 'HALTtail',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 8,
+          promptTokens: 4,
+          reasoningTokens: 0,
+          rawText: 'HALTtail',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).not.toContain('HALT');
+      expect(streamedText).not.toContain('tail');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect(msgDelta).toBeDefined();
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
+    });
+
+    it('streaming: detects a stop split across a held partial and tag-suppressed recovered text', async () => {
+      // Finding B (tag-suppression variant): the model emits "HA", then a
+      // suppressed <tool_call> on a no-tools turn, then "LTtail". The native
+      // cleaned done text "HALTtail" reconstitutes the visible text. The held
+      // "HA" must still be buffered when the recovered tail is scanned, so the
+      // already-streamed bytes never include any part of the matched stop.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'HA<tool_call>{}</tool_call>LTtail', done: false, isReasoning: false },
+        {
+          text: 'HALTtail',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 8,
+          promptTokens: 4,
+          reasoningTokens: 0,
+          rawText: 'HA<tool_call>{}</tool_call>LTtail',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).not.toContain('HALT');
+      expect(streamedText).not.toContain('tail');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect(msgDelta).toBeDefined();
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
+    });
+
+    it('streaming: suppresses the tool_use block when a stop matches in recovered terminal text', async () => {
+      // Finding C: tools enabled, streamed "prefix ", native done text
+      // "prefix HALT tail" plus one ok tool call. The stop is found only in
+      // the recovered terminal text, so the tool call must be suppressed and
+      // stop_reason must be stop_sequence — a streamed response must never
+      // carry both a tool_use block and stop_sequence. Matches non-streaming.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'prefix ', done: false, isReasoning: false },
+        {
+          text: 'prefix HALT tail',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [{ status: 'ok', id: 'call_w', name: 'get_weather', arguments: '{"location":"NYC"}' }],
+          thinking: null,
+          numTokens: 10,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: 'prefix HALT tail',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).not.toContain('HALT');
+
+      const toolBlock = events.find(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'tool_use',
+      );
+      expect(toolBlock).toBeUndefined();
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect(msgDelta).toBeDefined();
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
+    });
+
+    it('streaming: suppresses the tool_use block when a stop matches in tag-suppressed recovered text', async () => {
+      // Finding C (tag-suppression variant): the model emits "prefix ", a
+      // suppressed <tool_call>, then "HALT tail". The native cleaned done text
+      // "prefix HALT tail" surfaces the stop. Tools must be suppressed and the
+      // terminal must be stop_sequence — never both.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'prefix <tool_call>{"name":"get_weather"}</tool_call>HALT tail', done: false, isReasoning: false },
+        {
+          text: 'prefix HALT tail',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [{ status: 'ok', id: 'call_w', name: 'get_weather', arguments: '{"location":"NYC"}' }],
+          thinking: null,
+          numTokens: 10,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: 'prefix <tool_call>{"name":"get_weather"}</tool_call>HALT tail',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).not.toContain('HALT');
+
+      const toolBlock = events.find(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'tool_use',
+      );
+      expect(toolBlock).toBeUndefined();
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect(msgDelta).toBeDefined();
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
+    });
+
+    it('streaming: counts parked leading whitespace in the terminal overlap so a held stop never replays it', async () => {
+      // Wave #3 regression: the streamed delta " H" parks " " in
+      // `pendingLeadingWhitespace` (whitespace-only, no block open yet) and holds
+      // "H" in the stop detector (prefix of "HALT"). The native done text
+      // " HALTtail" carries the full visible text. The terminal overlap basis must
+      // include the parked " " so the recovered tail is only "ALTtail" (which
+      // completes the held "HALT") instead of the whole " HALTtail" — otherwise the
+      // already-received " H" gets replayed and the "H" of the stop leaks. Correct:
+      // emit exactly the pre-stop whitespace " ", matching the non-streaming result.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: ' H', done: false, isReasoning: false },
+        {
+          text: ' HALTtail',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 8,
+          promptTokens: 4,
+          reasoningTokens: 0,
+          rawText: ' HALTtail',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).toBe(' ');
+      expect(streamedText).not.toContain('H');
+      expect(streamedText).not.toContain('HALT');
+      expect(streamedText).not.toContain('tail');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
+    });
+
+    it('streaming: no-op with no stop_sequences never replays parked whitespace + tag residue', async () => {
+      // Wave #3 regression (C8 no-op): with NO stop_sequences the streamed delta
+      // " <" parks " " in `pendingLeadingWhitespace` and holds "<" in the tag
+      // buffer (possible tag start). The native done text " <x" carries the full
+      // visible text. The terminal overlap basis must include the parked " " and
+      // the held "<" so the recovered tail is only "x" — otherwise " <x" replays
+      // and the wire shows the duplicated " < <x". Correct: emit " <x" exactly once.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: ' <', done: false, isReasoning: false },
+        {
+          text: ' <x',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 4,
+          promptTokens: 2,
+          reasoningTokens: 0,
+          rawText: ' <x',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).toBe(' <x');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('end_turn');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe(null);
+    });
+
+    it('streaming: no-op control recovers only the unsent suffix after parked whitespace (no stop_sequences)', async () => {
+      // Wave #3 control: with NO stop_sequences the streamed delta " H" opens a
+      // text block immediately (non-whitespace), and the native done text " Htail"
+      // recovers only the unsent "tail". The combined stream is exactly " Htail" —
+      // byte-identical to the no-stop behavior, no duplication, no drop.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: ' H', done: false, isReasoning: false },
+        {
+          text: ' Htail',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 6,
+          promptTokens: 3,
+          reasoningTokens: 0,
+          rawText: ' Htail',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).toBe(' Htail');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('end_turn');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe(null);
     });
   });
 

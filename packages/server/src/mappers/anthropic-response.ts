@@ -52,7 +52,14 @@ export function anthropicToolUseIdToInternal(id: string): string {
   return id.startsWith('toolu_') ? `call_${id.slice('toolu_'.length)}` : id;
 }
 
-export function mapStopReason(finishReason: string, hasToolCalls: boolean): 'end_turn' | 'max_tokens' | 'tool_use' {
+export function mapStopReason(
+  finishReason: string,
+  hasToolCalls: boolean,
+  matchedStopSequence?: string | null,
+): 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' {
+  if (matchedStopSequence) {
+    return 'stop_sequence';
+  }
   if (finishReason === 'length') {
     return 'max_tokens';
   }
@@ -83,7 +90,11 @@ export function recoverSuppressedToolCallText(rawText: string): string {
     .replace(/<turn\|>/g, '');
 }
 
-export function buildAnthropicContent(result: ChatResult, allowToolUse = true): AnthropicResponseContent[] {
+export function buildAnthropicContent(
+  result: ChatResult,
+  allowToolUse = true,
+  stopMatched = false,
+): AnthropicResponseContent[] {
   const content: AnthropicResponseContent[] = [];
 
   if (result.thinking) {
@@ -91,9 +102,18 @@ export function buildAnthropicContent(result: ChatResult, allowToolUse = true): 
   }
 
   const parsedToolCalls = result.toolCalls.filter((t) => t.status === 'ok');
-  const okToolCalls = allowToolUse ? parsedToolCalls : [];
+  // A matched stop sequence halts generation at its position, so any tool call
+  // whose tag would have followed the stop boundary is dropped and the
+  // truncated visible text (`result.text`, already cut at the stop) is emitted
+  // verbatim — the suppressed-markup recovery is skipped because it would
+  // re-introduce text that lived after the stop.
+  const okToolCalls = stopMatched || !allowToolUse ? [] : parsedToolCalls;
   const text =
-    !allowToolUse && result.text.length === 0 && parsedToolCalls.length > 0 && containsToolCallMarkup(result.rawText)
+    !stopMatched &&
+    !allowToolUse &&
+    result.text.length === 0 &&
+    parsedToolCalls.length > 0 &&
+    containsToolCallMarkup(result.rawText)
       ? recoverSuppressedToolCallText(result.rawText)
       : result.text;
 
@@ -125,8 +145,13 @@ export function buildAnthropicResponse(
   performance?: PerformanceMetricsForUsage,
   allowToolUse = true,
   serverTiming?: ServerTimingForUsage,
+  matchedStopSequence?: string | null,
 ): AnthropicMessagesResponse {
-  const okToolCalls = allowToolUse ? result.toolCalls.filter((t) => t.status === 'ok') : [];
+  // A matched stop sequence takes precedence over tool_use: suppress the tool
+  // calls so `stop_reason: 'stop_sequence'` is never emitted alongside a
+  // tool_use block whose tag followed the stop boundary.
+  const stopMatched = Boolean(matchedStopSequence);
+  const okToolCalls = allowToolUse && !stopMatched ? result.toolCalls.filter((t) => t.status === 'ok') : [];
   const hasToolCalls = okToolCalls.length > 0;
 
   // Cache accounting (Anthropic Messages API spec):
@@ -173,9 +198,9 @@ export function buildAnthropicResponse(
     type: 'message',
     role: 'assistant',
     model: req.model,
-    content: buildAnthropicContent(result, allowToolUse),
-    stop_reason: mapStopReason(result.finishReason, hasToolCalls),
-    stop_sequence: null,
+    content: buildAnthropicContent(result, allowToolUse, stopMatched),
+    stop_reason: mapStopReason(result.finishReason, hasToolCalls, matchedStopSequence),
+    stop_sequence: matchedStopSequence ?? null,
     usage,
   };
 }
@@ -239,6 +264,7 @@ export function buildMessageDelta(
   cachedTokens?: number,
   performance?: PerformanceMetricsForUsage,
   serverTiming?: ServerTimingForUsage,
+  stopSequence?: string | null,
 ): AnthropicMessageDeltaEvent {
   // Streaming `message_delta` mirrors the non-streaming response's
   // cache accounting: when `cachedTokens > 0` we emit
@@ -267,7 +293,7 @@ export function buildMessageDelta(
     type: 'message_delta',
     delta: {
       stop_reason: stopReason,
-      stop_sequence: null,
+      stop_sequence: stopSequence ?? null,
     },
     usage,
   };

@@ -63,6 +63,18 @@ describe('mapStopReason', () => {
   it('maps unknown reason with tool calls to "tool_use"', () => {
     expect(mapStopReason('unknown', true)).toBe('tool_use');
   });
+
+  it('returns "stop_sequence" when a stop sequence matched', () => {
+    expect(mapStopReason('stop', false, 'HALT')).toBe('stop_sequence');
+  });
+
+  it('prioritises a matched stop sequence over "max_tokens"', () => {
+    expect(mapStopReason('length', false, 'HALT')).toBe('stop_sequence');
+  });
+
+  it('ignores a null matched stop sequence and keeps existing mapping', () => {
+    expect(mapStopReason('length', false, null)).toBe('max_tokens');
+  });
 });
 
 describe('buildAnthropicResponse', () => {
@@ -197,6 +209,38 @@ describe('buildAnthropicResponse', () => {
     const response = buildAnthropicResponse(result, baseReq, 'msg_len');
 
     expect(response.stop_reason).toBe('max_tokens');
+  });
+
+  it('stop_reason is "stop_sequence" with a non-null stop_sequence when a stop sequence matched', () => {
+    const result = makeChatResult();
+    const response = buildAnthropicResponse(result, baseReq, 'msg_stop_seq', undefined, true, undefined, 'HALT');
+
+    expect(response.stop_reason).toBe('stop_sequence');
+    expect(response.stop_sequence).toBe('HALT');
+  });
+
+  it('suppresses tool_use blocks when a stop sequence matched (stop wins over tool_use)', () => {
+    // A matched stop halts generation at its position, so a tool call whose
+    // tag would have followed the stop boundary must not be emitted alongside
+    // `stop_reason: 'stop_sequence'`. The truncated visible text stays.
+    const result = makeChatResult({
+      text: 'keep this ',
+      toolCalls: [
+        {
+          id: 'toolu_stop',
+          name: 'get_weather',
+          arguments: '{"city":"SF"}',
+          status: 'ok',
+          rawContent: '',
+        },
+      ],
+    });
+    const response = buildAnthropicResponse(result, baseReq, 'msg_stop_tool', undefined, true, undefined, 'HALT');
+
+    expect(response.stop_reason).toBe('stop_sequence');
+    expect(response.stop_sequence).toBe('HALT');
+    expect(response.content.some((b) => b.type === 'tool_use')).toBe(false);
+    expect(response.content).toEqual([{ type: 'text', text: 'keep this ' }]);
   });
 
   it('usage maps promptTokens → input_tokens and numTokens → output_tokens', () => {
@@ -537,6 +581,13 @@ describe('buildMessageDelta', () => {
     expect(event.delta.stop_reason).toBe('end_turn');
     expect(event.delta.stop_sequence).toBeNull();
     expect(event.usage.output_tokens).toBe(42);
+  });
+
+  it('emits stop_reason "stop_sequence" with the matched stop_sequence', () => {
+    const event = buildMessageDelta('stop_sequence', 5, undefined, undefined, undefined, undefined, 'HALT');
+
+    expect(event.delta.stop_reason).toBe('stop_sequence');
+    expect(event.delta.stop_sequence).toBe('HALT');
   });
 
   it('passes through input_tokens when supplied without cachedTokens', () => {
