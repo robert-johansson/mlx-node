@@ -22,12 +22,8 @@ import { LAUNCH_PRESETS, type LaunchPreset } from '@mlx-node/server';
  * top_k 50). repetitionPenalty 1.05 and the 8192-token output budget
  * match the dense family entry.
  *
- * `qwen3_next` (Qwen3-Coder-Next 80B-A3B): non-thinking coder family,
- * so the qwen3_5 `thinkingCoding` server preset does not apply. Values
- * are the Qwen3-Coder model-card recommendation (temperature 0.7 /
- * top_p 0.8 / top_k 20 / repetition_penalty 1.05) — deliberately NOT
- * `instructGeneral`, whose presencePenalty 1.5 degrades code with
- * legitimately repeated tokens. Output budget matches qwen3_5_moe.
+ * `qwen3_next` (Qwen3-Coder-Next) is served by the server table's own
+ * entry — added there so `mlx launch claude` gets the family too.
  */
 const AGENT_LAUNCH_PRESETS: Partial<Record<ModelType, LaunchPreset>> = {
   lfm2_moe: {
@@ -40,17 +36,6 @@ const AGENT_LAUNCH_PRESETS: Partial<Record<ModelType, LaunchPreset>> = {
       repetitionPenalty: 1.05,
     },
     maxOutputTokens: 8192,
-  },
-  qwen3_next: {
-    sampling: {
-      temperature: 0.7,
-      topP: 0.8,
-      topK: 20,
-      minP: 0.0,
-      presencePenalty: 0.0,
-      repetitionPenalty: 1.05,
-    },
-    maxOutputTokens: 81920,
   },
 };
 

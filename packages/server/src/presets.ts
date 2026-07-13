@@ -105,6 +105,22 @@ export const LAUNCH_PRESETS: Record<string, LaunchPreset> = {
     sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding,
     maxOutputTokens: 81920,
   },
+  // Qwen3-Coder-Next (80B-A3B hybrid GDN + gated-attention MoE): instruct-only
+  // coder family — no <think> blocks, so thinkingCoding does not apply. Values
+  // are the Qwen3-Coder model-card recommendation (temperature 0.7 / top_p 0.8
+  // / top_k 20 / repetition_penalty 1.05) — deliberately NOT instructGeneral,
+  // whose presencePenalty 1.5 degrades code with legitimately repeated tokens.
+  qwen3_next: {
+    sampling: {
+      temperature: 0.7,
+      topP: 0.8,
+      topK: 20,
+      minP: 0.0,
+      presencePenalty: 0.0,
+      repetitionPenalty: 1.05,
+    },
+    maxOutputTokens: 81920,
+  },
   gemma4: {
     sampling: GEMMA4_SAMPLING_DEFAULTS,
     maxOutputTokens: 16384,
