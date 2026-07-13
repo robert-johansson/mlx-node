@@ -62,6 +62,9 @@ const FAMILY_TRAITS: Record<string, FamilyTraits> = {
   qwen3: { reasoning: true, fallbackContextWindow: 40960 },
   qwen3_5: { reasoning: true, fallbackContextWindow: 262144 },
   qwen3_5_moe: { reasoning: true, fallbackContextWindow: 262144 },
+  // Qwen3-Coder-Next (80B-A3B hybrid GDN + gated-attention MoE): instruct-only
+  // coder family — no <think> blocks. Trained window matches qwen3_5.
+  qwen3_next: { reasoning: false, fallbackContextWindow: 262144 },
   gemma4: { reasoning: false, fallbackContextWindow: 131072 },
   lfm2: { reasoning: true, fallbackContextWindow: 128000 },
   lfm2_moe: { reasoning: true, fallbackContextWindow: 128000 },
