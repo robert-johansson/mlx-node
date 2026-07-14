@@ -198,6 +198,25 @@ Note: models emit `<think>` blocks per their thinking level — set `--thinking 
 
 **Per-turn token accounting (measurement-grade).** Every assistant record's `usage` carries engine-real counts, not estimates: `input` (prompt tokens MINUS the KV-cache-served prefix — add `cacheRead` back for the full prompt length), `output` (completion tokens), `reasoning` (thinking tokens: sampled-token count up to the `</think>` boundary, computed by the engine's `ReasoningTracker` during decode; a subset of `output`; 0 when no think block), and `totalTokens` (full prompt + completion — this drives pi's auto-compaction). The same numbers ride `message_end` rpc events. Verified: the same prompt at `--thinking off` vs `medium` yields `reasoning` 0 vs >0 with `output` differing accordingly.
 
+### Clean-room persona (replacing the coding-assistant frame)
+
+`--system-prompt` fully REPLACES pi's coding-assistant prompt (the separate `--append-system-prompt` exists for prepend-style use). In the custom-prompt branch pi also ignores tool snippets and guidelines, so extension tools cannot add prompt text. Two caveats, verified byte-for-byte:
+
+- pi UNCONDITIONALLY appends two lines to every system prompt: `Current date: YYYY-MM-DD` and `Current working directory: <cwd>`. The composed message is byte-identical to your text **plus exactly that suffix** — removing it would require forking pi. Launch from a neutral cwd if the path would break the persona frame.
+- Project context (`AGENTS.md`/`CLAUDE.md`) is appended INSIDE the system prompt unless `-nc`/`--no-context-files` is passed — with a marked AGENTS.md in cwd, the marker appears without `-nc` and is absent with it.
+
+The full clean-room incantation, plus the verification hook (`MLX_AGENT_DUMP_SYSTEM=<path>` writes the exact composed system prompt the model receives, each turn):
+
+```bash
+MLX_AGENT_DUMP_SYSTEM=/tmp/system-as-received.txt mlx agent \
+  --model mlx/<model> \
+  --system-prompt "$(cat persona.txt)" \
+  -nc --no-skills --no-extensions -e participant-tools.ts \
+  --no-builtin-tools
+```
+
+(`--no-extensions` disables discovery from the config home — third-party extensions could otherwise register tools; explicit `-e` paths still load.)
+
 ### Extensions and skills
 
 The leading positional commands pass through to pi and manage what lives under the agent config home:

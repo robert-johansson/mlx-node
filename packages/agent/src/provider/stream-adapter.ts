@@ -46,6 +46,7 @@ import type {
 } from '@earendil-works/pi-ai';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
 import type { ChatSession } from '@mlx-node/lm';
+import { writeFileSync } from 'node:fs';
 
 import type { DiscoveredModelLike } from '../types.js';
 import { buildChatConfig } from './chat-config.js';
@@ -234,6 +235,14 @@ export function makeMlxStreamSimple(
         }
         if (terminated) return;
         try {
+          // Clean-room verification hook: dump the exact system prompt the
+          // model receives AFTER pi's composition (custom prompt + optional
+          // context/skills sections + pi's unconditional date/cwd suffix).
+          // Overwritten each turn — the byte-level ground truth for "what
+          // did the participant actually read".
+          if (process.env.MLX_AGENT_DUMP_SYSTEM) {
+            writeFileSync(process.env.MLX_AGENT_DUMP_SYSTEM, context.systemPrompt ?? '');
+          }
           session.primeHistory(contextToChatMessages(context));
           const config = buildChatConfig(discovered.modelType, options, toolsToDefinitions(context.tools));
           for await (const event of session.startFromHistoryStream(config, signal)) {
