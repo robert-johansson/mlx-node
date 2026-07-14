@@ -4285,6 +4285,8 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "examples@workspace:examples"
   dependencies:
+    "@earendil-works/pi-ai": "npm:0.80.6"
+    "@earendil-works/pi-coding-agent": "npm:0.80.6"
     "@mlx-node/core": "workspace:*"
     "@mlx-node/lm": "workspace:*"
     "@mlx-node/trl": "workspace:*"

@@ -153,6 +153,21 @@ pi has no permission system of its own, so `mlx agent` installs a safety gate: e
 MLX_AGENT_AUTO_APPROVE=1 mlx agent -p 'run the test suite and report failures' --no-session
 ```
 
+### Custom tools
+
+A pi extension file can define its own tools with `defineTool` + `pi.registerTool`; `examples/echo-tool.ts` is the in-tree template (parameter schema, async execute, and an image-returning tool). Three properties matter for instrument-style setups that replace the coding toolset entirely:
+
+- `--no-builtin-tools --extension <file.ts>` yields a session whose ONLY tools are the extension's — no bash/write/edit.
+- Custom tools are never gated: the permission gate intercepts `bash`/`write`/`edit` by name, so extension tools run without prompts and without `MLX_AGENT_AUTO_APPROVE`, headless included. A tool needing its own approval flow implements it inside `execute`.
+- Headless `-p` runs drive multi-turn tool loops to completion (call → result → continuation), not just one turn.
+
+A tool result may carry images: return `{ type: 'image', data: <base64>, mimeType: 'image/png' }` parts alongside text. On a VLM the provider delivers the pixels to the model (internally hoisted onto a synthetic user turn to match the Qwen-VL trained format); text-only models reject image-bearing turns with a typed error.
+
+```bash
+mlx agent --model mlx/<model> --no-builtin-tools --extension examples/echo-tool.ts \
+  -p "call echo_tool with the word hello, then tell me what it returned"
+```
+
 ### Extensions and skills
 
 The leading positional commands pass through to pi and manage what lives under the agent config home:
