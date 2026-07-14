@@ -81,6 +81,19 @@ export function buildChatConfig(
     reasoningEffort: options?.reasoning === undefined ? 'none' : THINKING_LEVEL_TO_EFFORT[options.reasoning],
   };
   if (options?.maxTokens !== undefined) config.maxNewTokens = options.maxTokens;
+  // Per-run sampling override for measurement work (pi has no temperature
+  // flag and never sets SimpleStreamOptions.temperature itself, so without
+  // this the preset always wins). Explicit pi options still take precedence.
+  // The native sampler treats temperature <= 1e-6 as greedy argmax, so
+  // MLX_AGENT_TEMPERATURE=0 selects deterministic decoding.
+  const envTemp = process.env.MLX_AGENT_TEMPERATURE;
+  if (envTemp !== undefined && envTemp !== '') {
+    const parsed = Number(envTemp);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      throw new Error(`MLX_AGENT_TEMPERATURE must be a finite number >= 0, got "${envTemp}"`);
+    }
+    config.temperature = parsed;
+  }
   if (options?.temperature !== undefined) config.temperature = options.temperature;
   if (tools && tools.length > 0) config.tools = tools;
   // `reuseCache` is deliberately NOT set: ChatSession.mergeConfig forces it on.

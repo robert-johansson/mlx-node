@@ -51,6 +51,53 @@ describe('buildChatConfig', () => {
     expect(config.temperature).toBe(0.6);
   });
 
+  describe('MLX_AGENT_TEMPERATURE', () => {
+    const restore = process.env.MLX_AGENT_TEMPERATURE;
+    const setEnv = (v: string | undefined) => {
+      if (v === undefined) delete process.env.MLX_AGENT_TEMPERATURE;
+      else process.env.MLX_AGENT_TEMPERATURE = v;
+    };
+    const cleanup = () => setEnv(restore);
+
+    it('overrides the preset temperature (0 selects the greedy path)', () => {
+      setEnv('0');
+      try {
+        expect(buildChatConfig('qwen3_5', {}, undefined).temperature).toBe(0);
+      } finally {
+        cleanup();
+      }
+    });
+
+    it('loses to an explicit pi option', () => {
+      setEnv('0');
+      try {
+        expect(buildChatConfig('qwen3_5', { temperature: 0.3 }, undefined).temperature).toBe(0.3);
+      } finally {
+        cleanup();
+      }
+    });
+
+    it('rejects non-numeric and negative values loudly', () => {
+      for (const bad of ['abc', '-1', 'NaN']) {
+        setEnv(bad);
+        try {
+          expect(() => buildChatConfig('qwen3_5', {}, undefined)).toThrow(/MLX_AGENT_TEMPERATURE/);
+        } finally {
+          cleanup();
+        }
+      }
+    });
+
+    it('empty string means unset (preset wins)', () => {
+      setEnv('');
+      try {
+        expect(buildChatConfig('qwen3_5', {}, undefined).temperature).toBe(0.6);
+      } finally {
+        cleanup();
+      }
+    });
+  });
+
   it('attaches tools only when non-empty', () => {
     const tool = createToolDefinition('get_weather', 'weather', { location: { type: 'string' } }, ['location']);
     expect(buildChatConfig('qwen3_5', undefined, [tool]).tools).toEqual([tool]);

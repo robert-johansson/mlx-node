@@ -217,6 +217,16 @@ MLX_AGENT_DUMP_SYSTEM=/tmp/system-as-received.txt mlx agent \
 
 (`--no-extensions` disables discovery from the config home — third-party extensions could otherwise register tools; explicit `-e` paths still load.)
 
+### Temperature and reproducibility
+
+`MLX_AGENT_TEMPERATURE=<n>` overrides the launch preset's sampling temperature per run (an explicit pi-side option still wins). The native sampler treats temperature ≤ 1e-6 as greedy argmax, so `MLX_AGENT_TEMPERATURE=0` selects deterministic decoding. There is currently **no sampling seed on the chat path** — temp-0 is the only reproducible mode; seeded sampling at temp > 0 would be a small native feature (the RNG plumbing exists training-side as `GrpoEngineConfig.seed`).
+
+**Reproducibility on Thor/CUDA, as measured (2026-07-14, Ornith-1.0-35B-8bit):** `-p` at temperature 0 is byte-repeatable — two identical runs (thinking medium, ~150 generated tokens) produced byte-identical stdout. This rests on more than the paired test: since the qmm_sm80 cp_async race fix (mlx `caadb9da7`), the MoE forward on this hardware is bit-deterministic at the logits level (30/30 identical prefill+decode across runs; guard test `qmm_determinism_test` in genmlx), and greedy argmax plus the deterministic penalty transforms preserve that through sampling. Caveats that bound the claim:
+
+- The system prompt embeds the **current date and cwd** — runs are prompt-identical only same-day and same-cwd. Cross-day divergence is a *prompt* change, not nondeterminism.
+- Claims are **per-binary and per-checkpoint**: any mlx-node/MLX rebuild or model change re-baselines them; pin SHAs per administration batch.
+- Exit codes are unreliable (a known CUDA teardown abort can fire after output is complete) — compare bytes or the session JSONL, never exit codes.
+
 ### Extensions and skills
 
 The leading positional commands pass through to pi and manage what lives under the agent config home:
