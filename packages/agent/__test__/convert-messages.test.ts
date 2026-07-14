@@ -87,7 +87,7 @@ describe('contextToChatMessages', () => {
     expect(converted).toEqual([{ role: 'user', content: 'hi' }]);
   });
 
-  it('replaces image parts with [image omitted] placeholder lines', () => {
+  it('attaches user image bytes and hoists tool-result images (no placeholder text)', () => {
     const context: Context = {
       messages: [
         userMsg([
@@ -102,9 +102,13 @@ describe('contextToChatMessages', () => {
       ],
     };
 
-    const [user, , tool] = contextToChatMessages(context);
-    expect(user!.content).toBe('What is in this picture?\n[image omitted]');
-    expect(tool!.content).toBe('[image omitted]\ncaptured');
+    const [user, , tool, hoist] = contextToChatMessages(context);
+    expect(user!.content).toBe('What is in this picture?');
+    expect(user!.images).toEqual([new Uint8Array(Buffer.from('aGk=', 'base64'))]);
+    expect(tool!.content).toBe('captured');
+    expect(tool!.images).toBeUndefined();
+    expect(hoist!.role).toBe('user');
+    expect(hoist!.images).toEqual([new Uint8Array(Buffer.from('aGk=', 'base64'))]);
   });
 
   it('joins multiple user text parts with newlines', () => {
@@ -215,6 +219,100 @@ describe('contextToChatMessages', () => {
   it('keeps completed assistant messages with empty content (stop is not a husk)', () => {
     const converted = contextToChatMessages({ messages: [assistantMsg([], 'stop')] });
     expect(converted).toEqual([{ role: 'assistant', content: '' }]);
+  });
+});
+
+describe('contextToChatMessages — images', () => {
+  const PNG_A = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]);
+  const PNG_B = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 2]);
+  const imgPart = (bytes: Buffer) => ({ type: 'image' as const, data: bytes.toString('base64'), mimeType: 'image/png' });
+  const HOIST_TEXT = 'The image output of the preceding tool result is attached.';
+
+  it('user image parts ride ChatMessage.images with text joined, bytes decoded', () => {
+    const converted = contextToChatMessages({
+      messages: [userMsg([{ type: 'text', text: 'what is this?' }, imgPart(PNG_A)])],
+    });
+    expect(converted).toEqual([{ role: 'user', content: 'what is this?', images: [new Uint8Array(PNG_A)] }]);
+  });
+
+  it('multiple images in one user message preserve order; image-only message gets empty content', () => {
+    const converted = contextToChatMessages({
+      messages: [userMsg([imgPart(PNG_A), imgPart(PNG_B)])],
+    });
+    expect(converted).toEqual([{ role: 'user', content: '', images: [new Uint8Array(PNG_A), new Uint8Array(PNG_B)] }]);
+  });
+
+  it('text-only user messages carry no images field (byte-identical to pre-image conversion)', () => {
+    const converted = contextToChatMessages({ messages: [userMsg('hello')] });
+    expect(converted).toEqual([{ role: 'user', content: 'hello' }]);
+  });
+
+  it('tool-result images are hoisted onto a synthetic user message after the tool message', () => {
+    const converted = contextToChatMessages({
+      messages: [
+        assistantMsg([{ type: 'toolCall', id: 'call_look', name: 'look', arguments: {} }], 'toolUse'),
+        toolResultMsg('call_look', [{ type: 'text', text: 'crop 1 of 1' }, imgPart(PNG_A)]),
+      ],
+    });
+    expect(converted).toEqual([
+      { role: 'assistant', content: '', toolCalls: [{ id: 'call_look', name: 'look', arguments: '{}' }] },
+      { role: 'tool', content: 'crop 1 of 1', toolCallId: 'call_look', isError: false },
+      { role: 'user', content: HOIST_TEXT, images: [new Uint8Array(PNG_A)] },
+    ]);
+  });
+
+  it('image-less tool results are unchanged — no hoist message', () => {
+    const converted = contextToChatMessages({
+      messages: [
+        assistantMsg([{ type: 'toolCall', id: 'call_1', name: 'get_weather', arguments: {} }], 'toolUse'),
+        toolResultMsg('call_1', [{ type: 'text', text: 'sunny' }]),
+      ],
+    });
+    expect(converted.filter((m) => m.role === 'user')).toEqual([]);
+  });
+
+  it('hoist does not disturb orphan repair across a multi-tool fan-out', () => {
+    // Two sibling calls; only the first has a result (with an image). The
+    // hoist lands between the siblings, and the missing sibling still gets
+    // its synthetic No-result entry at flush.
+    const converted = contextToChatMessages({
+      messages: [
+        assistantMsg(
+          [
+            { type: 'toolCall', id: 'call_a', name: 'look', arguments: {} },
+            { type: 'toolCall', id: 'call_b', name: 'look', arguments: {} },
+          ],
+          'toolUse',
+        ),
+        toolResultMsg('call_a', [imgPart(PNG_A)]),
+        userMsg('carry on'),
+      ],
+    });
+    expect(converted).toEqual([
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [
+          { id: 'call_a', name: 'look', arguments: '{}' },
+          { id: 'call_b', name: 'look', arguments: '{}' },
+        ],
+      },
+      { role: 'tool', content: '', toolCallId: 'call_a', isError: false },
+      { role: 'user', content: HOIST_TEXT, images: [new Uint8Array(PNG_A)] },
+      { role: 'tool', content: 'No result provided', toolCallId: 'call_b', isError: true },
+      { role: 'user', content: 'carry on' },
+    ]);
+  });
+
+  it('conversion is deterministic across repeated calls (KV-prefix byte stability)', () => {
+    const context: Context = {
+      messages: [
+        userMsg([{ type: 'text', text: 'look at these' }, imgPart(PNG_A), imgPart(PNG_B)]),
+        assistantMsg([{ type: 'toolCall', id: 'c1', name: 'look', arguments: { at: 'stage' } }], 'toolUse'),
+        toolResultMsg('c1', [{ type: 'text', text: 'ok' }, imgPart(PNG_B)]),
+      ],
+    };
+    expect(contextToChatMessages(context)).toEqual(contextToChatMessages(context));
   });
 });
 

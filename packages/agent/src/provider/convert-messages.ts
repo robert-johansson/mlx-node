@@ -11,21 +11,47 @@
 import type { Context, ImageContent, Message, TextContent, Tool } from '@earendil-works/pi-ai';
 import type { ChatMessage, ToolDefinition } from '@mlx-node/lm';
 
-const IMAGE_PLACEHOLDER = '[image omitted]';
+/**
+ * Fixed text of the synthetic user message that carries tool-result
+ * images to the model (see {@link contextToChatMessages}). MUST stay
+ * byte-stable and count-independent: it is replayed on every turn, so
+ * any variation (image counts, tool names, timestamps) would change
+ * the token prefix and kill native KV reuse for the rest of the
+ * session.
+ */
+const TOOL_IMAGE_HOIST_TEXT = 'The image output of the preceding tool result is attached.';
 
-function joinParts(parts: ReadonlyArray<TextContent | ImageContent>): string {
-  return parts.map((part) => (part.type === 'image' ? IMAGE_PLACEHOLDER : part.text)).join('\n');
+/** Split pi content parts into joined text and decoded image bytes.
+ * Within-message interleaving is NOT preserved: the native Jinja
+ * serializer renders one text part followed by the image parts
+ * (matching mlx-vlm's ordering), so text is joined first and images
+ * follow. Cross-message ordering is exact. */
+function splitParts(parts: ReadonlyArray<TextContent | ImageContent>): { text: string; images: Uint8Array[] } {
+  const texts: string[] = [];
+  const images: Uint8Array[] = [];
+  for (const part of parts) {
+    if (part.type === 'image') {
+      images.push(new Uint8Array(Buffer.from(part.data, 'base64')));
+    } else {
+      texts.push(part.text);
+    }
+  }
+  return { text: texts.join('\n'), images };
 }
 
 /** Per-message conversion (byte-stable joins). Never drops — the drop / orphan
  * repair lives in {@link contextToChatMessages}, mirroring pi's transformMessages. */
 function convertMessage(message: Message): ChatMessage {
   switch (message.role) {
-    case 'user':
-      return {
-        role: 'user',
-        content: typeof message.content === 'string' ? message.content : joinParts(message.content),
-      };
+    case 'user': {
+      if (typeof message.content === 'string') {
+        return { role: 'user', content: message.content };
+      }
+      const { text, images } = splitParts(message.content);
+      const converted: ChatMessage = { role: 'user', content: text };
+      if (images.length > 0) converted.images = images;
+      return converted;
+    }
     case 'assistant': {
       // Thinking blocks are dropped: the native chat template re-renders
       // reasoning through its own <think> handling, and replayed thinking
@@ -41,14 +67,28 @@ function convertMessage(message: Message): ChatMessage {
       if (toolCalls.length > 0) converted.toolCalls = toolCalls;
       return converted;
     }
-    case 'toolResult':
+    case 'toolResult': {
+      // Images are NOT attached here: the native Jinja serializer emits
+      // image parts only for user-role messages, matching the model's
+      // trained format (Qwen-VL vision tokens live in user turns; tool
+      // responses are text inside <tool_response>). Tool-result images
+      // are hoisted onto a synthetic user message by
+      // {@link contextToChatMessages} instead.
+      const { text } = splitParts(message.content);
       return {
         role: 'tool',
-        content: joinParts(message.content),
+        content: text,
         toolCallId: message.toolCallId,
         isError: message.isError,
       };
+    }
   }
+}
+
+/** Decoded image bytes of a pi tool result, or `null` when it has none. */
+function toolResultImages(parts: ReadonlyArray<TextContent | ImageContent>): Uint8Array[] | null {
+  const { images } = splitParts(parts);
+  return images.length > 0 ? images : null;
 }
 
 /**
@@ -56,7 +96,22 @@ function convertMessage(message: Message): ChatMessage {
  * `ChatSession.primeHistory()`.
  *
  * - `systemPrompt` becomes the leading `system` message.
- * - Image parts become literal `[image omitted]` lines (v1 — no VLM plumbing).
+ * - USER image parts ride the converted message's `images` field: the
+ *   native session start extracts them in message order and the Jinja
+ *   serializer emits one vision part per image at the message's position,
+ *   so multiple images and images at multiple history positions both work.
+ * - TOOL-RESULT image parts are HOISTED onto a synthetic user message
+ *   (fixed text {@link TOOL_IMAGE_HOIST_TEXT}) pushed directly after the
+ *   tool message. The native serializer emits image parts only for
+ *   user-role messages — the model's trained format (Qwen-VL vision
+ *   tokens live in user turns) — so attaching them to the tool message
+ *   would render zero placeholders while the engine still extracted the
+ *   bytes: a feature/placeholder count mismatch. The hoist is
+ *   provider-internal; pi extensions keep returning images in tool
+ *   results per the pi content model.
+ * - Text-only models: an image-bearing history is rejected by the engine
+ *   with a typed `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error
+ *   before rendering (no silent placeholder substitution).
  *
  * Two-pass mirror of pi's canonical `transformMessages` (pi-ai
  * `dist/api/transform-messages.js`). That transform normally sanitizes the
@@ -124,10 +179,21 @@ export function contextToChatMessages(context: Context): ChatMessage[] {
         }
         break;
       }
-      case 'toolResult':
+      case 'toolResult': {
         seenToolResultIds.add(message.toolCallId);
         messages.push(convertMessage(message));
+        // Tool-image hoist: the image bytes ride a synthetic user message
+        // DIRECTLY after the tool result, preserving temporal order across
+        // multiple image-bearing tool calls. Pushed without flushing orphan
+        // state — sibling tool calls from the same assistant fan-out may
+        // still be awaiting results, and the hoist must not trigger
+        // synthetic "No result provided" entries for them.
+        const images = toolResultImages(message.content);
+        if (images) {
+          messages.push({ role: 'user', content: TOOL_IMAGE_HOIST_TEXT, images });
+        }
         break;
+      }
     }
   }
   flushOrphans();
