@@ -168,6 +168,34 @@ mlx agent --model mlx/<model> --no-builtin-tools --extension examples/echo-tool.
   -p "call echo_tool with the word hello, then tell me what it returned"
 ```
 
+### Observing and driving a session
+
+Two channels expose a running session's mind (think blocks, tool calls, streaming text); both are verified in this tree.
+
+**`--mode rpc` — delta-level, and the administration channel.** The agent reads JSON commands on stdin and emits JSON lines on stdout: command `response`s plus `AgentSessionEvent`s as they occur. Verified event flow for one tool-using prompt:
+
+```
+response(prompt) → agent_start → turn_start
+  → message_start/message_update*/message_end   (assistant; updates carry
+     text_start/text_delta/text_end, thinking_start/thinking_delta/thinking_end,
+     toolcall_start/toolcall_delta/toolcall_end sub-events)
+  → tool_execution_start {toolName, args} → tool_execution_end
+  → message_start/message_end                    (toolResult)
+→ turn_end → turn_start … → agent_end → agent_settled
+```
+
+Commands include `prompt`, `steer`, `abort`, `new_session`, `set_model`, `set_thinking_level`, `compact`, `get_state` — enough to script an entire administration without the TUI. Example: `mlx agent --model mlx/<model> --mode rpc --no-builtin-tools --extension tools.ts`, then write `{"type":"prompt","message":"..."}` lines to stdin.
+
+**Session JSONL — message-level, attach from outside.** Sessions persist under `~/.mlx-node/agent/sessions/` as JSONL, appended once per COMPLETED message (`appendFileSync`), so a live tail sees each think block and each tool call the moment it finishes — a tool call lands before its result executes. Stable record shape: every line has `{type, id, parentId, timestamp}` (ISO-8601); `type:"message"` lines carry a pi `message` with `role` `user` / `assistant` / `toolResult`; assistant `content` parts are `{type:"thinking", thinking}`, `{type:"text", text}`, `{type:"toolCall", id, name, arguments}` plus `stopReason` and `usage`; toolResult messages carry `toolCallId`, `toolName`, `isError`, and text/image parts. `parentId` chains records into pi's session tree (forks share the file).
+
+`examples/watch-session.ts` is the attach script — point it at a session file or the sessions directory and it prints each think block, tool call, and tool result as records land:
+
+```bash
+oxnode examples/watch-session.ts ~/.mlx-node/agent/sessions/<project-dir>/
+```
+
+Note: models emit `<think>` blocks per their thinking level — set `--thinking low|medium|high` if the mind panel should have deliberation to show.
+
 ### Extensions and skills
 
 The leading positional commands pass through to pi and manage what lives under the agent config home:
