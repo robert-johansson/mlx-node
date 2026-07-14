@@ -22,7 +22,8 @@ use crate::inference_trace::{
 use crate::model_thread::ResponseTx;
 use crate::models::qwen3_5::model::{
     VisionCache, VisionCacheInner, async_eval_layer_caches, compute_image_token_counts_per_image,
-    eval_layer_caches, inject_image_placeholders, vlm_prepare_vision_features,
+    eval_layer_caches, inject_image_placeholders, vlm_prepare_vision_continuation,
+    vlm_prepare_vision_features,
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
@@ -252,6 +253,16 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) cached_token_history: Vec<u32>,
     pub(crate) cached_image_key: Option<u64>,
     pub(crate) cached_rope_deltas: Option<i32>,
+    /// Number of images embedded in `cached_token_history` — `cached_image_key`
+    /// is the combined hash of exactly the FIRST `cached_image_count` images of
+    /// the conversation, enabling PREFIX-set reuse when an append-only session
+    /// adds images (genmlx-lds5; whole-set equality can never match once a
+    /// session grows its image list).
+    pub(crate) cached_image_count: usize,
+    /// Flattened `[t, h, w]` grid rows (3 per cached image) so a continuation
+    /// turn can re-derive the cached prefix's placeholder expansion and M-RoPE
+    /// positions WITHOUT re-processing the old images' pixels.
+    pub(crate) cached_image_grids: Vec<i32>,
     pub(crate) model_id: u64,
     /// Set when a flat eager-MTP turn stopped mid-cycle leaving `self.caches`
     /// advanced past the emitted token history (GDN state cannot be rewound).
@@ -721,6 +732,8 @@ impl Qwen35MoeInner {
             cached_token_history: Vec::new(),
             cached_image_key: None,
             cached_rope_deltas: None,
+            cached_image_count: 0,
+            cached_image_grids: Vec::new(),
             model_id,
             flat_mtp_caches_desynced: false,
             gdn_prefix_checkpoints: VecDeque::new(),
@@ -1222,6 +1235,8 @@ impl Qwen35MoeInner {
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_rope_deltas = None;
+        self.cached_image_count = 0;
+        self.cached_image_grids.clear();
         self.gdn_prefix_checkpoints.clear();
         self.gdn_last_history_checkpoint = None;
     }
@@ -2706,6 +2721,209 @@ impl Qwen35MoeInner {
         Ok(())
     }
 
+}
+
+    /// Resolved prefill inputs for a flat vision turn (genmlx-lds5): either a
+    /// CONTINUATION over the session's live flat caches (append-only history
+    /// whose cached expanded prefix + prefix image set verified — only the
+    /// appended segment, incl. any NEW images, is prefilled) or a FRESH full
+    /// prefill (state reset, current behavior).
+    struct FlatVisionPlan {
+        /// FULL expanded token sequence (cached prefix ++ appended): the
+        /// decode loop's history seed and the save-state base.
+        expanded_tokens: Vec<u32>,
+        /// Combined hash of ALL images in the conversation (save-state key).
+        image_cache_key: u64,
+        /// Flattened `[t,h,w]` rows of ALL images (save-state grids).
+        grids_flat: Vec<i32>,
+        /// Expanded tokens whose KV was reused (0 = fresh).
+        cached_prefix_len: usize,
+        /// Embeddings to prefill — appended segment on reuse, full on fresh.
+        inputs_embeds: MxArray,
+        /// M-RoPE positions matching `inputs_embeds`.
+        position_ids: MxArray,
+        /// Full-sequence rope delta for the decode loop.
+        rope_deltas: i64,
+        /// Total image count (save-state).
+        image_count: usize,
+    }
+
+    impl Qwen35MoeInner {
+        /// Try the continuation path, else fall back to the fresh full
+        /// prefill. Fresh path RESETS `self.caches` + reuse state (the
+        /// pre-genmlx-lds5 behavior); continuation leaves them live. The
+        /// gate is safe against every legacy state-writer: only the flat
+        /// vision save path sets `cached_image_count > 0`, and a prefix
+        /// image-key over 0 images never matches a real cached key.
+        fn plan_flat_vision_prefill(
+            &mut self,
+            tokens: &[u32],
+            images: &[Vec<u8>],
+            reuse_cache: bool,
+        ) -> Result<FlatVisionPlan> {
+            let sms = self.spatial_merge_size.unwrap_or(2);
+            let (vision_encoder, img_proc) =
+                match (self.vision_encoder.clone(), self.image_processor.clone()) {
+                    (Some(enc), Some(proc)) => (enc, proc),
+                    _ => {
+                        return Err(Error::from_reason(
+                            "VLM prefill requested but vision encoder/processor not loaded",
+                        ));
+                    }
+                };
+            let image_cache_key = compute_image_cache_key(images);
+
+            // --- continuation attempt ---
+            let k = self.cached_image_count;
+            // Prefix-image gate. k == 0 with a None key is the TEXT-saved
+            // prefix (save_cache_state_direct has_images=false) — a valid
+            // continuation base for the session's FIRST image turn: the
+            // cached prefix embeds no placeholders, so its expansion is
+            // itself. k > 0 requires the prefix-set key match. Legacy
+            // writers that set a key WITHOUT count bookkeeping (paged
+            // cores) fail both arms: Some(key) != None and a k=0 prefix
+            // hash never equals a real image-set hash.
+            let prefix_images_ok = if k == 0 {
+                self.cached_image_key.is_none()
+            } else {
+                self.cached_image_key == Some(compute_image_cache_key(&images[..k]))
+            };
+            if reuse_cache
+                && prefix_images_ok
+                && k <= images.len()
+                && self.cached_image_grids.len() == k * 3
+                && !self.cached_token_history.is_empty()
+                && self.caches.is_some()
+                && !self.flat_mtp_caches_desynced
+            {
+                let new_images = &images[k..];
+                let new_processed = if new_images.is_empty() {
+                    None
+                } else {
+                    let refs: Vec<&[u8]> = new_images.iter().map(|v| v.as_slice()).collect();
+                    Some(img_proc.process_many(&refs)?)
+                };
+                let mut counts = if k == 0 {
+                    Vec::new()
+                } else {
+                    let cached_grid_arr =
+                        MxArray::from_int32(&self.cached_image_grids, &[k as i64, 3])?;
+                    compute_image_token_counts_per_image(&cached_grid_arr, sms)?
+                };
+                let mut grids_flat = self.cached_image_grids.clone();
+                if let Some(ref pre) = new_processed {
+                    let new_grid = pre.grid_thw();
+                    counts.extend(compute_image_token_counts_per_image(&new_grid, sms)?);
+                    new_grid.eval();
+                    grids_flat.extend_from_slice(&new_grid.to_int32()?);
+                }
+                let expanded = inject_image_placeholders(tokens, &counts);
+                let cached_len = self.cached_token_history.len();
+                // Strictly-longer prefix match required: an exact match cannot
+                // continue (GDN state cannot re-emit the last token).
+                if expanded.len() > cached_len
+                    && expanded[..cached_len] == self.cached_token_history[..]
+                {
+                    let full_grid = MxArray::from_int32(
+                        &grids_flat,
+                        &[(grids_flat.len() / 3) as i64, 3],
+                    )?;
+                    let new_key = compute_image_cache_key(new_images);
+                    let embedding_weight = self.embedding.get_weight();
+                    let cont = vlm_prepare_vision_continuation(
+                        &expanded,
+                        cached_len,
+                        new_key,
+                        new_processed.as_ref(),
+                        &full_grid,
+                        &vision_encoder,
+                        sms,
+                        &embedding_weight,
+                        self.generation_stream,
+                        &self.vision_cache,
+                    )?;
+                    info!(
+                        "VLM prefix reuse: {} cached tokens, {} new tokens to prefill ({} new image(s))",
+                        cached_len,
+                        expanded.len() - cached_len,
+                        images.len() - k
+                    );
+                    return Ok(FlatVisionPlan {
+                        expanded_tokens: expanded,
+                        image_cache_key,
+                        grids_flat,
+                        cached_prefix_len: cached_len,
+                        inputs_embeds: cont.inputs_embeds,
+                        position_ids: cont.position_ids,
+                        rope_deltas: cont.rope_deltas,
+                        image_count: images.len(),
+                    });
+                }
+            }
+
+            // --- fresh full prefill (pre-lds5 behavior) ---
+            let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
+            let processed = img_proc.process_many(&image_refs)?;
+            let counts = compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
+            let expanded = inject_image_placeholders(tokens, &counts);
+            let grid = processed.grid_thw();
+            grid.eval();
+            let grids_flat: Vec<i32> = grid.to_int32()?.to_vec();
+            let embedding_weight = self.embedding.get_weight();
+            let input_ids = MxArray::from_uint32(&expanded, &[1, expanded.len() as i64])?;
+            let merge = vlm_prepare_vision_features(
+                &input_ids,
+                image_cache_key,
+                &processed,
+                &vision_encoder,
+                sms,
+                &embedding_weight,
+                self.generation_stream,
+                &self.vision_cache,
+            )?;
+            // Fresh flat per-layer caches (GDN linear slots + empty full-attention).
+            self.caches = Some(fresh_moe_layer_caches(&self.config));
+            self.clear_reuse_state();
+            self.flat_mtp_caches_desynced = false;
+            Ok(FlatVisionPlan {
+                expanded_tokens: expanded,
+                image_cache_key,
+                grids_flat,
+                cached_prefix_len: 0,
+                inputs_embeds: merge.inputs_embeds,
+                position_ids: merge.position_ids,
+                rope_deltas: merge.rope_deltas,
+                image_count: images.len(),
+            })
+        }
+
+        /// Persist the flat vision turn's reuse state (genmlx-lds5) — the
+        /// counterpart of the text path's `save_cache_state_direct` call,
+        /// with the image-prefix bookkeeping the continuation gate needs.
+        /// Trailing-token policy: the flat vision AR loops never forward the
+        /// final committed token (every exit breaks before the forward), so
+        /// it is dropped unconditionally to keep history == physical cache.
+        fn save_flat_vision_state(
+            &mut self,
+            reuse_cache: bool,
+            plan: &FlatVisionPlan,
+            generated_tokens: &[u32],
+        ) {
+            if !reuse_cache {
+                let _ = self.reset_caches_sync();
+                return;
+            }
+            let mut history = plan.expanded_tokens.clone();
+            if generated_tokens.len() > 1 {
+                history.extend_from_slice(&generated_tokens[..generated_tokens.len() - 1]);
+            }
+            self.cached_token_history = history;
+            self.cached_image_key = Some(plan.image_cache_key);
+            self.cached_image_count = plan.image_count;
+            self.cached_image_grids = plan.grids_flat.clone();
+            self.cached_rope_deltas = Some(plan.rope_deltas as i32);
+        }
+
     /// Whole-turn flat (non-paged) vision core — the CUDA/Linux and paging-off
     /// image-turn route for the MoE (bean genmlx-52mh; the dense sibling is
     /// `vision_flat_whole_turn_core` in `qwen3_5/model.rs`, bean genmlx-9v44).
@@ -2716,8 +2934,9 @@ impl Qwen35MoeInner {
     /// `vlm_prefill_flat_sync`), and decode rotates each generated token at
     /// the image-compressed position (`physical_slot + rope_deltas`) via a
     /// `[3,1,1]` M-RoPE position. Plain AR decode; MTP weights are ignored
-    /// (no draft/verify here). NON-continuable: caches are reset on the way
-    /// out (multi-turn image continuation is genmlx-djno).
+    /// (no draft/verify here). CONTINUABLE since genmlx-lds5: append-only
+    /// image sessions reuse the live flat caches via
+    /// `plan_flat_vision_prefill`; state is saved on the way out.
     #[allow(clippy::too_many_arguments)]
     fn vision_flat_whole_turn_core(
         &mut self,
@@ -2739,16 +2958,6 @@ impl Qwen35MoeInner {
             ));
         }
 
-        let (vision_encoder, img_proc) =
-            match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
-                (Some(enc), Some(proc)) => (enc, proc),
-                _ => {
-                    return Err(Error::from_reason(
-                        "VLM prefill requested but vision encoder/processor not loaded",
-                    ));
-                }
-            };
-
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let thinking_enabled = thinking.enabled;
@@ -2762,44 +2971,22 @@ impl Qwen35MoeInner {
         let mut first_token_instant: Option<std::time::Instant> = None;
         let sampling_config = p.sampling_config;
 
-        // === VLM image processing: expand placeholders + merge features ===
-        let sms = self.spatial_merge_size.unwrap_or(2);
-        let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
-        let processed = img_proc.process_many(&image_refs)?;
-        let per_image_token_counts =
-            compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
-        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
-        let image_cache_key = compute_image_cache_key(images);
-        let prompt_token_count = expanded_tokens.len() as u32;
-
-        let embed = self.embedding.clone();
-        let embedding_weight = embed.get_weight();
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
-
+        // === VLM prefill plan: continuation over the live caches, or fresh
+        // full prefill (genmlx-lds5) ===
         let generation_stream = self.generation_stream;
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
-        let merge = vlm_prepare_vision_features(
-            &input_ids,
-            image_cache_key,
-            &processed,
-            &vision_encoder,
-            sms,
-            &embedding_weight,
-            generation_stream,
-            &self.vision_cache,
-        )?;
-        let rope_deltas = merge.rope_deltas;
-
-        // Fresh flat per-layer caches (GDN linear slots + empty full-attention).
-        self.caches = Some(fresh_moe_layer_caches(&self.config));
-        self.cached_token_history.clear();
-        self.cached_image_key = None;
+        let plan = self.plan_flat_vision_prefill(&tokens, images, p.reuse_cache)?;
+        let expanded_tokens = plan.expanded_tokens.clone();
+        let prompt_token_count = expanded_tokens.len() as u32;
+        let rope_deltas = plan.rope_deltas;
         self.cached_rope_deltas = Some(rope_deltas as i32);
-        self.flat_mtp_caches_desynced = false;
+
+        let embed = self.embedding.clone();
+        let embedding_weight = embed.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
 
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
             // === PREFILL over merged embeds with 3-row M-RoPE ===
@@ -2810,8 +2997,8 @@ impl Qwen35MoeInner {
             let last_logits = {
                 let _stream_ctx = StreamContext::new(generation_stream);
                 let hidden = forward_pre_norm_embeds_mrope(
-                    &merge.inputs_embeds,
-                    &merge.position_ids,
+                    &plan.inputs_embeds,
+                    &plan.position_ids,
                     &mut self.layers,
                     &mut self.caches,
                 )?;
@@ -2913,10 +3100,10 @@ impl Qwen35MoeInner {
             }
         };
 
-        // NON-continuable: reset to a pristine non-live state so a follow-up
-        // text continue is rejected rather than cold-prefilling image-placeholder
-        // ids. (Multi-turn image continuation is a follow-up; see genmlx-djno.)
-        let _ = self.reset_caches_sync();
+        // Persist reuse state (genmlx-lds5): an append-only image session
+        // continues on the live caches next turn (multi-turn image
+        // continuation for the MoE flat path — the CUDA half of genmlx-djno).
+        self.save_flat_vision_state(p.reuse_cache, &plan, &generated_tokens);
 
         let performance = if report_perf {
             compute_performance_metrics(
@@ -2941,7 +3128,7 @@ impl Qwen35MoeInner {
             prompt_token_count,
             reasoning_tracker.reasoning_token_count(),
         )?;
-        result.cached_tokens = 0;
+        result.cached_tokens = plan.cached_prefix_len as u32;
         Ok(result)
     }
 
@@ -2974,16 +3161,6 @@ impl Qwen35MoeInner {
             ));
         }
 
-        let (vision_encoder, img_proc) =
-            match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
-                (Some(enc), Some(proc)) => (enc, proc),
-                _ => {
-                    return Err(Error::from_reason(
-                        "VLM prefill requested but vision encoder/processor not loaded",
-                    ));
-                }
-            };
-
         let include_reasoning = p.include_reasoning;
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
@@ -3002,52 +3179,30 @@ impl Qwen35MoeInner {
         let mut streamed_text_len = 0usize;
         let mut last_is_reasoning = thinking_enabled;
 
-        // === VLM image processing: expand placeholders + merge features ===
-        let sms = self.spatial_merge_size.unwrap_or(2);
-        let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
-        let processed = img_proc.process_many(&image_refs)?;
-        let per_image_token_counts =
-            compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
-        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
-        let image_cache_key = compute_image_cache_key(images);
-        let prompt_token_count = expanded_tokens.len() as u32;
-
-        let embed = self.embedding.clone();
-        let embedding_weight = embed.get_weight();
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
-
+        // === VLM prefill plan: continuation over the live caches, or fresh
+        // full prefill (genmlx-lds5) ===
         let generation_stream = self.generation_stream;
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
-        let merge = vlm_prepare_vision_features(
-            &input_ids,
-            image_cache_key,
-            &processed,
-            &vision_encoder,
-            sms,
-            &embedding_weight,
-            generation_stream,
-            &self.vision_cache,
-        )?;
-        let rope_deltas = merge.rope_deltas;
-
-        // Fresh flat per-layer caches (GDN linear slots + empty full-attention).
-        self.caches = Some(fresh_moe_layer_caches(&self.config));
-        self.cached_token_history.clear();
-        self.cached_image_key = None;
+        let plan = self.plan_flat_vision_prefill(&tokens, images, p.reuse_cache)?;
+        let expanded_tokens = plan.expanded_tokens.clone();
+        let prompt_token_count = expanded_tokens.len() as u32;
+        let rope_deltas = plan.rope_deltas;
         self.cached_rope_deltas = Some(rope_deltas as i32);
-        self.flat_mtp_caches_desynced = false;
+
+        let embed = self.embedding.clone();
+        let embedding_weight = embed.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
 
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
             // === PREFILL over merged embeds with 3-row M-RoPE ===
             let last_logits = {
                 let _stream_ctx = StreamContext::new(generation_stream);
                 let hidden = forward_pre_norm_embeds_mrope(
-                    &merge.inputs_embeds,
-                    &merge.position_ids,
+                    &plan.inputs_embeds,
+                    &plan.position_ids,
                     &mut self.layers,
                     &mut self.caches,
                 )?;
@@ -3183,10 +3338,10 @@ impl Qwen35MoeInner {
             }
         };
 
-        // NON-continuable: reset to a pristine non-live state so a follow-up
-        // text continue is rejected rather than cold-prefilling image-placeholder
-        // ids. (Multi-turn image continuation is a follow-up; see genmlx-djno.)
-        let _ = self.reset_caches_sync();
+        // Persist reuse state (genmlx-lds5): an append-only image session
+        // continues on the live caches next turn (multi-turn image
+        // continuation for the MoE flat path — the CUDA half of genmlx-djno).
+        self.save_flat_vision_state(p.reuse_cache, &plan, &generated_tokens);
 
         // Flush residual buffered bytes (mirrors the paged vision stream core).
         let full_text = tokenizer
@@ -3254,7 +3409,7 @@ impl Qwen35MoeInner {
                 prompt_tokens: Some(result.prompt_tokens),
                 reasoning_tokens: Some(result.reasoning_tokens),
                 raw_text: Some(result.raw_text.clone()),
-                cached_tokens: Some(0),
+                cached_tokens: Some(plan.cached_prefix_len as u32),
                 performance: result.performance.clone(),
                 is_reasoning: None,
             }),

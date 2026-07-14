@@ -9954,56 +9954,13 @@ pub(crate) fn vlm_prepare_vision_features(
     vision_cache: &VisionCache,
 ) -> Result<VisionMerge> {
     // === STEP 1: Compute vision features (with hash cache) ===
-    let combined_hash = image_cache_key;
-
-    let cached = {
-        let mut cache = vision_cache
-            .lock()
-            .map_err(|_| Error::from_reason("Vision cache mutex poisoned"))?;
-        cache.generation += 1;
-        let lru_gen = cache.generation;
-        if let Some((features, grid, lru)) = cache.entries.get_mut(&combined_hash) {
-            *lru = lru_gen;
-            tracing::debug!("Vision cache HIT for hash {:016x}", combined_hash);
-            Some((features.clone(), grid.clone()))
-        } else {
-            None
-        }
-    };
-
-    let (vision_features, grid) = if let Some((features, grid)) = cached {
-        (features, grid)
-    } else {
-        let grid = pre_processed.grid_thw();
-        let pv = pre_processed.pixel_values();
-        let pv_shape = pv.shape()?;
-        let pv_5d = pv.reshape(&[1, pv_shape[0], pv_shape[1], pv_shape[2], pv_shape[3]])?;
-
-        let features = {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            vision_encoder.forward(&pv_5d, &grid)?
-        };
-
-        {
-            let mut cache = vision_cache
-                .lock()
-                .map_err(|_| Error::from_reason("Vision cache mutex poisoned"))?;
-            if cache.entries.len() >= VISION_CACHE_MAX_ENTRIES
-                && let Some((&oldest_key, _)) =
-                    cache.entries.iter().min_by_key(|(_, (_, _, lru))| *lru)
-            {
-                cache.entries.remove(&oldest_key);
-            }
-            cache.generation += 1;
-            let lru_gen = cache.generation;
-            cache
-                .entries
-                .insert(combined_hash, (features.clone(), grid.clone(), lru_gen));
-        }
-        tracing::debug!("Vision cache MISS for hash {:016x}", combined_hash);
-
-        (features, grid)
-    };
+    let (vision_features, grid) = vision_features_cached(
+        image_cache_key,
+        pre_processed,
+        vision_encoder,
+        generation_stream,
+        vision_cache,
+    )?;
 
     // === STEP 2: Get text embeddings and merge with vision features ===
     let text_embeds = {
@@ -10034,6 +9991,162 @@ pub(crate) fn vlm_prepare_vision_features(
     );
 
     Ok(VisionMerge {
+        inputs_embeds,
+        position_ids,
+        rope_deltas,
+    })
+}
+
+/// Vision-encoder forward with the LRU memo cache — extracted from
+/// [`vlm_prepare_vision_features`] so the continuation path (below) shares
+/// the exact same caching semantics. Returns `(features, grid_thw)`.
+pub(crate) fn vision_features_cached(
+    image_cache_key: u64,
+    pre_processed: &ProcessedImages,
+    vision_encoder: &Qwen3_5VisionEncoder,
+    generation_stream: Stream,
+    vision_cache: &VisionCache,
+) -> Result<(MxArray, MxArray)> {
+    let combined_hash = image_cache_key;
+
+    let cached = {
+        let mut cache = vision_cache
+            .lock()
+            .map_err(|_| Error::from_reason("Vision cache mutex poisoned"))?;
+        cache.generation += 1;
+        let lru_gen = cache.generation;
+        if let Some((features, grid, lru)) = cache.entries.get_mut(&combined_hash) {
+            *lru = lru_gen;
+            tracing::debug!("Vision cache HIT for hash {:016x}", combined_hash);
+            Some((features.clone(), grid.clone()))
+        } else {
+            None
+        }
+    };
+
+    if let Some((features, grid)) = cached {
+        return Ok((features, grid));
+    }
+
+    let grid = pre_processed.grid_thw();
+    let pv = pre_processed.pixel_values();
+    let pv_shape = pv.shape()?;
+    let pv_5d = pv.reshape(&[1, pv_shape[0], pv_shape[1], pv_shape[2], pv_shape[3]])?;
+
+    let features = {
+        let _stream_ctx = StreamContext::new(generation_stream);
+        vision_encoder.forward(&pv_5d, &grid)?
+    };
+
+    {
+        let mut cache = vision_cache
+            .lock()
+            .map_err(|_| Error::from_reason("Vision cache mutex poisoned"))?;
+        if cache.entries.len() >= VISION_CACHE_MAX_ENTRIES
+            && let Some((&oldest_key, _)) = cache.entries.iter().min_by_key(|(_, (_, _, lru))| *lru)
+        {
+            cache.entries.remove(&oldest_key);
+        }
+        cache.generation += 1;
+        let lru_gen = cache.generation;
+        cache
+            .entries
+            .insert(combined_hash, (features.clone(), grid.clone(), lru_gen));
+    }
+    tracing::debug!("Vision cache MISS for hash {:016x}", combined_hash);
+
+    Ok((features, grid))
+}
+
+/// Prefill inputs for a CONTINUATION vision turn: the session's flat caches
+/// already hold `cached_len` expanded tokens (verified by the caller against
+/// the cached history + prefix image key, genmlx-lds5), and only the APPENDED
+/// segment — which may itself contain NEW images — is prefetched.
+pub(crate) struct VisionContinuation {
+    /// Merged embeddings of the appended segment only, `[1, A, H]`.
+    pub inputs_embeds: MxArray,
+    /// M-RoPE positions of the appended segment, `[3, 1, A]` — sliced from a
+    /// full-sequence [`get_rope_index`] so they are IDENTICAL to what a fresh
+    /// full prefill would assign those tokens (position math is a pure
+    /// function of token ids + grids; the cached prefix's KV was written with
+    /// the same function's prefix values).
+    pub position_ids: MxArray,
+    /// Full-sequence rope delta — the decode loop's `physical + delta`
+    /// correction for ALL images seen so far, old and new.
+    pub rope_deltas: i64,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn vlm_prepare_vision_continuation(
+    full_expanded_tokens: &[u32],
+    cached_len: usize,
+    new_images_key: u64,
+    new_processed: Option<&ProcessedImages>,
+    full_grid: &MxArray,
+    vision_encoder: &Qwen3_5VisionEncoder,
+    spatial_merge_size: i32,
+    text_model_embedding: &MxArray,
+    generation_stream: Stream,
+    vision_cache: &VisionCache,
+) -> Result<VisionContinuation> {
+    let appended = &full_expanded_tokens[cached_len..];
+    if appended.is_empty() {
+        return Err(Error::from_reason(
+            "vlm_prepare_vision_continuation: empty appended segment (exact-match \
+             continuation is not representable — GDN state cannot re-emit the last \
+             token; callers must treat exact matches as a miss)",
+        ));
+    }
+    let appended_ids = MxArray::from_uint32(appended, &[1, appended.len() as i64])?;
+
+    // Appended-segment embeddings: text embeds, with the NEW images' features
+    // merged at the appended placeholders. Old images' features are NOT
+    // recomputed — their KV already lives in the cache.
+    let text_embeds = {
+        let _stream_ctx = StreamContext::new(generation_stream);
+        let embedding = Embedding::from_weight(text_model_embedding)?;
+        embedding.forward(&appended_ids)?
+    };
+    let inputs_embeds = match new_processed {
+        Some(pre) => {
+            let (features, _grid) = vision_features_cached(
+                new_images_key,
+                pre,
+                vision_encoder,
+                generation_stream,
+                vision_cache,
+            )?;
+            let _stream_ctx = StreamContext::new(generation_stream);
+            let embed_dtype = text_embeds.dtype()?;
+            let vf_cast = if features.dtype()? != embed_dtype {
+                features.astype(embed_dtype)?
+            } else {
+                features
+            };
+            merge_input_ids_with_image_features(IMAGE_TOKEN_ID, &vf_cast, &text_embeds, &appended_ids)?
+        }
+        None => text_embeds,
+    };
+
+    // Positions: compute over the FULL sequence (cheap index math — no model
+    // work), then slice the appended window. `get_rope_index` output is
+    // `[3, batch=1, seq]`.
+    let full_ids = MxArray::from_uint32(
+        full_expanded_tokens,
+        &[1, full_expanded_tokens.len() as i64],
+    )?;
+    let (full_position_ids, rope_deltas) = get_rope_index(
+        &full_ids,
+        Some(full_grid),
+        spatial_merge_size,
+        IMAGE_TOKEN_ID,
+    )?;
+    let position_ids = full_position_ids.slice(
+        &[0, 0, cached_len as i64],
+        &[3, 1, full_expanded_tokens.len() as i64],
+    )?;
+
+    Ok(VisionContinuation {
         inputs_embeds,
         position_ids,
         rope_deltas,
