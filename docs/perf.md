@@ -33,6 +33,15 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_INFERENCE_TRACE_FILE` | Path for inference trace dump     |
 | `MLX_DEBUG_GEMMA4_DUMP`    | Diagnostic dumps for Gemma4       |
 
+### CUDA graph cache
+
+| Var                          | Effect                                                                                                                                                                                                                                            |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MLX_CUDA_GRAPH_CACHE_SIZE`  | Pre-size the per-device cache of instantiated CUDA graphs (default 400). Each distinct eval shape caches one graph exec; the cache auto-grows under thrash. Variable-shape workloads (agent sessions, many distinct prefill lengths) benefit from pre-sizing — e.g. `4000`. |
+| `MLX_USE_CUDA_GRAPHS=0`      | Disable CUDA graphs entirely (eager kernel launches).                                                                                                                                                                                              |
+
+Graph construction failures no longer abort the process: a failed node add flushes the partially built graph in stream order and completes that eval through the eager path (a one-line `[mlx]` warning is printed once); a failed instantiation evicts the cached execs and retries once. The next eval tries graphs again.
+
 ### Compile / decode control
 
 | Var                                                  | Effect                                                                                                                                                                               |
