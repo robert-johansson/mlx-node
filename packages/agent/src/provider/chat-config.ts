@@ -95,6 +95,20 @@ export function buildChatConfig(
     config.temperature = parsed;
   }
   if (options?.temperature !== undefined) config.temperature = options.temperature;
+  // Thinking-token budget for measurement sweeps (genmlx-fy9j): the native
+  // ReasoningTracker forces </think> at the cap, giving intermediate points
+  // between "no think" and "unlimited think". Only meaningful when thinking
+  // is enabled — on the qwen3.5 family `--thinking none|low` disables
+  // thinking at the template level (low == off), so pair this knob with
+  // `--thinking medium` or higher. usage.reasoning verifies each cap.
+  const envBudget = process.env.MLX_AGENT_THINKING_BUDGET;
+  if (envBudget !== undefined && envBudget !== '') {
+    const parsed = Number(envBudget);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new Error(`MLX_AGENT_THINKING_BUDGET must be an integer >= 0, got "${envBudget}"`);
+    }
+    config.thinkingTokenBudget = parsed;
+  }
   if (tools && tools.length > 0) config.tools = tools;
   // `reuseCache` is deliberately NOT set: ChatSession.mergeConfig forces it on.
   return config;

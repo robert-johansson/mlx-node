@@ -194,7 +194,7 @@ Commands include `prompt`, `steer`, `abort`, `new_session`, `set_model`, `set_th
 oxnode examples/watch-session.ts ~/.mlx-node/agent/sessions/<project-dir>/
 ```
 
-Note: models emit `<think>` blocks per their thinking level — set `--thinking low|medium|high` if the mind panel should have deliberation to show.
+Note: models emit `<think>` blocks per their thinking level — and on the qwen3.5 family the engine maps `--thinking none` AND `low` to `enable_thinking=false` (the model's own template semantics), so **`low` ≡ `off` there**; only `medium`/`high` think. For intermediate sweep points between "no think" and "unlimited think", set `MLX_AGENT_THINKING_BUDGET=<n>` with `--thinking medium`: the engine's ReasoningTracker forces `</think>` at the cap (0 = close immediately), and `usage.reasoning` verifies each cap.
 
 **Per-turn token accounting (measurement-grade).** Every assistant record's `usage` carries engine-real counts, not estimates: `input` (prompt tokens MINUS the KV-cache-served prefix — add `cacheRead` back for the full prompt length), `output` (completion tokens), `reasoning` (thinking tokens: sampled-token count up to the `</think>` boundary, computed by the engine's `ReasoningTracker` during decode; a subset of `output`; 0 when no think block), and `totalTokens` (full prompt + completion — this drives pi's auto-compaction). The same numbers ride `message_end` rpc events. Verified: the same prompt at `--thinking off` vs `medium` yields `reasoning` 0 vs >0 with `output` differing accordingly.
 

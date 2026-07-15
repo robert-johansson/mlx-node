@@ -98,6 +98,51 @@ describe('buildChatConfig', () => {
     });
   });
 
+  describe('MLX_AGENT_THINKING_BUDGET', () => {
+    const restore = process.env.MLX_AGENT_THINKING_BUDGET;
+    const setEnv = (v: string | undefined) => {
+      if (v === undefined) delete process.env.MLX_AGENT_THINKING_BUDGET;
+      else process.env.MLX_AGENT_THINKING_BUDGET = v;
+    };
+    const cleanup = () => setEnv(restore);
+
+    it('sets thinkingTokenBudget (0 = force </think> ASAP is valid)', () => {
+      for (const [v, expected] of [
+        ['256', 256],
+        ['0', 0],
+      ] as const) {
+        setEnv(v);
+        try {
+          expect(buildChatConfig('qwen3_5', { reasoning: 'medium' }, undefined).thinkingTokenBudget).toBe(expected);
+        } finally {
+          cleanup();
+        }
+      }
+    });
+
+    it('unset / empty leaves thinkingTokenBudget undefined', () => {
+      for (const v of [undefined, ''] as const) {
+        setEnv(v);
+        try {
+          expect(buildChatConfig('qwen3_5', { reasoning: 'medium' }, undefined).thinkingTokenBudget).toBeUndefined();
+        } finally {
+          cleanup();
+        }
+      }
+    });
+
+    it('rejects non-integers and negatives loudly', () => {
+      for (const bad of ['abc', '-5', '1.5', 'NaN']) {
+        setEnv(bad);
+        try {
+          expect(() => buildChatConfig('qwen3_5', {}, undefined)).toThrow(/MLX_AGENT_THINKING_BUDGET/);
+        } finally {
+          cleanup();
+        }
+      }
+    });
+  });
+
   it('attaches tools only when non-empty', () => {
     const tool = createToolDefinition('get_weather', 'weather', { location: { type: 'string' } }, ['location']);
     expect(buildChatConfig('qwen3_5', undefined, [tool]).tools).toEqual([tool]);
