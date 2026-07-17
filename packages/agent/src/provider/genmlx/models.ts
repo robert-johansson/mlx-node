@@ -10,10 +10,13 @@
  * Families served = exactly what the GenMLX OWNED forward implements
  * (genmlx.llm.forward supported-model-types): qwen3, qwen3_5, qwen3_5_moe.
  * qwen3_next is NOT served (its 80B checkpoints route to the native MoE
- * forward, which this provider never loads); vision input is excluded until
- * genmlx-5aah (entries are `input: ['text']` and image turns are rejected
- * at the session). Trait values byte-match the v1 table so the same
- * checkpoint advertises the same window under either provider.
+ * forward, which this provider never loads). Entries advertise
+ * `input: ['text']` byte-matching the v1 table (pi does not gate
+ * attachments on it — image turns flow regardless and the engine routes
+ * them through the owned VLM prefill since genmlx-5aah; non-VLM
+ * checkpoints reject them with a typed error). Trait values byte-match
+ * the v1 table so the same checkpoint advertises the same window under
+ * either provider.
  */
 
 import { readdir, readFile } from 'node:fs/promises';
