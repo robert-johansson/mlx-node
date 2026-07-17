@@ -2,7 +2,8 @@
  * GenmlxSession contract over a scripted fake engine (genmlx-djw6): the
  * callback→generator bridge, the ChatStreamEvent mapping, native-parity
  * abort semantics (no final event), engine-error surfacing, the image
- * gate, and reset/dispose bookkeeping. No nbb, no native code.
+ * wire shape (genmlx-5aah), and reset/dispose bookkeeping. No nbb, no
+ * native code.
  */
 import type { ChatMessage, ChatStreamEvent } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
@@ -17,7 +18,12 @@ interface FakeTurn {
 }
 
 interface FakeEngine extends GenmlxTurnEngine {
-  turns: Array<{ sessionId: string; messages: ChatMessage[]; config: Record<string, unknown> }>;
+  turns: Array<{
+    sessionId: string;
+    messages: ChatMessage[];
+    config: Record<string, unknown>;
+    images: Uint8Array[];
+  }>;
   aborted: string[];
   disposed: string[];
   sessionsMinted: number;
@@ -48,13 +54,14 @@ function makeEngine(script: FakeTurn[]): FakeEngine {
     sessionsMinted: 0,
     loadModel: vi.fn(async (path: string) => JSON.stringify({ path })),
     newSession: vi.fn(() => `fake-s${++engine.sessionsMinted}`),
-    turnStream: vi.fn(async (sessionId: string, messagesJson: string, configJson: string, onDelta) => {
+    turnStream: vi.fn(async (sessionId: string, messagesJson: string, configJson: string, onDelta, images) => {
       const turn = script[turnIndex++];
       if (!turn) throw new Error('fake engine: script exhausted');
       engine.turns.push({
         sessionId,
         messages: JSON.parse(messagesJson) as ChatMessage[],
         config: JSON.parse(configJson) as Record<string, unknown>,
+        images: images ?? [],
       });
       for (const delta of turn.deltas) onDelta(JSON.stringify(delta));
       if (turn.reject !== undefined) throw turn.reject;
@@ -173,15 +180,31 @@ describe('GenmlxSession', () => {
     await expect(collect(session)).rejects.toThrow('bridge died');
   });
 
-  it('rejects image-bearing history BEFORE touching the engine (5aah gate)', async () => {
-    const engine = makeEngine([]);
+  it('images ride the non-JSON leg: bytes stripped to a flat array, messages carry imageRefs (5aah)', async () => {
+    const engine = makeEngine([{ deltas: [], final: makeFinal() }]);
     const session = new GenmlxSession(engine);
+    const imageA = new Uint8Array([1, 2]);
+    const imageB = new Uint8Array([3, 4, 5]);
+    const imageC = new Uint8Array([6]);
     session.primeHistory([
-      { role: 'user', content: 'look', images: [new Uint8Array([1, 2])] } as unknown as ChatMessage,
+      { role: 'user', content: 'look', images: [imageA, imageB] } as unknown as ChatMessage,
+      { role: 'assistant', content: 'ok' } as ChatMessage,
+      { role: 'user', content: 'and this', images: [imageC] } as unknown as ChatMessage,
     ]);
-    await expect(collect(session)).rejects.toThrow(/IMAGE_UNSUPPORTED_ON_GENMLX_PROVIDER/);
-    expect(engine.turnStream).not.toHaveBeenCalled();
-    expect(engine.newSession).not.toHaveBeenCalled();
+    await collect(session);
+    const turn = engine.turns[0]!;
+    // Flat bytes array, message order preserved, indices correct.
+    expect(turn.images).toEqual([imageA, imageB, imageC]);
+    const wire = turn.messages as Array<{ images?: unknown; imageRefs?: number[] }>;
+    expect(wire[0]!.imageRefs).toEqual([0, 1]);
+    expect(wire[0]!.images).toBeUndefined();
+    expect(wire[1]!.imageRefs).toBeUndefined();
+    expect(wire[2]!.imageRefs).toEqual([2]);
+    // The session's own history is untouched (no images stripped in place).
+    expect((session as unknown as { history: Array<{ images?: unknown }> }).history[0]!.images).toEqual([
+      imageA,
+      imageB,
+    ]);
   });
 
   it('warm-reuse-touched fields exist (shared helper contract)', () => {

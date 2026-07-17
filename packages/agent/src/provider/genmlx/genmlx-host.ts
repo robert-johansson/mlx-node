@@ -44,12 +44,18 @@ export interface GenmlxTurnEngine {
    * prefill against the session's committed prefix, decode with per-token
    * `onDelta(deltaJson)` callbacks, resolve to the final-result JSON
    * (text/thinking/toolCallText/finishReason/token accounting).
+   *
+   * Image bytes ride `images` (genmlx-5aah) — the seam's non-JSON leg:
+   * messages reference them via `imageRefs` indices, and the engine
+   * reattaches before the chat-template render. An image-set change
+   * rebuilds the session branch through the owned VLM prefill.
    */
   turnStream(
     sessionId: string,
     messagesJson: string,
     configJson: string,
     onDelta: (deltaJson: string) => void,
+    images?: Uint8Array[],
   ): Promise<string>;
   /** Cooperative cancel of the session's in-flight decode loop. */
   abort(sessionId: string): void;

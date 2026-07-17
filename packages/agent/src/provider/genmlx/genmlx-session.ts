@@ -83,18 +83,22 @@ export class GenmlxSession {
     if (this.inFlight) {
       throw new Error('GenmlxSession: a turn is already in flight');
     }
-    // Image gate (until genmlx-5aah): bytes cannot ride the JSON seam, and
-    // the engine is text-only — reject BEFORE serialization, with the same
-    // typed prefix the v1 provider uses for image-capability errors.
-    for (const message of this.history) {
+    // Images ride the seam's non-JSON leg (genmlx-5aah): bytes go as a flat
+    // Uint8Array array, messages carry imageRefs indices into it (a JSON-
+    // stringified Uint8Array would explode into an index-keyed object). The
+    // engine reattaches them before the Rust chat-template render.
+    const imageBytes: Uint8Array[] = [];
+    const wireMessages = this.history.map((message) => {
       const images = (message as { images?: Uint8Array[] }).images;
-      if (images !== undefined && images.length > 0) {
-        throw new Error(
-          'IMAGE_UNSUPPORTED_ON_GENMLX_PROVIDER: image-bearing history — the genmlx provider ' +
-            'is text-only until genmlx-5aah lands; run VLM turns on the mlx provider.',
-        );
+      if (images === undefined || images.length === 0) {
+        return message;
       }
-    }
+      const imageRefs = images.map((bytes) => {
+        imageBytes.push(bytes);
+        return imageBytes.length - 1;
+      });
+      return { ...message, images: undefined, imageRefs };
+    });
     const sessionId = (this.sessionId ??= this.engine.newSession('{}'));
 
     // Callback-push → async-generator-pull bridge.
@@ -119,11 +123,17 @@ export class GenmlxSession {
     this.inFlight = true;
     try {
       this.engine
-        .turnStream(sessionId, JSON.stringify(this.history), JSON.stringify(config ?? {}), (deltaJson) => {
-          const delta = JSON.parse(deltaJson) as EngineDelta;
-          queue.push({ text: delta.text, done: false, isReasoning: delta.isReasoning === true });
-          notify();
-        })
+        .turnStream(
+          sessionId,
+          JSON.stringify(wireMessages),
+          JSON.stringify(config ?? {}),
+          (deltaJson) => {
+            const delta = JSON.parse(deltaJson) as EngineDelta;
+            queue.push({ text: delta.text, done: false, isReasoning: delta.isReasoning === true });
+            notify();
+          },
+          imageBytes,
+        )
         .then(
           (json) => {
             finalJson = json;
