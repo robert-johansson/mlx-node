@@ -155,6 +155,12 @@ export class GenmlxSession {
         // Native parity: aborted streams end cleanly with NO final event.
         return;
       }
+      if (final.finishReason === 'error') {
+        // Throw instead of yielding the in-band error final: the adapter's
+        // catch path marks the resident dirty either way, but a thrown error
+        // carries the ENGINE's message into the pi-visible terminal.
+        throw new Error(final.errorMessage ?? 'genmlx engine turn failed');
+      }
       yield {
         text: final.text,
         done: true,

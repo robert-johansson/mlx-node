@@ -549,9 +549,20 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     return;
   }
 
-  const discoverMlxModels = deps.discoverMlxModels ?? (await import('@mlx-node/agent')).discoverMlxModels;
+  const agentPkg = await import('@mlx-node/agent');
+  const discoverMlxModels = deps.discoverMlxModels ?? agentPkg.discoverMlxModels;
   let models = await discoverMlxModels(modelsDir);
+  // genmlx provider discovery (genmlx-djw6): same flat dir, the owned-forward
+  // family gate; pure config.json reads — no native addon loads here.
+  const genmlxModels = await agentPkg.discoverGenmlxModels(modelsDir);
 
+  if (models.length === 0 && genmlxModels.length > 0) {
+    // genmlx-only inventory (e.g. a models dir the mlx walk cannot serve):
+    // skip the download wizard and the mlx default-model machinery — an
+    // explicit --model genmlx/<name> drives provider selection (genmlx-djw6).
+    await runAgent({ modelsDir, models, genmlxModels, argv: scan.passthrough });
+    return;
+  }
   if (models.length === 0) {
     try {
       await (deps.wizard ?? runProductionWizard)(modelsDir);
@@ -594,5 +605,5 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     console.error(notice);
   }
 
-  await runAgent({ modelsDir, models, argv: agentArgv });
+  await runAgent({ modelsDir, models, genmlxModels, argv: agentArgv });
 }
