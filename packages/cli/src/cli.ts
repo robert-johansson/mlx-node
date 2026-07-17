@@ -81,8 +81,16 @@ async function main() {
     }
 
     case 'agent': {
+      const rest = args.slice(1);
+      // genmlx-djw6: the owned-forward model load needs more JS heap than
+      // Node's default; re-exec once with --max-old-space-size (see module).
+      const { relaunchAgentWithHeapHeadroom } = await import('./heap-relaunch.js');
+      const childCode = relaunchAgentWithHeapHeadroom(rest);
+      if (childCode !== null) {
+        process.exit(childCode);
+      }
       const { run } = await import('./commands/agent/index.js');
-      await run(args.slice(1));
+      await run(rest);
       break;
     }
 
