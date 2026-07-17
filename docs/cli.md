@@ -320,6 +320,22 @@ MLX_AGENT_DUMP_SYSTEM=/tmp/system-as-received.txt mlx agent \
 - Claims are **per-binary and per-checkpoint**: any mlx-node/MLX rebuild or model change re-baselines them; pin SHAs per administration batch.
 - Exit codes are unreliable (a known CUDA teardown abort can fire after output is complete) — compare bytes or the session JSONL, never exit codes.
 
+### The genmlx provider (owned forward, branch-ledger sessions)
+
+`--model genmlx/<dir-name>` selects the second in-process provider: completions come from GenMLX's owned forward (the CLJS turn engine in the genmlx repo, loaded over the nbb bridge) instead of the native `ChatSession`. Registration is strictly additive — the `mlx` provider is untouched and both register on every run; all Tier-1/2 flags, the permission gate, custom tools, rpc/JSONL observation, and the token-accounting fields carry over unchanged.
+
+What changes underneath:
+
+- **Turn state is a branch-ledger branch, not a replayed history.** Each turn token-diffs the rendered prompt against the session's committed prefix and prefills ONLY the suffix — `usage.cacheRead` shows the reused prefix length (a tool-loop continuation typically re-renders ~everything cached: e.g. 12,067-token turn, 12,044 cached, 23 prefilled). Session forking maps to an O(1) ledger fork by construction.
+- **Sampling is a native-parity reimplementation** (same greedy epsilon, filter order, penalty semantics), and the prompt render is the SAME Rust `applyChatTemplate` — temp-0 transcript parity vs the `mlx` provider is the design contract (the formal parity gates on the 35B are pending; treat cross-provider identity claims as unverified until then).
+
+Requirements and limits:
+
+- **Families**: qwen3 / qwen3_5 / qwen3_5_moe checkpoints only (what the owned forward implements). Text-only — image-bearing turns are rejected with a typed error until the vision port lands.
+- **One native host per process**: the first model use pins the process to `mlx` OR `genmlx` (dual dlopen aborts the process, so the latch refuses the second host with a clear error). Run one provider's models per `mlx agent` process.
+- **Env**: the genmlx repo is found automatically when mlx-node is checked out as its submodule; set `GENMLX_HOME` otherwise. `NODE_OPTIONS=--max-old-space-size=12288` is currently required for owned model loading under Node. The usual native-loading env (Thor: `GLIBC_TUNABLES` static-TLS etc.) applies as everywhere.
+- **Long completions**: the launch presets carry large `maxOutputTokens` and (since the vLLM-aligned change above) no repetition cutoff — on small models at preset temperature a turn can legitimately run for minutes. `MLX_AGENT_TEMPERATURE=0` is the fast deterministic mode; per-token detokenization cost also grows with generation length in this preview.
+
 ### Extensions and skills
 
 The leading positional commands pass through to pi and manage what lives under the agent config home:
