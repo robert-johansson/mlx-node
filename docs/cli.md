@@ -47,6 +47,55 @@ mlx convert --input ./model --output ./model-bf16 --dtype bf16
 mlx convert --input ./model --output ./model-q --quantize --q-recipe mixed_4_6
 ```
 
+### Official Unsloth MXFP and DGX recipes for Qwen3.5
+
+For verified dense and MoE Qwen3.5/Qwen3.6-family checkpoints, the fixed
+[official Unsloth class map](https://unsloth.ai/docs/models/qwen3.6#nvfp4) is
+available in two forms. Both keep FP8-class weights as MXFP8 and use the same
+AWQ imatrix pre-scaling:
+
+```bash
+# Apple MXFP variant: replace NVFP4 with MXFP4
+mlx convert -m qwen3_5_moe -q --q-recipe unsloth --q-mxfp \
+  --imatrix-path ./imatrix_unsloth.gguf_file \
+  -i ./qwen3.5-35b-a3b -o ./qwen3.5-35b-a3b-unsloth-mxfp4-mlx
+
+# Official DGX variant: retain NVFP4
+mlx convert -m qwen3_5_moe -q --q-mode nvfp4 --q-recipe unsloth \
+  --imatrix-path ./imatrix_unsloth.gguf_file \
+  -i ./qwen3.5-35b-a3b -o ./qwen3.5-35b-a3b-unsloth-nvfp4-mlx
+```
+
+Early FFNs use MXFP4 4/32 with `--q-mxfp`, or NVFP4 4/16 with
+`--q-mode nvfp4`. The final eight FFNs, attention q/k/v/o, GDN qkv/z/out, and
+`lm_head` use MXFP8 8/32 in both. Embeddings, routers, GDN a/b, vision, MTP,
+norms, and recurrent parameters remain BF16. Plain affine Unsloth alone keeps
+the legacy Dynamic 2.0 recipe.
+
+### NVIDIA modelopt recipe (data-free MXFP4 port)
+
+`--q-recipe nvidia` ports NVIDIA modelopt's `w4a16_nvfp4-fp8_attn-kv_fp8_cast`
+recipe with MXFP4 in place of NVFP4, for both dense `qwen3_5` and MoE
+`qwen3_5_moe`. It is a fixed per-layer format map (ignores `--q-bits` /
+`--q-group-size`), runs under `--q-mode affine`, and needs no imatrix: FFN +
+`lm_head` → mxfp4 4/32, attention q/k/v/o + GDN `in_proj_qkv`/`in_proj_z`/
+`out_proj` → mxfp8 8/32, GDN `in_proj_a`/`in_proj_b` + router gates → 8-bit
+affine, everything else bf16.
+
+It is supported **only** for `qwen3_5` / `qwen3_5_moe` (the port targets the
+Qwen3.5/3.6 hybrid modelopt recipe); passing it with any other `--model-type`,
+an omitted one, or a GGUF input is rejected upfront. Other families (e.g.
+`gemma4`) need their own recipe.
+
+```bash
+# dense
+mlx convert -m qwen3_5 -q --q-recipe nvidia \
+  -i ./qwen3.6-27b -o ./qwen3.6-27b-nvidia-mxfp4-mlx
+# MoE
+mlx convert -m qwen3_5_moe -q --q-recipe nvidia \
+  -i ./qwen3.6-35b-a3b -o ./qwen3.6-35b-a3b-nvidia-mxfp4-mlx
+```
+
 ### Qwen MTP quantization conversion
 
 ```bash
@@ -73,18 +122,19 @@ split). `--q-mtp split` (alias `drafter`) emits a body checkpoint with **no
 `qwen3_5_mtp` format (bare-keyed, BF16 MTP head); it does not require
 `--quantize`/`--q-recipe` and the body may be BF16 or already-quantized.
 
-| Flag               | Purpose                                                                         |
-| ------------------ | ------------------------------------------------------------------------------- |
-| `-i`, `--input`    | Source model directory (required)                                               |
-| `-o`, `--output`   | Output directory (required)                                                     |
-| `-d`, `--dtype`    | Target dtype: `float32` / `float16` / `bfloat16`                                |
-| `-q`, `--quantize` | Enable quantization                                                             |
-| `--q-recipe`       | One of `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`, `qwen3_5`, `unsloth` |
-| `--q-mode`         | `affine` (default) or `mxfp8`                                                   |
-| `--q-mtp`          | Qwen MTP-quant policy: `off`, `cyankiwi`, `all`, or `split` (alias `drafter`)   |
-| `--imatrix-path`   | Path to imatrix file for AWQ pre-scaling                                        |
-| `--mmproj`         | Vision-encoder conversion path                                                  |
-| `-v`, `--verbose`  | Verbose logging                                                                 |
+| Flag               | Purpose                                                                                   |
+| ------------------ | ----------------------------------------------------------------------------------------- |
+| `-i`, `--input`    | Source model directory (required)                                                         |
+| `-o`, `--output`   | Output directory (required)                                                               |
+| `-d`, `--dtype`    | Target dtype: `float32` / `float16` / `bfloat16`                                          |
+| `-q`, `--quantize` | Enable quantization                                                                       |
+| `--q-recipe`       | One of `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`, `qwen3_5`, `unsloth`, `nvidia` |
+| `--q-mode`         | `affine` (default), `mxfp4`, `mxfp8`, `nvfp4`, or `sym8`                                  |
+| `--q-mxfp`         | Select Unsloth's fixed MXFP map, or upgrade eligible decisions for other recipes          |
+| `--q-mtp`          | Qwen MTP-quant policy: `off`, `cyankiwi`, `all`, or `split` (alias `drafter`)             |
+| `--imatrix-path`   | Path to imatrix file for AWQ pre-scaling                                                  |
+| `--mmproj`         | Vision-encoder conversion path                                                            |
+| `-v`, `--verbose`  | Verbose logging                                                                           |
 
 ### GGUF → SafeTensors
 
@@ -106,6 +156,49 @@ The converter auto-detects model families and applies family-specific sanitizati
 Sharded models are also supported (parses `model.safetensors.index.json`).
 
 Foreign weight formats: Paddle `.pdiparams`, PyTorch `.pkl`.
+
+## `mlx calibrate`
+
+Calibrate per-tensor **FP8 (E4M3) activation `amax`** for an `--q-recipe nvidia`
+model so a later inference run reproduces NVIDIA modelopt's
+`w4a16_nvfp4-fp8_attn-kv_fp8_cast` **activation** math (W8A8 on the mxfp8
+attention/GDN projections).
+
+`mlx convert --q-recipe nvidia` only quantizes **weights**; activations stay
+bf16 until calibrated. This command runs the model over the NVIDIA calibration
+mix, records each attention/GDN mxfp8 projection's running `max|activation|`
+(modelopt `MaxCalibrator` semantics), and writes `input_amax` into the model's
+`config.json` **in place** — under both the `quantization` and
+`quantization_config` blocks. At load time each of those projections then
+fake-quantizes its input to E4M3 (`from_fp8(to_fp8(x·448/amax))·amax/448`) before
+the matmul. Only the mxfp8 attn/GDN sites (`self_attn.{q,k,v,o}_proj`, GDN
+`in_proj_qkv`/`in_proj_z`/`out_proj`) are calibrated; the mxfp4 FFN keeps bf16
+activations (modelopt is W4A16 there), and the affine a/b, gates, lm_head, and
+embeddings are untouched.
+
+> Apple GPUs have no FP8 matmul hardware — this is **fake-quant for numeric
+> parity, not speed**. Expect no throughput change, only a small activation
+> quantization error matching modelopt.
+
+```bash
+mlx calibrate \
+  -i ./qwen3.6-27b-nvidia-mxfp4-mlx \
+  --dataset ~/.cache/nvidia-calib/cnn_nemotron_v2_calib.jsonl \
+  --calib-size 1024 --calib-seq 512
+```
+
+| Flag            | Purpose                                                                        |
+| --------------- | ------------------------------------------------------------------------------ |
+| `-i`, `--input` | Model directory to calibrate in place (an `--q-recipe nvidia` model, required) |
+| `--dataset`     | Calibration JSONL of `{"text": "..."}` rows (required)                         |
+| `--calib-size`  | Number of dataset rows to run (default `1024`, matching modelopt `hf_ptq`)     |
+| `--calib-seq`   | Approximate prefill length per row in tokens (default `512`)                   |
+
+The default calibration mix is `cnn_dailymail` + Nemotron-Post-Training-v2,
+1024 samples at seq-len 512 (modelopt `hf_ptq` defaults); a 1024-row subset ships
+at `~/.cache/nvidia-calib/cnn_nemotron_v2_calib.jsonl`. Running on a non-nvidia
+(no mxfp8 attn/GDN) model calibrates 0 projections and leaves `config.json`
+unchanged.
 
 ## `mlx launch claude`
 

@@ -166,8 +166,21 @@ export declare class Gemma4Model {
    */
   hasBlockPagedCache(): boolean;
   modelId(): number;
+  /**
+   * Whether a draft model — DSpark or Google assistant — is loaded on
+   * this instance (via `Gemma4LoadOptions::draft_model_path`), enabling
+   * the speculative-decode whole-turn path.
+   *
+   * Note: this only reports draft availability. Whether speculative
+   * decoding actually runs on a given call also requires the per-request
+   * `enableMtp` flag. Named `hasMtpWeights` for parity with the Qwen3.5
+   * surface, but it reports an external draft model (either variant),
+   * not in-checkpoint MTP heads. Stubs from `new(config)` always return
+   * `false`.
+   */
+  hasMtpWeights(): boolean;
   /** Load a Gemma4 model from a directory. */
-  static load(modelPath: string): Promise<Gemma4Model>;
+  static load(modelPath: string, options?: Gemma4LoadOptions | undefined | null): Promise<Gemma4Model>;
   /**
    * Reset all caches and clear cached token history. Exposed
    * so tests and session-management code can start from a
@@ -2380,6 +2393,52 @@ export declare const enum BuiltinRewardType {
   JsonSchema = 'JsonSchema',
 }
 
+/**
+ * Data-free static FP8 activation-amax calibration over RAW-text PREFILL
+ * (NVIDIA modelopt `MaxCalibrator` parity), end to end in native code.
+ *
+ * The nvidia recipe covers BOTH `qwen3_5` (dense) and `qwen3_5_moe` (MoE), so
+ * this reads `<model_path>/config.json`'s `model_type` and dispatches to the
+ * matching loader + `CalibratePrefillRaw` command (any other `model_type` is a
+ * clear error). Both loaders are the SAME ones the inference session uses
+ * ([`persistence::load_with_thread`]) — the model is only usable on its
+ * dedicated model thread. Then:
+ *   1. dispatches `{Qwen35Cmd,Qwen35MoeCmd}::CalibratePrefillRaw`, which on the
+ *      model thread SELF-ARMS that thread's thread-local
+ *      [`ActivationAmaxCollector`] flag (RAII, AFTER load so no load-time eval
+ *      is recorded), tokenizes each `text` WITHOUT the chat template, truncates
+ *      to `calib_seq` tokens, and runs PREFILL ONLY (no generation) so every
+ *      mxfp8 attn/GDN projection's activation tap fires over realistic raw-text
+ *      activations, resetting caches between rows, then disarms on exit;
+ *   2. ONLY if the full loop succeeded — drains the per-tensor amax and
+ *      ATOMICALLY writes it into `<model_path>/config.json` (temp file +
+ *      `rename`).
+ *
+ * CONCURRENCY: the whole clear→prefill→take→write section is serialized by
+ * [`calib_guard`] (a process-wide `try_lock`); a second concurrent calibration
+ * fails fast with "another calibration is in progress". The arm flag is
+ * thread-local (so a concurrent inference model can't contaminate the run), but
+ * the running-max MAP is process-global, so serializing RUNS keeps two
+ * calibrations from interleaving `record`/`take` on it. The map is CLEARED at
+ * the very start so stale amax from a prior PANICKED run cannot leak into this
+ * write.
+ *
+ * On ANY error before the final write, the partial amax is discarded and
+ * `config.json` is left UNTOUCHED (a failed calibration must not mutate the
+ * live model in place). A run that prefilled ZERO rows (empty dataset, or every
+ * row tokenized to nothing) is likewise an ERROR that leaves `config.json`
+ * untouched — a no-op calibration must not report a silent success. Returns the
+ * number of projections calibrated (the count of collected amax entries); 0
+ * means a real prefill ran but the model exercised no activation-fp8 sites (not
+ * an nvidia-recipe checkpoint), and in that case `config.json` is left
+ * UNCHANGED (no rewrite).
+ */
+export declare function calibrateActivationAmaxRaw(
+  modelPath: string,
+  texts: Array<string>,
+  calibSeq: number,
+): Promise<number>;
+
 /** Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
 export interface ChatConfig {
   maxNewTokens?: number | undefined;
@@ -2405,11 +2464,11 @@ export interface ChatConfig {
   frequencyPenalty?: number | undefined;
   /** Number of recent tokens to consider for frequency penalty (default: 20) */
   frequencyContextSize?: number | undefined;
-  /** Max consecutive identical tokens before stopping (default: 16, 0 = disabled) */
+  /** Max consecutive identical tokens before stopping (default: 0 = disabled; opt in with a positive value) */
   maxConsecutiveTokens?: number | undefined;
-  /** Max n-gram repetitions before stopping (default: 3, 0 = disabled) */
+  /** Max n-gram repetitions before stopping (default: 0 = disabled; opt in with a positive value) */
   maxNgramRepeats?: number | undefined;
-  /** Max pattern size for n-gram repetition detection (default: 64) */
+  /** Max pattern size for n-gram repetition detection (default: 0 = disabled; opt in with a positive value) */
   ngramSize?: number | undefined;
   tools?: Array<ToolDefinition>;
   /**
@@ -2444,18 +2503,34 @@ export interface ChatConfig {
   reuseCache?: boolean | undefined;
   /**
    * MTP: opt-in flag enabling the Multi-Token Prediction speculative decode
-   * loop on the dense compiled path. Requires the model checkpoint to carry
-   * an MTP head (otherwise silently ignored). Default: `false`.
+   * loop (pure-Rust eager; qwen3.5 dense and MoE). Requires the model
+   * checkpoint to carry an MTP head (otherwise silently ignored). Default:
+   * `false`.
    */
   enableMtp?: boolean | undefined;
   /**
-   * MTP: number of draft tokens per speculative cycle. Clamped to `[1, 5]`
-   * by the verify FFI contract. Default: 1.
+   * MTP: number of draft tokens per speculative cycle.
    *
+   * On Qwen3.5 native MTP heads it is clamped to `[1, 5]` by the verify
+   * FFI contract, and when unset native code currently pins depth 1.
    * When `mtpAdaptiveDepth` is `true`, this value is used as the
    * throughput-policy seed and the expected-value policy's max depth.
    * Adaptive depth is opt-in; set `mtpAdaptiveDepth: true` explicitly to
    * enable it.
+   *
+   * Gemma4 external drafts (`draftModelPath`) resolve the field per draft
+   * variant instead (`gemma4/model.rs` `resolve_params`, always from the
+   * RAW config value — the engine's central `[1, 5]` clamp is an MTP-head
+   * contract that does not apply to external drafts):
+   * - DSpark: an unset `mtpDepth` runs full draft blocks (the draft
+   *   checkpoint's block size — 7 tokens on `dspark_gemma4_12b_block7`),
+   *   and an explicit `mtpDepth` acts as a CAP on that block (clamped to
+   *   `[1, blockSize]`).
+   * - Assistant (Google `gemma-4-*-it-assistant`): an unset `mtpDepth`
+   *   drafts 3 tokens per cycle (`ASSISTANT_DEFAULT_DEPTH`), and an
+   *   explicit `mtpDepth` clamps to `[1, 8]` (`ASSISTANT_MAX_DEPTH`).
+   *
+   * `mtpAdaptiveDepth` is ignored for both Gemma4 external-draft variants.
    */
   mtpDepth?: number | undefined;
   /**
@@ -2641,7 +2716,7 @@ export interface ConversionOptions {
   quantGroupSize?: number;
   /**
    * Quantization mode: "affine" (default), "mxfp4", "mxfp8", "nvfp4", or
-   * "sym8" (per-output-channel symmetric int8; dense qwen3_5 + lfm2/lfm2_moe + gemma4 in v1,
+   * "sym8" (per-output-channel symmetric int8; qwen3_5 + qwen3_5_moe + lfm2/lfm2_moe + gemma4,
    * implies bits=8, no group_size — consciously NOT mlx-lm-loadable)
    */
   quantMode?: string;
@@ -2657,8 +2732,12 @@ export interface ConversionOptions {
   imatrixPath?: string;
   /**
    * Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
-   * When true, applies after the recipe predicate: any 8-bit affine decision
-   * becomes mxfp8, any 4-bit decision becomes mxfp4. Requires `quant_mode = "affine"`.
+   * When true, applies after the recipe predicate: eligible 8-bit affine
+   * decisions become mxfp8 and 4-bit become mxfp4. Kept affine (not upgraded):
+   * affine-only loaders (lm_head, embed_tokens, router.proj,
+   * embedding_projection) at their recipe bits, MoE router gates (8-bit affine),
+   * and the recipe-pinned attention/GDN projections (o_proj / out_proj /
+   * in_proj_a / in_proj_b, 8-bit affine). Requires `quant_mode = "affine"`.
    * Forces `group_size = 32` for upgraded layers.
    */
   quantMxfp?: boolean;
@@ -2751,11 +2830,11 @@ export declare function createRandomQwen35Checkpoint(config: Qwen35Config, saveP
 /**
  * Create a random-init Qwen3.5 MoE model and save it to disk.
  *
- * Spawns a dedicated `ModelThread<Qwen35MoeCmd>` whose init builds a fresh
- * random-weight `Qwen35MoeInner` directly, then dispatches
- * `Qwen35MoeCmd::SaveModel` on that thread. The thread is dropped at the end
- * of the promise, so the in-memory model is released once the checkpoint has
- * been written. Used by TypeScript test fixtures that need an on-disk
+ * Spawns a dedicated model thread whose init runs
+ * [`create_random_qwen35_moe_checkpoint_sync`] (random-init inner + save);
+ * the thread holds no state and is dropped once the promise resolves, so
+ * the in-memory model is released as soon as the checkpoint has been
+ * written. Used by TypeScript test fixtures that need an on-disk
  * checkpoint without keeping a NAPI model instance alive.
  */
 export declare function createRandomQwen35MoeCheckpoint(config: Qwen35MoeConfig, savePath: string): Promise<undefined>;
@@ -3035,6 +3114,20 @@ export interface Gemma4Config {
   useBlockPagedCache?: boolean | undefined;
 }
 
+/** Optional load-time settings for [`Gemma4Model::load`]. */
+export interface Gemma4LoadOptions {
+  /**
+   * Directory of a draft checkpoint (config.json + safetensors) to load
+   * alongside the target model for speculative decoding — either a
+   * DSpark draft or a Google assistant draft; the kind is probed from
+   * the draft config.json. Draft decoding runs only on the flat KV-cache
+   * path: setting this while the model config explicitly enables
+   * `use_block_paged_cache` is a hard load error, and an unset
+   * `use_block_paged_cache` is forced to `false`.
+   */
+  draftModelPath?: string;
+}
+
 /**
  * Vision encoder configuration for Gemma4 multimodal models.
  *
@@ -3105,19 +3198,19 @@ export interface GenerationConfig {
   /** Number of recent tokens to consider for frequency penalty (default: 20) */
   frequencyContextSize?: number;
   /**
-   * Stop if same token repeats this many times consecutively (default: 16)
-   * Set to 0 to disable. Prevents OOM from degenerate repetitive generation.
+   * Stop if same token repeats this many times consecutively (default: 0 = disabled).
+   * Opt in by setting a positive value to guard against degenerate repetitive generation.
    */
   maxConsecutiveTokens?: number;
   /**
-   * Stop if a pattern repeats this many times consecutively (default: 3)
-   * Set to 0 to disable. Detects patterns like "A B A B A B".
+   * Stop if a pattern repeats this many times consecutively (default: 0 = disabled).
+   * Opt in with a positive value to detect patterns like "A B A B A B".
    * Uses range-based detection: checks all pattern sizes from 2 to ngram_size.
    */
   maxNgramRepeats?: number;
   /**
-   * Maximum pattern size for repetition detection (default: 64)
-   * All pattern sizes from 2 up to this value are checked each decode step.
+   * Maximum pattern size for repetition detection (default: 0 = disabled).
+   * When enabled, all pattern sizes from 2 up to this value are checked each decode step.
    * Larger values catch long phrase-level repetition common in small models.
    */
   ngramSize?: number;
@@ -3245,8 +3338,12 @@ export interface GgufConversionOptions {
   vlmKeyPrefix?: boolean;
   /**
    * Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
-   * When true, applies after the recipe predicate: any 8-bit affine decision
-   * becomes mxfp8, any 4-bit decision becomes mxfp4. Requires `quant_mode = "affine"`.
+   * When true, applies after the recipe predicate: eligible 8-bit affine
+   * decisions become mxfp8 and 4-bit become mxfp4. Kept affine (not upgraded):
+   * affine-only loaders (lm_head, embed_tokens, router.proj,
+   * embedding_projection) at their recipe bits, MoE router gates (8-bit affine),
+   * and the recipe-pinned attention/GDN projections (o_proj / out_proj /
+   * in_proj_a / in_proj_b, 8-bit affine). Requires `quant_mode = "affine"`.
    * Forces `group_size = 32` for upgraded layers.
    */
   quantMxfp?: boolean;

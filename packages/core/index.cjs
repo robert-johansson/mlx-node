@@ -779,6 +779,7 @@ module.exports.VLMChatResult = nativeBinding.VLMChatResult;
 module.exports.VLModel = nativeBinding.VLModel;
 module.exports.buildRewardOutputs = nativeBinding.buildRewardOutputs;
 module.exports.BuiltinRewardType = nativeBinding.BuiltinRewardType;
+module.exports.calibrateActivationAmaxRaw = nativeBinding.calibrateActivationAmaxRaw;
 module.exports.ChatRole = nativeBinding.ChatRole;
 module.exports.convertForeignWeights = nativeBinding.convertForeignWeights;
 module.exports.convertGgufToSafetensors = nativeBinding.convertGgufToSafetensors;

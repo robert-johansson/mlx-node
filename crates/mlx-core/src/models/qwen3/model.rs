@@ -20,6 +20,7 @@ use crate::engine::backend::{
 use crate::engine::cmd::{
     ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
 };
+use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::model_thread::{ModelThread, ResponseTx, send_and_await};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{
@@ -1059,9 +1060,15 @@ impl Qwen3Inner {
         let presence_context_size = config.presence_context_size.unwrap_or(20);
         let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
         let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
-        let ngram_size = config.ngram_size.unwrap_or(64);
+        let max_consecutive_tokens = config
+            .max_consecutive_tokens
+            .unwrap_or(crate::sampling::DEFAULT_MAX_CONSECUTIVE_TOKENS);
+        let max_ngram_repeats = config
+            .max_ngram_repeats
+            .unwrap_or(crate::sampling::DEFAULT_MAX_NGRAM_REPEATS);
+        let ngram_size = config
+            .ngram_size
+            .unwrap_or(crate::sampling::DEFAULT_NGRAM_SIZE);
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
         let return_logprobs = config.return_logprobs.unwrap_or(true);
         let prefill_step_size = config.prefill_step_size.unwrap_or(2048) as usize;
@@ -1782,9 +1789,15 @@ impl Qwen3Inner {
         let presence_context_size = config.presence_context_size.unwrap_or(20);
         let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
         let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
-        let ngram_size = config.ngram_size.unwrap_or(64);
+        let max_consecutive_tokens = config
+            .max_consecutive_tokens
+            .unwrap_or(crate::sampling::DEFAULT_MAX_CONSECUTIVE_TOKENS);
+        let max_ngram_repeats = config
+            .max_ngram_repeats
+            .unwrap_or(crate::sampling::DEFAULT_MAX_NGRAM_REPEATS);
+        let ngram_size = config
+            .ngram_size
+            .unwrap_or(crate::sampling::DEFAULT_NGRAM_SIZE);
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
         let return_logprobs = config.return_logprobs.unwrap_or(true);
         let prefill_step_size = config.prefill_step_size.unwrap_or(2048) as usize;
@@ -3569,8 +3582,14 @@ impl ChatBackend for Qwen3Inner {
         })
     }
 
-    fn has_paged_adapter(&self) -> bool {
-        self.paged_adapter.is_some()
+    fn execution_plan(&self) -> ExecutionPlan {
+        ExecutionPlan {
+            media: MediaPlan::NONE,
+            paged_attention: self.paged_adapter.as_ref().map(|_| PagedAttentionPlan {
+                supports_delta: true,
+            }),
+            speculative: None,
+        }
     }
 
     fn wired_limit_bytes(&self) -> Option<usize> {
@@ -3584,8 +3603,8 @@ impl ChatBackend for Qwen3Inner {
         // Record the turn's streaming-ness for `begin_decode`'s relabel
         // (`TurnSetup` does not carry it). The session core calls this
         // hook exactly once per generic-flow turn, before
-        // `begin_decode`; paged turns return from the probe earlier and
-        // never consult either hook.
+        // `begin_decode`; paged turns return from the planned executor
+        // earlier and never consult either hook.
         self.turn_is_streaming.set(is_streaming);
         match (is_streaming, is_delta) {
             (true, false) => "qwen3_chat_stream",
@@ -3597,21 +3616,19 @@ impl ChatBackend for Qwen3Inner {
         }
     }
 
-    fn session_holds_images(&self) -> bool {
-        // Structurally always `None` for text-only qwen3; checked anyway
-        // so the default `text_delta_image_guard` keeps its defensive
-        // behavior.
-        self.cached_image_key.is_some()
+    fn session_media(&self) -> MediaCapabilities {
+        // Qwen3 has no path that can populate media state. Keep the model's
+        // media contract truthful even though the legacy cache struct retains
+        // an always-None image-key slot for layout symmetry.
+        MediaCapabilities::NONE
     }
 
-    fn paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        // The probe is gated on `has_paged_adapter()`; with the adapter
-        // configured EVERY turn (fresh + delta, sync + streaming) takes
-        // the generic paged engine. `run_paged_turn` drives the adapter
-        // lifecycle via [`PagedBackend`], reusing the shared
-        // `run_decode_loop`. The probe runs for delta streaming turns too,
-        // routed by the engine's session-core dispatch.
-        Some(crate::engine::paged_turn::run_paged_turn(self, args))
+    fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        // `execution_plan` admits paged attention for every turn shape
+        // (fresh + delta, sync + streaming). The generic paged engine drives
+        // the adapter lifecycle via [`PagedBackend`] and reuses the shared
+        // `run_decode_loop`.
+        crate::engine::paged_turn::run_paged_turn(self, args)
     }
 }
 
@@ -5277,13 +5294,32 @@ mod tests {
     /// 97-token prompt. Tolerance budget mirrors the multi-chunk parity
     /// test (atol=rtol=5e-3 for bf16 + chunk-boundary fma reorderings).
     ///
-    /// Skips on no-Metal hosts.
+    /// Skips on no-Metal hosts, and on hosts whose half-precision GEMM
+    /// fails the `test_support::half_gemm_untrustworthy` canary: this
+    /// config's matmuls (K=64 projections, K=32 fallback-SDPA scores) sit
+    /// inside the vendored-MLX NAX unaligned-K broken regime on gen>=17
+    /// GPUs, and the 1-token tail chunk dispatches M=1 GEMV (correct)
+    /// where the single-shot rows go through the broken GEMM — so the two
+    /// paths deterministically diverge O(1) with no chunking bug present
+    /// (chunk-offset/mask/pool bookkeeping was verified independently:
+    /// the same comparison is byte-equal for 96/16 and 98/16 geometries,
+    /// and a patterned adapter write/read round-trip is exact for every
+    /// chunk geometry).
     #[test]
     fn test_chunked_prefill_uneven_tail_matches_single_shot() {
         // Block-paged needs the Metal backend; on a non-Metal build the
         // adapter is gated off (None) and there is nothing to exercise.
         if !crate::engine::persistence::compiled_forward_backend_available() {
             eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
+        if crate::test_support::half_gemm_untrustworthy() {
+            eprintln!(
+                "skipping test_chunked_prefill_uneven_tail_matches_single_shot: \
+                 half-precision GEMM fails the K=64/N=64 canary on this host \
+                 (vendored-MLX NAX unaligned-K bug); tiny-config chunked-vs-\
+                 single-shot parity is not meaningful here"
+            );
             return;
         }
         let cfg = paged_tiny_config(Some(true));
