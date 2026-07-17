@@ -29,6 +29,7 @@ use crate::models::qwen3_5::model::{
     eval_layer_caches, inject_image_placeholders, partition_prefill_chunks,
     vlm_prepare_vision_continuation, vlm_prepare_vision_features,
 };
+use crate::array::mask::create_causal_mask;
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
 

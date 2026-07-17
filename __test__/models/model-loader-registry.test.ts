@@ -11,6 +11,7 @@ const RAW_MODEL_TYPE_ALIASES = {
   qwen3: ['qwen3'],
   qwen3_5: ['qwen3_5'],
   qwen3_5_moe: ['qwen3_5_moe'],
+  qwen3_next: ['qwen3_next'],
   lfm2: ['lfm2'],
   lfm2_moe: ['lfm2_moe'],
   internvl_chat: ['internvl_chat'],

@@ -7100,10 +7100,8 @@ impl Qwen35Inner {
             }
         }
         if let Some(ref mut lm_head) = self.lm_head
-            && lm_head.is_quantized()
+            && lm_head.dequantize_to_standard()?
         {
-            let dense = lm_head.get_weight();
-            lm_head.set_weight(&dense)?;
             n += 1;
         }
         Ok(n)
@@ -9591,7 +9589,7 @@ fn forward_token_mrope(
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight_t: Option<&MxArray>,
 ) -> Result<MxArray> {
     let embedding = Embedding::from_weight(embedding_weight)?;
