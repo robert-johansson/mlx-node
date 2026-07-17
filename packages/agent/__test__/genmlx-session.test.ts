@@ -6,10 +6,11 @@
  * native code.
  */
 import type { ChatMessage, ChatStreamEvent } from '@mlx-node/lm';
-import { describe, expect, it, vi } from 'vite-plus/test';
+import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import type { GenmlxTurnEngine } from '../src/provider/genmlx/genmlx-host.js';
 import { GenmlxSession } from '../src/provider/genmlx/genmlx-session.js';
+import { setGenmlxBestOfK, setGenmlxToolVerifier } from '../src/provider/genmlx/genmlx-verifier.js';
 
 interface FakeTurn {
   deltas: Array<{ text: string; isReasoning?: boolean }>;
@@ -23,6 +24,7 @@ interface FakeEngine extends GenmlxTurnEngine {
     messages: ChatMessage[];
     config: Record<string, unknown>;
     images: Uint8Array[];
+    verifier: unknown;
   }>;
   aborted: string[];
   disposed: string[];
@@ -54,7 +56,7 @@ function makeEngine(script: FakeTurn[]): FakeEngine {
     sessionsMinted: 0,
     loadModel: vi.fn(async (path: string) => JSON.stringify({ path })),
     newSession: vi.fn(() => `fake-s${++engine.sessionsMinted}`),
-    turnStream: vi.fn(async (sessionId: string, messagesJson: string, configJson: string, onDelta, images) => {
+    turnStream: vi.fn(async (sessionId: string, messagesJson: string, configJson: string, onDelta, images, verifier) => {
       const turn = script[turnIndex++];
       if (!turn) throw new Error('fake engine: script exhausted');
       engine.turns.push({
@@ -62,6 +64,7 @@ function makeEngine(script: FakeTurn[]): FakeEngine {
         messages: JSON.parse(messagesJson) as ChatMessage[],
         config: JSON.parse(configJson) as Record<string, unknown>,
         images: images ?? [],
+        verifier,
       });
       for (const delta of turn.deltas) onDelta(JSON.stringify(delta));
       if (turn.reject !== undefined) throw turn.reject;
@@ -205,6 +208,65 @@ describe('GenmlxSession', () => {
       imageA,
       imageB,
     ]);
+  });
+
+  describe('best-of-K seam (genmlx-maww)', () => {
+    afterEach(() => {
+      setGenmlxBestOfK(null);
+      setGenmlxToolVerifier(null);
+      delete (globalThis as Record<string, unknown>).__GENMLX_TOOL_VERIFIER__;
+      delete process.env.MLX_AGENT_BEST_OF_K;
+    });
+
+    it('K rides the config JSON, the verifier rides the non-JSON leg', async () => {
+      const engine = makeEngine([{ deltas: [], final: makeFinal() }]);
+      const session = new GenmlxSession(engine);
+      const verifier = () => JSON.stringify({ winner: 0 });
+      setGenmlxBestOfK(3);
+      setGenmlxToolVerifier(verifier);
+      session.primeHistory(HISTORY);
+      await collect(session);
+      const turn = engine.turns[0]!;
+      expect(turn.config.bestOfK).toBe(3);
+      expect(turn.verifier).toBe(verifier);
+    });
+
+    it('scalar default: no bestOfK key, no verifier', async () => {
+      const engine = makeEngine([{ deltas: [], final: makeFinal() }]);
+      const session = new GenmlxSession(engine);
+      session.primeHistory(HISTORY);
+      await collect(session);
+      const turn = engine.turns[0]!;
+      expect('bestOfK' in turn.config).toBe(false);
+      expect(turn.verifier).toBeUndefined();
+    });
+
+    it('MLX_AGENT_BEST_OF_K is the CLI channel; the extension global is the verifier fallback', async () => {
+      const engine = makeEngine([{ deltas: [], final: makeFinal() }]);
+      const session = new GenmlxSession(engine);
+      const globalVerifier = () => JSON.stringify({ winner: 1 });
+      process.env.MLX_AGENT_BEST_OF_K = '4';
+      (globalThis as Record<string, unknown>).__GENMLX_TOOL_VERIFIER__ = globalVerifier;
+      session.primeHistory(HISTORY);
+      await collect(session);
+      const turn = engine.turns[0]!;
+      expect(turn.config.bestOfK).toBe(4);
+      expect(turn.verifier).toBe(globalVerifier);
+    });
+
+    it('K=1 and malformed env stay scalar', async () => {
+      const engine = makeEngine([
+        { deltas: [], final: makeFinal() },
+        { deltas: [], final: makeFinal() },
+      ]);
+      const session = new GenmlxSession(engine);
+      session.primeHistory(HISTORY);
+      process.env.MLX_AGENT_BEST_OF_K = '1';
+      await collect(session);
+      process.env.MLX_AGENT_BEST_OF_K = 'many';
+      await collect(session);
+      expect(engine.turns.every((turn) => !('bestOfK' in turn.config))).toBe(true);
+    });
   });
 
   it('warm-reuse-touched fields exist (shared helper contract)', () => {

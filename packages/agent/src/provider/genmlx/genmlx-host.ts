@@ -56,6 +56,9 @@ export interface GenmlxTurnEngine {
     configJson: string,
     onDelta: (deltaJson: string) => void,
     images?: Uint8Array[],
+    /** Best-of-K verifier (genmlx-maww): called once with all K candidates
+     *  when config.bestOfK > 1; see genmlx-verifier.ts for the contract. */
+    verifier?: (candidatesJson: string) => Promise<string> | string,
   ): Promise<string>;
   /** Cooperative cancel of the session's in-flight decode loop. */
   abort(sessionId: string): void;

@@ -3,6 +3,11 @@ export type { DiscoveredModelLike, StreamableSession } from './types.js';
 export { createGenmlxProviderExtension } from './provider/genmlx/index.js';
 export { GenmlxModelHost, type GenmlxModelHostOptions } from './provider/genmlx/genmlx-model-host.js';
 export { discoverGenmlxModels, type GenmlxModelInfo } from './provider/genmlx/models.js';
+export {
+  type GenmlxToolVerifier,
+  setGenmlxBestOfK,
+  setGenmlxToolVerifier,
+} from './provider/genmlx/genmlx-verifier.js';
 
 export { type CatalogEntry, MODEL_CATALOG, visibleCatalog } from './catalog.js';
 export { createPermissionGateExtension } from './extensions/permission-gate.js';

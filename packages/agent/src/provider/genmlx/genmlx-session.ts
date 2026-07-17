@@ -27,6 +27,7 @@ import type { ToolCallResult } from '@mlx-node/core';
 import type { ChatConfig, ChatMessage, ChatStreamEvent } from '@mlx-node/lm';
 
 import type { GenmlxTurnEngine } from './genmlx-host.js';
+import { resolveGenmlxBestOfK, resolveGenmlxVerifier } from './genmlx-verifier.js';
 
 /** Engine delta JSON shape (pi_provider.cljs emit!). */
 interface EngineDelta {
@@ -122,17 +123,29 @@ export class GenmlxSession {
 
     this.inFlight = true;
     try {
+      // Best-of-K (genmlx-maww): K + the verifier ride the seam per turn —
+      // K into the config JSON, the verifier on the non-JSON leg.
+      const bestOfK = resolveGenmlxBestOfK();
+      const wireConfig: Record<string, unknown> = { ...(config ?? {}) };
+      if (bestOfK !== null) {
+        wireConfig.bestOfK = bestOfK;
+        const timeoutMs = Number(process.env.MLX_AGENT_VERIFIER_TIMEOUT_MS ?? Number.NaN);
+        if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+          wireConfig.verifierTimeoutMs = timeoutMs;
+        }
+      }
       this.engine
         .turnStream(
           sessionId,
           JSON.stringify(wireMessages),
-          JSON.stringify(config ?? {}),
+          JSON.stringify(wireConfig),
           (deltaJson) => {
             const delta = JSON.parse(deltaJson) as EngineDelta;
             queue.push({ text: delta.text, done: false, isReasoning: delta.isReasoning === true });
             notify();
           },
           imageBytes,
+          resolveGenmlxVerifier(),
         )
         .then(
           (json) => {
