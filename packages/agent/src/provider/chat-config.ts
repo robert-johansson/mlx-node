@@ -10,7 +10,7 @@
 
 import type { SimpleStreamOptions, ThinkingLevel } from '@earendil-works/pi-ai';
 import type { ChatConfig, ModelType, ToolDefinition } from '@mlx-node/lm';
-import { LAUNCH_PRESETS, type LaunchPreset } from '@mlx-node/server';
+import { LAUNCH_PRESETS, type LaunchPreset } from '@mlx-node/server/presets';
 
 /**
  * Agent-local launch presets for model types `LAUNCH_PRESETS` does not

@@ -20,10 +20,64 @@ import { readdir, readFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
 import type { ProviderModelConfig } from '@earendil-works/pi-coding-agent';
-import { detectModelType, type ModelType } from '@mlx-node/lm';
+import type { ModelType } from '@mlx-node/lm';
 
 import type { DiscoveredModelLike } from '../types.js';
 import { launchPresetFor } from './chat-config.js';
+
+/**
+ * PURE mirror of `@mlx-node/lm`'s `detectModelType` (the declarative
+ * `MODEL_FAMILY_REGISTRY` match rules — raw `model_type` aliases, the
+ * nullish→qwen3 default, and the two architecture probes). Reimplemented
+ * here over a raw `config.json` read because importing the loader dlopens
+ * `@mlx-node/core` at module load, and discovery runs at CLI startup for
+ * BOTH providers — a `--model genmlx/*` run must reach first model use
+ * with no native addon loaded (genmlx-djw6 process purity; see
+ * native-owner.ts). Drift guard: the gated live suite compares this
+ * against the native `detectModelType` on real checkpoint dirs.
+ * Unknown raw types resolve to `undefined` → the caller skips (observably
+ * identical to "no preset/traits" skips).
+ */
+const RAW_MODEL_TYPE_ALIASES: Record<string, ModelType> = {
+  gemma4: 'gemma4',
+  gemma4_text: 'gemma4',
+  gemma4_unified: 'gemma4',
+  harrier: 'harrier',
+  qwen3: 'qwen3',
+  qwen3_5: 'qwen3_5',
+  qwen3_5_moe: 'qwen3_5_moe',
+  qwen3_next: 'qwen3_next',
+  lfm2: 'lfm2',
+  lfm2_moe: 'lfm2_moe',
+  internvl_chat: 'internvl_chat',
+  'qianfan-ocr': 'qianfan-ocr',
+};
+
+async function detectModelTypePure(modelPath: string): Promise<ModelType | undefined> {
+  const raw = await readFile(join(modelPath, 'config.json'), 'utf-8');
+  const config = JSON.parse(raw) as Record<string, unknown>;
+  const rawType = config.model_type;
+  const architectures = new Set<string>(
+    Array.isArray(config.architectures)
+      ? config.architectures.filter((a): a is string => typeof a === 'string')
+      : typeof config.architectures === 'string'
+        ? [config.architectures]
+        : [],
+  );
+  // Gemma's unified architecture is authoritative (matches the native loader).
+  if (architectures.has('Gemma4UnifiedForConditionalGeneration')) return 'gemma4';
+  const base =
+    rawType === undefined || rawType === null
+      ? 'qwen3'
+      : typeof rawType === 'string'
+        ? RAW_MODEL_TYPE_ALIASES[rawType]
+        : undefined;
+  // Harrier (embedding) refines a qwen3 base: encoder-only architectures.
+  if (base === 'qwen3' && architectures.has('Qwen3Model') && !architectures.has('Qwen3ForCausalLM')) {
+    return 'harrier';
+  }
+  return base;
+}
 
 /** A discovered local checkpoint paired with its pi provider model entry. */
 export interface MlxModelInfo {
@@ -123,11 +177,15 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
     if (!entry.isDirectory()) continue;
     const full = join(modelsDir, entry.name);
 
-    let modelType: ModelType;
+    let modelType: ModelType | undefined;
     try {
-      modelType = await detectModelType(full);
+      modelType = await detectModelTypePure(full);
     } catch (err) {
       if (debug) console.warn(`[mlx] skip ${full}: ${(err as Error).message}`);
+      continue;
+    }
+    if (modelType === undefined) {
+      if (debug) console.warn(`[mlx] skip ${full}: unrecognized model_type`);
       continue;
     }
 

@@ -25,7 +25,14 @@ function getSession(host: MlxModelHost, modelId: string): Promise<ChatSession> {
 }
 
 async function flushMicrotasks(rounds = 8): Promise<void> {
-  for (let i = 0; i < rounds; i++) await Promise.resolve();
+  // Real task boundaries, not bare microtasks: the host's first load path
+  // awaits a lazy dynamic import('@mlx-node/lm') (the process-purity
+  // conversion, genmlx-djw6), which resolves across a macrotask under the
+  // test module runner. The ordering assertions are unaffected — a parked
+  // gate blocks the next callback no matter how patient the flush is.
+  for (let i = 0; i < rounds; i++) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
 }
 
 describe('MlxModelHost', () => {

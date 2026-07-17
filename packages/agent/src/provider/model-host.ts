@@ -13,13 +13,27 @@
  * overlapping native activity on the compiled-path globals).
  */
 
-import { ChatSession, loadModel, type SessionCapableModel } from '@mlx-node/lm';
+import type { ChatSession, loadModel, SessionCapableModel } from '@mlx-node/lm';
 
 import type { DiscoveredModelLike } from '../types.js';
+import { claimNativeOwner } from './native-owner.js';
 
 export interface MlxModelHostOptions {
   /** Injectable model loader so tests can stub native loading. */
   loadModelFn?: typeof loadModel;
+}
+
+/**
+ * Lazy native entry: `@mlx-node/lm` (and its `@mlx-node/core` dlopen) is
+ * reached ONLY here, on first real model load, behind the process latch —
+ * so registering the mlx provider next to the genmlx one never touches
+ * native code, and a genmlx-pinned process gets a clear error instead of
+ * the two-runtimes SIGTRAP (genmlx-djw6 process purity).
+ */
+async function loadNativeHost(): Promise<{ loadModel: typeof loadModel; ChatSession: typeof ChatSession }> {
+  claimNativeOwner('mlx');
+  const lm = await import('@mlx-node/lm');
+  return { loadModel: lm.loadModel, ChatSession: lm.ChatSession };
 }
 
 interface ResidentModel {
@@ -41,13 +55,13 @@ interface ResidentModel {
 
 export class MlxModelHost {
   private readonly byName = new Map<string, DiscoveredModelLike>();
-  private readonly loadModelFn: typeof loadModel;
+  private readonly loadModelFn: typeof loadModel | null;
   private resident: ResidentModel | null = null;
   private chain: Promise<unknown> = Promise.resolve();
 
   constructor(models: DiscoveredModelLike[], opts: MlxModelHostOptions = {}) {
     for (const model of models) this.byName.set(model.name, model);
-    this.loadModelFn = opts.loadModelFn ?? loadModel;
+    this.loadModelFn = opts.loadModelFn ?? null;
   }
 
   get residentId(): string | null {
@@ -90,8 +104,9 @@ export class MlxModelHost {
         session = this.resident.session;
       } else {
         this.resident = null;
-        const model = await this.loadModelFn(entry.path);
-        session = new ChatSession(model as unknown as SessionCapableModel);
+        const native = await loadNativeHost();
+        const model = await (this.loadModelFn ?? native.loadModel)(entry.path);
+        session = new native.ChatSession(model as unknown as SessionCapableModel);
         this.resident = { id: modelId, session, model, dirty: false };
       }
       return await fn(session);

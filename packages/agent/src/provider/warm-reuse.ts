@@ -30,7 +30,7 @@
  * instance.
  */
 
-import type { ChatSession, SessionCapableModel } from '@mlx-node/lm';
+import type { StreamableSession } from '../types.js';
 
 /**
  * Private structural view of the `ChatSession` JS-side state that the
@@ -86,9 +86,7 @@ export const WARM_REUSE_TOUCHED_FIELDS = Object.keys(WARM_REUSE_TOUCHED_FIELD_SE
  * the reused prefix on the next `chatSessionStart` and skip the
  * corresponding re-prefill.
  */
-export async function resetPreservingNativeCacheForWarmReuse<M extends SessionCapableModel>(
-  session: ChatSession<M>,
-): Promise<void> {
+export async function resetPreservingNativeCacheForWarmReuse(session: StreamableSession): Promise<void> {
   // TypeScript `private` fields are only compile-time checks; at
   // runtime they are ordinary properties. The cast through
   // `ChatSessionWarmReuseInternals` preserves full static typing for

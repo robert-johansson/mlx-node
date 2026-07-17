@@ -45,10 +45,9 @@ import type {
   SimpleStreamOptions,
 } from '@earendil-works/pi-ai';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
-import type { ChatSession } from '@mlx-node/lm';
 import { writeFileSync } from 'node:fs';
 
-import type { DiscoveredModelLike } from '../types.js';
+import type { DiscoveredModelLike, StreamableSession } from '../types.js';
 import { buildChatConfig } from './chat-config.js';
 import { contextToChatMessages, toolsToDefinitions } from './convert-messages.js';
 import { coerceErrorMessage } from './error-coercion.js';
@@ -64,7 +63,7 @@ export interface StreamSimpleHost {
   /** Discovery record for `modelId` (source of the `ModelType` → launch preset). */
   modelInfo(modelId: string): DiscoveredModelLike | undefined;
   /** Atomic resident selection + serialized inference closure (see `MlxModelHost`). */
-  runWithResident<T>(modelId: string, fn: (session: ChatSession) => Promise<T>): Promise<T>;
+  runWithResident<T>(modelId: string, fn: (session: StreamableSession) => Promise<T>): Promise<T>;
   /** Flag the resident as post-error so the next turn does a full reset (see `MlxModelHost`). */
   markResidentDirty(modelId: string): void;
   /** Read-and-clear the resident's post-error flag; `true` ⇒ full-reset this turn. */

@@ -68,6 +68,10 @@ export default defineConfig({
       '@mlx-node/agent': resolve(__dirname, './packages/agent/src/index.ts'),
       '@mlx-node/privacy': resolve(__dirname, './packages/privacy/src/index.ts'),
       '@mlx-node/trl': resolve(__dirname, './packages/trl/src/index.ts'),
+      // Longer key FIRST: object aliases prefix-match in order, and the
+      // native-free presets subpath (genmlx-djw6 process purity) must not
+      // fall through to the barrel alias below.
+      '@mlx-node/server/presets': resolve(__dirname, './packages/server/src/presets.ts'),
       '@mlx-node/server': resolve(__dirname, './packages/server/src/index.ts'),
     },
   },

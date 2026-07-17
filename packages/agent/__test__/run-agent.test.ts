@@ -77,7 +77,7 @@ describe('runAgent', () => {
     expect(env.MLX_PAGED_PREFILL_CHUNK_SIZE).toBe('512');
   });
 
-  it('passes exactly the provider and permission-gate extensions, in order', async () => {
+  it('passes exactly the two provider extensions and the permission gate, in order', async () => {
     const { main, calls } = makeSeam();
     await runAgent({ modelsDir: '/models', models: [], argv: [], mainImpl: main });
 
@@ -90,7 +90,7 @@ describe('runAgent', () => {
       expect(typeof named.factory).toBe('function');
       return named.name;
     });
-    expect(names).toEqual(['mlx-provider', 'mlx-permission-gate']);
+    expect(names).toEqual(['mlx-provider', 'genmlx-provider', 'mlx-permission-gate']);
   });
 
   it('forwards argv verbatim', async () => {

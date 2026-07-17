@@ -21,6 +21,8 @@ import { join } from 'node:path';
 import type { InlineExtension } from '@earendil-works/pi-coding-agent';
 
 import { createPermissionGateExtension } from './extensions/permission-gate.js';
+import { createGenmlxProviderExtension } from './provider/genmlx/index.js';
+import type { GenmlxModelInfo } from './provider/genmlx/models.js';
 import { createMlxProviderExtension } from './provider/index.js';
 import type { MlxModelInfo } from './provider/models.js';
 
@@ -32,6 +34,10 @@ export interface RunAgentOptions {
   modelsDir: string;
   /** Discovered models to serve through the in-process `mlx` provider. */
   models: MlxModelInfo[];
+  /** Discovered models to serve through the in-process `genmlx` provider
+   *  (owned-forward families; genmlx-djw6). Empty/omitted → the provider
+   *  still registers with no models, which pi treats as unavailable. */
+  genmlxModels?: GenmlxModelInfo[];
   /** Passthrough args handed to pi's `main()` verbatim. */
   argv: string[];
   /** Test seam; when set, the pi dynamic import is skipped entirely. */
@@ -54,6 +60,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   // with `mainImpl` injected, pi is never imported at all.
   const main: RunAgentMain = opts.mainImpl ?? (await import('@earendil-works/pi-coding-agent')).main;
   await main(opts.argv, {
-    extensionFactories: [createMlxProviderExtension(opts.models), createPermissionGateExtension()],
+    extensionFactories: [
+      createMlxProviderExtension(opts.models),
+      createGenmlxProviderExtension(opts.genmlxModels ?? []),
+      createPermissionGateExtension(),
+    ],
   });
 }
