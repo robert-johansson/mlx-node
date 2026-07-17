@@ -333,8 +333,8 @@ Requirements and limits:
 
 - **Families**: qwen3 / qwen3_5 / qwen3_5_moe checkpoints only (what the owned forward implements). Text-only — image-bearing turns are rejected with a typed error until the vision port lands.
 - **One native host per process**: the first model use pins the process to `mlx` OR `genmlx` (dual dlopen aborts the process, so the latch refuses the second host with a clear error). Run one provider's models per `mlx agent` process.
-- **Env**: the genmlx repo is found automatically when mlx-node is checked out as its submodule; set `GENMLX_HOME` otherwise. `NODE_OPTIONS=--max-old-space-size=12288` is currently required for owned model loading under Node. The usual native-loading env (Thor: `GLIBC_TUNABLES` static-TLS etc.) applies as everywhere.
-- **Long completions**: the launch presets carry large `maxOutputTokens` and (since the vLLM-aligned change above) no repetition cutoff — on small models at preset temperature a turn can legitimately run for minutes. `MLX_AGENT_TEMPERATURE=0` is the fast deterministic mode; per-token detokenization cost also grows with generation length in this preview.
+- **Env**: the genmlx repo is found automatically when mlx-node is checked out as its submodule; set `GENMLX_HOME` otherwise. JS-heap headroom for owned model loading is automatic: `mlx agent` re-execs itself once with `--max-old-space-size=12288` when the current V8 limit is below target (`MLX_AGENT_MAX_OLD_SPACE_MB` overrides the target, `0` disables the relaunch). The usual native-loading env (Thor: `GLIBC_TUNABLES` static-TLS etc.) applies as everywhere.
+- **Long completions**: the launch presets carry large `maxOutputTokens` and (since the vLLM-aligned change above) no repetition cutoff — on small models at preset temperature a turn can legitimately run for minutes. `MLX_AGENT_TEMPERATURE=0` is the fast deterministic mode. (Detokenization is incremental — a pending-tokens window per step — so per-token cost is flat in generation length.)
 
 ### Extensions and skills
 
