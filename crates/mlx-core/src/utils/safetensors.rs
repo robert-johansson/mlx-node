@@ -824,6 +824,17 @@ fn save_safetensors_single<P: AsRef<Path>>(
         .flush()
         .map_err(|e| Error::from_reason(format!("Failed to flush file: {}", e)))?;
 
+    // fsync before returning (genmlx-sm9w): flush() only reaches the OS page
+    // cache, and a multi-GB payload can sit there for seconds after the save
+    // promise resolves — a host crash in that window loses a checkpoint the
+    // caller was told is saved. sync_all() makes promise resolution mean
+    // "durably on disk".
+    writer
+        .into_inner()
+        .map_err(|e| Error::from_reason(format!("Failed to finish write: {}", e)))?
+        .sync_all()
+        .map_err(|e| Error::from_reason(format!("Failed to fsync file: {}", e)))?;
+
     Ok(())
 }
 

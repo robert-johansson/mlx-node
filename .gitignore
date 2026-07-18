@@ -220,3 +220,4 @@ __pycache__/
 *.metallib
 .vite-agent
 /Model-Optimizer
+packages/genmlx-core/index.d.ts
