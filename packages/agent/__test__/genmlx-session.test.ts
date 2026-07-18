@@ -29,6 +29,7 @@ interface FakeEngine extends GenmlxTurnEngine {
   aborted: string[];
   disposed: string[];
   sessionsMinted: number;
+  sessionOpts: string[];
 }
 
 function makeFinal(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -54,22 +55,28 @@ function makeEngine(script: FakeTurn[]): FakeEngine {
     aborted: [],
     disposed: [],
     sessionsMinted: 0,
+    sessionOpts: [],
     loadModel: vi.fn(async (path: string) => JSON.stringify({ path })),
-    newSession: vi.fn(() => `fake-s${++engine.sessionsMinted}`),
-    turnStream: vi.fn(async (sessionId: string, messagesJson: string, configJson: string, onDelta, images, verifier) => {
-      const turn = script[turnIndex++];
-      if (!turn) throw new Error('fake engine: script exhausted');
-      engine.turns.push({
-        sessionId,
-        messages: JSON.parse(messagesJson) as ChatMessage[],
-        config: JSON.parse(configJson) as Record<string, unknown>,
-        images: images ?? [],
-        verifier,
-      });
-      for (const delta of turn.deltas) onDelta(JSON.stringify(delta));
-      if (turn.reject !== undefined) throw turn.reject;
-      return JSON.stringify(turn.final);
+    newSession: vi.fn((optsJson: string) => {
+      engine.sessionOpts.push(optsJson);
+      return `fake-s${++engine.sessionsMinted}`;
     }),
+    turnStream: vi.fn(
+      async (sessionId: string, messagesJson: string, configJson: string, onDelta, images, verifier) => {
+        const turn = script[turnIndex++];
+        if (!turn) throw new Error('fake engine: script exhausted');
+        engine.turns.push({
+          sessionId,
+          messages: JSON.parse(messagesJson) as ChatMessage[],
+          config: JSON.parse(configJson) as Record<string, unknown>,
+          images: images ?? [],
+          verifier,
+        });
+        for (const delta of turn.deltas) onDelta(JSON.stringify(delta));
+        if (turn.reject !== undefined) throw turn.reject;
+        return JSON.stringify(turn.final);
+      },
+    ),
     abort: vi.fn((sessionId: string) => {
       engine.aborted.push(sessionId);
     }),
@@ -80,9 +87,14 @@ function makeEngine(script: FakeTurn[]): FakeEngine {
   return engine;
 }
 
-async function collect(session: GenmlxSession, config = {}, signal?: AbortSignal): Promise<ChatStreamEvent[]> {
+async function collect(
+  session: GenmlxSession,
+  config = {},
+  signal?: AbortSignal,
+  piSessionId?: string,
+): Promise<ChatStreamEvent[]> {
   const events: ChatStreamEvent[] = [];
-  for await (const event of session.startFromHistoryStream(config, signal)) events.push(event);
+  for await (const event of session.startFromHistoryStream(config, signal, piSessionId)) events.push(event);
   return events;
 }
 
@@ -266,6 +278,87 @@ describe('GenmlxSession', () => {
       process.env.MLX_AGENT_BEST_OF_K = 'many';
       await collect(session);
       expect(engine.turns.every((turn) => !('bestOfK' in turn.config))).toBe(true);
+    });
+  });
+
+  describe('per-pi-session keying + fork hints (genmlx-lin9)', () => {
+    const UUID_A = '019f5ee0-9c21-7643-8cd9-30d18827f2ed';
+    const FILE_A = `/x/sessions/proj/2026-07-14T04-26-46-177Z_${UUID_A}.jsonl`;
+
+    it('keys engine sessions per pi session id; anonymous callers share one', async () => {
+      const engine = makeEngine([
+        { deltas: [], final: makeFinal() },
+        { deltas: [], final: makeFinal() },
+        { deltas: [], final: makeFinal() },
+        { deltas: [], final: makeFinal() },
+      ]);
+      const session = new GenmlxSession(engine);
+      session.primeHistory(HISTORY);
+      await collect(session, {}, undefined, 'pi-a');
+      await collect(session, {}, undefined, 'pi-b');
+      await collect(session, {}, undefined, 'pi-a');
+      await collect(session); // anonymous
+      expect(engine.newSession).toHaveBeenCalledTimes(3);
+      expect(engine.turns[2]!.sessionId).toBe(engine.turns[0]!.sessionId);
+      expect(engine.turns[1]!.sessionId).not.toBe(engine.turns[0]!.sessionId);
+      expect(engine.turns[3]!.sessionId).not.toBe(engine.turns[0]!.sessionId);
+      expect(engine.sessionOpts).toEqual(['{}', '{}', '{}']);
+    });
+
+    it('a fork hint mints the new engine session via forkFrom (O(1) fork)', async () => {
+      const engine = makeEngine([
+        { deltas: [], final: makeFinal() },
+        { deltas: [], final: makeFinal() },
+      ]);
+      const session = new GenmlxSession(engine);
+      session.primeHistory(HISTORY);
+      await collect(session, {}, undefined, UUID_A);
+      const sourceEngineId = engine.turns[0]!.sessionId;
+      session.noteFork('new-pi-id', FILE_A);
+      await collect(session, {}, undefined, 'new-pi-id');
+      expect(engine.sessionOpts[1]).toBe(JSON.stringify({ forkFrom: sourceEngineId }));
+      expect(engine.turns[1]!.sessionId).not.toBe(sourceEngineId);
+    });
+
+    it('a hint whose source has no engine session falls back to a cold start', async () => {
+      const engine = makeEngine([{ deltas: [], final: makeFinal() }]);
+      const session = new GenmlxSession(engine);
+      session.primeHistory(HISTORY);
+      session.noteFork('new-pi-id', FILE_A); // UUID_A never had a turn
+      await collect(session, {}, undefined, 'new-pi-id');
+      expect(engine.sessionOpts).toEqual(['{}']);
+    });
+
+    it('a refused fork mint (e.g. source busy) falls back to a cold start', async () => {
+      const engine = makeEngine([
+        { deltas: [], final: makeFinal() },
+        { deltas: [], final: makeFinal() },
+      ]);
+      const inner = engine.newSession;
+      engine.newSession = vi.fn((optsJson: string) => {
+        if (optsJson.includes('forkFrom')) throw new Error('fork-source-busy');
+        return inner(optsJson);
+      }) as FakeEngine['newSession'];
+      const session = new GenmlxSession(engine);
+      session.primeHistory(HISTORY);
+      await collect(session, {}, undefined, UUID_A);
+      session.noteFork('new-pi-id', FILE_A);
+      await collect(session, {}, undefined, 'new-pi-id');
+      expect(engine.turns[1]!.sessionId).not.toBe(engine.turns[0]!.sessionId);
+      expect(engine.sessionOpts).toEqual(['{}', '{}']); // only the cold mints landed
+    });
+
+    it('reset disposes EVERY keyed engine session', async () => {
+      const engine = makeEngine([
+        { deltas: [], final: makeFinal() },
+        { deltas: [], final: makeFinal() },
+      ]);
+      const session = new GenmlxSession(engine);
+      session.primeHistory(HISTORY);
+      await collect(session, {}, undefined, 'pi-a');
+      await collect(session, {}, undefined, 'pi-b');
+      session.reset();
+      expect(new Set(engine.disposed)).toEqual(new Set([engine.turns[0]!.sessionId, engine.turns[1]!.sessionId]));
     });
   });
 

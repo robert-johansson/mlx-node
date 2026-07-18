@@ -59,16 +59,24 @@ export class GenmlxSession {
   private turnCount = 0;
   private unresolvedOkToolCallCount: number | null = null;
 
-  private sessionId: string | null = null;
+  /**
+   * Engine sessions keyed by pi session id (genmlx-lin9). Callers that
+   * carry no `options.sessionId` share the `''` key — exactly the old
+   * one-memoized-session behavior.
+   */
+  private readonly sessionIds = new Map<string, string>();
+  /** Fork hints: new pi session id -> source session FILE (session_start). */
+  private readonly pendingForks = new Map<string, string>();
 
   constructor(private readonly engine: GenmlxTurnEngine) {}
 
-  /** Dispose the engine session (branch + registry) and wipe TS state. */
+  /** Dispose every engine session (branches + registry) and wipe TS state. */
   reset(): void {
-    if (this.sessionId !== null) {
-      this.engine.dispose(this.sessionId);
-      this.sessionId = null;
+    for (const engineId of this.sessionIds.values()) {
+      this.engine.dispose(engineId);
     }
+    this.sessionIds.clear();
+    this.pendingForks.clear();
     this.inFlight = false;
     this.history = [];
     this.lastImagesKey = null;
@@ -76,11 +84,65 @@ export class GenmlxSession {
     this.unresolvedOkToolCallCount = null;
   }
 
+  /**
+   * Record an in-process pi session fork (genmlx-lin9): when pi's runtime
+   * forks a session (`session_start` reason "fork"), the NEW pi session's
+   * first turn should mint its engine session as an O(1) `branch-from`
+   * fork of the source's — the shared committed prefix then DELTA-PREFILLS
+   * instead of cold-replaying. The hint is consulted (and consumed) at
+   * engine-session mint time; an unresolvable source falls back to a cold
+   * session, never an error. A fork cut at an interior entry yields a
+   * history that is a strict PREFIX of the source's committed tokens — the
+   * engine's rebuild rule then full-prefills correctly, so hints are O(1)
+   * for leaf forks (counterfactual administration) and merely neutral
+   * elsewhere.
+   */
+  noteFork(newPiSessionId: string, previousSessionFile: string): void {
+    this.pendingForks.set(newPiSessionId, previousSessionFile);
+  }
+
+  /** Pi session ids embed in session file names: `<timestamp>_<uuid>.jsonl`. */
+  private static piSessionIdFromFile(file: string): string | null {
+    const match = /_([0-9a-f-]{36})\.jsonl$/i.exec(file);
+    return match?.[1] ?? null;
+  }
+
+  /** Existing engine session for `piKey`, else mint one (fork-aware). */
+  private ensureEngineSession(piKey: string): string {
+    const existing = this.sessionIds.get(piKey);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const sourceFile = this.pendingForks.get(piKey);
+    this.pendingForks.delete(piKey);
+    if (sourceFile !== undefined) {
+      const sourcePiId = GenmlxSession.piSessionIdFromFile(sourceFile);
+      const sourceEngineId = sourcePiId !== null ? this.sessionIds.get(sourcePiId) : undefined;
+      if (sourceEngineId !== undefined) {
+        try {
+          const forked = this.engine.newSession(JSON.stringify({ forkFrom: sourceEngineId }));
+          this.sessionIds.set(piKey, forked);
+          return forked;
+        } catch {
+          // e.g. :fork-source-busy — fall through to a cold session; the
+          // engine's delta prefill still reuses nothing worse than v1 would.
+        }
+      }
+    }
+    const fresh = this.engine.newSession('{}');
+    this.sessionIds.set(piKey, fresh);
+    return fresh;
+  }
+
   primeHistory(messages: ChatMessage[]): void {
     this.history = messages;
   }
 
-  async *startFromHistoryStream(config?: ChatConfig, signal?: AbortSignal): AsyncGenerator<ChatStreamEvent> {
+  async *startFromHistoryStream(
+    config?: ChatConfig,
+    signal?: AbortSignal,
+    piSessionId?: string,
+  ): AsyncGenerator<ChatStreamEvent> {
     if (this.inFlight) {
       throw new Error('GenmlxSession: a turn is already in flight');
     }
@@ -100,7 +162,7 @@ export class GenmlxSession {
       });
       return { ...message, images: undefined, imageRefs };
     });
-    const sessionId = (this.sessionId ??= this.engine.newSession('{}'));
+    const sessionId = this.ensureEngineSession(piSessionId ?? '');
 
     // Callback-push → async-generator-pull bridge.
     const queue: ChatStreamEvent[] = [];

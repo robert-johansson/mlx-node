@@ -89,6 +89,16 @@ describe('GenmlxModelHost', () => {
     expect(engine.loadModel).toHaveBeenCalledTimes(2);
   });
 
+  it('noteFork delegates to the resident session and no-ops without one (genmlx-lin9)', async () => {
+    const { host } = makeHost();
+    // No resident: the hint is dropped, never an error.
+    expect(() => host.noteFork('new-pi', '/x/sessions/p/t_00000000-0000-0000-0000-000000000000.jsonl')).not.toThrow();
+    const session = await getSession(host, 'ornith-35b');
+    const spy = vi.spyOn(session, 'noteFork');
+    host.noteFork('new-pi', '/x/sessions/p/t_00000000-0000-0000-0000-000000000000.jsonl');
+    expect(spy).toHaveBeenCalledWith('new-pi', '/x/sessions/p/t_00000000-0000-0000-0000-000000000000.jsonl');
+  });
+
   it('serializes callbacks FIFO (a parked first callback blocks the second)', async () => {
     const { host } = makeHost();
     const order: string[] = [];

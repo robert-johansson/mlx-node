@@ -70,6 +70,15 @@ export class GenmlxModelHost {
     });
   }
 
+  /**
+   * Record an in-process pi session fork on the resident session
+   * (genmlx-lin9). No resident means no engine state worth forking — the
+   * hint is dropped and the forked session simply cold-starts.
+   */
+  noteFork(newPiSessionId: string, previousSessionFile: string): void {
+    this.resident?.session.noteFork(newPiSessionId, previousSessionFile);
+  }
+
   markResidentDirty(modelId: string): void {
     if (this.resident?.id === modelId) {
       this.resident.dirty = true;

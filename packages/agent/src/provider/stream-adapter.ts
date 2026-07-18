@@ -36,6 +36,8 @@
  *     layer is swallowed: there is no further recovery surface.
  */
 
+import { writeFileSync } from 'node:fs';
+
 import type {
   Api,
   AssistantMessage,
@@ -45,7 +47,6 @@ import type {
   SimpleStreamOptions,
 } from '@earendil-works/pi-ai';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
-import { writeFileSync } from 'node:fs';
 
 import type { DiscoveredModelLike, StreamableSession } from '../types.js';
 import { buildChatConfig } from './chat-config.js';
@@ -244,7 +245,10 @@ export function makeMlxStreamSimple(
           }
           session.primeHistory(contextToChatMessages(context));
           const config = buildChatConfig(discovered.modelType, options, toolsToDefinitions(context.tools));
-          for await (const event of session.startFromHistoryStream(config, signal)) {
+          // options.sessionId (pi's session identity) rides along so the
+          // genmlx session can key engine state per conversation and honor
+          // fork hints (genmlx-lin9); the v1 ChatSession ignores it.
+          for await (const event of session.startFromHistoryStream(config, signal, options?.sessionId)) {
             if (event.done) {
               if (event.finishReason === 'error') {
                 // In-band native error terminal: chat-session yields a `done`

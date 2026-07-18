@@ -16,9 +16,9 @@
 
 import type { ExtensionAPI, InlineExtension } from '@earendil-works/pi-coding-agent';
 
+import { makeMlxStreamSimple } from '../stream-adapter.js';
 import { GenmlxModelHost } from './genmlx-model-host.js';
 import type { GenmlxModelInfo } from './models.js';
-import { makeMlxStreamSimple } from '../stream-adapter.js';
 
 export function createGenmlxProviderExtension(models: GenmlxModelInfo[], host?: GenmlxModelHost): InlineExtension {
   const resolvedHost = host ?? new GenmlxModelHost(models.map((m) => m.discovered));
@@ -32,6 +32,22 @@ export function createGenmlxProviderExtension(models: GenmlxModelInfo[], host?: 
         apiKey: 'genmlx-local',
         streamSimple,
         models: models.map((m) => m.piModel),
+      });
+      // O(1) counterfactual fork (genmlx-lin9): an IN-PROCESS pi fork fires
+      // session_start with reason "fork" AFTER the new runtime binds, so
+      // ctx.sessionManager already names the NEW session while the event
+      // carries the SOURCE file. The hint lets the forked session's first
+      // turn mint its engine session as a branch-from of the source —
+      // delta-prefilling the shared prefix instead of cold-replaying it.
+      // (The startup `--fork` is a fresh process with no resident engine —
+      // no event fires there, and a cold prefill is genuinely required.)
+      pi.on('session_start', (event, ctx) => {
+        if (event.reason === 'fork' && event.previousSessionFile) {
+          const newId = ctx.sessionManager?.getSessionId();
+          if (newId) {
+            resolvedHost.noteFork(newId, event.previousSessionFile);
+          }
+        }
       });
     },
   };

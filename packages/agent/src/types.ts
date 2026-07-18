@@ -19,6 +19,16 @@ export interface StreamableSession {
   reset(): void | Promise<void>;
   /** Replace the session's committed history wholesale (turnCount must be 0). */
   primeHistory(messages: ChatMessage[]): void;
-  /** Run one turn from the primed history as a ChatStreamEvent stream. */
-  startFromHistoryStream(config?: ChatConfig, signal?: AbortSignal): AsyncGenerator<ChatStreamEvent>;
+  /**
+   * Run one turn from the primed history as a ChatStreamEvent stream.
+   * `piSessionId` (pi's `options.sessionId`, genmlx-lin9) lets a session
+   * implementation key per-conversation engine state; the v1 `ChatSession`
+   * takes two parameters and satisfies this structurally (fewer-params
+   * assignability) — it simply never sees the id.
+   */
+  startFromHistoryStream(
+    config?: ChatConfig,
+    signal?: AbortSignal,
+    piSessionId?: string,
+  ): AsyncGenerator<ChatStreamEvent>;
 }
