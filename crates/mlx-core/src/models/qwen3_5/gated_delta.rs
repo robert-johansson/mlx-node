@@ -136,13 +136,17 @@ fn compute_g_log(a_log: &MxArray, a: &MxArray, dt_bias: &MxArray) -> Result<MxAr
     sp.mul(&scale)?.negative()
 }
 
-/// Fused gating: computes both beta and g in a single Metal kernel dispatch.
+/// Fused gating: computes both beta and g in a single kernel dispatch
+/// (Metal + CUDA-JIT — the same custom-kernel path as the recurrence).
 ///
 /// beta = sigmoid(b)
 /// g = -exp(a_log) * softplus(a + dt_bias)
 ///
-/// Returns: (beta [B, T, Hv] in input dtype, g [B, T, Hv] in f32)
-fn fused_gdn_gating(
+/// Returns FLAT (beta in input dtype, g in f32) — callers reshape to
+/// [B, T, Hv]. `pub` for the genmlx-core NAPI export (genmlx-krma): the
+/// GenMLX-owned CLJS forward dispatches the same kernel the native forward
+/// uses, replacing its ~8-op composed gate chain per GDN layer.
+pub fn fused_gdn_gating(
     b: &MxArray,
     a: &MxArray,
     a_log: &MxArray,

@@ -1385,6 +1385,48 @@ pub fn gated_delta_step(
     Ok(vec![y, new_state])
 }
 
+/// Fused GDN gating in ONE kernel dispatch (genmlx-krma) — the same kernel
+/// the native qwen3.5 forward uses (Metal + CUDA-JIT): beta = sigmoid(b),
+/// g_log = -exp(a_log) * softplus(a + dt_bias). b/a `[B,T,Hv]` (model
+/// dtype); a_log/dt_bias `[Hv]` f32 (per-head). Returns `[beta, g_log]`
+/// reshaped to `[B,T,Hv]` — beta in b's dtype, g_log f32 (the log-space
+/// gate contract of gatedDeltaScan/Step). NOT differentiable — decode and
+/// scoring paths only. Lazy — builds graph, evals nothing.
+#[napi(js_name = "fusedGdnGating")]
+pub fn fused_gdn_gating_op(
+    b: &MxArray,
+    a: &MxArray,
+    a_log: &MxArray,
+    dt_bias: &MxArray,
+) -> Result<Vec<MxArray>> {
+    let err = |m: String| Error::from_reason(format!("fused_gdn_gating: {m}"));
+    for (name, arr) in [("b", b), ("a", a)] {
+        let nd = arr.ndim()?;
+        if nd != 3 {
+            return Err(err(format!("{name} must be [B,T,Hv] (ndim 3), got ndim {nd}")));
+        }
+    }
+    let (batch, t, hv) = (b.shape_at(0)?, b.shape_at(1)?, b.shape_at(2)?);
+    for (axis, want) in [(0u32, batch), (1, t), (2, hv)] {
+        let got = a.shape_at(axis)?;
+        if got != want {
+            return Err(err(format!("a axis {axis} must be {want} (from b), got {got}")));
+        }
+    }
+    for (name, arr) in [("a_log", a_log), ("dt_bias", dt_bias)] {
+        let nd = arr.ndim()?;
+        if nd != 1 || arr.shape_at(0)? != hv {
+            return Err(err(format!("{name} must be [Hv={hv}] (per-head), got ndim {nd}")));
+        }
+    }
+    let (beta, g_log) =
+        mlx_core::models::qwen3_5::gated_delta::fused_gdn_gating(b, a, a_log, dt_bias, hv as i32)
+            .map_err(|e| err(format!("{e}")))?;
+    let beta = beta.reshape(&[batch, t, hv])?;
+    let g_log = g_log.reshape(&[batch, t, hv])?;
+    Ok(vec![beta, g_log])
+}
+
 /// Dequantize a packed-quantized tensor (mlx.core.dequantize): `w` u32-packed
 /// `[.., out, in/(32/bits)]` with `scales`/`biases` `[.., out, in/group_size]`
 /// back to full precision (scales' dtype unless `out_dtype` >= 0: 0=float32,
