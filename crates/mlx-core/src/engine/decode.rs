@@ -252,6 +252,7 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
         // `generated_tokens`, so pushing it here is safe; both histories
         // advance together at the top.
         generated_tokens.push(token_id);
+        profiler.step();
 
         // Cache-maintenance cadence runs EVERY committed step, here at the
         // loop TOP — including terminal/length-exit steps that break
@@ -343,7 +344,11 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
                 (t, false)
             };
 
-            profiler.begin("eval_caches");
+            // `eval_step` only schedules the sampled token/logit graph for
+            // asynchronous evaluation. Cache materialization is performed by
+            // the next forward boundary, so calling this phase `eval_caches`
+            // made traces look like duplicate cache work.
+            profiler.begin("schedule_eval");
             step.eval_step(&next_token, &logits, budget_forced);
             profiler.end();
 
@@ -494,8 +499,6 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
             Some(next) => y = next,
             None => break,
         }
-
-        profiler.step();
     }
 
     profiler.snapshot_memory_after();
@@ -605,6 +608,8 @@ mod run_decode_loop_tests {
     /// Greedy (T=0) params from a default `ChatConfig` plus overrides.
     fn greedy_params(mutate: impl FnOnce(&mut ChatConfig)) -> ChatParams {
         let mut cfg = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             temperature: Some(0.0),
             ..Default::default()
         };

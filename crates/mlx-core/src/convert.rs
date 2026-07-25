@@ -217,6 +217,245 @@ pub(crate) mod recipe {
         pub(crate) is_moe: bool,
     }
 
+    #[derive(Clone, Debug)]
+    pub(super) struct QwenVisionUniformQuant {
+        mode: &'static str,
+        bits: i32,
+        group_size: i32,
+    }
+
+    pub(super) fn checked_qwen_vision_dequant_handle(
+        handle: *mut mlx_sys::mlx_array,
+        weight_key: &str,
+    ) -> Result<MxArray> {
+        if handle.is_null() {
+            return Err(Error::from_reason(format!(
+                "Failed to dequantize Qwen vision weight '{weight_key}'; refusing to emit packed vision storage for a dense-only loader"
+            )));
+        }
+        MxArray::from_handle(handle, "vision_dequant")
+    }
+
+    fn is_qwen_vision_key(key: &str) -> bool {
+        key.starts_with("vision_tower.")
+            || key.starts_with("model.visual.")
+            || key.contains(".vision_tower.")
+            || key.contains(".visual.")
+    }
+
+    /// Validate the source quantization block before Qwen sanitize performs any
+    /// key rewrite, cast, dequantization, or expert stacking. The Qwen vision
+    /// runtime is dense-only, so convert supports only one uniform packed
+    /// affine/MXFP/NVFP mode for every pre-quantized vision group. A vision
+    /// per-layer override (or plain-FP8/sym8 storage) needs a per-prefix storage
+    /// decoder that does not exist here; reject it instead of silently applying
+    /// the top-level mode to every vision tensor.
+    pub(super) fn qwen_vision_quantization_preflight(
+        weights: &HashMap<String, MxArray>,
+        config: &serde_json::Value,
+    ) -> Result<Option<QwenVisionUniformQuant>> {
+        use crate::models::quant_dispatch::{
+            PerLayerMode, parse_quant_settings, select_quantization_block,
+        };
+
+        // Use the same fail-closed alias selector as every loader: malformed or
+        // divergent modern/legacy blocks reject before any sanitizer mutation.
+        let quant_cfg = select_quantization_block(config)?;
+
+        // This shared parser rejects explicit unknown/non-string top-level and
+        // per-layer modes. Run it before inspecting or transforming arrays so a
+        // bad language-only override cannot be discovered only after vision was
+        // already dequantized.
+        let (top_level_bits, top_level_group_size, top_level_mode, parsed_overrides) =
+            parse_quant_settings(quant_cfg, 8, 32)?;
+
+        let vision_scale_keys: Vec<&str> = weights
+            .keys()
+            .filter(|key| is_qwen_vision_key(key) && key.ends_with(".scales"))
+            .map(String::as_str)
+            .collect();
+        let vision_bias_keys: Vec<&str> = weights
+            .keys()
+            .filter(|key| is_qwen_vision_key(key) && key.ends_with(".biases"))
+            .map(String::as_str)
+            .collect();
+        let vision_fp8_scale_keys: Vec<&str> = weights
+            .keys()
+            .filter(|key| is_qwen_vision_key(key) && key.ends_with(".weight_scale_inv"))
+            .map(String::as_str)
+            .collect();
+
+        let mut has_prequantized_vision = !vision_scale_keys.is_empty()
+            || !vision_bias_keys.is_empty()
+            || !vision_fp8_scale_keys.is_empty();
+        for (key, weight) in weights
+            .iter()
+            .filter(|(key, _)| is_qwen_vision_key(key) && key.ends_with(".weight"))
+        {
+            let dtype = weight.dtype()?;
+            if !matches!(dtype, DType::Float32 | DType::Float16 | DType::BFloat16) {
+                has_prequantized_vision = true;
+                let base = key.strip_suffix(".weight").expect("suffix checked");
+                if !weights.contains_key(&format!("{base}.scales"))
+                    && !weights.contains_key(&format!("{base}.weight_scale_inv"))
+                {
+                    return Err(Error::from_reason(format!(
+                        "Qwen vision source has non-float weight '{key}' ({dtype:?}) without a recognized quantization sidecar"
+                    )));
+                }
+            }
+        }
+
+        if has_prequantized_vision {
+            let raw_vision_override =
+                quant_cfg
+                    .and_then(|value| value.as_object())
+                    .is_some_and(|obj| {
+                        obj.iter().any(|(key, value)| {
+                            is_qwen_vision_key(key)
+                                && value.as_object().is_some_and(|entry| {
+                                    entry.contains_key("bits")
+                                        || entry.contains_key("group_size")
+                                        || entry.contains_key("mode")
+                                })
+                        })
+                    });
+            if raw_vision_override || parsed_overrides.keys().any(|key| is_qwen_vision_key(key)) {
+                return Err(Error::from_reason(
+                    "Qwen vision source uses per-layer quantization overrides, but convert's dense-only vision sanitizer supports only one uniform packed mode; dequantize the vision tower before conversion"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // No `.scales`-based packed vision group reaches Step 1b. BF16 vision
+        // and NVIDIA `weight_scale_inv` FP8 continue through their existing
+        // paths after the metadata preflight above.
+        if vision_scale_keys.is_empty() {
+            return Ok(None);
+        }
+
+        let obj = quant_cfg.and_then(|value| value.as_object());
+        if !obj.is_some_and(|obj| {
+            obj.contains_key("mode") && obj.contains_key("bits") && obj.contains_key("group_size")
+        }) {
+            return Err(Error::from_reason(
+                "Qwen vision source has packed .scales storage but no explicit uniform mode/bits/group_size metadata"
+                    .to_string(),
+            ));
+        }
+        let mode = top_level_mode.expect("explicit mode was parsed above");
+        let uniform = match mode {
+            PerLayerMode::Affine => QwenVisionUniformQuant {
+                mode: "affine",
+                bits: top_level_bits,
+                group_size: top_level_group_size,
+            },
+            PerLayerMode::Mxfp4 => QwenVisionUniformQuant {
+                mode: "mxfp4",
+                bits: top_level_bits,
+                group_size: top_level_group_size,
+            },
+            PerLayerMode::Mxfp8 => QwenVisionUniformQuant {
+                mode: "mxfp8",
+                bits: top_level_bits,
+                group_size: top_level_group_size,
+            },
+            PerLayerMode::Nvfp4 => QwenVisionUniformQuant {
+                mode: "nvfp4",
+                bits: top_level_bits,
+                group_size: top_level_group_size,
+            },
+            PerLayerMode::Fp8E4m3 | PerLayerMode::Sym8 => {
+                return Err(Error::from_reason(format!(
+                    "Qwen vision source mode {mode:?} is not a uniform packed mode supported by the dense vision sanitizer; dequantize the vision tower before conversion"
+                )));
+            }
+        };
+
+        for scale_key in &vision_scale_keys {
+            let base = scale_key.strip_suffix(".scales").expect("suffix checked");
+            if !weights.contains_key(&format!("{base}.weight")) {
+                return Err(Error::from_reason(format!(
+                    "Qwen vision quantization group '{base}' is missing its .weight tensor"
+                )));
+            }
+            let has_biases = weights.contains_key(&format!("{base}.biases"));
+            if uniform.mode == "affine" && !has_biases {
+                return Err(Error::from_reason(format!(
+                    "Qwen affine vision quantization group '{base}' is missing mandatory .biases"
+                )));
+            }
+            if uniform.mode != "affine" && has_biases {
+                return Err(Error::from_reason(format!(
+                    "Qwen {} vision quantization group '{base}' unexpectedly has affine .biases",
+                    uniform.mode
+                )));
+            }
+        }
+        for bias_key in &vision_bias_keys {
+            let base = bias_key.strip_suffix(".biases").expect("suffix checked");
+            if !weights.contains_key(&format!("{base}.scales")) {
+                return Err(Error::from_reason(format!(
+                    "Qwen vision quantization group '{base}' has orphaned .biases without .scales"
+                )));
+            }
+        }
+        for scale_key in &vision_fp8_scale_keys {
+            let weight_key = scale_key.replace("_scale_inv", "");
+            if !weights.contains_key(&weight_key) {
+                return Err(Error::from_reason(format!(
+                    "Qwen vision FP8 sidecar '{scale_key}' has no matching weight '{weight_key}'"
+                )));
+            }
+        }
+
+        Ok(Some(uniform))
+    }
+
+    fn individual_qwen_expert_component(key: &str) -> Option<&str> {
+        let parts: Vec<&str> = key.split('.').collect();
+        for index in 0..parts.len().saturating_sub(3) {
+            if parts[index] == "experts"
+                && parts[index + 1].parse::<usize>().is_ok()
+                && matches!(parts[index + 2], "gate_proj" | "up_proj" | "down_proj")
+                && index + 4 == parts.len()
+            {
+                return Some(parts[index + 3]);
+            }
+        }
+        None
+    }
+
+    /// Individual Qwen experts are stacked by consuming only `.weight` arrays.
+    /// Reject quantized groups before any sanitize mutation because their
+    /// per-expert sidecars cannot be losslessly canonicalized into the stacked
+    /// representation. Already-stacked `switch_mlp.*` artifacts never match the
+    /// numeric `experts.{N}` pattern and remain supported.
+    pub(super) fn reject_prequantized_qwen_individual_experts(
+        weights: &HashMap<String, MxArray>,
+    ) -> Result<()> {
+        for (key, value) in weights {
+            match individual_qwen_expert_component(key) {
+                Some("scales" | "biases" | "weight_scale_inv") => {
+                    return Err(Error::from_reason(format!(
+                        "Qwen convert: pre-quantized individual expert source is unsupported (found '{key}'); convert from an unquantized checkpoint or an already-stacked canonical artifact"
+                    )));
+                }
+                Some("weight") => {
+                    let dtype = value.dtype()?;
+                    if !matches!(dtype, DType::Float32 | DType::Float16 | DType::BFloat16) {
+                        return Err(Error::from_reason(format!(
+                            "Qwen convert: pre-quantized individual expert source is unsupported (expert weight '{key}' has non-float dtype {dtype:?}); convert from an unquantized checkpoint or an already-stacked canonical artifact"
+                        )));
+                    }
+                }
+                Some(_) | None => {}
+            }
+        }
+        Ok(())
+    }
+
     impl ConversionRecipe for Qwen35Recipe {
         fn model_types(&self) -> &'static [&'static str] {
             &["qwen3_5", "qwen3_5_moe"]
@@ -245,6 +484,13 @@ pub(crate) mod recipe {
             _tie_word_embeddings: bool,
             _verbose: bool,
         ) -> Result<HashMap<String, MxArray>> {
+            // Both guards borrow the untouched source map and run before ANY
+            // key remap, cast, dequantization, or stacking. This ordering is
+            // load-bearing: an error must not leave a partially-mutated vision
+            // group or discard per-expert quantization sidecars.
+            let vision_quant = qwen_vision_quantization_preflight(&weights, config)?;
+            reject_prequantized_qwen_individual_experts(&weights)?;
+
             let target_dtype = match target_dtype_str {
                 "float32" | "f32" => DType::Float32,
                 "float16" | "f16" => DType::Float16,
@@ -365,17 +611,6 @@ pub(crate) mod recipe {
             // (U32 packed + U8 scales). Dequantize them to bf16 since our vision encoder
             // uses standard Linear layers, not QuantizedLinear.
             {
-                let quant_cfg = config
-                    .get("quantization")
-                    .or_else(|| config.get("quantization_config"));
-                let quant_mode = quant_cfg
-                    .and_then(|q| q["mode"].as_str())
-                    .unwrap_or("affine");
-                let quant_bits = quant_cfg.and_then(|q| q["bits"].as_i64()).unwrap_or(8) as i32;
-                let quant_group_size = quant_cfg
-                    .and_then(|q| q["group_size"].as_i64())
-                    .unwrap_or(32) as i32;
-
                 let vision_scale_keys: Vec<String> = new_weights
                     .keys()
                     .filter(|k| k.starts_with("vision_tower.") && k.ends_with(".scales"))
@@ -383,60 +618,64 @@ pub(crate) mod recipe {
                     .collect();
 
                 if !vision_scale_keys.is_empty() {
+                    let quant = vision_quant.as_ref().ok_or_else(|| {
+                        Error::from_reason(
+                            "Qwen vision quantization preflight did not resolve a uniform packed mode"
+                                .to_string(),
+                        )
+                    })?;
                     info!(
                         "  Dequantizing {} pre-quantized vision weights (mode={}, bits={}, group_size={})...",
                         vision_scale_keys.len(),
-                        quant_mode,
-                        quant_bits,
-                        quant_group_size
+                        quant.mode,
+                        quant.bits,
+                        quant.group_size
                     );
 
-                    let mode_cstr =
-                        std::ffi::CString::new(quant_mode).unwrap_or_else(|_| c"affine".into());
+                    let mode_cstr = std::ffi::CString::new(quant.mode).map_err(|_| {
+                        Error::from_reason("Invalid Qwen vision quantization mode string")
+                    })?;
 
                     for scale_key in &vision_scale_keys {
                         let base = scale_key.strip_suffix(".scales").unwrap();
                         let weight_key = format!("{}.weight", base);
                         let biases_key = format!("{}.biases", base);
 
-                        let scales = new_weights.remove(scale_key);
-                        let weight = new_weights.remove(&weight_key);
-                        let biases = new_weights.remove(&biases_key);
+                        // Borrow the complete source group until the FFI call and
+                        // handle validation succeed. A null handle now aborts the
+                        // conversion without first removing any source tensor.
+                        let w = new_weights.get(&weight_key).ok_or_else(|| {
+                            Error::from_reason(format!(
+                                "Qwen vision quantization group '{base}' lost its .weight after preflight"
+                            ))
+                        })?;
+                        let s = new_weights.get(scale_key).ok_or_else(|| {
+                            Error::from_reason(format!(
+                                "Qwen vision quantization group '{base}' lost its .scales after preflight"
+                            ))
+                        })?;
+                        let biases_ptr = new_weights
+                            .get(&biases_key)
+                            .map_or(std::ptr::null_mut(), |b| b.as_raw_ptr());
+                        let handle = unsafe {
+                            mlx_sys::mlx_dequantize(
+                                w.as_raw_ptr(),
+                                s.as_raw_ptr(),
+                                biases_ptr,
+                                quant.group_size,
+                                quant.bits,
+                                -1, // output dtype from scales
+                                mode_cstr.as_ptr(),
+                            )
+                        };
+                        let dequant = checked_qwen_vision_dequant_handle(handle, &weight_key)?;
+                        let dequant = dequant.astype(target_dtype)?;
+                        dequant.eval();
 
-                        if let (Some(w), Some(s)) = (weight, scales) {
-                            let biases_ptr = biases
-                                .as_ref()
-                                .map_or(std::ptr::null_mut(), |b| b.as_raw_ptr());
-                            let handle = unsafe {
-                                mlx_sys::mlx_dequantize(
-                                    w.as_raw_ptr(),
-                                    s.as_raw_ptr(),
-                                    biases_ptr,
-                                    quant_group_size,
-                                    quant_bits,
-                                    -1, // output dtype from scales
-                                    mode_cstr.as_ptr(),
-                                )
-                            };
-                            if handle.is_null() {
-                                warn!("  Failed to dequantize vision weight: {}", weight_key);
-                                // Put originals back faithfully, including the
-                                // `.biases` sidecar removed above, so a failed
-                                // dequant preserves the complete source quant group
-                                // instead of writing an incomplete (corrupt) one.
-                                new_weights.insert(weight_key, w);
-                                new_weights.insert(scale_key.clone(), s);
-                                if let Some(b) = biases {
-                                    new_weights.insert(biases_key, b);
-                                }
-                            } else {
-                                let dequant = MxArray::from_handle(handle, "vision_dequant")?;
-                                let dequant = dequant.astype(target_dtype)?;
-                                dequant.eval();
-                                new_weights.insert(weight_key, dequant);
-                                info!("    Dequantized: {}", base);
-                            }
-                        }
+                        new_weights.remove(scale_key);
+                        new_weights.remove(&biases_key);
+                        new_weights.insert(weight_key, dequant);
+                        info!("    Dequantized: {}", base);
                     }
 
                     info!(
@@ -1865,14 +2104,12 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         if quant_mode == "nvfp4" {
             validate_nvfp4_recipe(recipe).map_err(Error::from_reason)?;
         }
-        // Unsloth recipe requires imatrix for near-lossless attention/SSM quantization
-        if recipe == "unsloth" && imatrix_path.is_none() {
-            return Err(Error::from_reason(
-                "unsloth recipe requires --imatrix-path: imatrix calibration data is needed \
-                 for near-lossless quantization of attention/SSM layers"
-                    .to_string(),
-            ));
-        }
+        // Legacy Dynamic 2.0 relies on AWQ calibration. The fixed official
+        // Qwen maps may defer this check until family + sanitized tensor-shape
+        // selection below; that late gate prevents a caller which bypasses the
+        // CLI from silently falling back to the legacy predicate without AWQ.
+        validate_unsloth_imatrix_selector(recipe, imatrix_path.as_deref(), quant_mxfp, &quant_mode)
+            .map_err(Error::from_reason)?;
     }
 
     // Validate input directory
@@ -2417,6 +2654,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // Apply AWQ pre-scaling if imatrix provided
     let mut converted_tensors = converted_tensors;
     if let Some(ref imatrix_path) = imatrix_path {
+        reject_awq_for_prequantized_body(&converted_tensors)?;
         let imatrix = crate::utils::imatrix::parse_imatrix(imatrix_path)?;
         let num_layers = infer_num_layers_from_weights(&converted_tensors);
         let modified = apply_awq_prescaling(&mut converted_tensors, &imatrix, 0.5, num_layers)?;
@@ -2479,6 +2717,33 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             }
         );
 
+        // Resolve and validate the fixed Unsloth map before dispatching to a
+        // model-specific quantization branch. Most recipes use the generic
+        // branch below, but privacy-filter owns a dedicated predicate and
+        // would otherwise bypass the late no-imatrix fail-closed gate.
+        let recipe_weight_keys = quant_recipe
+            .as_ref()
+            .map(|_| converted_tensors.keys().cloned().collect::<Vec<_>>());
+        let official_unsloth_kind = match (quant_recipe.as_deref(), recipe_weight_keys.as_deref()) {
+            (Some(recipe), Some(weight_keys)) => {
+                let kind = select_and_validate_official_unsloth_recipe(
+                    recipe,
+                    imatrix_path.as_deref(),
+                    quant_mxfp,
+                    &quant_mode,
+                    &config,
+                    model_type.as_deref(),
+                    weight_keys,
+                )
+                .map_err(Error::from_reason)?;
+                if recipe == "unsloth" && imatrix_path.is_none() {
+                    warn!("{}", UNSLOTH_NO_IMATRIX_WARNING);
+                }
+                kind
+            }
+            _ => None,
+        };
+
         if is_privacy_filter {
             // Privacy-filter has a dedicated predicate: quantize attention
             // projections (q/k/v/o) and MoE experts (gate_up_proj, down_proj);
@@ -2535,7 +2800,9 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 );
             }
         } else if let Some(ref recipe) = quant_recipe {
-            let weight_keys: Vec<String> = converted_tensors.keys().cloned().collect();
+            let weight_keys = recipe_weight_keys
+                .as_deref()
+                .expect("recipe keys are collected whenever quant_recipe is present");
             // Recipes emit affine `Custom` decisions for protected tensors
             // (lm_head, AWQ-corrected attn/SSM projections, etc). Affine
             // quantize only supports group_size ∈ {32, 64, 128}, so when the
@@ -2549,22 +2816,9 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             } else {
                 quant_group_size
             };
-            // Verified Qwen hybrids use Unsloth's official float class map:
-            // `--q-mxfp` translates FP8/NVFP4 to MXFP8/MXFP4, while
-            // `--q-mode nvfp4` preserves NVFP4 for the low FFN class and uses
-            // MXFP8 for the high class. This is not a mechanical rewrite of
-            // the legacy Dynamic 2.0 affine decisions.
-            // The official map is Qwen3.5/Qwen3.6-hybrid-specific. Gate on the
-            // input config (ground truth), the requested sanitizer family, and
-            // the sanitized weight shape. If any of those are unavailable or
-            // disagree, preserve the legacy family-agnostic upgrade wrappers.
-            let is_qwen35_hybrid =
-                is_qwen35_hybrid_checkpoint(&config, model_type.as_deref(), &weight_keys);
-            let official_unsloth_kind =
-                select_official_unsloth_recipe(recipe, quant_mxfp, &quant_mode, is_qwen35_hybrid);
             let predicate = match official_unsloth_kind {
-                Some(kind) => build_official_unsloth_recipe(&weight_keys, kind),
-                None => build_predicate_for_recipe(recipe, &weight_keys, quant_bits, recipe_gs)
+                Some(kind) => build_official_unsloth_recipe(weight_keys, kind),
+                None => build_predicate_for_recipe(recipe, weight_keys, quant_bits, recipe_gs)
                     .map_err(Error::from_reason)?,
             };
             let predicate: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
@@ -2810,31 +3064,15 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         // on mode=="sym8" and never read group_size for sym8 layers. Per-layer
         // affine fallbacks (routers/gates, stacked experts, K%16!=0) carry
         // their own complete {bits, group_size, mode} override entries.
-        let group_size_value = if quant_mode_effective == "sym8" {
-            serde_json::Value::Null
-        } else {
-            serde_json::json!(quant_group_size_effective)
-        };
-        let mut quant_obj = serde_json::json!({
-            "group_size": group_size_value,
-            "bits": quant_bits_effective,
-            "mode": quant_mode_effective,
-        });
-        if let Some(obj) = quant_obj.as_object_mut() {
-            for (path, override_val) in &per_layer_overrides {
-                if is_mtp_key(path) {
-                    continue;
-                }
-                // Privacy-filter uses bare `model.*` keys natively; other models
-                // need the `language_model.model.*` prefix expected by mlx-lm.
-                let key = if is_privacy_filter {
-                    path.clone()
-                } else {
-                    crate::utils::normalize_override_key(path)
-                };
-                obj.insert(key, override_val.clone());
-            }
-        }
+        let group_size = (quant_mode_effective != "sym8").then_some(quant_group_size_effective);
+        let quant_obj = build_quantization_object(
+            quant_bits_effective,
+            group_size,
+            &quant_mode_effective,
+            &per_layer_overrides,
+            is_privacy_filter,
+            /* skip_mtp */ true,
+        );
         output_config["quantization"] = quant_obj.clone();
         output_config["quantization_config"] = quant_obj;
     }
@@ -4045,17 +4283,68 @@ fn is_qwen35_hybrid_checkpoint(
         && has_qwen35_hybrid_weight_shape(weight_keys)
 }
 
-/// Which official Unsloth float class map to emit. The two variants differ only
-/// in the early-FFN low format; their MXFP8 and BF16 tensor classes are shared.
+/// Which fixed Unsloth tensor-class map to emit. Apple translates the source
+/// classes to MXFP4/MXFP8; DGX preserves NVFP4 and plain per-output E4M3 FP8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OfficialUnslothRecipeKind {
-    /// Translate the official NVFP4 class to MLX MXFP4 (4/32).
+    /// Translate the upstream NVFP4 class to MLX MXFP4 (4/32).
     Mxfp,
-    /// Preserve the official DGX NVFP4 class (4/16).
+    /// Preserve the DGX NVFP4 (4/16) + plain E4M3 FP8 weight classes.
     Nvfp4,
 }
 
-/// Select an official class map only for a verified Qwen3.5/Qwen3.6 hybrid
+/// User-facing warning for a verified fixed Unsloth map without calibration.
+/// The tensor-class assignment is deterministic and remains identical; only
+/// the optional AWQ weight reparameterization is absent.
+pub(crate) const UNSLOTH_NO_IMATRIX_WARNING: &str = "Unsloth fixed class map selected without --imatrix-path: AWQ pre-scaling is skipped; \
+     the MXFP4/MXFP8 or NVFP4/plain-FP8 class map is unchanged, but quantization quality may be lower.";
+
+/// Early imatrix policy gate, before model loading or MLX initialization.
+///
+/// Plain affine Unsloth is the legacy Dynamic 2.0 recipe and still requires
+/// calibration. `--q-mxfp` and `--q-mode nvfp4` merely defer the decision:
+/// only a later, independently verified fixed Qwen class-map selection may
+/// actually proceed without an imatrix.
+pub(crate) fn validate_unsloth_imatrix_selector(
+    recipe: &str,
+    imatrix_path: Option<&str>,
+    quant_mxfp: bool,
+    quant_mode: &str,
+) -> std::result::Result<(), String> {
+    if recipe != "unsloth" || imatrix_path.is_some() || quant_mxfp || quant_mode == "nvfp4" {
+        return Ok(());
+    }
+    Err(
+        "legacy affine unsloth recipe requires --imatrix-path for AWQ pre-scaling; \
+         without calibration, only the fixed tensor-class maps selected by --q-mxfp or \
+         --q-mode nvfp4 are supported"
+            .to_string(),
+    )
+}
+
+/// Late fail-closed gate after family + sanitized tensor-shape selection.
+///
+/// A no-imatrix request is valid only if it selected one of the fixed
+/// maps. This prevents the SafeTensors and GGUF backends from falling through
+/// to the family-agnostic legacy predicate when callers bypass CLI validation.
+pub(crate) fn validate_unsloth_imatrix_after_selection(
+    recipe: &str,
+    imatrix_path: Option<&str>,
+    official_kind: Option<OfficialUnslothRecipeKind>,
+) -> std::result::Result<(), String> {
+    if recipe != "unsloth" || imatrix_path.is_some() || official_kind.is_some() {
+        return Ok(());
+    }
+    Err(
+        "unsloth without --imatrix-path is supported only for a verified Qwen3.5/Qwen3.6 \
+         hybrid checkpoint using the fixed --q-mxfp or --q-mode nvfp4 class map; \
+         family/shape validation did not select a fixed map, so refusing to fall back \
+         to legacy Dynamic 2.0 without AWQ calibration"
+            .to_string(),
+    )
+}
+
+/// Select a fixed class map only for a verified Qwen3.5/Qwen3.6 hybrid
 /// checkpoint. Plain affine and non-Qwen/ambiguous inputs continue through the
 /// legacy Dynamic 2.0 predicate and its existing upgrade wrappers.
 pub(crate) fn select_official_unsloth_recipe(
@@ -4076,7 +4365,30 @@ pub(crate) fn select_official_unsloth_recipe(
     }
 }
 
-/// Build the official Unsloth float class map for Qwen3.5 hybrid models.
+/// Select and validate the SafeTensors fixed Unsloth class map from the input
+/// config, requested sanitizer family, and sanitized tensor inventory.
+///
+/// This helper is deliberately called before model-specific quantization
+/// dispatch. A sanitizer-managed branch (currently privacy-filter) must not be
+/// able to bypass the late no-imatrix gate merely because it uses a dedicated
+/// predicate instead of [`build_predicate_for_recipe`].
+fn select_and_validate_official_unsloth_recipe(
+    recipe: &str,
+    imatrix_path: Option<&str>,
+    quant_mxfp: bool,
+    quant_mode: &str,
+    config: &serde_json::Value,
+    requested_model_type: Option<&str>,
+    weight_keys: &[String],
+) -> std::result::Result<Option<OfficialUnslothRecipeKind>, String> {
+    let is_qwen35_hybrid = is_qwen35_hybrid_checkpoint(config, requested_model_type, weight_keys);
+    let official_kind =
+        select_official_unsloth_recipe(recipe, quant_mxfp, quant_mode, is_qwen35_hybrid);
+    validate_unsloth_imatrix_after_selection(recipe, imatrix_path, official_kind)?;
+    Ok(official_kind)
+}
+
+/// Build the fixed Unsloth tensor-class map for Qwen3.5 hybrid models.
 ///
 /// Selected for verified Qwen hybrids under either `--q-mxfp` (early FFNs use
 /// MXFP4) or `--q-mode nvfp4` (early FFNs use NVFP4). The existing
@@ -4084,10 +4396,11 @@ pub(crate) fn select_official_unsloth_recipe(
 /// fallback for non-Qwen/ambiguous inputs. AWQ pre-scaling is unchanged.
 ///
 /// The language-model depth is inferred from the weight keys. FFNs in the final
-/// eight transformer layers use MXFP8; earlier FFNs use the selected MXFP4 or
-/// NVFP4 low format. Attention, GDN qkv/z/out, and lm_head use MXFP8 at every
-/// depth. Embeddings, router gates, split GDN a/b, vision, MTP, norms, and
-/// recurrent parameters remain BF16.
+/// eight transformer layers use the selected high format: MXFP8 for `Mxfp`,
+/// plain per-output E4M3 FP8 for `Nvfp4`. Earlier FFNs use MXFP4 or NVFP4,
+/// respectively. Attention, GDN qkv/z/out, and lm_head use the same selected
+/// high format at every depth. Embeddings, router gates, split GDN a/b, vision,
+/// MTP, norms, and recurrent parameters remain BF16.
 pub(crate) fn build_official_unsloth_recipe(
     weight_keys: &[String],
     kind: OfficialUnslothRecipeKind,
@@ -4114,6 +4427,11 @@ pub(crate) fn build_official_unsloth_recipe(
             group_size: 32,
             mode: "mxfp8".to_string(),
         };
+        let fp8_e4m3 = || QuantDecision::Custom {
+            bits: crate::quant::fp8_weight::FP8_E4M3_BITS,
+            group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
+            mode: crate::quant::fp8_weight::FP8_E4M3_MODE.to_string(),
+        };
         let mxfp4 = || QuantDecision::Custom {
             bits: 4,
             group_size: 32,
@@ -4127,6 +4445,10 @@ pub(crate) fn build_official_unsloth_recipe(
         let low_ffn = || match kind {
             OfficialUnslothRecipeKind::Mxfp => mxfp4(),
             OfficialUnslothRecipeKind::Nvfp4 => nvfp4(),
+        };
+        let high = || match kind {
+            OfficialUnslothRecipeKind::Mxfp => mxfp8(),
+            OfficialUnslothRecipeKind::Nvfp4 => fp8_e4m3(),
         };
 
         // Fail closed for side modules and embeddings, even when a nested key
@@ -4142,9 +4464,9 @@ pub(crate) fn build_official_unsloth_recipe(
         }
 
         // should_quantize() excludes lm_head family-wide, but Qwen3.5's head is
-        // mode-aware and the official MXFP map explicitly assigns it MXFP8.
+        // mode-aware and the fixed map explicitly assigns its high format.
         if key.contains("lm_head") && key.ends_with(".weight") {
-            return mxfp8();
+            return high();
         }
 
         if !should_quantize(key, /* embed_quantizable */ false) {
@@ -4167,7 +4489,7 @@ pub(crate) fn build_official_unsloth_recipe(
             || key.contains("linear_attn.in_proj_z")
             || key.contains("linear_attn.out_proj");
         if is_attention || is_gdn {
-            return mxfp8();
+            return high();
         }
 
         // Covers dense MLPs, stacked routed experts (`switch_mlp`), raw expert
@@ -4176,7 +4498,7 @@ pub(crate) fn build_official_unsloth_recipe(
             && (key.contains("gate_proj") || key.contains("up_proj") || key.contains("down_proj"));
         if is_ffn {
             return match extract_layer_index(key) {
-                Some(layer) if layer >= final_eight_start => mxfp8(),
+                Some(layer) if layer >= final_eight_start => high(),
                 Some(_) => low_ffn(),
                 None => QuantDecision::Skip,
             };
@@ -4733,7 +5055,8 @@ pub(crate) const NVFP4_NO_RECIPE_ERROR: &str = "--q-mode nvfp4 requires --q-reci
      Pure NVFP4 corrupts sensitivity-critical tensors (linear_attn.out_proj, \
      self_attn.o_proj, mlp.down_proj, in_proj_qkv/z, q/k/v_proj) without a \
      recipe's per-tensor affine fallbacks. 'qwen3_5' works without an \
-     imatrix; 'unsloth' is the gold-standard but requires --imatrix-path.";
+     imatrix; 'unsloth' may omit it only when family/shape validation selects \
+     the fixed official Qwen class map.";
 
 /// Recipe predicates drive per-key `QuantDecision`s that bypass every
 /// sym8-scoped guard in the legacy (no-recipe) path: the `sym8_eligible`
@@ -4850,6 +5173,50 @@ const QUANTIZE_TILE_NUM_EXPERTS: i64 = 32;
 /// guaranteed to split into at least one full tile plus an optional
 /// remainder (256 → 8 tiles of 32; 128 → 4; 64 → 2; 32 → 1).
 const QUANTIZE_TILE_THRESHOLD_NUM_EXPERTS: i64 = 32;
+
+/// Quantize a plain per-output-channel E4M3 weight, tiling large 3-D expert
+/// stacks along axis 0. This mirrors [`quantize_with_optional_tiling`]'s
+/// watchdog discipline: each expert tile is evaluated and synchronized before
+/// the next tile is built, then raw E4M3 weights and `[E,N,1]` BF16 scales are
+/// concatenated independently. Slicing the expert axis cannot change a row's
+/// per-output max, so the result is bit-identical to one whole-stack call.
+fn quantize_plain_fp8_with_optional_tiling(
+    array: &MxArray,
+    key_for_error: &str,
+) -> Result<(MxArray, MxArray)> {
+    let ndim = array.ndim()? as usize;
+    let leading_dim = if ndim == 3 { array.shape_at(0)? } else { 0 };
+    let should_tile = ndim == 3 && leading_dim >= QUANTIZE_TILE_THRESHOLD_NUM_EXPERTS;
+
+    if !should_tile {
+        return crate::quant::fp8_weight::quantize_per_output_channel(array, key_for_error);
+    }
+
+    let mut weight_chunks = Vec::new();
+    let mut scale_chunks = Vec::new();
+    let mut start = 0;
+    while start < leading_dim {
+        let end = (start + QUANTIZE_TILE_NUM_EXPERTS).min(leading_dim);
+        let slice = array.slice_axis(0, start, end)?;
+        let (weight, scales) = crate::quant::fp8_weight::quantize_per_output_channel(
+            &slice,
+            &format!("{key_for_error} chunk [{start}, {end})"),
+        )?;
+        weight.eval();
+        scales.eval();
+        crate::array::memory::synchronize_and_clear_cache();
+        weight_chunks.push(weight);
+        scale_chunks.push(scales);
+        start = end;
+    }
+
+    let weight_refs = weight_chunks.iter().collect::<Vec<_>>();
+    let scale_refs = scale_chunks.iter().collect::<Vec<_>>();
+    Ok((
+        MxArray::concatenate_many(weight_refs, Some(0))?,
+        MxArray::concatenate_many(scale_refs, Some(0))?,
+    ))
+}
 
 /// Quantize `array` with optional axis-0 tiling for large 3D MoE expert
 /// tensors. For 2D inputs and small 3D inputs this is a direct passthrough
@@ -5122,6 +5489,175 @@ struct QuantEntry {
     mode: String,
 }
 
+fn serialized_quant_override(entry: &QuantEntry) -> serde_json::Value {
+    let group_size = if entry.mode == crate::quant::fp8_weight::FP8_E4M3_MODE {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!(entry.group_size)
+    };
+    serde_json::json!({
+        "bits": entry.bits,
+        "group_size": group_size,
+        "mode": entry.mode,
+    })
+}
+
+fn record_quant_override_if_non_default(
+    overrides: &mut HashMap<String, serde_json::Value>,
+    prefix: &str,
+    entry: &QuantEntry,
+    default_bits: i32,
+    default_group_size: i32,
+    default_mode: &str,
+) {
+    if entry.bits != default_bits
+        || entry.group_size != default_group_size
+        || entry.mode != default_mode
+    {
+        overrides.insert(prefix.to_string(), serialized_quant_override(entry));
+    }
+}
+
+/// Validate that an already-sidecarred tensor actually matches the format the
+/// active recipe resolves for it. Re-conversion cannot dequantize/requantize,
+/// so retaining bytes under different metadata would be silent corruption.
+fn validate_existing_quantized_entry(
+    weights: &HashMap<String, MxArray>,
+    prefix: &str,
+    entry: &QuantEntry,
+) -> Result<()> {
+    let weight = weights.get(&format!("{prefix}.weight")).ok_or_else(|| {
+        Error::from_reason(format!(
+            "already-quantized group '{prefix}' is missing its .weight tensor"
+        ))
+    })?;
+    let scales = weights.get(&format!("{prefix}.scales")).ok_or_else(|| {
+        Error::from_reason(format!(
+            "already-quantized group '{prefix}' uses a non-canonical or missing scale sidecar; \
+             re-conversion requires .scales so recipe metadata can be preserved safely"
+        ))
+    })?;
+    let weight_dtype = weight.dtype()?;
+    let scales_dtype = scales.dtype()?;
+
+    if entry.mode == crate::quant::fp8_weight::FP8_E4M3_MODE {
+        if weights.contains_key(&format!("{prefix}.biases")) {
+            return Err(Error::from_reason(format!(
+                "already-quantized plain FP8 group '{prefix}' unexpectedly has .biases"
+            )));
+        }
+        let ndim = weight.ndim()? as usize;
+        if ndim != 2 && ndim != 3 {
+            return Err(Error::from_reason(format!(
+                "already-quantized plain FP8 group '{prefix}' must be rank-2 [N,K] or \
+                 rank-3 [E,N,K], got rank {ndim}"
+            )));
+        }
+        crate::quant::fp8_weight::validate_storage_metadata(weight, scales, ndim, prefix)?;
+        return Ok(());
+    }
+
+    let scale_is_float = matches!(
+        scales_dtype,
+        DType::Float32 | DType::Float16 | DType::BFloat16
+    );
+    match entry.mode.as_str() {
+        "affine" => {
+            if weight_dtype != DType::Uint32 || !scale_is_float {
+                return Err(Error::from_reason(format!(
+                    "already-quantized group '{prefix}' does not match resolved affine storage: \
+                     weight={weight_dtype:?}, scales={scales_dtype:?}"
+                )));
+            }
+            let biases = weights.get(&format!("{prefix}.biases")).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "already-quantized affine group '{prefix}' is missing mandatory .biases"
+                ))
+            })?;
+            if !matches!(
+                biases.dtype()?,
+                DType::Float32 | DType::Float16 | DType::BFloat16
+            ) {
+                return Err(Error::from_reason(format!(
+                    "already-quantized affine group '{prefix}' has non-floating .biases"
+                )));
+            }
+        }
+        "mxfp4" | "mxfp8" | "nvfp4" => {
+            if weight_dtype != DType::Uint32 || scales_dtype != DType::Uint8 {
+                return Err(Error::from_reason(format!(
+                    "already-quantized group '{prefix}' does not match resolved {} storage: \
+                     weight={weight_dtype:?}, scales={scales_dtype:?}",
+                    entry.mode
+                )));
+            }
+            if weights.contains_key(&format!("{prefix}.biases")) {
+                return Err(Error::from_reason(format!(
+                    "already-quantized {} group '{prefix}' unexpectedly has .biases",
+                    entry.mode
+                )));
+            }
+        }
+        "sym8" => {
+            if weight_dtype != DType::Int8 || !scale_is_float {
+                return Err(Error::from_reason(format!(
+                    "already-quantized group '{prefix}' does not match resolved sym8 storage: \
+                     weight={weight_dtype:?}, scales={scales_dtype:?}"
+                )));
+            }
+        }
+        other => {
+            return Err(Error::from_reason(format!(
+                "cannot preserve already-quantized group '{prefix}': unsupported resolved mode '{other}'"
+            )));
+        }
+    }
+
+    let weight_shape = weight.shape()?.to_vec();
+    let scale_shape = scales.shape()?.to_vec();
+    if weight_shape.len() < 2 || weight_shape.len() != scale_shape.len() {
+        return Err(Error::from_reason(format!(
+            "already-quantized group '{prefix}' has incompatible weight/scales shapes \
+             {weight_shape:?} and {scale_shape:?}"
+        )));
+    }
+    let mut expected_scale_shape = weight_shape[..weight_shape.len() - 1].to_vec();
+    if entry.mode == "sym8" {
+        // sym8 keeps source orientation and stores one scale per output row.
+    } else {
+        if entry.bits <= 0 || 32 % entry.bits != 0 || entry.group_size <= 0 {
+            return Err(Error::from_reason(format!(
+                "already-quantized group '{prefix}' resolved invalid bits/group_size {}/{}",
+                entry.bits, entry.group_size
+            )));
+        }
+        let original_k = weight_shape[weight_shape.len() - 1] * (32 / entry.bits) as i64;
+        if original_k % entry.group_size as i64 != 0 {
+            return Err(Error::from_reason(format!(
+                "already-quantized group '{prefix}' packed K={original_k} is not divisible by resolved group_size {}",
+                entry.group_size
+            )));
+        }
+        expected_scale_shape.push(original_k / entry.group_size as i64);
+    }
+    if scale_shape != expected_scale_shape {
+        return Err(Error::from_reason(format!(
+            "already-quantized group '{prefix}' scale shape {scale_shape:?} does not match \
+             resolved {} bits={} group_size={} expectation {expected_scale_shape:?}",
+            entry.mode, entry.bits, entry.group_size
+        )));
+    }
+    if entry.mode == "affine" {
+        let biases_shape = weights[&format!("{prefix}.biases")].shape()?.to_vec();
+        if biases_shape != expected_scale_shape {
+            return Err(Error::from_reason(format!(
+                "already-quantized affine group '{prefix}' bias shape {biases_shape:?} does not match {expected_scale_shape:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The emission-loop quantizability gates, hoisted into ONE place so the sym8
 /// group-coherence pass (`enforce_sym8_group_coherence`) and the emission loop
 /// in `quantize_weights_inner` can never diverge: a `QuantEntry` actually
@@ -5135,7 +5671,11 @@ fn quant_entry_emits(array: &MxArray, mode: &str, group_size: i32) -> Result<boo
         return Ok(false);
     }
     let last_dim = array.shape_at((ndim - 1) as u32)? as i32;
-    Ok(if mode == "sym8" {
+    Ok(if mode == crate::quant::fp8_weight::FP8_E4M3_MODE {
+        // Plain FP8 is per-output-channel and has no K-axis group alignment.
+        // Its quantizer strictly accepts only dense [N,K] and expert [E,N,K].
+        ndim == 2 || ndim == 3
+    } else if mode == "sym8" {
         last_dim % 16 == 0
     } else {
         last_dim % group_size == 0
@@ -5471,6 +6011,7 @@ fn quantize_weights_inner(
     // Collect quantization decisions for each weight key (see the
     // module-level `QuantEntry`).
     let mut entries: Vec<QuantEntry> = Vec::new();
+    let mut preexisting_overrides: HashMap<String, serde_json::Value> = HashMap::new();
 
     for key in weights.keys() {
         // Guard against re-quantizing an ALREADY-quantized checkpoint. The
@@ -5486,9 +6027,70 @@ fn quantize_weights_inner(
             // packed/affine group carries `{base}.scales`; an FP8 group carries
             // `{base}.weight_scale_inv`. Convert has no dequant-then-requant
             // path, so re-quantizing here would double-quantize / corrupt.
-            if weights.contains_key(&format!("{base}.scales"))
-                || weights.contains_key(&format!("{base}.weight_scale_inv"))
-            {
+            let has_scales = weights.contains_key(&format!("{base}.scales"));
+            let has_source_fp8_scale = weights.contains_key(&format!("{base}.weight_scale_inv"));
+            if has_scales || has_source_fp8_scale {
+                if let Some(pred) = predicate {
+                    let entry = match pred(key) {
+                        QuantDecision::Skip => {
+                            return Err(Error::from_reason(format!(
+                                "cannot safely re-convert already-quantized group '{base}': \
+                                 the active recipe requires this tensor to remain dense"
+                            )));
+                        }
+                        QuantDecision::Default => {
+                            if !should_quantize(key, embed_quantizable) {
+                                return Err(Error::from_reason(format!(
+                                    "cannot safely re-convert already-quantized group '{base}': \
+                                     the active recipe/default predicate does not quantize this key"
+                                )));
+                            }
+                            QuantEntry {
+                                key: key.clone(),
+                                bits: default_bits,
+                                group_size: default_group_size,
+                                mode: default_mode.to_string(),
+                            }
+                        }
+                        QuantDecision::Custom {
+                            bits,
+                            group_size,
+                            mode,
+                        } => QuantEntry {
+                            key: key.clone(),
+                            bits,
+                            group_size,
+                            mode,
+                        },
+                    };
+                    validate_existing_quantized_entry(weights, base, &entry)?;
+                    record_quant_override_if_non_default(
+                        &mut preexisting_overrides,
+                        base,
+                        &entry,
+                        default_bits,
+                        default_group_size,
+                        default_mode,
+                    );
+                } else if has_scales {
+                    // Plain FP8 cannot inherit any supported uniform top-level
+                    // default. Without a recipe there is no safe way to
+                    // reconstruct its required per-layer mode override.
+                    let weight = weights.get(key).expect("key comes from weights.keys()");
+                    let scales = &weights[&format!("{base}.scales")];
+                    if weight.dtype()? == DType::Uint8
+                        && matches!(
+                            scales.dtype()?,
+                            DType::Float32 | DType::Float16 | DType::BFloat16
+                        )
+                    {
+                        return Err(Error::from_reason(format!(
+                            "cannot safely re-convert plain FP8 group '{base}' without a recipe: \
+                             its fp8_e4m3 per-layer override cannot be inferred from the \
+                             requested top-level mode"
+                        )));
+                    }
+                }
                 info!(
                     "skipping quantization of '{}': already quantized (sidecar present)",
                     key
@@ -5682,7 +6284,7 @@ fn quantize_weights_inner(
         default_group_size
     );
 
-    let mut per_layer_overrides: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut per_layer_overrides = preexisting_overrides;
     let mut count = 0;
 
     for entry in &entries {
@@ -5702,22 +6304,29 @@ fn quantize_weights_inner(
         // Eval to materialize (prevents lazy graph OOM)
         array.eval();
 
-        let (q_weight, q_scales, q_biases) = if entry.mode == "sym8" {
-            // Per-output-channel symmetric int8: int8 [N,K] .weight (source
-            // orientation, NO packing) + f32 [N] .scales, NO .biases.
-            let (q, s) = sym8_quantize_store(&array, &entry.key)?;
-            (q, s, None)
-        } else {
-            let mode_c = CString::new(entry.mode.as_str())
-                .map_err(|_| Error::from_reason("Invalid quantize mode string"))?;
-            quantize_with_optional_tiling(
-                &array,
-                entry.group_size,
-                entry.bits,
-                mode_c.as_c_str(),
-                &entry.key,
-            )?
-        };
+        let (q_weight, q_scales, q_biases) =
+            if entry.mode == crate::quant::fp8_weight::FP8_E4M3_MODE {
+                // Plain E4M3 checkpoint storage: raw Uint8 [...,N,K] + BF16
+                // [...,N,1] inverse/dequant scale. Runtime reconstructs BF16 once
+                // at load and keeps activation math A16; this is not MXFP8/W8A8.
+                let (q, s) = quantize_plain_fp8_with_optional_tiling(&array, &entry.key)?;
+                (q, s, None)
+            } else if entry.mode == "sym8" {
+                // Per-output-channel symmetric int8: int8 [N,K] .weight (source
+                // orientation, NO packing) + f32 [N] .scales, NO .biases.
+                let (q, s) = sym8_quantize_store(&array, &entry.key)?;
+                (q, s, None)
+            } else {
+                let mode_c = CString::new(entry.mode.as_str())
+                    .map_err(|_| Error::from_reason("Invalid quantize mode string"))?;
+                quantize_with_optional_tiling(
+                    &array,
+                    entry.group_size,
+                    entry.bits,
+                    mode_c.as_c_str(),
+                    &entry.key,
+                )?
+            };
 
         let prefix = entry.key.strip_suffix(".weight").unwrap_or(&entry.key);
         weights.insert(format!("{}.weight", prefix), q_weight);
@@ -5731,19 +6340,14 @@ fn quantize_weights_inner(
         // Use the weight key as-is (minus .weight suffix) so that the override
         // key matches the module path in mlx-lm/mlx-vlm's class_predicate.
         // Our own persistence.rs strips prefixes on read, so it handles any format.
-        if entry.bits != default_bits
-            || entry.group_size != default_group_size
-            || entry.mode != default_mode
-        {
-            per_layer_overrides.insert(
-                prefix.to_string(),
-                serde_json::json!({
-                    "bits": entry.bits,
-                    "group_size": entry.group_size,
-                    "mode": entry.mode,
-                }),
-            );
-        }
+        record_quant_override_if_non_default(
+            &mut per_layer_overrides,
+            prefix,
+            entry,
+            default_bits,
+            default_group_size,
+            default_mode,
+        );
 
         count += 1;
 
@@ -5780,6 +6384,38 @@ fn quantize_weights(
     embed_quantizable: bool,
 ) -> Result<HashMap<String, serde_json::Value>> {
     quantize_weights_inner(weights, bits, group_size, mode, None, embed_quantizable)
+}
+
+/// Build the canonical quantization config object used by both SafeTensors and
+/// GGUF writers. Keeping normalization and null-group serialization here makes
+/// it impossible for the two alias blocks or conversion frontends to diverge.
+pub(crate) fn build_quantization_object(
+    bits: i32,
+    group_size: Option<i32>,
+    mode: &str,
+    per_layer_overrides: &HashMap<String, serde_json::Value>,
+    is_privacy_filter: bool,
+    skip_mtp: bool,
+) -> serde_json::Value {
+    let mut quant_obj = serde_json::json!({
+        "group_size": group_size,
+        "bits": bits,
+        "mode": mode,
+    });
+    if let Some(obj) = quant_obj.as_object_mut() {
+        for (path, override_value) in per_layer_overrides {
+            if skip_mtp && is_mtp_key(path) {
+                continue;
+            }
+            let key = if is_privacy_filter {
+                path.clone()
+            } else {
+                crate::utils::normalize_override_key(path)
+            };
+            obj.insert(key, override_value.clone());
+        }
+    }
+    quant_obj
 }
 
 /// Public wrapper for quantize_weights, accessible from other crate modules (e.g., GGUF converter).
@@ -5880,6 +6516,31 @@ fn dequant_fp8(weight: &MxArray, scale_inv: &MxArray, target_dtype: DType) -> Re
 }
 
 // ── AWQ Pre-Scaling ─────────────────────────────────────────────────────────
+
+/// Reject AWQ reparameterization of an already-quantized transformer body.
+///
+/// AWQ multiplies projection weights and folds inverse scales into norms. On a
+/// converted checkpoint those projection weights are packed Uint32/Uint8 and
+/// the norms may already carry the prior AWQ fold; applying it again corrupts
+/// both while leaving sidecar shapes superficially valid. There is no
+/// dequantize/requantize path, so an imatrix request must fail before mutation.
+pub(crate) fn reject_awq_for_prequantized_body(weights: &HashMap<String, MxArray>) -> Result<()> {
+    let sidecar = weights.keys().find(|key| {
+        let normalized = crate::models::mtp_drafter::strip_wrapper_prefix(key);
+        normalized.starts_with("layers.")
+            && (normalized.ends_with(".scales")
+                || normalized.ends_with(".biases")
+                || normalized.ends_with(".weight_scale_inv"))
+    });
+    if let Some(sidecar) = sidecar {
+        return Err(Error::from_reason(format!(
+            "Cannot apply --imatrix-path AWQ pre-scaling to an already-quantized model body: \
+             found quantization sidecar '{sidecar}'. Packed weights cannot be safely AWQ-scaled \
+             and this converter has no dequantize/requantize path; refusing before mutating tensors."
+        )));
+    }
+    Ok(())
+}
 
 /// Apply AWQ-style pre-scaling using imatrix importance scores.
 ///
@@ -6250,6 +6911,59 @@ pub(crate) fn infer_num_layers_from_weights(weights: &HashMap<String, MxArray>) 
 mod tests {
     use super::*;
     use crate::convert::recipe::{self, ConversionRecipe};
+
+    #[test]
+    fn imatrix_rejects_prequantized_body_before_mutating_packed_weight_or_norm() {
+        let packed = MxArray::from_uint32(&[0x1234_5678, 0x9abc_def0], &[1, 2]).unwrap();
+        let scales = MxArray::from_uint8(&[127], &[1, 1]).unwrap();
+        let norm = MxArray::from_float32(&[1.25, 0.75], &[2])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let weights = HashMap::from([
+            ("model.layers.0.mlp.gate_proj.weight".to_string(), packed),
+            ("model.layers.0.mlp.gate_proj.scales".to_string(), scales),
+            (
+                "model.layers.0.post_attention_layernorm.weight".to_string(),
+                norm,
+            ),
+        ]);
+        let packed_before = weights["model.layers.0.mlp.gate_proj.weight"]
+            .to_uint32()
+            .unwrap()
+            .to_vec();
+        let norm_before = weights["model.layers.0.post_attention_layernorm.weight"]
+            .to_uint16_native()
+            .unwrap();
+
+        let err = reject_awq_for_prequantized_body(&weights)
+            .expect_err("imatrix/AWQ must reject an already-packed body");
+        let message = err.reason.to_string();
+        assert!(message.contains("--imatrix-path"), "{message}");
+        assert!(message.contains("before mutating"), "{message}");
+        assert_eq!(
+            weights["model.layers.0.mlp.gate_proj.weight"]
+                .to_uint32()
+                .unwrap()
+                .to_vec(),
+            packed_before,
+            "packed bytes must remain bit-exact"
+        );
+        assert_eq!(
+            weights["model.layers.0.post_attention_layernorm.weight"]
+                .to_uint16_native()
+                .unwrap(),
+            norm_before,
+            "AWQ-folded norm must remain bit-exact"
+        );
+
+        let dense_only = HashMap::from([(
+            "model.layers.0.mlp.gate_proj.weight".to_string(),
+            MxArray::from_float32(&[1.0, 2.0], &[1, 2]).unwrap(),
+        )]);
+        reject_awq_for_prequantized_body(&dense_only)
+            .expect("fresh BF16/F32 + imatrix remains supported");
+    }
 
     /// AWQ pre-scaling must fire on VLM-wrapped checkpoints whose sanitized
     /// weights carry the `language_model.model.layers.*` prefix (e.g. the
@@ -8090,7 +8804,7 @@ mod tests {
         );
         assert!(
             NVFP4_NO_RECIPE_ERROR.contains("unsloth"),
-            "error must mention 'unsloth' as the imatrix-required recipe, got: {NVFP4_NO_RECIPE_ERROR}"
+            "error must mention 'unsloth' and its calibrated/fixed-map path, got: {NVFP4_NO_RECIPE_ERROR}"
         );
     }
 
@@ -8570,6 +9284,13 @@ mod tests {
         }
     }
 
+    fn assert_bfloat16_bit_exact(a: &MxArray, b: &MxArray, label: &str) {
+        assert_shape_eq(a, b, label);
+        let va = a.to_uint16_native().unwrap();
+        let vb = b.to_uint16_native().unwrap();
+        assert_eq!(va, vb, "{label}: BF16 payload mismatch");
+    }
+
     #[test]
     fn quantize_with_optional_tiling_passthrough_for_2d() {
         use std::ffi::CString;
@@ -8681,6 +9402,164 @@ mod tests {
             biases.as_ref().unwrap(),
             biases_ref.as_ref().unwrap(),
             "uneven affine biases",
+        );
+    }
+
+    #[test]
+    fn plain_fp8_tiled_experts_match_whole_stack_and_keep_storage_shapes() {
+        // 80 experts -> 32 + 32 + 16. Per-row scaling only reduces K, so
+        // axis-0 tiles must be byte-identical to one whole-stack conversion.
+        let w = MxArray::random_normal(&[80, 12, 64], 0.0, 0.02, Some(DType::Float32)).unwrap();
+        w.eval();
+        let (tiled_weight, tiled_scales) =
+            quantize_plain_fp8_with_optional_tiling(&w, "test.fp8.experts.weight").unwrap();
+        let (whole_weight, whole_scales) =
+            crate::quant::fp8_weight::quantize_per_output_channel(&w, "reference").unwrap();
+
+        assert_eq!(tiled_weight.dtype().unwrap(), DType::Uint8);
+        assert_eq!(tiled_weight.shape().unwrap().to_vec(), vec![80, 12, 64]);
+        assert_eq!(tiled_scales.dtype().unwrap(), DType::BFloat16);
+        assert_eq!(tiled_scales.shape().unwrap().to_vec(), vec![80, 12, 1]);
+        assert_uint8_bit_exact(&tiled_weight, &whole_weight, "plain-fp8 expert bytes");
+        assert_bfloat16_bit_exact(&tiled_scales, &whole_scales, "plain-fp8 expert scales");
+    }
+
+    #[test]
+    fn plain_fp8_recipe_emission_uses_u8_weight_bf16_row_scale_and_null_group() {
+        let key = "language_model.model.layers.0.self_attn.q_proj.weight";
+        let mut weights = HashMap::from([(
+            key.to_string(),
+            MxArray::random_normal(&[6, 16], 0.0, 0.02, Some(DType::BFloat16)).unwrap(),
+        )]);
+        let predicate: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+            Box::new(|_| QuantDecision::Custom {
+                bits: crate::quant::fp8_weight::FP8_E4M3_BITS,
+                group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
+                mode: crate::quant::fp8_weight::FP8_E4M3_MODE.to_string(),
+            });
+        let overrides =
+            quantize_weights_with_recipe_pub(&mut weights, 4, 16, "nvfp4", &*predicate, false)
+                .unwrap();
+        let prefix = key.strip_suffix(".weight").unwrap();
+        assert_eq!(weights[key].dtype().unwrap(), DType::Uint8);
+        assert_eq!(weights[key].shape().unwrap().to_vec(), vec![6, 16]);
+        assert_eq!(
+            weights[&format!("{prefix}.scales")].dtype().unwrap(),
+            DType::BFloat16
+        );
+        assert_eq!(
+            weights[&format!("{prefix}.scales")]
+                .shape()
+                .unwrap()
+                .to_vec(),
+            vec![6, 1]
+        );
+        assert!(!weights.contains_key(&format!("{prefix}.biases")));
+        assert_eq!(
+            overrides[prefix],
+            serde_json::json!({
+                "bits": 8,
+                "group_size": null,
+                "mode": "fp8_e4m3"
+            })
+        );
+    }
+
+    #[test]
+    fn reconverting_official_nvfp4_artifact_preserves_loadable_fp8_overrides_and_aliases() {
+        let early = "layers.0.mlp.gate_proj";
+        let high = "layers.1.mlp.gate_proj";
+        let filler = "layers.8.input_layernorm";
+        let mut weights = HashMap::from([
+            (
+                format!("{early}.weight"),
+                MxArray::random_normal(&[4, 16], 0.0, 0.02, Some(DType::BFloat16)).unwrap(),
+            ),
+            (
+                format!("{high}.weight"),
+                MxArray::random_normal(&[4, 16], 0.0, 0.02, Some(DType::BFloat16)).unwrap(),
+            ),
+            (
+                format!("{filler}.weight"),
+                MxArray::ones(&[4], Some(DType::BFloat16)).unwrap(),
+            ),
+        ]);
+        let weight_keys = weights.keys().cloned().collect::<Vec<_>>();
+        let predicate =
+            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::Nvfp4);
+
+        let first_overrides =
+            quantize_weights_with_recipe_pub(&mut weights, 4, 16, "nvfp4", &*predicate, false)
+                .expect("fresh fixed DGX conversion");
+        assert!(!first_overrides.contains_key(early));
+        assert_eq!(
+            first_overrides[high],
+            serde_json::json!({
+                "bits": 8,
+                "group_size": null,
+                "mode": "fp8_e4m3"
+            })
+        );
+
+        // Feed the already-quantized artifact through the same conversion a
+        // second time. No tensor is re-quantized, but the active recipe must
+        // reconstruct the identical mixed override map from the retained
+        // storage or the high class would inherit top-level NVFP4 on reload.
+        let second_overrides =
+            quantize_weights_with_recipe_pub(&mut weights, 4, 16, "nvfp4", &*predicate, false)
+                .expect("fixed DGX re-conversion");
+        assert_eq!(second_overrides, first_overrides);
+
+        let quant = build_quantization_object(4, Some(16), "nvfp4", &second_overrides, false, true);
+        let config = serde_json::json!({
+            "quantization": quant.clone(),
+            "quantization_config": quant.clone(),
+        });
+        assert_eq!(config["quantization"], config["quantization_config"]);
+
+        let (bits, group_size, top_level_mode, per_layer) =
+            crate::models::quant_dispatch::parse_quant_settings(Some(&quant), 4, 64)
+                .expect("re-converted config must parse");
+        assert_eq!((bits, group_size), (4, 16));
+        assert_eq!(
+            top_level_mode,
+            Some(crate::models::quant_dispatch::PerLayerMode::Nvfp4)
+        );
+        assert_eq!(
+            per_layer[high].mode,
+            crate::models::quant_dispatch::PerLayerMode::Fp8E4m3
+        );
+
+        let default = crate::models::quant_dispatch::default_per_layer_quant(
+            bits,
+            group_size,
+            top_level_mode.unwrap(),
+        );
+        let early_plq =
+            crate::models::quant_dispatch::effective_plq_for(early, &per_layer, default, None);
+        assert_eq!(
+            early_plq.mode,
+            crate::models::quant_dispatch::PerLayerMode::Nvfp4
+        );
+        assert!(
+            crate::models::qwen3_5::quantized_linear::try_build_nvfp4_quantized_linear(
+                &weights, early,
+            )
+            .is_some()
+        );
+        crate::models::quant_dispatch::ensure_plain_fp8_storage_resolves_fp8_e4m3(
+            &weights,
+            high,
+            per_layer[high].mode,
+            "reconversion-test",
+        )
+        .unwrap();
+        assert!(
+            crate::models::qwen3_5::quantized_linear::try_build_fp8_e4m3_quantized_linear(
+                &weights, high,
+            )
+            .unwrap()
+            .is_some()
         );
     }
 
@@ -10473,6 +11352,293 @@ mod tests {
     }
 
     #[test]
+    fn qwen_vision_preflight_rejects_malformed_metadata_before_mutation() {
+        let key = "model.visual.blocks.0.attn.qkv.weight";
+        let weight = MxArray::ones(&[4, 4], Some(DType::BFloat16)).unwrap();
+        let original_handle = weight.as_raw_ptr();
+        let weights = HashMap::from([(key.to_string(), weight)]);
+
+        for config in [
+            serde_json::json!({"quantization": "affine"}),
+            serde_json::json!({"quantization": {"mode": 7, "bits": 8, "group_size": 32}}),
+            serde_json::json!({"quantization": {"mode": "typo", "bits": 8, "group_size": 32}}),
+        ] {
+            let err = recipe::qwen_vision_quantization_preflight(&weights, &config)
+                .expect_err("malformed source quantization metadata must reject");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("quantization") || msg.contains("quantization mode"),
+                "unexpected preflight error: {msg}"
+            );
+            assert_eq!(
+                weights[key].as_raw_ptr(),
+                original_handle,
+                "preflight failure must not replace or mutate the source vision array"
+            );
+        }
+
+        // The production sanitizer must run the same borrowed preflight before
+        // consuming/remapping the tensor map.
+        let err = recipe::Qwen35Recipe { is_moe: true }
+            .sanitize(
+                weights,
+                &serde_json::json!({"quantization": {"mode": false}}),
+                "bfloat16",
+                true,
+                false,
+            )
+            .err()
+            .expect("sanitize must reject malformed metadata before transforms");
+        assert!(err.to_string().contains("quantization mode"));
+
+        let err = recipe::checked_qwen_vision_dequant_handle(
+            std::ptr::null_mut(),
+            "vision_tower.blocks.0.attn.qkv.weight",
+        )
+        .err()
+        .expect("a null dequant handle must abort conversion");
+        assert!(
+            err.to_string().contains("dense-only loader"),
+            "null dequant must fail closed, got: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_vision_preflight_rejects_per_layer_override_before_dequantization() {
+        let base = "model.visual.blocks.0.attn.qkv";
+        let weight_key = format!("{base}.weight");
+        let scales_key = format!("{base}.scales");
+        let biases_key = format!("{base}.biases");
+        let weights = HashMap::from([
+            (
+                weight_key.clone(),
+                MxArray::from_uint32(&[0u32; 8], &[2, 4]).unwrap(),
+            ),
+            (
+                scales_key.clone(),
+                MxArray::ones(&[2, 2], Some(DType::BFloat16)).unwrap(),
+            ),
+            (
+                biases_key.clone(),
+                MxArray::zeros(&[2, 2], Some(DType::BFloat16)).unwrap(),
+            ),
+        ]);
+        let handles = [&weight_key, &scales_key, &biases_key].map(|key| weights[key].as_raw_ptr());
+        let config = serde_json::json!({
+            "quantization": {
+                "mode": "affine",
+                "bits": 8,
+                "group_size": 32,
+                "model.visual.blocks.0.attn.qkv": {
+                    "mode": "mxfp8",
+                    "bits": 8,
+                    "group_size": 32
+                }
+            }
+        });
+
+        let err = recipe::qwen_vision_quantization_preflight(&weights, &config)
+            .expect_err("mixed/per-layer vision quantization must reject");
+        assert!(err.to_string().contains("per-layer quantization overrides"));
+        for (key, expected) in [&weight_key, &scales_key, &biases_key]
+            .into_iter()
+            .zip(handles)
+        {
+            assert_eq!(
+                weights[key].as_raw_ptr(),
+                expected,
+                "preflight must leave the complete vision quant group untouched"
+            );
+        }
+
+        let err = recipe::qwen_vision_quantization_preflight(&weights, &serde_json::json!({}))
+            .expect_err("packed vision storage without metadata must not guess affine 8/32");
+        assert!(
+            err.to_string()
+                .contains("no explicit uniform mode/bits/group_size metadata"),
+            "unexpected missing-metadata error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_vision_uniform_affine_dequant_and_bf16_passthrough_remain_supported() {
+        let mode = std::ffi::CString::new("affine").unwrap();
+        let source = MxArray::random_normal(&[4, 64], 0.0, 0.02, Some(DType::BFloat16)).unwrap();
+        let (packed, scales, biases) = quantize_with_optional_tiling(
+            &source,
+            32,
+            8,
+            mode.as_c_str(),
+            "model.visual.proj.weight",
+        )
+        .unwrap();
+        let mut weights = HashMap::from([
+            ("model.visual.proj.weight".to_string(), packed),
+            ("model.visual.proj.scales".to_string(), scales),
+            (
+                "model.visual.proj.biases".to_string(),
+                biases.expect("affine quantization emits biases"),
+            ),
+            (
+                "model.visual.norm.weight".to_string(),
+                MxArray::ones(&[4], Some(DType::BFloat16)).unwrap(),
+            ),
+        ]);
+        let config = serde_json::json!({
+            "num_experts": 2,
+            "num_hidden_layers": 0,
+            "quantization": {"mode": "affine", "bits": 8, "group_size": 32}
+        });
+
+        let out = recipe::Qwen35Recipe { is_moe: true }
+            .sanitize(
+                std::mem::take(&mut weights),
+                &config,
+                "bfloat16",
+                true,
+                false,
+            )
+            .expect("uniform affine vision source must dequantize");
+        assert_eq!(
+            out["vision_tower.proj.weight"].dtype().unwrap(),
+            DType::BFloat16
+        );
+        assert!(!out.contains_key("vision_tower.proj.scales"));
+        assert!(!out.contains_key("vision_tower.proj.biases"));
+        assert_eq!(
+            out["vision_tower.norm.weight"].dtype().unwrap(),
+            DType::BFloat16,
+            "ordinary BF16 vision tensors must remain supported"
+        );
+    }
+
+    fn qwen_bf16_individual_experts() -> HashMap<String, MxArray> {
+        let mut weights = HashMap::new();
+        for expert in 0..2 {
+            for (proj, shape) in [
+                ("gate_proj", [3, 4]),
+                ("up_proj", [3, 4]),
+                ("down_proj", [4, 3]),
+            ] {
+                weights.insert(
+                    format!("model.layers.0.mlp.experts.{expert}.{proj}.weight"),
+                    MxArray::ones(&shape, Some(DType::BFloat16)).unwrap(),
+                );
+            }
+        }
+        weights
+    }
+
+    #[test]
+    fn qwen_individual_expert_preflight_rejects_quantized_groups_before_stacking() {
+        let key = "model.layers.0.mlp.experts.0.gate_proj.weight";
+        let scale_key = "model.layers.0.mlp.experts.0.gate_proj.scales";
+        let weight = MxArray::ones(&[3, 4], Some(DType::BFloat16)).unwrap();
+        let original_handle = weight.as_raw_ptr();
+        let weights = HashMap::from([
+            (key.to_string(), weight),
+            (
+                scale_key.to_string(),
+                MxArray::ones(&[3, 1], Some(DType::BFloat16)).unwrap(),
+            ),
+        ]);
+
+        let err = recipe::reject_prequantized_qwen_individual_experts(&weights)
+            .expect_err("individual expert sidecars must reject");
+        assert!(err.to_string().contains("pre-quantized individual expert"));
+        assert_eq!(
+            weights[key].as_raw_ptr(),
+            original_handle,
+            "borrowed expert preflight must run before stacking/removal"
+        );
+
+        let packed_key = "model.layers.0.mlp.experts.0.up_proj.weight";
+        let packed = HashMap::from([(
+            packed_key.to_string(),
+            MxArray::from_uint32(&[0u32; 4], &[2, 2]).unwrap(),
+        )]);
+        let err = recipe::reject_prequantized_qwen_individual_experts(&packed)
+            .expect_err("sidecarless packed individual expert must reject");
+        assert!(err.to_string().contains("non-float dtype"));
+
+        let err = recipe::Qwen35Recipe { is_moe: true }
+            .sanitize(
+                weights,
+                &serde_json::json!({"num_experts": 2, "num_hidden_layers": 1}),
+                "bfloat16",
+                true,
+                false,
+            )
+            .err()
+            .expect("production sanitizer must wire the expert preflight");
+        assert!(err.to_string().contains("pre-quantized individual expert"));
+    }
+
+    #[test]
+    fn qwen_bf16_individual_stacking_and_quantized_stacked_artifacts_remain_supported() {
+        let config = serde_json::json!({"num_experts": 2, "num_hidden_layers": 1});
+        let out = recipe::Qwen35Recipe { is_moe: true }
+            .sanitize(
+                qwen_bf16_individual_experts(),
+                &config,
+                "bfloat16",
+                true,
+                false,
+            )
+            .expect("BF16 individual experts must still stack");
+        for (proj, expected) in [
+            ("gate_proj", vec![2, 3, 4]),
+            ("up_proj", vec![2, 3, 4]),
+            ("down_proj", vec![2, 4, 3]),
+        ] {
+            let key = format!("language_model.model.layers.0.mlp.switch_mlp.{proj}.weight");
+            assert_eq!(out[&key].shape().unwrap().to_vec(), expected);
+        }
+        assert!(!out.keys().any(|key| key.contains(".mlp.experts.")));
+
+        // Converter-produced already-stacked affine storage is canonical and
+        // must not be caught by the numeric `experts.{N}` guard.
+        let mode = std::ffi::CString::new("affine").unwrap();
+        let source = MxArray::random_normal(&[2, 4, 64], 0.0, 0.02, Some(DType::BFloat16)).unwrap();
+        let (weight, scales, biases) = quantize_with_optional_tiling(
+            &source,
+            64,
+            4,
+            mode.as_c_str(),
+            "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight",
+        )
+        .unwrap();
+        let base = "language_model.model.layers.0.mlp.switch_mlp.gate_proj";
+        let stacked = HashMap::from([
+            (format!("{base}.weight"), weight),
+            (format!("{base}.scales"), scales),
+            (
+                format!("{base}.biases"),
+                biases.expect("affine quantization emits biases"),
+            ),
+        ]);
+        let out = recipe::Qwen35Recipe { is_moe: true }
+            .sanitize(
+                stacked,
+                &serde_json::json!({
+                    "num_experts": 2,
+                    "num_hidden_layers": 1,
+                    "quantization": {"mode": "affine", "bits": 4, "group_size": 64}
+                }),
+                "bfloat16",
+                true,
+                false,
+            )
+            .expect("already-stacked quantized artifact must remain supported");
+        assert_eq!(
+            out[&format!("{base}.weight")].dtype().unwrap(),
+            DType::Uint32
+        );
+        assert!(out.contains_key(&format!("{base}.scales")));
+        assert!(out.contains_key(&format!("{base}.biases")));
+    }
+
+    #[test]
     fn sanitize_qwen35_moe_fp8_branch_preserves_sym8_scales() {
         // MIXED checkpoint: ONE FP8 pair anywhere flips the sanitizer into the
         // has_fp8 branch. Its post-dequant cast loop must NOT astype every
@@ -11193,6 +12359,99 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unsloth_no_imatrix_selector_keeps_plain_affine_fail_closed() {
+        let err = validate_unsloth_imatrix_selector("unsloth", None, false, "affine")
+            .expect_err("legacy affine Unsloth must still require AWQ calibration");
+        assert!(err.contains("legacy affine"), "unexpected error: {err}");
+        assert!(err.contains("--imatrix-path"), "unexpected error: {err}");
+
+        validate_unsloth_imatrix_selector("unsloth", Some("imatrix.gguf"), false, "affine")
+            .expect("legacy affine with an imatrix must remain accepted");
+    }
+
+    #[test]
+    fn unsloth_no_imatrix_fixed_selectors_defer_to_verified_map_gate() {
+        validate_unsloth_imatrix_selector("unsloth", None, true, "affine")
+            .expect("--q-mxfp may defer to fixed-map verification");
+        validate_unsloth_imatrix_selector("unsloth", None, false, "nvfp4")
+            .expect("--q-mode nvfp4 may defer to fixed-map verification");
+    }
+
+    #[test]
+    fn unsloth_no_imatrix_late_gate_requires_an_official_map() {
+        let err = validate_unsloth_imatrix_after_selection("unsloth", None, None)
+            .expect_err("an unverified no-imatrix request must not use the legacy fallback");
+        assert!(
+            err.contains("verified Qwen3.5/Qwen3.6"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("refusing to fall back"),
+            "unexpected error: {err}"
+        );
+
+        for kind in [
+            OfficialUnslothRecipeKind::Mxfp,
+            OfficialUnslothRecipeKind::Nvfp4,
+        ] {
+            validate_unsloth_imatrix_after_selection("unsloth", None, Some(kind))
+                .expect("a verified fixed map may run without an imatrix");
+        }
+        validate_unsloth_imatrix_after_selection("unsloth", Some("imatrix.gguf"), None)
+            .expect("an imatrix keeps the existing fallback behavior available");
+    }
+
+    #[test]
+    fn unsloth_no_imatrix_privacy_filter_is_rejected_before_dedicated_quantization() {
+        let config = serde_json::json!({
+            "model_type": "privacy-filter",
+            "tie_word_embeddings": false,
+        });
+        let weight_keys = [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.mlp.experts.gate_up_proj.weight",
+            "model.layers.0.mlp.experts.down_proj.weight",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+        for (quant_mxfp, quant_mode) in [(true, "affine"), (false, "nvfp4")] {
+            let err = select_and_validate_official_unsloth_recipe(
+                "unsloth",
+                None,
+                quant_mxfp,
+                quant_mode,
+                &config,
+                Some("privacy-filter"),
+                &weight_keys,
+            )
+            .expect_err("privacy-filter must not bypass no-imatrix fixed-map validation");
+            assert!(
+                err.contains("verified Qwen3.5/Qwen3.6"),
+                "unexpected error for mode={quant_mode}, q_mxfp={quant_mxfp}: {err}"
+            );
+        }
+
+        assert_eq!(
+            select_and_validate_official_unsloth_recipe(
+                "unsloth",
+                Some("imatrix.gguf"),
+                true,
+                "affine",
+                &config,
+                Some("privacy-filter"),
+                &weight_keys,
+            )
+            .expect("calibrated privacy-filter behavior must remain available"),
+            None,
+        );
+    }
+
     fn qwen35_hybrid_test_keys() -> Vec<String> {
         [
             "language_model.model.layers.0.self_attn.q_proj.weight",
@@ -11228,7 +12487,7 @@ mod tests {
         ] {
             assert!(
                 is_qwen35_hybrid_checkpoint(&config, Some(requested), &keys),
-                "config={config}, requested={requested} must select the official map"
+                "config={config}, requested={requested} must select the fixed map"
             );
         }
     }
@@ -11419,10 +12678,10 @@ mod tests {
             group_size: 16,
             mode: "nvfp4".to_string(),
         };
-        let mxfp8 = || QuantDecision::Custom {
-            bits: 8,
-            group_size: 32,
-            mode: "mxfp8".to_string(),
+        let fp8_e4m3 = || QuantDecision::Custom {
+            bits: crate::quant::fp8_weight::FP8_E4M3_BITS,
+            group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
+            mode: crate::quant::fp8_weight::FP8_E4M3_MODE.to_string(),
         };
 
         for family in ["switch_mlp", "experts", "shared_expert"] {
@@ -11430,7 +12689,11 @@ mod tests {
                 let early = format!("language_model.model.layers.31.mlp.{family}.{suffix}.weight");
                 assert_eq!(predicate(&early), nvfp4(), "{early} must be nvfp4 4/16");
                 let late = format!("language_model.model.layers.32.mlp.{family}.{suffix}.weight");
-                assert_eq!(predicate(&late), mxfp8(), "{late} must be mxfp8 8/32");
+                assert_eq!(
+                    predicate(&late),
+                    fp8_e4m3(),
+                    "{late} must be plain per-output E4M3 FP8"
+                );
             }
         }
 
@@ -11444,7 +12707,11 @@ mod tests {
             "language_model.model.layers.1.linear_attn.out_proj.weight",
             "language_model.lm_head.weight",
         ] {
-            assert_eq!(predicate(key), mxfp8(), "{key} must be mxfp8 8/32");
+            assert_eq!(
+                predicate(key),
+                fp8_e4m3(),
+                "{key} must be plain per-output E4M3 FP8"
+            );
         }
 
         for key in [

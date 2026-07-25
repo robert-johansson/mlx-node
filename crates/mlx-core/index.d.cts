@@ -2319,6 +2319,20 @@ export declare function calibrateActivationAmaxRaw(
 
 /** Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
 export interface ChatConfig {
+  /**
+   * Internal logical cache owner. The agent provider forwards Pi's stable
+   * session id so model-global GDN sidecars can retain parent and child
+   * branches independently. This does not namespace the physical paged KV
+   * cache; exact token/extra-key hashes remain shareable across owners.
+   */
+  cacheOwnerId?: string | undefined;
+  /**
+   * Internal top-level owner for the bounded Qwen3.5 GDN sidecar store.
+   * `cache_owner_id` may identify a child Pi session; this separately
+   * identifies the current interactive root so /new and /resume can rotate
+   * the protected branch without changing PagedAttention cache identity.
+   */
+  cacheRootOwnerId?: string | undefined;
   maxNewTokens?: number | undefined;
   temperature?: number | undefined;
   topK?: number | undefined;
@@ -2455,6 +2469,8 @@ export interface ChatMessage {
   isError?: boolean;
   /** Reasoning content for thinking mode (used with <think> tags) */
   reasoningContent?: string;
+  /** Thinking mode used when this historical assistant message was generated. */
+  thinkingEnabled?: boolean;
   /** Image data for VLM models (encoded image bytes: PNG/JPEG, passed as Uint8Array/Buffer) */
   images?: Array<Uint8Array> | undefined;
   /** Audio data for unified Gemma 4 (encoded audio bytes: WAV, passed as Uint8Array/Buffer) */

@@ -571,8 +571,9 @@ impl GatedDeltaNet {
         self.out_proj.set_quantized(ql);
     }
 
-    /// Whether any of the in_proj_qkvz/in_proj_ba/out_proj projections hold
-    /// quantized weights.
+    /// Whether any mode-aware projection in this GDN block
+    /// (in_proj_qkvz/in_proj_ba/out_proj) holds quantized weights.
+    /// Convolution, norms, and recurrent parameters are always dense.
     pub fn is_quantized(&self) -> bool {
         self.in_proj_qkvz.is_quantized()
             || self.in_proj_ba.is_quantized()

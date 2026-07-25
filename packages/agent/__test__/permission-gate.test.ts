@@ -187,6 +187,94 @@ describe('createPermissionGateExtension', () => {
     expect(selectCalls[0]!.options).toEqual(['Yes', 'Always (this session)', 'No']);
   });
 
+  it('binds a pending approval dialog to the active agent abort signal and fails closed', async () => {
+    const handler = loadGateHandler();
+    const abort = new AbortController();
+    let notifySelectStarted!: () => void;
+    const selectStarted = new Promise<void>((resolve) => {
+      notifySelectStarted = resolve;
+    });
+    let forwardedSignal: AbortSignal | undefined;
+    const ctx = {
+      hasUI: true,
+      signal: abort.signal,
+      ui: {
+        select: (_title: string, _options: string[], opts?: { signal?: AbortSignal }): Promise<string | undefined> => {
+          forwardedSignal = opts?.signal;
+          notifySelectStarted();
+          return new Promise((resolve) => {
+            if (forwardedSignal?.aborted) {
+              resolve(undefined);
+              return;
+            }
+            forwardedSignal?.addEventListener('abort', () => resolve(undefined), { once: true });
+          });
+        },
+      },
+    } as unknown as ExtensionContext;
+
+    const pending = handler(toolCallEvent('bash', { command: 'sleep 30' }), ctx);
+    await selectStarted;
+    expect(forwardedSignal).toBe(abort.signal);
+
+    abort.abort();
+    await expect(pending).resolves.toEqual({
+      block: true,
+      reason: 'Blocked by user',
+    });
+  });
+
+  it('gates subagent delegation and discloses child tool access', async () => {
+    const handler = loadGateHandler();
+    const { ctx, selectCalls } = makeCtx(true, 'Yes');
+    const result = await handler(
+      toolCallEvent('subagent', { agent: 'worker', task: 'fix the bug', cwd: '/repo/worktree' }),
+      ctx,
+    );
+    expect(result).toBeUndefined();
+    expect(selectCalls).toHaveLength(1);
+    expect(selectCalls[0]!.title).toContain('Allow delegated subagent tool access?');
+    expect(selectCalls[0]!.title).toContain('may use bash/write/edit without further prompts');
+    expect(selectCalls[0]!.title).toContain('Execution mode: single');
+    expect(selectCalls[0]!.title).toContain('worker: fix the bug [cwd: /repo/worktree]');
+  });
+
+  it('discloses queued subagent names, tasks, cwd, and project scope', async () => {
+    const handler = loadGateHandler();
+    const { ctx, selectCalls } = makeCtx(true, 'Yes', { cwd: '/repo' });
+    await handler(
+      toolCallEvent('subagent', {
+        agentScope: 'both',
+        tasks: [
+          { agent: 'scout', task: 'trace auth', cwd: '/repo/a' },
+          { agent: 'reviewer', task: 'review the diff' },
+        ],
+      }),
+      ctx,
+    );
+    const title = selectCalls[0]!.title;
+    expect(title).toContain('Execution mode: parallel');
+    expect(title).toContain('Agent scope: both');
+    expect(title).toContain('scout: trace auth [cwd: /repo/a]');
+    expect(title).toContain('reviewer: review the diff [cwd: /repo]');
+  });
+
+  it('summarizes the actual queued mode before stray top-level agent fields', async () => {
+    const handler = loadGateHandler();
+    const { ctx, selectCalls } = makeCtx(true, 'Yes', { cwd: '/repo' });
+    await handler(
+      toolCallEvent('subagent', {
+        agent: 'decoy-without-task',
+        tasks: [{ agent: 'worker', task: 'modify the project', cwd: '/outside' }],
+      }),
+      ctx,
+    );
+    const title = selectCalls[0]!.title;
+    expect(title).toContain('Execution mode: parallel');
+    expect(title).toContain('worker: modify the project [cwd: /outside]');
+    expect(title).not.toContain('decoy-without-task');
+  });
+
   it('blocks a gated tool when the user answers No', async () => {
     const handler = loadGateHandler();
     const { ctx } = makeCtx(true, 'No');

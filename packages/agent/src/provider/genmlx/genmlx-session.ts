@@ -17,14 +17,14 @@
  *   warm path is a no-op here beyond the TS field wipe: the engine's
  *   token-diff delta prefill IS the warm reuse, structurally.
  *
- * The five `private` fields at the top exist so the shared warm-reuse
- * helper (which wipes them through a structural cast) stays a single
+ * The `private` fields at the top exist so the shared warm-reuse helper
+ * (which wipes them through a structural cast) stays a single
  * implementation across both providers; the genmlx session's real state
  * lives CLJS-side keyed by session id, so wiping them is always safe.
  */
 
 import type { ToolCallResult } from '@mlx-node/core';
-import type { ChatConfig, ChatMessage, ChatStreamEvent } from '@mlx-node/lm';
+import type { ChatConfig, ChatMessage, ChatStreamEvent, SessionContextLimits } from '@mlx-node/lm';
 
 import type { GenmlxTurnEngine } from './genmlx-host.js';
 import { resolveGenmlxBestOfK, resolveGenmlxVerifier } from './genmlx-verifier.js';
@@ -56,13 +56,16 @@ export class GenmlxSession {
   private inFlight = false;
   private history: ChatMessage[] = [];
   private lastImagesKey: string | null = null;
+  private lastAudioKey: string | null = null;
   private turnCount = 0;
   private unresolvedOkToolCallCount: number | null = null;
+  private needsFullReplay = false;
 
   /**
-   * Engine sessions keyed by pi session id (genmlx-lin9). Callers that
-   * carry no `options.sessionId` share the `''` key — exactly the old
-   * one-memoized-session behavior.
+   * Engine sessions keyed by pi session id (genmlx-lin9), which arrives as
+   * `ChatConfig.cacheOwnerId` — the same `options.sessionId` the native path
+   * uses to scope its per-branch cache state. Callers that carry no session
+   * id share the `''` key — exactly the old one-memoized-session behavior.
    */
   private readonly sessionIds = new Map<string, string>();
   /** Fork hints: new pi session id -> source session FILE (session_start). */
@@ -80,8 +83,33 @@ export class GenmlxSession {
     this.inFlight = false;
     this.history = [];
     this.lastImagesKey = null;
+    this.lastAudioKey = null;
     this.turnCount = 0;
     this.unresolvedOkToolCallCount = null;
+    this.needsFullReplay = false;
+  }
+
+  /**
+   * No load-time physical context snapshot exists on this path: the owned
+   * forward has no paged pool and the engine reports no window. Reporting
+   * nothing leaves Pi on the discovery-time context window, which
+   * `models.ts` already reads from the same checkpoint's `config.json` —
+   * the correct value here, not a placeholder.
+   */
+  contextLimits(): SessionContextLimits | undefined {
+    return undefined;
+  }
+
+  /**
+   * Image turns always reach the engine (genmlx-5aah): bytes ride the seam's
+   * non-JSON leg and the owned VLM prefill consumes them, so the pi→native
+   * conversion must keep image blocks rather than replace them with text
+   * placeholders. The TS face cannot know whether the resident checkpoint is
+   * multimodal; a text-only one rejects images with a typed engine error,
+   * which is the visible failure this capability is honest about.
+   */
+  supportsImages(): boolean {
+    return true;
   }
 
   /**
@@ -138,11 +166,7 @@ export class GenmlxSession {
     this.history = messages;
   }
 
-  async *startFromHistoryStream(
-    config?: ChatConfig,
-    signal?: AbortSignal,
-    piSessionId?: string,
-  ): AsyncGenerator<ChatStreamEvent> {
+  async *startFromHistoryStream(config?: ChatConfig, signal?: AbortSignal): AsyncGenerator<ChatStreamEvent> {
     if (this.inFlight) {
       throw new Error('GenmlxSession: a turn is already in flight');
     }
@@ -162,7 +186,7 @@ export class GenmlxSession {
       });
       return { ...message, images: undefined, imageRefs };
     });
-    const sessionId = this.ensureEngineSession(piSessionId ?? '');
+    const sessionId = this.ensureEngineSession(config?.cacheOwnerId ?? '');
 
     // Callback-push → async-generator-pull bridge.
     const queue: ChatStreamEvent[] = [];

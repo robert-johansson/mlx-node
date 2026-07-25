@@ -1,13 +1,13 @@
 /**
  * `createPermissionGateExtension` — pi has no permission system of its
  * own, so this inline extension is the product's v1 safety layer: every
- * `bash` / `write` / `edit` tool call must be approved before pi
+ * `bash` / `write` / `edit` / delegated `subagent` tool call must be approved before pi
  * executes it.
  *
  * Behavior (settled design):
  * - Interactive (`ctx.hasUI`): prompt via `ctx.ui.select` with the
- *   command (bash) or file path (write/edit) as the detail line, passed
- *   through `sanitizeDetail` (control-byte encoding + length cap).
+ *   command (bash), file path (write/edit), or delegated task (subagent) as the detail line, passed
+ *   through `sanitizeApprovalDetail` (control-byte encoding + length cap).
  *   "Always (this session)" allow-lists the tool name in memory for the
  *   lifetime of this extension instance.
  * - Non-interactive: allow only when `MLX_AGENT_AUTO_APPROVE=1`,
@@ -25,89 +25,12 @@ import { join } from 'node:path';
 
 import type { ExtensionAPI, ExtensionContext, InlineExtension, ToolCallEvent } from '@earendil-works/pi-coding-agent';
 
-const GATED_TOOLS: ReadonlySet<string> = new Set(['bash', 'write', 'edit']);
+import { sanitizeApprovalDetail } from './approval-detail.js';
+import { normalizeSubagentMode } from './subagent.js';
+
+const GATED_TOOLS: ReadonlySet<string> = new Set(['bash', 'write', 'edit', 'subagent']);
 
 const AUTO_APPROVE_ENV = 'MLX_AGENT_AUTO_APPROVE';
-
-/** Longest detail line (in chars) shown in the approval prompt. */
-const DETAIL_MAX_CHARS = 500;
-/** Most detail lines shown before truncation kicks in. */
-const DETAIL_MAX_LINES = 6;
-const TRUNCATION_MARKER = '… [truncated]';
-
-/**
- * Every character that must be rendered visibly instead of reaching the
- * terminal: C0 controls except `\n` and `\t`, DEL, and the C1 range
- * U+0080–U+009F (which contains the raw CSI/OSC/ST bytes U+009B, U+009D
- * and U+009C). Matched one character at a time — deliberately NOT as
- * multi-character escape "sequences": CSI parameters/finals and OSC
- * payloads are ordinary printable bytes that bash still parses and
- * executes, so any sequence-level deletion makes real shell syntax
- * invisible while it still runs (and CSI/OSC/ST termination is ambiguous
- * to parse in the first place — e.g. an unterminated OSC has no defined
- * end).
- */
-// eslint-disable-next-line no-control-regex
-const CONTROL_CHAR_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
-
-/** Render one control character as visible `\xNN` text (e.g. ESC → `\x1b`). */
-function encodeControlChar(ch: string): string {
-  return `\\x${ch.charCodeAt(0).toString(16).padStart(2, '0')}`;
-}
-
-/**
- * Sanitize model-controlled text before it is embedded in the approval
- * prompt. The prompt is this product's only permission UI, so it must not
- * depend on pi's TUI stripping terminal escapes (it does not — pi-tui's
- * `wrapTextWithAnsi` deliberately preserves ANSI): a crafted bash command
- * could otherwise move the cursor, erase lines, or restyle the prompt to
- * disguise what is being approved.
- *
- * Encode, never delete. An earlier deletion-based version stripped whole
- * "escape sequences", but the bytes inside a CSI/OSC-shaped span are
- * still shell syntax that bash executes — a command could display as a
- * safe-looking prefix while a pipe or a second command hid inside what
- * the sanitizer parsed as an escape payload. Instead:
- *
- * - Every printable character is preserved verbatim — nothing bash could
- *   interpret (letters, digits, shell metacharacters, spaces) is removed
- *   or altered.
- * - Every control character (C0 except `\n`/`\t`, DEL, C1) is rendered
- *   as visible `\xNN` text, so no byte that could drive the terminal
- *   survives, and no shell text can hide behind one.
- * - Output is capped at DETAIL_MAX_LINES lines and DETAIL_MAX_CHARS
- *   chars (counted after encoding) with a visible truncation marker, so
- *   a huge command cannot flood the prompt off the screen.
- */
-function sanitizeDetail(text: string): string {
-  let out = text.replace(CONTROL_CHAR_RE, encodeControlChar);
-  let truncated = false;
-
-  const lines = out.split('\n');
-  if (lines.length > DETAIL_MAX_LINES) {
-    out = lines.slice(0, DETAIL_MAX_LINES).join('\n');
-    truncated = true;
-  }
-  if (out.length > DETAIL_MAX_CHARS) {
-    out = out.slice(0, DETAIL_MAX_CHARS);
-    // Do not leave a lone high surrogate behind after the hard cut.
-    const last = out.charCodeAt(out.length - 1);
-    if (last >= 0xd800 && last <= 0xdbff) {
-      out = out.slice(0, -1);
-    }
-    truncated = true;
-  }
-  if (truncated) {
-    out += ` ${TRUNCATION_MARKER}`;
-  }
-  if (out.trim().length === 0 && text.length > 0) {
-    // Control characters always encode to visible text, so this only
-    // fires for whitespace-only input; show something rather than an
-    // approvable-looking blank line.
-    return '(unprintable content)';
-  }
-  return out;
-}
 
 /**
  * Per-layer snapshot of pi's `shellCommandPrefix`: the RAW value contributed by
@@ -255,13 +178,48 @@ const FRESH_SESSION_REASONS: ReadonlySet<string> = new Set(['startup', 'new', 'r
  * throw — a handler error would fail closed upstream, but the prompt
  * should still render and let the user decide.
  */
-function describeToolCall(toolName: string, event: ToolCallEvent): string {
+function describeToolCall(toolName: string, event: ToolCallEvent, defaultCwd?: string): string {
   const rawInput: unknown = (event as { input?: unknown }).input;
   const input: Record<string, unknown> =
     typeof rawInput === 'object' && rawInput !== null ? (rawInput as Record<string, unknown>) : {};
   if (toolName === 'bash') {
     const command = input['command'];
     return typeof command === 'string' && command.length > 0 ? command : '(unknown command)';
+  }
+  if (toolName === 'subagent') {
+    const agent = typeof input['agent'] === 'string' ? input['agent'] : undefined;
+    const task = typeof input['task'] === 'string' ? input['task'] : undefined;
+    const scope = typeof input['agentScope'] === 'string' ? input['agentScope'] : 'user';
+    const tasks = Array.isArray(input['tasks']) ? input['tasks'] : [];
+    const chainItems = Array.isArray(input['chain']) ? input['chain'] : [];
+    const { mode } = normalizeSubagentMode({ agent, task, tasks, chain: chainItems });
+    const describeItems = (value: unknown): string[] =>
+      Array.isArray(value)
+        ? value.map((raw, index) => {
+            const item = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {};
+            const itemAgent = typeof item['agent'] === 'string' ? item['agent'] : '(unknown agent)';
+            const itemTask = typeof item['task'] === 'string' ? item['task'] : '(unknown task)';
+            const resolvedCwd = typeof item['cwd'] === 'string' ? item['cwd'] : defaultCwd;
+            const cwd = resolvedCwd ? ` [cwd: ${resolvedCwd}]` : '';
+            return `${index + 1}. ${itemAgent}: ${itemTask}${cwd}`;
+          })
+        : [];
+    const items = describeItems(tasks);
+    const chain = describeItems(chainItems);
+    const singleCwd = typeof input['cwd'] === 'string' ? input['cwd'] : defaultCwd;
+    const single = `${agent ?? '(unknown agent)'}: ${task ?? '(unknown task)'}${singleCwd ? ` [cwd: ${singleCwd}]` : ''}`;
+    const summary =
+      mode === 'chain'
+        ? `Chain: ${chain.join(' | ')}`
+        : mode === 'parallel'
+          ? `Queued tasks: ${items.join(' | ')}`
+          : single;
+    return [
+      'Delegated agent sessions may use bash/write/edit without further prompts.',
+      `Execution mode: ${mode}`,
+      `Agent scope: ${scope}`,
+      summary,
+    ].join('\n');
   }
   // write/edit: pi's canonical field is `path`; `file_path` is the
   // compat alias pi's own renderers also accept.
@@ -337,7 +295,7 @@ export function createPermissionGateExtension(): InlineExtension {
         // title is rendered by a third-party TUI that passes ANSI through.
         // For bash, prepend pi's effective `shellCommandPrefix` so the prompt
         // shows the full program pi will execute, not just the model's arg.
-        const command = describeToolCall(toolName, event);
+        const command = describeToolCall(toolName, event, ctx.cwd);
         let detailSource = command;
         if (toolName === 'bash') {
           // Snapshot is primary (faithful to pi's baked value, incl. reload
@@ -363,8 +321,15 @@ export function createPermissionGateExtension(): InlineExtension {
           // eslint-disable-next-line @typescript-eslint/no-base-to-string
           detailSource = raw ? `${String(raw)}\n${command}` : command;
         }
-        const detail = sanitizeDetail(detailSource);
-        const choice = await ctx.ui.select(`Allow ${toolName}?\n\n  ${detail}`, ['Yes', 'Always (this session)', 'No']);
+        const detail = sanitizeApprovalDetail(detailSource);
+        const title = toolName === 'subagent' ? 'Allow delegated subagent tool access?' : `Allow ${toolName}?`;
+        // Bind the dialog to the active agent operation. Pi's selector only
+        // resolves on Ctrl+C/abort when the extension forwards this signal;
+        // otherwise the UI can disappear while this awaited tool_call hook
+        // remains pending and keeps the whole tool batch suspended.
+        const choice = await ctx.ui.select(`${title}\n\n  ${detail}`, ['Yes', 'Always (this session)', 'No'], {
+          signal: ctx.signal,
+        });
 
         if (choice === 'Yes') {
           return undefined;

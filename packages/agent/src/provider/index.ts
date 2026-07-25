@@ -19,6 +19,7 @@ import type { ExtensionAPI, InlineExtension } from '@earendil-works/pi-coding-ag
 
 import { MlxModelHost } from './model-host.js';
 import type { MlxModelInfo } from './models.js';
+import { PerformanceStatus } from './performance-status.js';
 import { makeMlxStreamSimple } from './stream-adapter.js';
 
 /**
@@ -30,7 +31,13 @@ import { makeMlxStreamSimple } from './stream-adapter.js';
  */
 export function createMlxProviderExtension(models: MlxModelInfo[], host?: MlxModelHost): InlineExtension {
   const resolvedHost = host ?? new MlxModelHost(models.map((m) => m.discovered));
-  const streamSimple = makeMlxStreamSimple(resolvedHost);
+  const performanceStatus = new PerformanceStatus();
+  // This closure outlives Pi runtime replacement. Pi creates a replacement
+  // runtime for /new and /resume and reruns inline extension factories; each
+  // new factory's session_start updates the root while child sessions keep
+  // using this registered stream.
+  let rootCacheOwnerId: string | undefined;
+  const streamSimple = makeMlxStreamSimple(resolvedHost, performanceStatus.record, () => rootCacheOwnerId);
   return {
     name: 'mlx-provider',
     factory: (pi: ExtensionAPI) => {
@@ -40,6 +47,22 @@ export function createMlxProviderExtension(models: MlxModelInfo[], host?: MlxMod
         apiKey: 'mlx-local',
         streamSimple,
         models: models.map((m) => m.piModel),
+      });
+      pi.on('session_start', (_event, ctx) => {
+        rootCacheOwnerId = ctx.sessionManager.getSessionId();
+      });
+      pi.on('message_end', (event, ctx) => {
+        performanceStatus.showMessage(event, ctx);
+      });
+      // Do not clear on turn_start. Pi emits a fresh turn after every tool
+      // result, before the next inference has terminal metrics to replace the
+      // completed sample; clearing here makes the footer disappear precisely
+      // while a long tool-follow-up prefill is running.
+      pi.on('model_select', (_event, ctx) => {
+        performanceStatus.clear(ctx);
+      });
+      pi.on('session_shutdown', (_event, ctx) => {
+        performanceStatus.clear(ctx);
       });
     },
   };

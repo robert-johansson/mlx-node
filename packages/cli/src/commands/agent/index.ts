@@ -4,16 +4,16 @@
  *
  * pi owns almost every flag, so this command never `parseArgs`es the
  * full argv: {@link scanAgentArgs} lifts out only what mlx handles
- * (`--models-dir`, help, the blocked `update` positional) and forwards
+ * (`--models-dir`, tracing, help, the blocked `update` positional) and forwards
  * the rest verbatim. Boot discipline (spike-proven, see
  * `packages/agent/src/run-agent.ts`): pi may `process.exit()` inside
  * `runAgent`, print mode owns stdout/stdin, so nothing here runs after
  * the handoff and nothing here reads stdin.
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { MlxModelInfo } from '@mlx-node/agent';
@@ -23,6 +23,12 @@ export interface AgentArgScan {
   modelsDir?: string;
   /** `--models-dir` was present without a value — usage error. */
   modelsDirMissingValue: boolean;
+  /** Enable bounded native inference diagnostics (`--trace-dir` implies this). */
+  trace: boolean;
+  /** Directory selected by `--trace-dir` (the flag pair is removed from `passthrough`). */
+  traceDir?: string;
+  /** `--trace-dir` was present without a value — usage error. */
+  traceDirMissingValue: boolean;
   /**
    * `-h`/`--help` seen and this is NOT a pi pass-through invocation
    * (`install`/`remove`/`uninstall`/`list`/`config` print their own
@@ -107,7 +113,7 @@ const VALUE_CONSUMING_ARGS: ReadonlySet<string> = new Set([
  *
  * ONE pi-parity, value-aware walk (sibling of {@link withDefaultModel}'s model
  * scan, sharing {@link VALUE_CONSUMING_ARGS}): mlx's own options
- * (`--models-dir`, `-h`/`--help`) are recognized ONLY in an option-NAME
+ * (`--models-dir`, `--trace`, `--trace-dir`, `-h`/`--help`) are recognized ONLY in an option-NAME
  * position. A token sitting in a pi value-consumer's value slot
  * (`--system-prompt --models-dir` → "--models-dir" is systemPrompt's value) is
  * forwarded verbatim, never hijacked as mlx's flag. Routing (`help`/`update`)
@@ -118,6 +124,9 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   const passthrough: string[] = [];
   let modelsDir: string | undefined;
   let modelsDirMissingValue = false;
+  let trace = false;
+  let traceDir: string | undefined;
+  let traceDirMissingValue = false;
   let helpSeen = false;
   let piOneShot = false;
 
@@ -166,6 +175,36 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       }
       continue;
     }
+    if (arg === '--trace') {
+      trace = true;
+      continue;
+    }
+    if (arg === '--trace-dir') {
+      trace = true;
+      const next = argv[i + 1];
+      // Match --models-dir's value rules: never swallow the next option. A
+      // dash-leading directory remains available through --trace-dir=<dir>.
+      if (next === undefined || next.startsWith('-')) {
+        traceDirMissingValue = true;
+      } else if (next.length === 0) {
+        traceDirMissingValue = true;
+        i++;
+      } else {
+        traceDir = next;
+        i++;
+      }
+      continue;
+    }
+    if (arg.startsWith('--trace-dir=')) {
+      trace = true;
+      const value = arg.slice('--trace-dir='.length);
+      if (value.length === 0) {
+        traceDirMissingValue = true;
+      } else {
+        traceDir = value;
+      }
+      continue;
+    }
     if (arg === '-h' || arg === '--help') {
       helpSeen = true;
     }
@@ -181,6 +220,9 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   return {
     modelsDir,
     modelsDirMissingValue,
+    trace,
+    traceDir,
+    traceDirMissingValue,
     help: helpSeen && !PI_PASSTHROUGH_COMMANDS.has(passthrough[0] ?? ''),
     update: passthrough[0] === 'update',
     piOneShot,
@@ -188,15 +230,89 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   };
 }
 
+const DEFAULT_AGENT_LOG_FILTER = 'mlx_core::inference=info,mlx_core::decode=info';
+
+export interface AgentTracingSetupOptions {
+  /** @internal Hermetic environment seam for tests. */
+  env?: NodeJS.ProcessEnv;
+  /** @internal Home-directory seam for tests. */
+  homeDir?: string;
+  /** @internal Clock seam for a deterministic per-run directory. */
+  now?: Date;
+  /** @internal Process-id seam for a deterministic per-run directory. */
+  pid?: number;
+  /** @internal Output seam. Production writes to stderr so pi keeps stdout. */
+  announce?: (line: string) => void;
+}
+
 /**
- * Args carrying an EXPLICIT model choice or a concrete session copy: ALL
- * default injection is suppressed and the argv is forwarded verbatim.
- * - `--model` / `--models` — the user already named a model or a scope; pi
- *   resolves it directly.
- * - `--fork` — copies the source session (messages + saved model) into a new
- *   one; injecting anything would fight the restore.
+ * Configure the native Rust `tracing` subscriber before `@mlx-node/agent`
+ * imports the addon. N-API initializes the subscriber while loading the addon,
+ * so the target filter and file must already be present in the environment.
+ *
+ * The diagnostics are opt-in through `--trace` or `--trace-dir`. Caller-supplied
+ * `MLX_NODE_LOG` and `MLX_NODE_LOG_FILE` values always win. Otherwise each
+ * process gets a bounded inference/decode filter and a fresh file below
+ * `~/.mlx-node/logs/agent/` (or the explicit trace directory).
  */
-const FULL_SUPPRESS_ARGS: ReadonlySet<string> = new Set(['--model', '--models', '--fork']);
+export function configureAgentTracing(
+  scan: Pick<AgentArgScan, 'trace' | 'traceDir'>,
+  options: AgentTracingSetupOptions = {},
+): string | undefined {
+  const env = options.env ?? process.env;
+  const requested = scan.trace || scan.traceDir !== undefined;
+  if (!requested) return undefined;
+
+  env.MLX_NODE_LOG ??= DEFAULT_AGENT_LOG_FILTER;
+
+  const explicitFile = env.MLX_NODE_LOG_FILE;
+  let traceDir: string | undefined;
+  let logFile: string;
+  if (explicitFile !== undefined && explicitFile.trim() !== '') {
+    // Preserve the user's environment value verbatim; use its trimmed path for
+    // pre-creation/announcement because the Rust subscriber applies the same
+    // trim before opening it.
+    logFile = explicitFile.trim();
+  } else {
+    traceDir = scan.traceDir
+      ? resolve(scan.traceDir)
+      : join(
+          options.homeDir ?? homedir(),
+          '.mlx-node',
+          'logs',
+          'agent',
+          `${(options.now ?? new Date()).toISOString().replace(/[:.]/g, '-')}-pid-${options.pid ?? process.pid}`,
+        );
+    logFile = join(traceDir, 'inference.log');
+    env.MLX_NODE_LOG_FILE = logFile;
+  }
+
+  // Diagnostics are never a launch prerequisite. Pre-create private paths when
+  // possible; subscriber initialization remains responsible for opening its
+  // actual writer after the deferred addon import.
+  try {
+    const parent = dirname(logFile);
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    if (traceDir !== undefined) chmodSync(traceDir, 0o700);
+    const fd = openSync(logFile, 'a', 0o600);
+    closeSync(fd);
+    chmodSync(logFile, 0o600);
+  } catch {
+    // Best effort by contract: diagnostics I/O must never prevent startup.
+  }
+
+  (options.announce ?? ((line: string) => console.error(line)))(`mlx agent: inference log ${logFile}`);
+  return logFile;
+}
+
+/**
+ * An explicit `--models` scope is authoritative: the user already named the
+ * complete picker/cycling scope, so forward it verbatim. A concrete `--model`
+ * is different: it chooses the active model but does NOT constrain pi's model
+ * selector, so {@link withDefaultModel} still adds the local-only scope around
+ * it.
+ */
+const FULL_SUPPRESS_ARGS: ReadonlySet<string> = new Set(['--models']);
 
 /**
  * Session / provider carriers where a bare `--model mlx/<id>` injection is
@@ -218,6 +334,10 @@ const FULL_SUPPRESS_ARGS: ReadonlySet<string> = new Set(['--model', '--models', 
  *   <p>` via `buildFallbackModel`, minting a bogus CLOUD `<p>/mlx/<id>` custom
  *   model; a `--models` scope carries no provider and cannot. Verified against
  *   pi 0.80.6 `core/model-resolver.js` + `main.js` `buildSessionOptions`.
+ * - `--fork`: like the other session carriers, pi restores the copied
+ *   session's model because the session already contains messages; the scope
+ *   only keeps the model selector/cycling list local and does not replace the
+ *   restored model.
  */
 const SESSION_PROVIDER_CARRIER_ARGS: ReadonlySet<string> = new Set([
   '--provider',
@@ -227,7 +347,29 @@ const SESSION_PROVIDER_CARRIER_ARGS: ReadonlySet<string> = new Set([
   '--resume',
   '--session',
   '--session-id',
+  '--fork',
 ]);
+
+/** Collect real option names with the same unconditional value consumption as pi. */
+function collectPiOptionNames(argv: readonly string[]): Set<string> {
+  const optionNames = new Set<string>();
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i]!;
+    optionNames.add(token);
+    if (VALUE_CONSUMING_ARGS.has(token) && i + 1 < argv.length) {
+      i++;
+    }
+  }
+  return optionNames;
+}
+
+function injectsConcreteDefault(optionNames: ReadonlySet<string>): boolean {
+  return (
+    !optionNames.has('--models') &&
+    !optionNames.has('--model') &&
+    !Array.from(SESSION_PROVIDER_CARRIER_ARGS).some((arg) => optionNames.has(arg))
+  );
+}
 
 /**
  * Keep a launch on-machine at the AUTHORITATIVE CLI-arg layer (above settings
@@ -235,11 +377,14 @@ const SESSION_PROVIDER_CARRIER_ARGS: ReadonlySet<string> = new Set([
  * (e.g. a `GROQ_API_KEY` in the shell) make pi's "first available model"
  * fallback pick a CLOUD model over the local ones — the opposite of what
  * `mlx agent` promises. Three cases:
- * - explicit model / scope / fork ({@link FULL_SUPPRESS_ARGS}) → forward as-is;
- * - session / provider carrier ({@link SESSION_PROVIDER_CARRIER_ARGS}) →
+ * - explicit scope ({@link FULL_SUPPRESS_ARGS}) → forward as-is;
+ * - session / provider / fork carrier ({@link SESSION_PROVIDER_CARRIER_ARGS}) →
  *   prepend `--models mlx/*` (a local-only scope that preserves session restore
  *   yet blocks a cloud default for a new / unknown / empty session);
- * - plain fresh run → prepend `--model mlx/<default>`.
+ * - explicit model → prepend `--models mlx/*` so the picker starts in the
+ *   local scope (the registry boundary separately keeps its `all` view local);
+ * - plain fresh run → prepend both the local scope and
+ *   `--model mlx/<default>`.
  * Pure function, exported for tests.
  */
 export function withDefaultModel(passthrough: string[], defaultModelId: string): string[] {
@@ -251,24 +396,22 @@ export function withDefaultModel(passthrough: string[], defaultModelId: string):
   // a consumer both classifies AND skips its own following value in this one
   // pass; a sentinel consumed as some earlier option's value is skipped here and
   // never classifies.
-  const optionNames = new Set<string>();
-  for (let i = 0; i < passthrough.length; i++) {
-    const token = passthrough[i]!;
-    optionNames.add(token);
-    if (VALUE_CONSUMING_ARGS.has(token) && i + 1 < passthrough.length) {
-      i++; // the next token is this option's value, never an option name
-    }
-  }
+  const optionNames = collectPiOptionNames(passthrough);
 
-  // Fail-closed default is to inject a LOCAL model; suppress only on a real
-  // explicit model/scope/fork, and scope (not bare --model) for a real carrier.
+  // Fail-closed default is to inject a LOCAL model and LOCAL picker scope.
+  // Suppress only when the user supplied an explicit scope. A concrete model
+  // still needs the scope: --model selects one model but pi otherwise exposes
+  // every authenticated provider in /model.
   if (Array.from(FULL_SUPPRESS_ARGS).some((arg) => optionNames.has(arg))) {
     return passthrough;
+  }
+  if (optionNames.has('--model')) {
+    return ['--models', 'mlx/*', ...passthrough];
   }
   if (Array.from(SESSION_PROVIDER_CARRIER_ARGS).some((arg) => optionNames.has(arg))) {
     return ['--models', 'mlx/*', ...passthrough];
   }
-  return ['--model', `mlx/${defaultModelId}`, ...passthrough];
+  return ['--models', 'mlx/*', '--model', `mlx/${defaultModelId}`, ...passthrough];
 }
 
 /** A `defaultProvider`/`defaultModel` pair persisted by pi's `/model`. */
@@ -452,16 +595,30 @@ mlx options (handled before pi sees the args):
   --models-dir <dir>        Local models directory (default: ~/.mlx-node/models;
                             also via MLX_MODELS_DIR or ~/.mlx-node/config.json).
                             Dash-leading paths need the --models-dir=<dir> form.
+  --trace                   Enable bounded native inference diagnostics.
+  --trace-dir <dir>         Write inference.log in this directory (implies
+                            --trace; dash-leading paths need --trace-dir=<dir>).
 
 First run: when no local model exists, an interactive wizard offers a curated
 download. Agent config home: ~/.mlx-node/agent (override: PI_CODING_AGENT_DIR).
 
 Environment:
-  MLX_AGENT_AUTO_APPROVE=1  Auto-approve bash/write/edit tool calls in headless
+  MLX_AGENT_AUTO_APPROVE=1  Auto-approve bash/write/edit/subagent tool calls in headless
                             print/json runs — without an attached UI the
                             permission gate blocks them otherwise.
+  MLX_AGENT_ENABLE_GEMMA_DRAFT=1
+                            Use an embedded Gemma4 draft for flat speculative
+                            decoding instead of the default paged AR path.
+  MLX_NODE_LOG              Override the Rust tracing target filter used by --trace.
+  MLX_NODE_LOG_FILE         Override the Rust tracing log file used by --trace.
 
 Notes:
+  The built-in subagent tool provides scout/planner/reviewer/worker. Each child
+  is an isolated in-memory Pi session inside the parent process. Child sessions
+  share one resident model/cache host; up to four tool loops may overlap while
+  model inference is serialized. Separate mlx agent processes do not share
+  model memory. --no-extensions (or -ne) disables subagents as well as
+  discovered extensions.
   'mlx agent update' is disabled — update @mlx-node/cli via your package
   manager instead. 'install'/'remove'/'list' manage pi extensions, themes and
   skills under the agent config home; 'config' edits which are enabled.
@@ -518,6 +675,16 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     return;
   }
 
+  if (scan.traceDirMissingValue) {
+    console.error('Missing value for --trace-dir (a dash-leading path needs the --trace-dir=<dir> form)');
+    process.exitCode = 1;
+    return;
+  }
+
+  // Must run before the deferred `@mlx-node/agent` import below. The native
+  // tracing subscriber is installed while the native addon initializes.
+  const traceLogFile = configureAgentTracing(scan);
+
   // Deferred imports: `@mlx-node/agent` loads the native addon and the
   // pure `scanAgentArgs` export above must stay importable without it.
   const resolveModelsDir = deps.resolveModelsDir ?? (await import('../../config.js')).resolveModelsDir;
@@ -528,7 +695,7 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
   if (scan.help) {
     printAgentPreamble();
     // pi appends its full flag list and process.exit(0)s on this path.
-    await runAgent({ modelsDir, models: [], argv: ['--help'] });
+    await runAgent({ modelsDir, models: [], argv: ['--help'], traceLogFile });
     return;
   }
 
@@ -545,7 +712,7 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
   // path downloads a model in a TTY — then actually lists it — or prints
   // the exact `mlx download model` commands headless.
   if (PI_PASSTHROUGH_COMMANDS.has(scan.passthrough[0] ?? '') || scan.piOneShot) {
-    await runAgent({ modelsDir, models: [], argv: scan.passthrough });
+    await runAgent({ modelsDir, models: [], argv: scan.passthrough, traceLogFile });
     return;
   }
 
@@ -595,15 +762,14 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
   if (persisted === undefined) {
     (deps.writePersistedDefault ?? writePersistedDefaultModel)('mlx', modelId);
   }
+  const passthroughOptionNames = collectPiOptionNames(scan.passthrough);
   const agentArgv = withDefaultModel(scan.passthrough, modelId);
-  // A notice only makes sense when injection actually overrode a non-mlx
-  // persisted default. An identity return (FULL_SUPPRESS: --model/--models/
-  // --fork) overrode nothing, so the notice would be a lie; both the
-  // `--models mlx/*` scope and the fresh-run `--model` injection return a new
-  // array, so `agentArgv !== scan.passthrough` marks a real override.
-  if (notice !== undefined && agentArgv !== scan.passthrough) {
+  // A notice only makes sense when a concrete default actually overrode a
+  // non-mlx persisted default. Adding the local picker scope around an explicit
+  // --model does not override that explicit choice and must stay silent.
+  if (notice !== undefined && injectsConcreteDefault(passthroughOptionNames)) {
     console.error(notice);
   }
 
-  await runAgent({ modelsDir, models, genmlxModels, argv: agentArgv });
+  await runAgent({ modelsDir, models, genmlxModels, argv: agentArgv, traceLogFile });
 }

@@ -445,6 +445,15 @@ impl DecoderLayer {
             down_proj,
         };
     }
+
+    /// Whether any main-model projection in this decoder layer is quantized.
+    pub fn is_quantized(&self) -> bool {
+        let attention = match &self.attn {
+            AttentionType::Linear(gdn) => gdn.is_quantized(),
+            AttentionType::Full(attn) => attn.is_quantized(),
+        };
+        attention || self.mlp.is_quantized()
+    }
 }
 
 #[cfg(test)]

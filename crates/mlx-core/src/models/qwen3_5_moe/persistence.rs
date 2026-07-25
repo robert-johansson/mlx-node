@@ -11,13 +11,13 @@ use tracing::{info, warn};
 use crate::array::{DType, MxArray};
 use crate::engine::persistence::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
-    prewarm_checkpoint_pages,
+    prewarm_checkpoint_pages, strip_qwen35_vision_weight_prefix,
 };
 use crate::models::mtp_drafter::{DrafterBodyVariant, MTP_MOE_LAYER_LINEAR_SUFFIXES};
 use crate::models::quant_dispatch::{
     default_per_layer_quant, effective_plq_for, ensure_dense_weight_floating,
-    ensure_int8_storage_resolves_sym8, has_sym8_mode, normalize_per_layer_key, parse_quant_block,
-    resolve_default_mode,
+    ensure_int8_storage_resolves_sym8, ensure_plain_fp8_storage_resolves_fp8_e4m3, has_sym8_mode,
+    normalize_per_layer_key, parse_quant_settings, resolve_default_mode, select_quantization_block,
 };
 use crate::models::qwen3_5::persistence::{
     MTP_LAYER_LINEAR_SUFFIXES, augment_mtplx_mtp_quantization_with_suffixes, load_vision_weights,
@@ -33,7 +33,8 @@ use super::model::{Qwen3_5MoeModel, Qwen35MoeInner, handle_qwen35_moe_cmd};
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
     MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, QuantizedSwitchLinear,
-    is_mxfp8_checkpoint, is_quantized_checkpoint, try_build_mxfp4_quantized_linear,
+    is_mxfp8_checkpoint, is_quantized_checkpoint, try_build_fp8_e4m3_quantized_linear,
+    try_build_fp8_e4m3_quantized_switch_linear, try_build_mxfp4_quantized_linear,
     try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
     try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
     try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
@@ -526,6 +527,7 @@ fn apply_weights_moe_inner(
         // int8 STORAGE with non-sym8 metadata = config drift — fail loud
         // before the int8 tensor can flow into the affine/mxfp builders.
         ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "qwen3_5_moe")?;
+        ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "qwen3_5_moe")?;
         // Result<Option<..>>: `Ok(None)` = "prefix not quantized, fall back
         // to the dense-weight branch"; `Err` = fail-loud (a malformed sym8
         // layer must never silently fall back, see
@@ -534,6 +536,7 @@ fn apply_weights_moe_inner(
             PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
             PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
+            PerLayerMode::Fp8E4m3 => try_build_fp8_e4m3_quantized_linear(params, prefix)?,
             PerLayerMode::Affine => {
                 try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
             }
@@ -570,10 +573,12 @@ fn apply_weights_moe_inner(
      -> Result<Option<QuantizedSwitchLinear>> {
         let plq = effective_plq_for(prefix, per_layer_quant, default_plq, Some(default_gate_plq));
         ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "qwen3_5_moe")?;
+        ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "qwen3_5_moe")?;
         Ok(match plq.mode {
             PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
             PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, prefix),
+            PerLayerMode::Fp8E4m3 => try_build_fp8_e4m3_quantized_switch_linear(params, prefix)?,
             PerLayerMode::Affine => {
                 try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
             }
@@ -1507,18 +1512,14 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     // Split vision/text weights
                     let has_vision = raw_params
                         .keys()
-                        .any(|k| k.starts_with("vision_tower.") || k.starts_with("visual."));
+                        .any(|k| strip_qwen35_vision_weight_prefix(k).is_some());
 
                     let (text_raw_params, vision_params) = if has_vision {
                         let mut vision_params: HashMap<String, MxArray> = HashMap::new();
                         let mut text_params: HashMap<String, MxArray> = HashMap::new();
                         for (name, array) in raw_params {
-                            if name.starts_with("vision_tower.") || name.starts_with("visual.") {
-                                let vkey = name
-                                    .strip_prefix("vision_tower.")
-                                    .or_else(|| name.strip_prefix("visual."))
-                                    .unwrap_or(&name)
-                                    .to_string();
+                            if let Some(vkey) = strip_qwen35_vision_weight_prefix(&name) {
+                                let vkey = vkey.to_string();
                                 vision_params.insert(vkey, array);
                             } else {
                                 text_params.insert(name, array);
@@ -1544,19 +1545,13 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     );
 
                     // Parse quantization config
-                    let quant_cfg = raw
-                        .get("quantization")
-                        .or_else(|| raw.get("quantization_config"));
-                    let quant_bits = quant_cfg
-                        .and_then(|q| q["bits"].as_i64())
-                        .unwrap_or(DEFAULT_QUANT_BITS as i64)
-                        as i32;
-                    let quant_group_size = quant_cfg
-                        .and_then(|q| q["group_size"].as_i64())
-                        .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64)
-                        as i32;
-                    let (top_level_mode, mut per_layer_quant) =
-                        parse_quant_block(quant_cfg, quant_group_size);
+                    let quant_cfg = select_quantization_block(&raw)?;
+                    let (quant_bits, quant_group_size, top_level_mode, mut per_layer_quant) =
+                        parse_quant_settings(
+                            quant_cfg,
+                            DEFAULT_QUANT_BITS,
+                            DEFAULT_QUANT_GROUP_SIZE,
+                        )?;
 
                     // Augment the per-layer-quant table with the MTP head's
                     // quantization metadata derived from the
@@ -1584,7 +1579,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                         config.n_mtp_layers,
                         mtp_linear_suffixes,
                         &mut per_layer_quant,
-                    );
+                    )?;
 
                     // sym8 emits mixed-dtype K/V (f32 K after the f32-weight
                     // k_norm, bf16 V) which the block-paged pool hard-rejects;
@@ -1657,6 +1652,15 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                         &per_layer_quant,
                     )?;
 
+                    // Delay physical paged-pool allocation until all text and
+                    // vision weights are resident so the live-memory cap sees
+                    // the actual model footprint.
+                    if let Some(ref vparams) = vision_params {
+                        let arrays: Vec<&MxArray> = vparams.values().collect();
+                        crate::array::memory::materialize_weights(&arrays)?;
+                    }
+                    inner.initialize_paged_adapter()?;
+
                     // Deterministic weight-byte total for the cache-limit
                     // coordinator. Includes text + vision weights when a
                     // vision encoder is loaded. `saturating_add` guards
@@ -1680,9 +1684,18 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
             let model_id = inner.model_id;
             let config_out = inner.config.clone();
             let image_processor = inner.image_processor.as_ref().map(Arc::clone);
+            let spatial_merge_size = inner.spatial_merge_size.unwrap_or(2);
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
             let mtp_active = inner.has_mtp_weights();
+            let vision_active = super::model::qwen35_moe_vision_active(
+                inner.vision_encoder.is_some(),
+                inner.image_processor.is_some(),
+                paged_active,
+            );
+            let context_limits = crate::models::qwen3_5::model::Qwen3_5ContextLimits::from_tuple(
+                inner.paged_context_limits(),
+            );
 
             Ok((
                 inner,
@@ -1690,10 +1703,13 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     config_out,
                     model_id,
                     image_processor,
+                    spatial_merge_size,
                     tokenizer_out,
                     cache_limit_guard,
                     paged_active,
                     mtp_active,
+                    vision_active,
+                    context_limits,
                 ),
             ))
         },
@@ -1703,11 +1719,14 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
     let (
         config,
         _model_id,
-        _image_processor,
+        image_processor,
+        spatial_merge_size,
         _tokenizer,
         cache_limit_guard,
         paged_active,
         mtp_active,
+        vision_active,
+        context_limits,
     ) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
@@ -1717,6 +1736,10 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         config,
         paged_active,
         mtp_active,
+        vision_active,
+        image_processor,
+        spatial_merge_size,
+        context_limits,
         _cache_limit_guard: cache_limit_guard,
     })
 }
@@ -2163,6 +2186,81 @@ mod tests {
             format!("{base}.scales"),
             MxArray::from_float32(&s, &[n]).expect("scales"),
         );
+    }
+
+    #[test]
+    fn plain_fp8_expert_trio_dispatches_through_moe_loader() {
+        let config = tiny_sym8_moe_cfg();
+        let mut inner =
+            Qwen35MoeInner::new(config.clone()).expect("Qwen35MoeInner::new must succeed");
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "embedding.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 8 * 64], &[8, 64]).expect("embedding"),
+        );
+        params.insert(
+            "final_norm.weight".to_string(),
+            MxArray::from_float32(&vec![1.0f32; 64], &[64]).expect("final_norm"),
+        );
+        // A dense q_proj is enough for the loader's attention completeness
+        // gate; the FP8 expert sidecars below make the checkpoint quantized.
+        params.insert(
+            "layers.0.self_attn.q_proj.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 128 * 64], &[128, 64]).expect("q_proj"),
+        );
+        params.insert(
+            "layers.0.mlp.gate.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 4 * 64], &[4, 64]).expect("router gate"),
+        );
+
+        let mut per_layer_quant = HashMap::new();
+        for suffix in ["gate_proj", "up_proj", "down_proj"] {
+            let base = format!("layers.0.mlp.switch_mlp.{suffix}");
+            let source = MxArray::from_float32(&vec![0.25f32; 4 * 64 * 64], &[4, 64, 64])
+                .expect("expert source")
+                .astype(DType::BFloat16)
+                .expect("expert bf16");
+            let (weight, scales) =
+                crate::quant::fp8_weight::quantize_per_output_channel(&source, &base)
+                    .expect("plain fp8 expert quantization");
+            params.insert(format!("{base}.weight"), weight);
+            params.insert(format!("{base}.scales"), scales);
+            per_layer_quant.insert(
+                base,
+                default_per_layer_quant(
+                    crate::quant::fp8_weight::FP8_E4M3_BITS,
+                    crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
+                    PerLayerMode::Fp8E4m3,
+                ),
+            );
+        }
+
+        apply_weights_moe_inner(
+            &mut inner,
+            &params,
+            &config,
+            4,
+            32,
+            None,
+            &per_layer_quant,
+            /* has_vision */ false,
+        )
+        .expect("plain FP8 switch_mlp expert trio must load");
+
+        match &inner.layers[0].mlp {
+            MLPType::MoE(moe) => {
+                let switch = moe.get_switch_mlp();
+                assert!(
+                    switch.is_quantized(),
+                    "plain FP8 trio must install the quantized SwitchGLU backend"
+                );
+                let weight = switch.get_gate_proj_weight();
+                assert_eq!(weight.dtype().unwrap(), DType::Uint8);
+                assert_eq!(weight.shape().unwrap().to_vec(), vec![4, 64, 64]);
+            }
+            _ => panic!("layer 0 must be MoE (decoder_sparse_step = 1)"),
+        }
     }
 
     #[test]
@@ -2823,7 +2921,10 @@ mod tests {
             "affine checkpoints must keep their block-paged request"
         );
         if crate::engine::persistence::compiled_forward_backend_available() {
-            let inner = Qwen35MoeInner::new(cfg).expect("Qwen35MoeInner::new must succeed");
+            let mut inner = Qwen35MoeInner::new(cfg).expect("Qwen35MoeInner::new must succeed");
+            inner
+                .initialize_paged_adapter()
+                .expect("post-load paged adapter initialization must succeed");
             assert!(
                 inner.paged_adapter.is_some(),
                 "affine paged config must build the paged adapter"

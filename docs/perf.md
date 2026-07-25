@@ -62,6 +62,7 @@ Graph construction failures no longer abort the process: a failed node add flush
 | `MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL` | Override decode-time `clear_cache` cadence |
 | `MLX_PAGED_PREFILL_EVAL_INTERVAL`       | Override prefill `eval` cadence            |
 | `MLX_PAGED_PREFILL_CHUNK_SIZE`          | Prefill chunk size                         |
+| `MLX_PAGED_GROUPED_QWEN35=0`            | Disable the default-on BF16 D256/BS16 grouped decode kernel (24Q/4KV above 16K q1 / 8K q2; 16Q/2KV above 32K q1 / 16K q2) for same-binary A/B or driver rollback |
 | `MLX_TEST_PAGED`                        | Test-only paged-path toggle                |
 
 ### Memory pool
@@ -428,8 +429,9 @@ The Qwen3.5 GDN recurrence uses the **per-step** kernel by default on **every** 
 | 4-bit affine | `mlx_quantized_matmul` (mode `affine`, configurable group size and bits)                                                                                 |
 | MXFP4        | `--q-mode mxfp4`, or the early-FFN class in `--q-recipe unsloth --q-mxfp`; 4-bit microscaling with group size 32                                         |
 | MXFP8        | `mlx_gather_qmm` with `mode="mxfp8"` (used for MoE expert routing); returns `[quantized, scales]`                                                        |
-| NVFP4        | `--q-recipe unsloth --q-mode nvfp4`; early FFNs use NVFP4 4/16 in the official DGX class map                                                             |
-| FP8 E4M3     | `mlx_dequantize` — dequant **before** expert stacking; no re-quantization after stacking                                                                 |
+| NVFP4        | `--q-recipe unsloth --q-mode nvfp4`; early FFNs use NVFP4 4/16 weight storage with standard MLX A16 quantized matmul in the fixed DGX class map           |
+| FP8 E4M3 import | Source `.weight_scale_inv` checkpoints are dequantized **before** expert stacking; no re-quantization after stacking                              |
+| Plain FP8 weights | Unsloth DGX high class: `fp8_e4m3` raw U8 weights + per-output BF16 scales; current runtime dequantizes once to BF16 and runs A16 matmul/gather-mm (not native W8A8) |
 | FP8 KV cache | Paged-adapter only — `KVCacheDType::Fp8` with per-layer scale management via `KvScaleManager`. FP8 KV is intentionally rejected by the flat-path attach. |
 
 ### Recipes
@@ -438,10 +440,15 @@ The Qwen3.5 GDN recurrence uses the **per-step** kernel by default on **every** 
 
 - mlx-lm-style mixed-bit: `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`
 - `qwen3_5` — Qwen3.5-tuned recipe
-- `unsloth` — requires imatrix calibration. `--q-mxfp` selects the official map
-  translated from NVFP4/FP8 to MXFP4/MXFP8; `--q-mode nvfp4` selects the
-  official DGX map with NVFP4/MXFP8. Both use the final-eight FFN split and the
-  same BF16 exclusions. Plain affine alone keeps the legacy Dynamic 2.0 map.
+- `unsloth` — legacy affine requires imatrix calibration. `--q-mxfp` selects
+  the fixed tensor-class map translated from NVFP4/FP8 to MXFP4/MXFP8;
+  `--q-mode nvfp4` selects the DGX weight map with NVFP4/plain per-output E4M3 FP8. These fixed maps may omit the
+  imatrix; AWQ pre-scaling is then skipped and quality may be lower, while the
+  class map remains unchanged. Both use the final-eight FFN split and the same
+  BF16 exclusions. DGX runtime remains A16 for both weight classes and does not
+  preserve Unsloth's calibrated global scales, W4A4/W8A8 activation execution,
+  or calibrated FP8 KV-cache scales; no upstream numerical or performance
+  parity is claimed. Plain affine alone keeps the legacy Dynamic 2.0 map.
 
 AWQ-style imatrix pre-scaling is supported for improved low-bit quality.
 

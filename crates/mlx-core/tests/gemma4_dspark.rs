@@ -103,6 +103,8 @@ async fn load_dspark_model(model: &str, draft: &str) -> Gemma4Model {
 
 fn chat_config(max_new_tokens: i32, enable_mtp: bool) -> ChatConfig {
     ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
         temperature: Some(0.0),
         top_k: None,
@@ -137,6 +139,7 @@ fn user_message(content: &str) -> ChatMessage {
         tool_call_id: None,
         is_error: None,
         reasoning_content: None,
+        thinking_enabled: None,
         images: None,
         audio: None,
     }

@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -9,6 +9,7 @@ import { describe, expect, it, vi } from 'vite-plus/test';
 import {
   type AgentRunDeps,
   chooseDefaultModel,
+  configureAgentTracing,
   expandPiAgentDir,
   readPersistedDefaultModel,
   run,
@@ -73,6 +74,51 @@ describe('scanAgentArgs', () => {
       expect(scan.modelsDir).toBe('-odd-dir');
       expect(scan.modelsDirMissingValue).toBe(false);
       expect(scan.passthrough).toEqual(['-p', 'hi']);
+    });
+  });
+
+  describe('trace extraction', () => {
+    it('extracts --trace without forwarding it to pi', () => {
+      const scan = scanAgentArgs(['--trace', '-p', 'hi']);
+      expect(scan.trace).toBe(true);
+      expect(scan.traceDir).toBeUndefined();
+      expect(scan.traceDirMissingValue).toBe(false);
+      expect(scan.passthrough).toEqual(['-p', 'hi']);
+    });
+
+    it('extracts both --trace-dir forms and makes them imply tracing', () => {
+      const spaced = scanAgentArgs(['--trace-dir', '/tmp/mlx-trace', '-p', 'hi']);
+      expect(spaced.trace).toBe(true);
+      expect(spaced.traceDir).toBe('/tmp/mlx-trace');
+      expect(spaced.traceDirMissingValue).toBe(false);
+      expect(spaced.passthrough).toEqual(['-p', 'hi']);
+
+      const inline = scanAgentArgs(['--trace-dir=-odd-dir', '-c']);
+      expect(inline.trace).toBe(true);
+      expect(inline.traceDir).toBe('-odd-dir');
+      expect(inline.traceDirMissingValue).toBe(false);
+      expect(inline.passthrough).toEqual(['-c']);
+    });
+
+    it('reports a missing --trace-dir value without swallowing the next option', () => {
+      for (const argv of [['--trace-dir'], ['--trace-dir='], ['--trace-dir', ''], ['--trace-dir', '--help']]) {
+        const scan = scanAgentArgs(argv);
+        expect(scan.trace).toBe(true);
+        expect(scan.traceDir).toBeUndefined();
+        expect(scan.traceDirMissingValue).toBe(true);
+      }
+      expect(scanAgentArgs(['--trace-dir', '--help']).passthrough).toEqual(['--help']);
+    });
+
+    it('does not hijack trace flags that occupy a pi option value slot', () => {
+      const flagValue = scanAgentArgs(['--system-prompt', '--trace', '-p', 'hi']);
+      expect(flagValue.trace).toBe(false);
+      expect(flagValue.passthrough).toEqual(['--system-prompt', '--trace', '-p', 'hi']);
+
+      const dirFlagValue = scanAgentArgs(['--system-prompt', '--trace-dir', '/still-passthrough']);
+      expect(dirFlagValue.trace).toBe(false);
+      expect(dirFlagValue.traceDir).toBeUndefined();
+      expect(dirFlagValue.passthrough).toEqual(['--system-prompt', '--trace-dir', '/still-passthrough']);
     });
   });
 
@@ -227,24 +273,122 @@ describe('scanAgentArgs', () => {
   });
 });
 
+describe('configureAgentTracing', () => {
+  async function withTempHome(fn: (home: string) => Promise<void> | void): Promise<void> {
+    const home = await mkdtemp(join(tmpdir(), 'mlx-agent-trace-'));
+    try {
+      await fn(home);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+
+  it('does nothing when the CLI does not request diagnostics', () => {
+    const env: NodeJS.ProcessEnv = {};
+    const announcements: string[] = [];
+    expect(
+      configureAgentTracing({ trace: false }, { env, announce: (line) => announcements.push(line) }),
+    ).toBeUndefined();
+    expect(env.MLX_NODE_LOG).toBeUndefined();
+    expect(env.MLX_NODE_LOG_FILE).toBeUndefined();
+    expect(announcements).toEqual([]);
+  });
+
+  it('creates a private deterministic per-run file for --trace and announces its exact path once', async () => {
+    await withTempHome((home) => {
+      const env: NodeJS.ProcessEnv = {};
+      const announcements: string[] = [];
+      const logFile = configureAgentTracing(
+        { trace: true },
+        {
+          env,
+          homeDir: home,
+          now: new Date('2026-07-14T01:02:03.456Z'),
+          pid: 4242,
+          announce: (line) => announcements.push(line),
+        },
+      );
+      const expectedDir = join(home, '.mlx-node', 'logs', 'agent', '2026-07-14T01-02-03-456Z-pid-4242');
+      const expectedFile = join(expectedDir, 'inference.log');
+      expect(logFile).toBe(expectedFile);
+      expect(env.MLX_NODE_LOG).toBe('mlx_core::inference=info,mlx_core::decode=info');
+      expect(env.MLX_NODE_LOG_FILE).toBe(expectedFile);
+      expect(statSync(expectedDir).mode & 0o777).toBe(0o700);
+      expect(statSync(expectedFile).mode & 0o777).toBe(0o600);
+      expect(announcements).toEqual([`mlx agent: inference log ${expectedFile}`]);
+    });
+  });
+
+  it('uses an explicit --trace-dir and enables tracing even without a separate --trace', async () => {
+    await withTempHome((home) => {
+      const traceDir = join(home, 'chosen');
+      const env: NodeJS.ProcessEnv = {};
+      const logFile = configureAgentTracing({ trace: false, traceDir }, { env, announce: () => {} });
+      expect(logFile).toBe(join(traceDir, 'inference.log'));
+      expect(env.MLX_NODE_LOG).toBe('mlx_core::inference=info,mlx_core::decode=info');
+      expect(env.MLX_NODE_LOG_FILE).toBe(logFile);
+      expect(statSync(traceDir).mode & 0o777).toBe(0o700);
+      expect(statSync(logFile!).mode & 0o777).toBe(0o600);
+    });
+  });
+
+  it('preserves an explicit MLX_NODE_LOG filter', async () => {
+    await withTempHome((home) => {
+      const env: NodeJS.ProcessEnv = { MLX_NODE_LOG: 'mlx_core::inference=info' };
+      const logFile = configureAgentTracing(
+        { trace: true },
+        {
+          env,
+          homeDir: home,
+          now: new Date('2026-07-14T02:00:00.000Z'),
+          pid: 7,
+          announce: () => {},
+        },
+      );
+      expect(logFile).toBe(join(home, '.mlx-node', 'logs', 'agent', '2026-07-14T02-00-00-000Z-pid-7', 'inference.log'));
+      expect(env.MLX_NODE_LOG).toBe('mlx_core::inference=info');
+      expect(env.MLX_NODE_LOG_FILE).toBe(logFile);
+    });
+  });
+
+  it('preserves an explicit MLX_NODE_LOG_FILE over --trace-dir', async () => {
+    await withTempHome((home) => {
+      const explicit = join(home, 'explicit', 'native.log');
+      const explicitEnvValue = `  ${explicit}  `;
+      const env: NodeJS.ProcessEnv = { MLX_NODE_LOG_FILE: explicitEnvValue };
+      const announcements: string[] = [];
+      const logFile = configureAgentTracing(
+        { trace: true, traceDir: join(home, 'ignored') },
+        { env, announce: (line) => announcements.push(line) },
+      );
+      expect(logFile).toBe(explicit);
+      expect(env.MLX_NODE_LOG_FILE).toBe(explicitEnvValue);
+      expect(statSync(explicit).mode & 0o777).toBe(0o600);
+      expect(announcements).toEqual([`mlx agent: inference log ${explicit}`]);
+    });
+  });
+});
+
 describe('withDefaultModel', () => {
-  it('prepends --model mlx/<id> to a fresh run', () => {
+  it('prepends an mlx-only scope and --model mlx/<id> to a fresh run', () => {
     expect(withDefaultModel(['-p', 'hi'], 'qwen3.5-0.8b-mlx-bf16')).toEqual([
+      '--models',
+      'mlx/*',
       '--model',
       'mlx/qwen3.5-0.8b-mlx-bf16',
       '-p',
       'hi',
     ]);
-    expect(withDefaultModel([], 'some-model')).toEqual(['--model', 'mlx/some-model']);
+    expect(withDefaultModel([], 'some-model')).toEqual(['--models', 'mlx/*', '--model', 'mlx/some-model']);
   });
 
-  it('respects an explicit --model, --models scope, or --provider', () => {
+  it('scopes an explicit --model while respecting an explicit --models scope', () => {
     const withModel = ['--model', 'mlx/other-model', '-p', 'hi'];
-    expect(withDefaultModel(withModel, 'default-model')).toBe(withModel);
+    expect(withDefaultModel(withModel, 'default-model')).toEqual(['--models', 'mlx/*', ...withModel]);
     const withScope = ['--models', 'mlx/a,mlx/b'];
     expect(withDefaultModel(withScope, 'default-model')).toBe(withScope);
     const withProvider = ['--provider', 'mlx', '--model', 'x'];
-    expect(withDefaultModel(withProvider, 'default-model')).toBe(withProvider);
+    expect(withDefaultModel(withProvider, 'default-model')).toEqual(['--models', 'mlx/*', ...withProvider]);
   });
 
   it('scopes a provider-only run to mlx/* instead of a bare --model (no bogus cloud model)', () => {
@@ -264,7 +408,7 @@ describe('withDefaultModel', () => {
     // model (options.model stays undefined) and only picks an mlx model for a
     // new / unknown / empty session — never a cloud default. So prepend the
     // scope, never a bare --model that would fight the restore. (--fork is a
-    // full suppressor, covered separately below.)
+    // scoped session carrier, covered separately below.)
     for (const args of [['-c'], ['--continue'], ['-r'], ['--resume'], ['--session', 'abc'], ['--session-id', 'abc']]) {
       const out = withDefaultModel(args, 'default-model');
       expect(out).toEqual(['--models', 'mlx/*', ...args]);
@@ -272,14 +416,23 @@ describe('withDefaultModel', () => {
     }
   });
 
-  it('leaves a --fork run unchanged — the forked session restores its own model', () => {
+  it('scopes a --fork run without replacing the forked session model', () => {
     const argv = ['--fork', 'abc123', '-p', 'continue where we left off'];
-    expect(withDefaultModel(argv, 'default-model')).toBe(argv);
+    const out = withDefaultModel(argv, 'default-model');
+    expect(out).toEqual(['--models', 'mlx/*', ...argv]);
+    expect(out).not.toContain('--model');
   });
 
   it('does not treat prompt text as a flag', () => {
     const argv = ['-p', 'please run --continue for me'];
-    expect(withDefaultModel(argv, 'm')).toEqual(['--model', 'mlx/m', '-p', 'please run --continue for me']);
+    expect(withDefaultModel(argv, 'm')).toEqual([
+      '--models',
+      'mlx/*',
+      '--model',
+      'mlx/m',
+      '-p',
+      'please run --continue for me',
+    ]);
   });
 
   describe('value-aware scan: a sentinel consumed as a VALUE must not suppress injection', () => {
@@ -291,6 +444,8 @@ describe('withDefaultModel', () => {
       // Mutation guard: reverting to `passthrough.some(FULL_SUPPRESS_ARGS.has)`
       // makes this expect the unchanged argv and the test fails.
       expect(withDefaultModel(['--system-prompt', '--model', '-p', 'hi'], 'd')).toEqual([
+        '--models',
+        'mlx/*',
         '--model',
         'mlx/d',
         '--system-prompt',
@@ -302,6 +457,8 @@ describe('withDefaultModel', () => {
 
     it('injects a local model when --provider is the VALUE of --append-system-prompt', () => {
       expect(withDefaultModel(['--append-system-prompt', '--provider'], 'd')).toEqual([
+        '--models',
+        'mlx/*',
         '--model',
         'mlx/d',
         '--append-system-prompt',
@@ -312,16 +469,24 @@ describe('withDefaultModel', () => {
     it('injects a local model when a carrier (-c) is consumed as the VALUE of --name', () => {
       // --name consumes `-c` as its value (pi: args[++i]); the benign reverse
       // direction — the leftover run is a plain fresh run → concrete --model.
-      expect(withDefaultModel(['--name', '-c'], 'd')).toEqual(['--model', 'mlx/d', '--name', '-c']);
+      expect(withDefaultModel(['--name', '-c'], 'd')).toEqual([
+        '--models',
+        'mlx/*',
+        '--model',
+        'mlx/d',
+        '--name',
+        '-c',
+      ]);
     });
 
     it('still classifies a REAL option name after its consumer sentinel skips its own value', () => {
       // A real `--session-id foo` (consumer + carrier) still scopes to mlx/*, and
-      // a real explicit `--model x` (consumer + full-suppress) still forwards
-      // unchanged — the sentinel classifies AND skips its value in one pass.
+      // a real explicit `--model x` (consumer) keeps its concrete selection but
+      // gains the local-only scope. The sentinel classifies AND skips its value
+      // in one pass.
       expect(withDefaultModel(['--session-id', 'foo'], 'd')).toEqual(['--models', 'mlx/*', '--session-id', 'foo']);
       const explicit = ['--model', 'x', '-p', 'hi'];
-      expect(withDefaultModel(explicit, 'd')).toBe(explicit);
+      expect(withDefaultModel(explicit, 'd')).toEqual(['--models', 'mlx/*', ...explicit]);
     });
   });
 });
@@ -371,7 +536,12 @@ describe('run() argv routing', () => {
     const calls = {
       discover: [] as string[],
       wizard: [] as string[],
-      runAgent: [] as Array<{ modelsDir: string; models: MlxModelInfo[]; argv: string[] }>,
+      runAgent: [] as Array<{
+        modelsDir: string;
+        models: MlxModelInfo[];
+        argv: string[];
+        traceLogFile?: string;
+      }>,
       writes: [] as Array<{ provider: string; modelId: string }>,
     };
     const deps: AgentRunDeps = {
@@ -381,7 +551,12 @@ describe('run() argv routing', () => {
         return Promise.resolve(discoverBatches[Math.min(calls.discover.length - 1, discoverBatches.length - 1)]!);
       },
       runAgent: (opts) => {
-        calls.runAgent.push({ modelsDir: opts.modelsDir, models: opts.models, argv: opts.argv });
+        calls.runAgent.push({
+          modelsDir: opts.modelsDir,
+          models: opts.models,
+          argv: opts.argv,
+          traceLogFile: opts.traceLogFile,
+        });
         return Promise.resolve();
       },
       wizard: (modelsDir) => {
@@ -466,6 +641,82 @@ describe('run() argv routing', () => {
     }
   });
 
+  it('exits 1 on a valueless --trace-dir before importing or handing off to the agent', async () => {
+    for (const argv of [['--trace-dir'], ['--trace-dir='], ['--trace-dir', ''], ['--trace-dir', '--help']]) {
+      const { deps, calls } = makeDeps();
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const prevExitCode = process.exitCode;
+      try {
+        await run(argv, deps);
+        expect(process.exitCode).toBe(1);
+        expect(errorSpy.mock.calls.flat().join('\n')).toContain('Missing value for --trace-dir');
+      } finally {
+        process.exitCode = prevExitCode;
+        errorSpy.mockRestore();
+      }
+      expect(calls.runAgent).toHaveLength(0);
+      expect(calls.discover).toHaveLength(0);
+      expect(calls.wizard).toHaveLength(0);
+    }
+  });
+
+  it('documents the mlx trace flags and environment in the help preamble', async () => {
+    const { deps, calls } = makeDeps();
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await run(['--help'], deps);
+      const output = logSpy.mock.calls.flat().join('\n');
+      expect(output).toContain('--trace');
+      expect(output).toContain('--trace-dir <dir>');
+      expect(output).toContain('MLX_NODE_LOG');
+      expect(output).toContain('MLX_NODE_LOG_FILE');
+      expect(output).toContain('isolated in-memory Pi session');
+      expect(output).toContain('model inference is serialized');
+      expect(output).toContain('Separate mlx agent processes do not share');
+    } finally {
+      logSpy.mockRestore();
+    }
+    expect(calls.runAgent).toHaveLength(1);
+    expect(calls.runAgent[0]!.argv).toEqual(['--help']);
+  });
+
+  it('configures Rust tracing and strips mlx trace flags before the agent handoff', async () => {
+    const traceRoot = await mkdtemp(join(tmpdir(), 'mlx-agent-run-trace-'));
+    const logDir = join(traceRoot, 'logs');
+    const previousFilter = process.env.MLX_NODE_LOG;
+    const previousFile = process.env.MLX_NODE_LOG_FILE;
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      delete process.env.MLX_NODE_LOG;
+      delete process.env.MLX_NODE_LOG_FILE;
+      const { deps, calls } = makeDeps();
+      const baseResolve = deps.resolveModelsDir!;
+      deps.resolveModelsDir = (explicit) => {
+        // This dependency is resolved immediately after the deferred-import
+        // boundary, so observing both values here guards the required ordering.
+        expect(process.env.MLX_NODE_LOG).toBe('mlx_core::inference=info,mlx_core::decode=info');
+        expect(process.env.MLX_NODE_LOG_FILE).toBe(join(logDir, 'inference.log'));
+        return baseResolve(explicit);
+      };
+
+      await run(['--trace-dir', logDir, '-p', 'hi'], deps);
+
+      expect(calls.runAgent).toHaveLength(1);
+      expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/fake-model', '-p', 'hi']);
+      expect(calls.runAgent[0]!.traceLogFile).toBe(join(logDir, 'inference.log'));
+      expect(errorSpy.mock.calls.flat().join('\n')).toContain(
+        `mlx agent: inference log ${join(logDir, 'inference.log')}`,
+      );
+    } finally {
+      if (previousFilter === undefined) delete process.env.MLX_NODE_LOG;
+      else process.env.MLX_NODE_LOG = previousFilter;
+      if (previousFile === undefined) delete process.env.MLX_NODE_LOG_FILE;
+      else process.env.MLX_NODE_LOG_FILE = previousFile;
+      errorSpy.mockRestore();
+      await rm(traceRoot, { recursive: true, force: true });
+    }
+  });
+
   it('still blocks update with exit code 1 before anything runs', async () => {
     const { deps, calls } = makeDeps();
     const prevExitCode = process.exitCode;
@@ -480,21 +731,21 @@ describe('run() argv routing', () => {
     expect(calls.wizard).toHaveLength(0);
   });
 
-  it('still injects --model mlx/<id> on a fresh agent run', async () => {
+  it('injects an mlx-only scope and --model mlx/<id> on a fresh agent run', async () => {
     const { deps, calls } = makeDeps();
     await run(['-p', 'hi'], deps);
     expect(calls.discover).toHaveLength(1);
     expect(calls.wizard).toHaveLength(0);
     expect(calls.runAgent).toHaveLength(1);
-    expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/fake-model', '-p', 'hi']);
+    expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/fake-model', '-p', 'hi']);
     expect(calls.runAgent[0]!.models.map((m) => m.discovered.name)).toEqual(['fake-model']);
   });
 
-  it('still skips injection when the run already carries --model', async () => {
+  it('keeps an explicit model and adds the mlx-only selector scope', async () => {
     const { deps, calls } = makeDeps();
     await run(['--model', 'mlx/other', '-p', 'hi'], deps);
     expect(calls.runAgent).toHaveLength(1);
-    expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/other', '-p', 'hi']);
+    expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/other', '-p', 'hi']);
   });
 
   it('still runs the wizard for a fresh agent run with no models, then injects the downloaded one', async () => {
@@ -503,14 +754,14 @@ describe('run() argv routing', () => {
     expect(calls.wizard).toHaveLength(1);
     expect(calls.discover).toHaveLength(2);
     expect(calls.runAgent).toHaveLength(1);
-    expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/downloaded-model', '-p', 'hi']);
+    expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/downloaded-model', '-p', 'hi']);
   });
 
-  it('forwards a --fork run unchanged so pi restores the forked session model', async () => {
+  it('scopes a --fork run while allowing pi to restore the forked session model', async () => {
     const { deps, calls } = makeDeps();
     await run(['--fork', 'abc123', '-p', 'hi'], deps);
     expect(calls.runAgent).toHaveLength(1);
-    expect(calls.runAgent[0]!.argv).toEqual(['--fork', 'abc123', '-p', 'hi']);
+    expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--fork', 'abc123', '-p', 'hi']);
     expect(calls.runAgent[0]!.argv).not.toContain('--model');
   });
 
@@ -546,7 +797,7 @@ describe('run() argv routing', () => {
     await run(['--list-models'], deps);
     expect(calls.wizard).toHaveLength(1);
     expect(calls.runAgent).toHaveLength(1);
-    expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/downloaded-model', '--list-models']);
+    expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/downloaded-model', '--list-models']);
   });
 
   it('keeps an empty --export value on the wizard path with zero models (pi would silently no-op)', async () => {
@@ -554,7 +805,7 @@ describe('run() argv routing', () => {
     await run(['--export', ''], deps);
     expect(calls.wizard).toHaveLength(1);
     expect(calls.runAgent).toHaveLength(1);
-    expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/downloaded-model', '--export', '']);
+    expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/downloaded-model', '--export', '']);
   });
 
   /**
@@ -587,7 +838,7 @@ describe('run() argv routing', () => {
         const { deps, calls } = makeDeps(twoModels());
         deps.readPersistedDefault = () => readPersistedDefaultModel(agentDir);
         await run(['-p', 'hi'], deps);
-        expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/model-b', '-p', 'hi']);
+        expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/model-b', '-p', 'hi']);
       });
     });
 
@@ -596,7 +847,7 @@ describe('run() argv routing', () => {
         const { deps, calls } = makeDeps(twoModels());
         deps.readPersistedDefault = () => readPersistedDefaultModel(agentDir);
         await run(['-p', 'hi'], deps);
-        expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/model-a', '-p', 'hi']);
+        expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/model-a', '-p', 'hi']);
       });
     });
 
@@ -612,7 +863,7 @@ describe('run() argv routing', () => {
         } finally {
           errorSpy.mockRestore();
         }
-        expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/model-a', '-p', 'hi']);
+        expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/model-a', '-p', 'hi']);
         expect(notices).toContain('anthropic/claude-x');
         expect(notices).toContain('mlx/model-a');
       });
@@ -630,7 +881,7 @@ describe('run() argv routing', () => {
         } finally {
           errorSpy.mockRestore();
         }
-        expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/model-b', '-p', 'hi']);
+        expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/model-b', '-p', 'hi']);
         expect(errorCallCount).toBe(0);
       });
     });
@@ -757,7 +1008,7 @@ describe('run() argv routing', () => {
       // `--models mlx/*` for carriers) is applied regardless of whether the
       // belt seed persisted.
       const cases: Array<{ argv: string[]; expected: string[] }> = [
-        { argv: ['-p', 'hi'], expected: ['--model', 'mlx/fake-model', '-p', 'hi'] },
+        { argv: ['-p', 'hi'], expected: ['--models', 'mlx/*', '--model', 'mlx/fake-model', '-p', 'hi'] },
         { argv: ['-c'], expected: ['--models', 'mlx/*', '-c'] },
         { argv: ['--session-id', 'unknown-xyz'], expected: ['--models', 'mlx/*', '--session-id', 'unknown-xyz'] },
         { argv: ['--provider', 'groq'], expected: ['--models', 'mlx/*', '--provider', 'groq'] },

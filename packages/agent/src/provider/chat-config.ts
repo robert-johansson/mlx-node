@@ -64,10 +64,32 @@ const THINKING_LEVEL_TO_EFFORT: Record<ThinkingLevel, 'low' | 'medium' | 'high'>
   max: 'high',
 };
 
+export interface ResolvedReasoningMode {
+  reasoningEffort: 'none' | 'low' | 'medium' | 'high';
+  /** The `enable_thinking` value implied by `reasoningEffort` for templates. */
+  thinkingEnabled: boolean;
+}
+
+/**
+ * Resolve Pi's thinking level once for both native config and persisted replay
+ * provenance. Keeping these values together prevents a low/minimal turn from
+ * being replayed later as an enabled-thinking turn merely because the Pi
+ * option was present.
+ */
+export function resolveReasoningMode(reasoning: ThinkingLevel | undefined): ResolvedReasoningMode {
+  const reasoningEffort = reasoning === undefined ? 'none' : THINKING_LEVEL_TO_EFFORT[reasoning];
+  return {
+    reasoningEffort,
+    thinkingEnabled: reasoningEffort === 'medium' || reasoningEffort === 'high',
+  };
+}
+
 export function buildChatConfig(
   modelType: ModelType,
   options: SimpleStreamOptions | undefined,
   tools: ToolDefinition[] | undefined,
+  rootCacheOwnerId?: string,
+  resolvedReasoning = resolveReasoningMode(options?.reasoning),
 ): ChatConfig {
   const preset = launchPresetFor(modelType);
   if (!preset) {
@@ -78,8 +100,20 @@ export function buildChatConfig(
   const config: ChatConfig = {
     ...preset.sampling,
     maxNewTokens: preset.maxOutputTokens,
-    reasoningEffort: options?.reasoning === undefined ? 'none' : THINKING_LEVEL_TO_EFFORT[options.reasoning],
+    reasoningEffort: resolvedReasoning.reasoningEffort,
+    // The terminal native chunk carries TTFT/prefill/decode telemetry when
+    // requested. The provider keeps it transient and only renders it in TUI.
+    reportPerformance: true,
   };
+  // Pi assigns one stable id to the root AgentSession and a distinct id to
+  // every in-memory subagent session. Native Qwen3.5 uses this only to retain
+  // GDN sidecars per logical branch; PagedAttention KV blocks remain shared by
+  // their existing exact content hashes.
+  if (options?.sessionId !== undefined) config.cacheOwnerId = options.sessionId;
+  // The active owner above can be a child AgentSession. Keep the current
+  // top-level session identity separate so a /new or /resume rotation updates
+  // which branch the bounded GDN sidecar store protects from child eviction.
+  if (rootCacheOwnerId !== undefined) config.cacheRootOwnerId = rootCacheOwnerId;
   if (options?.maxTokens !== undefined) config.maxNewTokens = options.maxTokens;
   // Per-run sampling override for measurement work (pi has no temperature
   // flag and never sets SimpleStreamOptions.temperature itself, so without

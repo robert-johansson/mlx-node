@@ -5,12 +5,13 @@
  * wire shape (genmlx-5aah), and reset/dispose bookkeeping. No nbb, no
  * native code.
  */
-import type { ChatMessage, ChatStreamEvent } from '@mlx-node/lm';
+import type { ChatConfig, ChatMessage, ChatStreamEvent } from '@mlx-node/lm';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import type { GenmlxTurnEngine } from '../src/provider/genmlx/genmlx-host.js';
 import { GenmlxSession } from '../src/provider/genmlx/genmlx-session.js';
 import { setGenmlxBestOfK, setGenmlxToolVerifier } from '../src/provider/genmlx/genmlx-verifier.js';
+import { WARM_REUSE_TOUCHED_FIELDS } from '../src/provider/warm-reuse.js';
 
 interface FakeTurn {
   deltas: Array<{ text: string; isReasoning?: boolean }>;
@@ -87,14 +88,17 @@ function makeEngine(script: FakeTurn[]): FakeEngine {
   return engine;
 }
 
+/** `piSessionId` reaches the session the way the adapter delivers it: as
+ *  `ChatConfig.cacheOwnerId` (pi's `options.sessionId`; genmlx-lin9). */
 async function collect(
   session: GenmlxSession,
-  config = {},
+  config: ChatConfig = {},
   signal?: AbortSignal,
   piSessionId?: string,
 ): Promise<ChatStreamEvent[]> {
   const events: ChatStreamEvent[] = [];
-  for await (const event of session.startFromHistoryStream(config, signal, piSessionId)) events.push(event);
+  const owned: ChatConfig = piSessionId === undefined ? config : { ...config, cacheOwnerId: piSessionId };
+  for await (const event of session.startFromHistoryStream(owned, signal)) events.push(event);
   return events;
 }
 
@@ -365,7 +369,7 @@ describe('GenmlxSession', () => {
   it('warm-reuse-touched fields exist (shared helper contract)', () => {
     const session = new GenmlxSession(makeEngine([]));
     const internals = session as unknown as Record<string, unknown>;
-    for (const field of ['inFlight', 'history', 'lastImagesKey', 'turnCount', 'unresolvedOkToolCallCount']) {
+    for (const field of WARM_REUSE_TOUCHED_FIELDS) {
       expect(field in internals, `missing warm-reuse field ${field}`).toBe(true);
     }
   });

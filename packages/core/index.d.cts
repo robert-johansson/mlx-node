@@ -165,6 +165,11 @@ export declare class Gemma4Model {
    * without a model-thread roundtrip.
    */
   hasBlockPagedCache(): boolean;
+  /**
+   * Whether this loaded instance can execute image-bearing chat turns.
+   * Config-only stubs and incomplete/non-paged physical paths return false.
+   */
+  supportsImages(): boolean;
   modelId(): number;
   /**
    * Whether a draft model — DSpark or Google assistant — is loaded on
@@ -1245,6 +1250,28 @@ export declare class Qwen35Model {
    */
   hasMtpWeights(): boolean;
   /**
+   * Whether this loaded model instance can execute image-bearing turns.
+   *
+   * This is an authoritative load-time snapshot, not a `config.json`
+   * family guess: it requires a loaded vision encoder, image processor,
+   * and the block-paged KV adapter used by the dense vision path.
+   */
+  supportsImages(): boolean;
+  /**
+   * Synchronous snapshot used by higher layers to preflight rendered
+   * prompts and clamp output before native cache allocation.
+   */
+  contextLimits(): Qwen35ContextLimits;
+  /**
+   * Compute the exact prompt length after Qwen image-placeholder expansion
+   * without running the vision encoder or touching inference caches.
+   *
+   * `prompt_tokens` is the already-rendered chat-template output. `messages`
+   * supplies the complete image history so both fresh and leased-session
+   * preflights account for every image in template order.
+   */
+  expandedPromptTokenCount(promptTokens: Uint32Array, messages: Array<ChatMessage>): Promise<number>;
+  /**
    * Load a pretrained model from a directory.
    *
    * Expects the directory to contain:
@@ -1388,6 +1415,21 @@ export declare class Qwen35MoeModel {
    * the per-request `enableMtp` flag.
    */
   hasMtpWeights(): boolean;
+  /**
+   * Whether this loaded model instance can execute image-bearing turns.
+   *
+   * This is an authoritative load-time snapshot, not a model-family guess:
+   * it requires the loaded vision encoder, image processor, and block-paged
+   * KV adapter used by the MoE vision path.
+   */
+  supportsImages(): boolean;
+  /** Synchronous active-context snapshot shared with the dense wrapper. */
+  contextLimits(): Qwen35ContextLimits;
+  /**
+   * Exact, non-mutating Qwen image-placeholder expansion count for a fully
+   * rendered prompt and complete message history.
+   */
+  expandedPromptTokenCount(promptTokens: Uint32Array, messages: Array<ChatMessage>): Promise<number>;
   /** Load a pretrained model from a directory. */
   static load(path: string): Promise<Qwen35MoeModel>;
   /** Generate text from a prompt token sequence. */
@@ -2335,6 +2377,20 @@ export declare function calibrateActivationAmaxRaw(
 
 /** Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
 export interface ChatConfig {
+  /**
+   * Internal logical cache owner. The agent provider forwards Pi's stable
+   * session id so model-global GDN sidecars can retain parent and child
+   * branches independently. This does not namespace the physical paged KV
+   * cache; exact token/extra-key hashes remain shareable across owners.
+   */
+  cacheOwnerId?: string | undefined;
+  /**
+   * Internal top-level owner for the bounded Qwen3.5 GDN sidecar store.
+   * `cache_owner_id` may identify a child Pi session; this separately
+   * identifies the current interactive root so /new and /resume can rotate
+   * the protected branch without changing PagedAttention cache identity.
+   */
+  cacheRootOwnerId?: string | undefined;
   maxNewTokens?: number | undefined;
   temperature?: number | undefined;
   topK?: number | undefined;
@@ -2416,15 +2472,18 @@ export interface ChatConfig {
    * variant instead (`gemma4/model.rs` `resolve_params`, always from the
    * RAW config value — the engine's central `[1, 5]` clamp is an MTP-head
    * contract that does not apply to external drafts):
-   * - DSpark: an unset `mtpDepth` runs full draft blocks (the draft
-   *   checkpoint's block size — 7 tokens on `dspark_gemma4_12b_block7`),
-   *   and an explicit `mtpDepth` acts as a CAP on that block (clamped to
-   *   `[1, blockSize]`).
+   * - DSpark: with both knobs unset, full draft blocks (the checkpoint's
+   *   block size — 7 tokens on `dspark_gemma4_12b_block7`) run behind a
+   *   short target-AR/DSpark break-even calibration. A short generation
+   *   budget that cannot finish calibration retains the fixed-block
+   *   schedule. An explicit
+   *   `mtpDepth` caps and pins the block unless `mtpAdaptiveDepth: true`
+   *   opts the guard back in; explicit `false` disables it.
    * - Assistant (Google `gemma-4-*-it-assistant`): an unset `mtpDepth`
    *   drafts 3 tokens per cycle (`ASSISTANT_DEFAULT_DEPTH`), and an
    *   explicit `mtpDepth` clamps to `[1, 8]` (`ASSISTANT_MAX_DEPTH`).
    *
-   * `mtpAdaptiveDepth` is ignored for both Gemma4 external-draft variants.
+   * `mtpAdaptiveDepth` is ignored for the Gemma4 assistant variant.
    */
   mtpDepth?: number | undefined;
   /**
@@ -2437,7 +2496,9 @@ export interface ChatConfig {
    * `MLX_MTP_EV_ALLOW_DEEPEN=0` to pin the base depth.
    * When false, the loop pins `mtpDepth` for every cycle.
    *
-   * Default: false. An explicit value always wins over the default.
+   * Default: false, except Gemma4 DSpark enables its measured break-even
+   * guard when both this field and `mtpDepth` are unset. An explicit value
+   * always wins over the family default.
    */
   mtpAdaptiveDepth?: boolean | undefined;
 }
@@ -2471,6 +2532,17 @@ export interface ChatMessage {
   isError?: boolean;
   /** Reasoning content for thinking mode (used with <think> tags) */
   reasoningContent?: string;
+  /**
+   * Thinking mode used when this assistant message was generated.
+   *
+   * This is replay provenance, not a request override. Gemma4's disabled-
+   * thinking generation prefix contains an explicit empty thought channel,
+   * while an enabled-thinking turn that emitted no reasoning contains no
+   * such channel. Keeping the historical mode on the message lets the chat
+   * template reproduce either byte sequence even when a later request
+   * changes its current thinking setting.
+   */
+  thinkingEnabled?: boolean;
   /** Image data for VLM models (encoded image bytes: PNG/JPEG, passed as Uint8Array/Buffer) */
   images?: Array<Uint8Array> | undefined;
   /** Audio data for unified Gemma 4 (encoded audio bytes: WAV, passed as Uint8Array/Buffer) */
@@ -3014,8 +3086,9 @@ export interface Gemma4LoadOptions {
    * Directory of a draft checkpoint (config.json + safetensors) to load
    * alongside the target model for speculative decoding — either a
    * DSpark draft or a Google assistant draft; the kind is probed from
-   * the draft config.json. Draft decoding runs only on the flat KV-cache
-   * path: setting this while the model config explicitly enables
+   * the draft config.json. When omitted, `<model_path>/draft/` is loaded
+   * automatically when present. Draft decoding runs only on the flat
+   * KV-cache path: setting this while the model config explicitly enables
    * `use_block_paged_cache` is a hard load error, and an unset
    * `use_block_paged_cache` is forced to `false`.
    */
@@ -3197,6 +3270,13 @@ export interface GgufConversionOptions {
   inputPath: string;
   /** Output directory for converted SafeTensors model */
   outputDir: string;
+  /**
+   * Optional directory containing the authoritative HuggingFace config and
+   * tokenizer/processor assets. GGUF metadata is not rich enough to recreate
+   * unified Gemma4 config fields such as head_dim, layer_types, vision, and
+   * audio configuration exactly.
+   */
+  configSourceDir?: string;
   /** Target dtype: "float32", "float16", "bfloat16" (default: keep original) */
   dtype?: string;
   /** Enable verbose logging */
@@ -3997,7 +4077,7 @@ export interface Qwen35Config {
   /**
    * GPU memory budget for paged KV cache in megabytes.
    * Only used when `use_block_paged_cache` is true.
-   * Default: 2048 (2GB).
+   * Default: automatically sized for one full-context sequence.
    */
   pagedCacheMemoryMb?: number | undefined;
   /**
@@ -4048,6 +4128,18 @@ export interface Qwen35Config {
    * unavailable.
    */
   nMtpLayers: number;
+}
+
+/**
+ * Trained and physically available active-context limits for one loaded
+ * Qwen3.5 model. Values are snapshots because the physical pool is fixed for
+ * the lifetime of the resident model.
+ */
+export interface Qwen35ContextLimits {
+  trainedWindowTokens: number;
+  effectiveWindowTokens: number;
+  pagedBlockCapacity: number;
+  pagedBlockSize: number;
 }
 
 /** Generation configuration for Qwen3.5 */
@@ -4105,7 +4197,7 @@ export interface Qwen35MoeConfig {
   /**
    * GPU memory budget for paged KV cache in megabytes.
    * Only used when `use_block_paged_cache` is true.
-   * Default: 2048 (2GB).
+   * Default: automatically sized for one full-context sequence.
    */
   pagedCacheMemoryMb?: number | undefined;
   /**

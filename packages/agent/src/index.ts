@@ -11,6 +11,17 @@ export {
 
 export { type CatalogEntry, MODEL_CATALOG, visibleCatalog } from './catalog.js';
 export { createPermissionGateExtension } from './extensions/permission-gate.js';
+export {
+  createSubagentExtension,
+  discoverSubagents,
+  normalizeSubagentMode,
+  type InProcessSubagentSession,
+  type SubagentConfig,
+  type SubagentExtensionOptions,
+  type SubagentMode,
+  type SubagentSessionCreateOptions,
+} from './extensions/subagent.js';
+export { createTerminalTitleExtension } from './extensions/terminal-title.js';
 export { buildChatConfig } from './provider/chat-config.js';
 export { contextToChatMessages, toolsToDefinitions } from './provider/convert-messages.js';
 export { TurnEmitter } from './provider/events.js';

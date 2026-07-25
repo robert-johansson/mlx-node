@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
@@ -24,9 +24,17 @@ use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
 use crate::model_thread::ResponseTx;
+#[cfg(test)]
+use crate::models::qwen3_5::gdn_checkpoint_store::compute_paged_prefix_block_hash;
+use crate::models::qwen3_5::gdn_checkpoint_store::{
+    GDN_PREFIX_CHECKPOINT_LIMIT, GDN_PREFIX_CHECKPOINTS_PER_OWNER, GdnCheckpointLineage,
+    compute_paged_prefix_block_hashes, find_longest_valid_gdn_checkpoint_index,
+    prune_gdn_checkpoints, replay_gdn_cache_and_commit,
+};
 use crate::models::qwen3_5::model::{
-    VisionCache, VisionCacheInner, async_eval_layer_caches, compute_image_token_counts_per_image,
-    eval_layer_caches, inject_image_placeholders, partition_prefill_chunks,
+    IMAGE_TOKEN_ID, Qwen3_5ContextLimits, VisionCache, VisionCacheInner, async_eval_layer_caches,
+    compute_image_token_counts_per_image, constrain_paged_context_params, eval_layer_caches,
+    inject_image_placeholders, partition_prefill_chunks, qwen35_expanded_prompt_token_count,
     vlm_prepare_vision_continuation, vlm_prepare_vision_features,
 };
 use crate::array::mask::create_causal_mask;
@@ -43,8 +51,8 @@ use crate::array::MxArray;
 use crate::engine;
 use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup};
 use crate::engine::{
-    apply_all_penalties, compute_image_cache_key, compute_performance_metrics, extract_chat_params,
-    finalize_chat_result, save_cache_state_direct, verify_cache_prefix_direct,
+    apply_all_penalties, compute_performance_metrics, extract_chat_params, finalize_chat_result,
+    save_cache_state_direct, verify_cache_prefix_direct,
 };
 use crate::models::qwen3_5::mtp_decode;
 use crate::nn::{Embedding, Linear, RMSNorm};
@@ -65,30 +73,59 @@ fn fresh_moe_layer_caches(config: &Qwen3_5MoeConfig) -> Vec<Qwen3_5LayerCache> {
         .collect()
 }
 
-const MOE_GDN_PREFIX_CHECKPOINT_LIMIT: usize = 8;
-
 struct MoeGdnPrefixCheckpoint {
+    owner_id: String,
     prefix_len: u32,
     block_size: u32,
     final_block_hash: u64,
+    block_hashes: Vec<u64>,
     tokens: Vec<u32>,
     caches: Vec<Qwen3_5LayerCache>,
+}
+
+impl GdnCheckpointLineage for MoeGdnPrefixCheckpoint {
+    fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
+
+    fn prefix_len(&self) -> u32 {
+        self.prefix_len
+    }
+
+    fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    fn final_block_hash(&self) -> u64 {
+        self.final_block_hash
+    }
+
+    fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    fn block_hashes(&self) -> &[u64] {
+        &self.block_hashes
+    }
 }
 
 struct MoeGdnHistoryCheckpoint {
+    owner_id: String,
+    image_key: Option<u64>,
     tokens: Vec<u32>,
     caches: Vec<Qwen3_5LayerCache>,
 }
 
-struct MoeGdnPrefixPreparation {
-    state: &'static str,
-    already_primed: bool,
+pub(super) struct MoeGdnPrefixPreparation {
+    pub(super) state: &'static str,
+    pub(super) already_primed: bool,
+    pub(super) restored_prefix_tokens: u32,
+    pub(super) replayed_prefix_tokens: u32,
 }
 
 #[derive(Default)]
 struct MoeGdnCheckpointStoreTrace {
     stored: bool,
-    hash_ms: f64,
     eval_ms: f64,
     clone_ms: f64,
     token_clone_ms: f64,
@@ -101,13 +138,6 @@ impl MoeGdnCheckpointStoreTrace {
         self.total_ms = start.map(elapsed_ms).unwrap_or(0.0);
         self
     }
-}
-
-fn moe_gdn_store_replayed_prefix_checkpoint_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        crate::inference_trace::env_flag_enabled("MLX_MOE_GDN_REPLAY_PREFIX_CHECKPOINT")
-    })
 }
 
 #[derive(Clone, Copy)]
@@ -191,42 +221,6 @@ fn clone_moe_linear_layer_caches(
     Some(cloned)
 }
 
-fn compute_paged_prefix_block_hash(
-    tokens: &[u32],
-    prefix_len: u32,
-    block_size: u32,
-    extra_keys_per_block: &[Vec<u64>],
-    cache_salt: u64,
-) -> Option<u64> {
-    if prefix_len == 0 || block_size == 0 || !prefix_len.is_multiple_of(block_size) {
-        return None;
-    }
-
-    let prefix_len = prefix_len as usize;
-    let block_size = block_size as usize;
-    if prefix_len > tokens.len() {
-        return None;
-    }
-
-    let num_blocks = prefix_len / block_size;
-    let mut parent_hash = 0;
-    for block_idx in 0..num_blocks {
-        let extra_keys = extra_keys_per_block.get(block_idx)?;
-        let start = block_idx * block_size;
-        let end = start + block_size;
-        parent_hash = if block_idx == 0 && cache_salt != 0 {
-            let mut salted_keys = Vec::with_capacity(extra_keys.len() + 1);
-            salted_keys.extend_from_slice(extra_keys);
-            salted_keys.push(cache_salt);
-            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, &salted_keys)
-        } else {
-            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, extra_keys)
-        };
-    }
-
-    Some(parent_hash)
-}
-
 // Import the shared model ID counter from the dense module — dense and MoE
 // share the same C++ weight map, so IDs must be globally unique.
 use crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER;
@@ -256,6 +250,10 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) vision_cache: VisionCache,
     pub(crate) cached_token_history: Vec<u32>,
     pub(crate) cached_image_key: Option<u64>,
+    /// Absolute expanded-token positions paired with their per-image content
+    /// hashes for the live paged request. Retained across text continuations
+    /// so image-conditioned blocks keep the same prefix-cache identity.
+    pub(crate) cached_paged_image_token_positions: Vec<(u32, u64)>,
     pub(crate) cached_rope_deltas: Option<i32>,
     /// Number of images embedded in `cached_token_history` — `cached_image_key`
     /// is the combined hash of exactly the FIRST `cached_image_count` images of
@@ -274,8 +272,15 @@ pub(crate) struct Qwen35MoeInner {
     /// history into fresh caches. Pure-flat sessions only; the paged path
     /// rolls back its adapter directly.
     pub(crate) flat_mtp_caches_desynced: bool,
+    active_cache_owner_id: String,
+    gdn_root_cache_owner_id: Option<String>,
+    gdn_root_cache_owner_is_explicit: bool,
     gdn_prefix_checkpoints: VecDeque<MoeGdnPrefixCheckpoint>,
     gdn_last_history_checkpoint: Option<MoeGdnHistoryCheckpoint>,
+    /// Set when the infallible paged-finalize hook could not register or
+    /// release the request. `save_paged_history` consumes this latch instead of
+    /// republishing expanded image-placeholder history as a live session.
+    paged_finalize_failed: bool,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache) for
     /// full-attention layers — same semantics as the dense model.
     /// **Opt-in via `Qwen3_5MoeConfig::use_block_paged_cache`.**
@@ -325,12 +330,21 @@ pub(crate) struct Qwen35MoeInner {
 /// Build the MoE media admission contract from this loaded family's own
 /// components. Image execution needs the encoder, processor, and paged KV
 /// adapter; incomplete stacks still enter the backend for its precise error.
+pub(crate) const fn qwen35_moe_vision_active(
+    has_vision_encoder: bool,
+    has_image_processor: bool,
+    has_paged_adapter: bool,
+) -> bool {
+    has_vision_encoder && has_image_processor && has_paged_adapter
+}
+
 const fn qwen35_moe_media_plan(
     has_vision_encoder: bool,
     has_image_processor: bool,
     has_paged_adapter: bool,
 ) -> MediaPlan {
-    let images_available = has_vision_encoder && has_image_processor && has_paged_adapter;
+    let images_available =
+        qwen35_moe_vision_active(has_vision_encoder, has_image_processor, has_paged_adapter);
     MediaPlan::with_backend_validation(
         MediaCapabilities {
             images: images_available,
@@ -691,77 +705,10 @@ impl Qwen35MoeInner {
 
         let model_id = QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-        // Block-paged KV adapter — opt-in via `use_block_paged_cache`.
-        // See `Qwen35Inner::new` (dense model) for the full architectural
-        // discussion; this is the MoE-side mirror.
-        // Block-paged KV uses Metal-only kernels; when paged is forced on (config
-        // or `MLX_QWEN35_PAGED_OVERRIDE=1`) on a non-Metal backend, leave the
-        // adapter None so dispatch falls through to flat eager instead of hitting
-        // the throwing CUDA stubs. macOS keeps building it (probe always true).
-        let paged_adapter = if config.use_block_paged_cache.unwrap_or(false)
-            && crate::engine::persistence::compiled_forward_backend_available()
-        {
-            let attn_layer_count = config.full_attention_layer_count() as u32;
-            if attn_layer_count == 0 {
-                return Err(Error::from_reason(
-                    "Qwen3.5 MoE block-paged adapter: config has no full_attention layers; \
-                     paged KV cache requires at least one attention layer.",
-                ));
-            }
-
-            let block_size = config.paged_block_size.unwrap_or(16);
-            let gpu_memory_mb = config.paged_cache_memory_mb.unwrap_or(2048);
-            let head_size = config.head_dim as u32;
-            let num_kv_heads = config.num_kv_heads as u32;
-
-            let pa_config = mlx_paged_attn::PagedAttentionConfig {
-                block_size,
-                gpu_memory_mb,
-                head_size,
-                num_kv_heads,
-                num_layers: attn_layer_count,
-                use_fp8_cache: Some(false),
-                max_seq_len: Some(config.max_position_embeddings as u32),
-                max_batch_size: Some(32),
-            };
-
-            let num_blocks = pa_config.calculate_num_blocks();
-            if num_blocks == 0 {
-                return Err(Error::from_reason(format!(
-                    "Qwen3.5 MoE block-paged adapter: gpu_memory_mb={gpu_memory_mb} too small \
-                     (head_size={head_size}, num_kv_heads={num_kv_heads}, \
-                     block_size={block_size}, num_attn_layers={attn_layer_count})"
-                )));
-            }
-
-            let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-                num_blocks, block_size,
-            )));
-
-            let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
-            let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, cache_dtype)
-                .map_err(|e| {
-                    Error::from_reason(format!(
-                        "Failed to construct LayerKVPool for Qwen3.5 MoE block-paged adapter: {e}"
-                    ))
-                })?;
-
-            let adapter =
-                PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
-                    Error::from_reason(format!(
-                        "Failed to construct Qwen3.5 MoE PagedKVCacheAdapter: {e}"
-                    ))
-                })?;
-
-            info!(
-                "Qwen3.5 MoE block-paged adapter enabled: num_blocks={}, block_size={}, \
-                 gpu_memory_mb={}, num_attn_layers={}, cache_dtype=BFloat16",
-                num_blocks, block_size, gpu_memory_mb, attn_layer_count
-            );
-            Some(adapter)
-        } else {
-            None
-        };
+        // Persistence constructs the physical pool only after weights are
+        // installed and materialized, when live unified-memory pressure can be
+        // measured safely.
+        let paged_adapter = None;
 
         // Multi-Token Prediction (MTP) head. Built when the config
         // reports `n_mtp_layers > 0` (i.e. the checkpoint shipped MTP
@@ -797,19 +744,21 @@ impl Qwen35MoeInner {
             vision_encoder: None,
             image_processor: None,
             spatial_merge_size: None,
-            vision_cache: Arc::new(Mutex::new(VisionCacheInner {
-                entries: HashMap::new(),
-                generation: 0,
-            })),
+            vision_cache: Arc::new(Mutex::new(VisionCacheInner::new())),
             cached_token_history: Vec::new(),
             cached_image_key: None,
+            cached_paged_image_token_positions: Vec::new(),
             cached_rope_deltas: None,
             cached_image_count: 0,
             cached_image_grids: Vec::new(),
             model_id,
             flat_mtp_caches_desynced: false,
+            active_cache_owner_id: String::new(),
+            gdn_root_cache_owner_id: None,
+            gdn_root_cache_owner_is_explicit: false,
             gdn_prefix_checkpoints: VecDeque::new(),
             gdn_last_history_checkpoint: None,
+            paged_finalize_failed: false,
             paged_adapter,
             mtp,
             mtp_weights_loaded: false,
@@ -819,6 +768,142 @@ impl Qwen35MoeInner {
             branch_caches: HashMap::new(),
             next_branch_id: 0,
         })
+    }
+
+    /// MoE mirror of the dense post-materialization adaptive paged-pool
+    /// initialization.
+    pub(crate) fn initialize_paged_adapter(&mut self) -> Result<()> {
+        if !self.config.use_block_paged_cache.unwrap_or(false)
+            || !crate::engine::persistence::compiled_forward_backend_available()
+        {
+            return Ok(());
+        }
+        if self.paged_adapter.is_some() {
+            return Ok(());
+        }
+        let attn_layer_count = self.config.full_attention_layer_count() as u32;
+        if attn_layer_count == 0 {
+            return Err(Error::from_reason(
+                "Qwen3.5 MoE block-paged adapter requires at least one full_attention layer",
+            ));
+        }
+        let block_size = self.config.paged_block_size.unwrap_or(16);
+        let head_size = self.config.head_dim as u32;
+        let num_kv_heads = self.config.num_kv_heads as u32;
+        let max_seq_len = self.config.max_position_embeddings as u32;
+        let default_memory_mb =
+            crate::models::qwen3_5::config::qwen35_default_paged_cache_memory_mb(
+                max_seq_len,
+                block_size,
+                head_size,
+                num_kv_heads,
+                attn_layer_count,
+            );
+        let (requested_memory_mb, requested_source) =
+            crate::models::qwen3_5::config::qwen35_resolve_paged_cache_memory_mb(
+                self.config.paged_cache_memory_mb,
+                default_memory_mb,
+            );
+        let pa_config = mlx_paged_attn::PagedAttentionConfig {
+            block_size,
+            gpu_memory_mb: requested_memory_mb,
+            head_size,
+            num_kv_heads,
+            num_layers: attn_layer_count,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(max_seq_len),
+            max_batch_size: Some(32),
+        };
+        let requested_blocks = pa_config.calculate_num_blocks();
+        if requested_blocks == 0 {
+            return Err(Error::from_reason(format!(
+                "Qwen3.5 MoE requested paged cache {requested_memory_mb} MiB cannot hold one block"
+            )));
+        }
+        let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+        let (num_blocks, sizing_source) = match mlx_paged_attn::profile::load_time_pool_sizing(
+            requested_blocks,
+            attn_layer_count,
+            num_kv_heads,
+            head_size,
+            block_size,
+            cache_dtype,
+        ) {
+            Ok(sizing) => (
+                sizing.selected_blocks,
+                format!(
+                    "adaptive(requested_blocks={}, active_mib={}, working_set_mib={})",
+                    sizing.requested_blocks,
+                    sizing.metal_active_bytes / (1024 * 1024),
+                    sizing
+                        .metal_working_set_bytes
+                        .map(|v| (v / (1024 * 1024)).to_string())
+                        .unwrap_or_else(|| "n/a".to_string())
+                ),
+            ),
+            Err(e) => {
+                return Err(Error::from_reason(format!(
+                    "Qwen3.5 MoE adaptive paged cache sizing failed safely; refusing an \
+                     uncapped pool request: {e}"
+                )));
+            }
+        };
+        let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+            num_blocks, block_size,
+        )));
+        let pool =
+            mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, cache_dtype).map_err(|e| {
+                Error::from_reason(format!("Failed to construct Qwen3.5 MoE KV pool: {e}"))
+            })?;
+        self.paged_adapter = Some(
+            PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
+                Error::from_reason(format!(
+                    "Failed to construct Qwen3.5 MoE paged adapter: {e}"
+                ))
+            })?,
+        );
+        info!(
+            "Qwen3.5 MoE paged adapter enabled after weight materialization: num_blocks={}, \
+             block_size={}, effective_window_tokens={}, trained_window_tokens={}, \
+             requested_memory_mib={}, requested_source={}, sizing_source={}",
+            num_blocks,
+            block_size,
+            num_blocks.saturating_mul(block_size).min(max_seq_len),
+            max_seq_len,
+            requested_memory_mb,
+            requested_source,
+            sizing_source,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn paged_context_limits(&self) -> (u32, u32, u32, u32) {
+        let trained = self.config.max_position_embeddings.max(0) as u32;
+        let Some(adapter) = self.paged_adapter.as_ref() else {
+            return (trained, trained, 0, 0);
+        };
+        let blocks = adapter.block_capacity();
+        let block_size = adapter.block_size();
+        (
+            trained,
+            trained.min(adapter.max_capacity_tokens()),
+            blocks,
+            block_size,
+        )
+    }
+
+    fn preflight_paged_context(
+        &self,
+        prompt_tokens: usize,
+        params: &mut engine::ChatParams,
+    ) -> Result<()> {
+        let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+            Error::from_reason("context_length_exceeded: paged cache is not initialized")
+        })?;
+        let capacity = adapter
+            .max_capacity_tokens()
+            .min(self.config.max_position_embeddings.max(0) as u32);
+        constrain_paged_context_params("Qwen3.5 MoE", prompt_tokens, capacity, params)
     }
 
     /// Store the checkpoint's parsed `generation_config.json` defaults.
@@ -1075,7 +1160,9 @@ impl Qwen35MoeInner {
         let per_image_token_counts =
             compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
         let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
-        let image_cache_key = compute_image_cache_key(images);
+        // Branchable flat prefill clears the live-session image key below, so
+        // only the per-image vision-cache identities are needed here.
+        let (_, per_image_hashes) = engine::compute_image_cache_keys(images);
 
         let embed = self.embedding.clone();
         let embedding_weight = embed.get_weight();
@@ -1090,7 +1177,7 @@ impl Qwen35MoeInner {
 
         let merge = vlm_prepare_vision_features(
             &input_ids,
-            image_cache_key,
+            &per_image_hashes,
             &processed,
             &vision_encoder,
             sms,
@@ -1378,21 +1465,106 @@ impl Qwen35MoeInner {
     fn clear_reuse_state(&mut self) {
         self.cached_token_history.clear();
         self.cached_image_key = None;
+        self.cached_paged_image_token_positions.clear();
         self.cached_rope_deltas = None;
         self.cached_image_count = 0;
         self.cached_image_grids.clear();
         self.gdn_prefix_checkpoints.clear();
         self.gdn_last_history_checkpoint = None;
+        self.gdn_root_cache_owner_id = None;
+        self.gdn_root_cache_owner_is_explicit = false;
+        self.paged_finalize_failed = false;
+    }
+
+    /// Tear down a partially prepared or partially executed paged turn.
+    ///
+    /// MoE's full-attention K/V lives in the adapter while its GDN recurrent
+    /// state lives in `self.caches`. If either half fails, retaining the other
+    /// half together with old media/history metadata creates a false-live
+    /// session. Preserve allocator-owned content-addressed blocks, but clear
+    /// every model-local continuation signal and recurrent checkpoint.
+    fn discard_moe_paged_session(&mut self) {
+        if let Some(adapter) = self.paged_adapter.as_mut()
+            && let Err(release_error) = adapter.release_request()
+        {
+            tracing::warn!(
+                target: "mlx_core::qwen3_5_moe::paged",
+                "failed to release MoE paged request during invalidation: {release_error}",
+            );
+        }
+        if let Some(caches) = self.caches.as_mut() {
+            for cache in caches {
+                cache.reset();
+            }
+        }
+        self.caches = None;
+        self.clear_reuse_state();
+        self.flat_mtp_caches_desynced = false;
+    }
+
+    fn invalidate_moe_paged_session(&mut self, context: &str) {
+        tracing::warn!(
+            target: "mlx_core::qwen3_5_moe::paged",
+            "invalidating MoE paged session after {context}",
+        );
+        self.discard_moe_paged_session();
+    }
+
+    /// Fallible terminal lifecycle for the hand-written MoE paged cores.
+    /// Registration failure is a turn failure: invalidate before any history
+    /// or GDN checkpoint can be published.
+    fn finalize_moe_manual_paged_turn(
+        &mut self,
+        image_token_positions: &[(u32, u64)],
+    ) -> Result<()> {
+        let finalize_result = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| "MoE manual paged finalization: paged_adapter is None".to_owned())
+            .and_then(|adapter| {
+                let finalize_extra_keys = engine::build_paged_extra_keys(
+                    adapter.request_tokens().len(),
+                    adapter.block_size(),
+                    image_token_positions,
+                );
+                adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0)
+            });
+        match finalize_result {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                self.invalidate_moe_paged_session("manual finalization failure");
+                Err(Error::from_reason(format!(
+                    "MoE paged finalization failed: {error}"
+                )))
+            }
+        }
+    }
+
+    /// MoE mirror of dense's terminal paged-finalization downgrade. The engine
+    /// saves history immediately after the infallible finalize hook, so an
+    /// adapter failure must invalidate every live image-session signal and
+    /// leave a latch that prevents that save from reviving placeholder history.
+    fn downgrade_failed_paged_finalize(&mut self, error: &str) {
+        tracing::warn!(
+            target: "mlx_core::qwen3_5_moe::paged",
+            "paged adapter finalization failed; invalidating the MoE session: {error}",
+        );
+        self.discard_moe_paged_session();
+        self.paged_finalize_failed = true;
     }
 
     fn find_moe_gdn_history_checkpoint(
         &self,
         tokens: &[u32],
         prefix_len: u32,
+        expected_image_key: Option<u64>,
     ) -> Option<Vec<Qwen3_5LayerCache>> {
         let prefix_tokens = tokens.get(..prefix_len as usize)?;
         let checkpoint = self.gdn_last_history_checkpoint.as_ref()?;
-        if checkpoint.tokens.as_slice() != prefix_tokens {
+        if checkpoint.owner_id != self.active_cache_owner_id
+            || checkpoint.image_key != expected_image_key
+            || checkpoint.tokens.as_slice() != prefix_tokens
+        {
             return None;
         }
         clone_moe_linear_layer_caches(&self.config, &checkpoint.caches)
@@ -1426,112 +1598,153 @@ impl Qwen35MoeInner {
         trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
 
         let update_start = trace_enabled.then(std::time::Instant::now);
-        self.gdn_last_history_checkpoint = Some(MoeGdnHistoryCheckpoint { tokens, caches });
+        self.gdn_last_history_checkpoint = Some(MoeGdnHistoryCheckpoint {
+            owner_id: self.active_cache_owner_id.clone(),
+            image_key: self.cached_image_key,
+            tokens,
+            caches,
+        });
         trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
         trace.stored = true;
         Ok(trace.finish(total_start))
     }
 
-    fn find_moe_gdn_prefix_checkpoint(
-        &self,
-        tokens: &[u32],
-        prefix_len: u32,
-        block_size: u32,
-        extra_keys_per_block: &[Vec<u64>],
-        cache_salt: u64,
-    ) -> Option<Vec<Qwen3_5LayerCache>> {
-        let final_block_hash = compute_paged_prefix_block_hash(
-            tokens,
-            prefix_len,
-            block_size,
-            extra_keys_per_block,
-            cache_salt,
-        )?;
-        let prefix_len_usize = prefix_len as usize;
-        let prefix_tokens = tokens.get(..prefix_len_usize)?;
-
-        self.gdn_prefix_checkpoints
-            .iter()
-            .rev()
-            .find(|checkpoint| {
-                checkpoint.prefix_len == prefix_len
-                    && checkpoint.block_size == block_size
-                    && checkpoint.final_block_hash == final_block_hash
-                    && checkpoint.tokens.as_slice() == prefix_tokens
-                    && moe_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches))
-            })
-            .and_then(|checkpoint| clone_moe_linear_layer_caches(&self.config, &checkpoint.caches))
-    }
-
-    fn remember_moe_gdn_prefix_checkpoint(
+    pub(super) fn find_moe_gdn_prefix_checkpoint(
         &mut self,
         tokens: &[u32],
         prefix_len: u32,
         block_size: u32,
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
-    ) -> Result<MoeGdnCheckpointStoreTrace> {
-        let trace_enabled = inference_trace_enabled();
-        let total_start = trace_enabled.then(std::time::Instant::now);
-        let mut trace = MoeGdnCheckpointStoreTrace::default();
-        let hash_start = trace_enabled.then(std::time::Instant::now);
-        let Some(final_block_hash) = compute_paged_prefix_block_hash(
+    ) -> Option<(u32, Vec<Qwen3_5LayerCache>)> {
+        let checkpoint_idx = find_longest_valid_gdn_checkpoint_index(
+            &self.gdn_prefix_checkpoints,
+            &self.active_cache_owner_id,
+            tokens,
+            prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+            |checkpoint| moe_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)),
+        )?;
+        let restored_prefix_len = self.gdn_prefix_checkpoints[checkpoint_idx].prefix_len;
+        let caches = clone_moe_linear_layer_caches(
+            &self.config,
+            &self.gdn_prefix_checkpoints[checkpoint_idx].caches,
+        )?;
+        let checkpoint = self.gdn_prefix_checkpoints.remove(checkpoint_idx)?;
+        self.gdn_prefix_checkpoints.push_back(checkpoint);
+        Some((restored_prefix_len, caches))
+    }
+
+    pub(super) fn remember_moe_gdn_materialized_prefix_checkpoint(
+        &mut self,
+        tokens: &[u32],
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+        checkpoint: crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint,
+    ) -> bool {
+        let prefix_len = checkpoint.prefix_len;
+        if !moe_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)) {
+            return false;
+        }
+        let Some(block_hashes) = compute_paged_prefix_block_hashes(
             tokens,
             prefix_len,
             block_size,
             extra_keys_per_block,
             cache_salt,
         ) else {
-            trace.hash_ms = hash_start.map(elapsed_ms).unwrap_or(0.0);
-            return Ok(trace.finish(total_start));
+            return false;
         };
-        trace.hash_ms = hash_start.map(elapsed_ms).unwrap_or(0.0);
+        let Some(final_block_hash) = block_hashes.last().copied() else {
+            return false;
+        };
         let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
-            return Ok(trace.finish(total_start));
+            return false;
         };
 
-        let eval_start = trace_enabled.then(std::time::Instant::now);
-        eval_layer_caches(&self.caches)?;
-        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
-        let clone_start = trace_enabled.then(std::time::Instant::now);
-        let Some(caches) = self
-            .caches
-            .as_ref()
-            .and_then(|caches| clone_moe_linear_layer_caches(&self.config, caches))
-        else {
-            trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
-            return Ok(trace.finish(total_start));
-        };
-        trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
-        let token_clone_start = trace_enabled.then(std::time::Instant::now);
-        let prefix_tokens = prefix_tokens.to_vec();
-        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let update_start = trace_enabled.then(std::time::Instant::now);
-        self.gdn_prefix_checkpoints.retain(|checkpoint| {
-            !(checkpoint.prefix_len == prefix_len
-                && checkpoint.block_size == block_size
-                && checkpoint.final_block_hash == final_block_hash
-                && checkpoint.tokens == prefix_tokens)
+        self.gdn_prefix_checkpoints.retain(|existing| {
+            !(existing.owner_id == self.active_cache_owner_id
+                && existing.prefix_len == prefix_len
+                && existing.block_size == block_size
+                && existing.final_block_hash == final_block_hash
+                && existing.tokens.as_slice() == prefix_tokens)
         });
         self.gdn_prefix_checkpoints
             .push_back(MoeGdnPrefixCheckpoint {
+                owner_id: self.active_cache_owner_id.clone(),
                 prefix_len,
                 block_size,
                 final_block_hash,
-                tokens: prefix_tokens,
-                caches,
+                block_hashes,
+                tokens: prefix_tokens.to_vec(),
+                caches: checkpoint.caches,
             });
-        while self.gdn_prefix_checkpoints.len() > MOE_GDN_PREFIX_CHECKPOINT_LIMIT {
-            self.gdn_prefix_checkpoints.pop_front();
-        }
-        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
-        trace.stored = true;
-
-        Ok(trace.finish(total_start))
+        self.prune_moe_gdn_prefix_checkpoints();
+        true
     }
 
-    fn prepare_moe_gdn_prefix_state(
+    fn prune_moe_gdn_prefix_checkpoints(&mut self) {
+        let active_owner_id = self.active_cache_owner_id.clone();
+        let root_owner_id = self
+            .gdn_root_cache_owner_id
+            .get_or_insert(active_owner_id)
+            .clone();
+        let checkpoint_limit = if self.gdn_root_cache_owner_is_explicit {
+            GDN_PREFIX_CHECKPOINT_LIMIT
+        } else {
+            GDN_PREFIX_CHECKPOINTS_PER_OWNER
+        };
+        prune_gdn_checkpoints(
+            &mut self.gdn_prefix_checkpoints,
+            checkpoint_limit,
+            GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            &root_owner_id,
+        );
+    }
+
+    pub(super) fn publish_moe_gdn_materialized_prefix_checkpoint(
+        &mut self,
+        tokens: &[u32],
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+        checkpoint: Option<crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint>,
+    ) {
+        let Some(checkpoint) = checkpoint else {
+            return;
+        };
+        let prefix_len = checkpoint.prefix_len;
+        let Some(block_size) = self
+            .paged_adapter
+            .as_ref()
+            .map(|adapter| adapter.block_size())
+        else {
+            return;
+        };
+        let stored = self.remember_moe_gdn_materialized_prefix_checkpoint(
+            tokens,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+            checkpoint,
+        );
+        tracing::info!(
+            target: "mlx_core::inference",
+            event = "gdn_prefix_checkpoint_store",
+            model = "qwen3_5_moe",
+            prefix_tokens = prefix_len,
+            block_size,
+            cache_owner_id = %self.active_cache_owner_id,
+            cache_root_owner_id = %self.gdn_root_cache_owner_id.as_deref().unwrap_or(""),
+            stored,
+            retained_checkpoints = self.gdn_prefix_checkpoints.len(),
+            "MoE GDN prefix checkpoint stored"
+        );
+    }
+
+    pub(super) fn prepare_moe_gdn_prefix_state(
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,
@@ -1540,61 +1753,64 @@ impl Qwen35MoeInner {
         cache_salt: u64,
         continued_live_prefix: bool,
     ) -> Result<MoeGdnPrefixPreparation> {
+        let image_aware_prefix = extra_keys_per_block.iter().any(|keys| !keys.is_empty());
         let trace_enabled = inference_trace_enabled();
-        let prepare_trace_start = trace_enabled.then(std::time::Instant::now);
+        let inference_info_enabled =
+            tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
+        let prepare_start = (trace_enabled || inference_info_enabled).then(std::time::Instant::now);
+        let cache_owner_id = self.active_cache_owner_id.clone();
+        let cache_root_owner_id = self.gdn_root_cache_owner_id.clone().unwrap_or_default();
+        let finish = |state: &'static str,
+                      restored_prefix_tokens: u32,
+                      replayed_prefix_tokens: u32|
+         -> MoeGdnPrefixPreparation {
+            if inference_info_enabled {
+                tracing::info!(
+                    target: "mlx_core::inference",
+                    event = "gdn_prefix_prepare",
+                    model = "qwen3_5_moe",
+                    cache_owner_id = %cache_owner_id,
+                    cache_root_owner_id = %cache_root_owner_id,
+                    state,
+                    cached_prefix_tokens = cached_prefix_len,
+                    restored_prefix_tokens,
+                    replayed_prefix_tokens,
+                    elapsed_ms = prepare_start.map(elapsed_ms).unwrap_or(0.0),
+                    "MoE GDN prefix state prepared"
+                );
+            }
+            let preparation = MoeGdnPrefixPreparation {
+                state,
+                already_primed: cached_prefix_len > 0,
+                restored_prefix_tokens,
+                replayed_prefix_tokens,
+            };
+            debug_assert_eq!(
+                preparation.already_primed,
+                preparation.restored_prefix_tokens > 0 || preparation.replayed_prefix_tokens > 0,
+                "MoE GDN prefix preparation must account for every primed prefix"
+            );
+            preparation
+        };
         let gdn_caches_ready = moe_paged_linear_caches_ready(&self.config, self.caches.as_deref());
         if gdn_caches_ready && continued_live_prefix {
-            if let Some(start) = prepare_trace_start {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=live \
-                     cached_prefix_tokens={} elapsed_ms={:.1}",
-                    cached_prefix_len,
-                    elapsed_ms(start)
-                ));
-            }
-            return Ok(MoeGdnPrefixPreparation {
-                state: "live",
-                already_primed: true,
-            });
+            return Ok(finish("live", cached_prefix_len, 0));
         }
 
         let gdn_prefix_from_history = cached_prefix_len > 0
             && self.cached_token_history.len() == cached_prefix_len as usize
             && tokens.starts_with(&self.cached_token_history);
         if gdn_caches_ready && gdn_prefix_from_history {
-            if let Some(start) = prepare_trace_start {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=last_history \
-                     cached_prefix_tokens={} elapsed_ms={:.1}",
-                    cached_prefix_len,
-                    elapsed_ms(start)
-                ));
-            }
-            return Ok(MoeGdnPrefixPreparation {
-                state: "last_history",
-                already_primed: true,
-            });
+            return Ok(finish("last_history", cached_prefix_len, 0));
         }
         if cached_prefix_len > 0 {
             let history_lookup_start = trace_enabled.then(std::time::Instant::now);
             let history_checkpoint =
-                self.find_moe_gdn_history_checkpoint(tokens, cached_prefix_len);
+                self.find_moe_gdn_history_checkpoint(tokens, cached_prefix_len, None);
             let history_lookup_ms = history_lookup_start.map(elapsed_ms);
             if let Some(checkpoint) = history_checkpoint {
                 self.caches = Some(checkpoint);
-                if let Some(start) = prepare_trace_start {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=last_history_checkpoint \
-                         cached_prefix_tokens={} history_lookup_ms={:.1} elapsed_ms={:.1}",
-                        cached_prefix_len,
-                        history_lookup_ms.unwrap_or(0.0),
-                        elapsed_ms(start)
-                    ));
-                }
-                return Ok(MoeGdnPrefixPreparation {
-                    state: "last_history_checkpoint",
-                    already_primed: true,
-                });
+                return Ok(finish("last_history_checkpoint", cached_prefix_len, 0));
             } else if trace_enabled {
                 let history_checkpoint_len = self
                     .gdn_last_history_checkpoint
@@ -1619,7 +1835,6 @@ impl Qwen35MoeInner {
             }
         }
 
-        let prefix_lookup_start = trace_enabled.then(std::time::Instant::now);
         let prefix_checkpoint = self.find_moe_gdn_prefix_checkpoint(
             tokens,
             cached_prefix_len,
@@ -1627,38 +1842,63 @@ impl Qwen35MoeInner {
             extra_keys_per_block,
             cache_salt,
         );
-        let prefix_lookup_ms = prefix_lookup_start.map(elapsed_ms);
-        if let Some(checkpoint) = prefix_checkpoint {
-            self.caches = Some(checkpoint);
-            if let Some(start) = prepare_trace_start {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=checkpoint \
-                     cached_prefix_tokens={} prefix_lookup_ms={:.1} elapsed_ms={:.1}",
-                    cached_prefix_len,
-                    prefix_lookup_ms.unwrap_or(0.0),
-                    elapsed_ms(start)
+        if let Some((restored_prefix_len, checkpoint)) = prefix_checkpoint {
+            let replayed_prefix_len = cached_prefix_len
+                .checked_sub(restored_prefix_len)
+                .ok_or_else(|| {
+                    Error::from_reason("MoE GDN checkpoint is longer than the cached paged prefix")
+                })?;
+            if replayed_prefix_len == 0 {
+                self.caches = Some(checkpoint);
+                return Ok(finish("checkpoint", restored_prefix_len, 0));
+            }
+            if image_aware_prefix {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                self.caches = Some(fresh_moe_layer_caches(&self.config));
+                return Err(Error::from_reason(
+                    "image-conditioned GDN prefix requires an exact checkpoint or the original image embeddings",
                 ));
             }
-            return Ok(MoeGdnPrefixPreparation {
-                state: "checkpoint",
-                already_primed: true,
-            });
+
+            let replay_suffix = tokens
+                .get(restored_prefix_len as usize..cached_prefix_len as usize)
+                .ok_or_else(|| {
+                    Error::from_reason(
+                        "MoE paged GDN checkpoint replay range exceeds prompt length",
+                    )
+                })?;
+            let embed = self.embedding.clone();
+            let layers = &mut self.layers;
+            replay_gdn_cache_and_commit(&mut self.caches, checkpoint, |staged| {
+                super::paged_forward::run_gdn_only_prefill_materialized(
+                    replay_suffix,
+                    &embed,
+                    layers,
+                    staged,
+                )
+            })?;
+            return Ok(finish(
+                "checkpoint_replay_materialized",
+                restored_prefix_len,
+                replayed_prefix_len,
+            ));
         }
 
-        self.caches = Some(fresh_moe_layer_caches(&self.config));
+        let fresh_caches = fresh_moe_layer_caches(&self.config);
         if cached_prefix_len == 0 {
-            if let Some(start) = prepare_trace_start {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=replay \
-                     cached_prefix_tokens=0 prefix_lookup_ms={:.1} elapsed_ms={:.1}",
-                    prefix_lookup_ms.unwrap_or(0.0),
-                    elapsed_ms(start)
-                ));
+            self.caches = Some(fresh_caches);
+            return Ok(finish("cold", 0, 0));
+        }
+        if image_aware_prefix {
+            if let Some(adapter) = self.paged_adapter.as_mut() {
+                let _ = adapter.release_request();
             }
-            return Ok(MoeGdnPrefixPreparation {
-                state: "replay",
-                already_primed: false,
-            });
+            self.caches = Some(fresh_caches);
+            return Err(Error::from_reason(
+                "image-conditioned GDN prefix cannot be reconstructed from placeholder token ids",
+            ));
         }
 
         let cached_prefix_len_usize = cached_prefix_len as usize;
@@ -1666,58 +1906,141 @@ impl Qwen35MoeInner {
             Error::from_reason("MoE paged GDN prefix replay length exceeds prompt length")
         })?;
         let embed = self.embedding.clone();
-        let caches_ref = self
-            .caches
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("MoE paged GDN prefix caches not initialized"))?;
-        let replay_trace_start = trace_enabled.then(std::time::Instant::now);
-        super::paged_forward::run_gdn_only_prefill(prefix, &embed, &mut self.layers, caches_ref)?;
-        let replay_ms = replay_trace_start.map(elapsed_ms);
-        let store_trace = if moe_gdn_store_replayed_prefix_checkpoint_enabled() {
-            self.remember_moe_gdn_prefix_checkpoint(
-                tokens,
-                cached_prefix_len,
-                block_size,
-                extra_keys_per_block,
-                cache_salt,
-            )?
-        } else {
-            MoeGdnCheckpointStoreTrace::default()
-        };
-        if let Some(start) = prepare_trace_start {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state={} \
-                 cached_prefix_tokens={} prefix_lookup_ms={:.1} replay_ms={:.1} stored={} \
-                 store_hash_ms={:.1} store_eval_ms={:.1} store_clone_ms={:.1} \
-                 store_token_clone_ms={:.1} store_update_ms={:.1} store_ms={:.1} \
-                 elapsed_ms={:.1}",
-                if store_trace.stored {
-                    "replay_store"
-                } else {
-                    "replay"
-                },
-                cached_prefix_len,
-                prefix_lookup_ms.unwrap_or(0.0),
-                replay_ms.unwrap_or(0.0),
-                store_trace.stored,
-                store_trace.hash_ms,
-                store_trace.eval_ms,
-                store_trace.clone_ms,
-                store_trace.token_clone_ms,
-                store_trace.update_ms,
-                store_trace.total_ms,
-                elapsed_ms(start)
-            ));
+        let layers = &mut self.layers;
+        replay_gdn_cache_and_commit(&mut self.caches, fresh_caches, |staged| {
+            super::paged_forward::run_gdn_only_prefill_materialized(prefix, &embed, layers, staged)
+        })?;
+        Ok(finish("replay_materialized", 0, cached_prefix_len))
+    }
+
+    /// Image-aware GDN prefix preparation. Only exact sidecars on the same
+    /// image-keyed paged lineage may be restored; otherwise the caller must
+    /// discard the K/V candidate and rerun the full image merge from position
+    /// zero with fresh recurrent caches.
+    fn prepare_moe_gdn_vlm_prefix_state(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+        continued_live_prefix: bool,
+        image_key: u64,
+    ) -> Result<bool> {
+        if cached_prefix_len == 0 {
+            self.caches = Some(fresh_moe_layer_caches(&self.config));
+            return Ok(false);
         }
 
-        Ok(MoeGdnPrefixPreparation {
-            state: if store_trace.stored {
-                "replay_store"
-            } else {
-                "replay"
-            },
-            already_primed: true,
-        })
+        let caches_ready = moe_paged_linear_caches_ready(&self.config, self.caches.as_deref());
+        if caches_ready && continued_live_prefix && self.cached_image_key == Some(image_key) {
+            return Ok(true);
+        }
+        let active_history_matches = caches_ready
+            && self.cached_image_key == Some(image_key)
+            && self.cached_token_history.len() == cached_prefix_len as usize
+            && tokens.starts_with(&self.cached_token_history);
+        if active_history_matches {
+            return Ok(true);
+        }
+        if let Some(checkpoint) =
+            self.find_moe_gdn_history_checkpoint(tokens, cached_prefix_len, Some(image_key))
+        {
+            self.caches = Some(checkpoint);
+            return Ok(true);
+        }
+        if let Some((restored_prefix_len, checkpoint)) = self.find_moe_gdn_prefix_checkpoint(
+            tokens,
+            cached_prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+        ) && restored_prefix_len == cached_prefix_len
+        {
+            self.caches = Some(checkpoint);
+            return Ok(true);
+        }
+
+        self.caches = Some(fresh_moe_layer_caches(&self.config));
+        Ok(false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_moe_vlm_paged_prefix(
+        &mut self,
+        tokens: &[u32],
+        total_budget: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        reuse_cache: bool,
+        allow_live_continue: bool,
+        image_key: u64,
+    ) -> Result<engine::VlmPagedPrefixResolution> {
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
+        let candidate_plan_result = match self.paged_adapter.as_mut() {
+            Some(adapter) => adapter
+                .prepare_turn_per_block_with_max_cache_hit_tokens(
+                    0,
+                    tokens,
+                    total_budget,
+                    allow_live_continue,
+                    extra_keys_per_block,
+                    0,
+                    !reuse_cache,
+                    max_cache_hit_tokens,
+                )
+                .map_err(Error::from_reason),
+            None => Err(Error::from_reason(
+                "prepare_moe_vlm_paged_prefix: paged_adapter is None",
+            )),
+        };
+        let candidate_plan = match candidate_plan_result {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.invalidate_moe_paged_session("VLM paged-prefix preparation failure");
+                return Err(error);
+            }
+        };
+
+        let gdn_prefix_already_primed = match self.prepare_moe_gdn_vlm_prefix_state(
+            tokens,
+            candidate_plan.cached_prefix_len,
+            block_size,
+            extra_keys_per_block,
+            0,
+            candidate_plan.continued_live_prefix,
+            image_key,
+        ) {
+            Ok(primed) => primed,
+            Err(error) => {
+                self.invalidate_moe_paged_session("VLM GDN-prefix preparation failure");
+                return Err(error);
+            }
+        };
+
+        let resolution =
+            engine::resolve_vlm_paged_prefix(candidate_plan, gdn_prefix_already_primed, || {
+                self.paged_adapter
+                    .as_mut()
+                    .ok_or_else(|| {
+                        "prepare_moe_vlm_paged_prefix: paged_adapter dropped before cold restart"
+                            .to_string()
+                    })?
+                    .restart_prepared_turn_cold_per_block(
+                        0,
+                        tokens,
+                        total_budget,
+                        extra_keys_per_block,
+                        0,
+                    )
+            });
+        match resolution {
+            Ok(resolution) => Ok(resolution),
+            Err(error) => {
+                self.invalidate_moe_paged_session("VLM cold-restart failure");
+                Err(Error::from_reason(error))
+            }
+        }
     }
 
     /// Set the tokenizer.
@@ -1734,17 +2057,20 @@ impl Qwen35MoeInner {
     /// on both flat and paged paths.
     pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) -> Result<()> {
         self.vision_encoder = Some(Arc::new(enc));
+        self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
         Ok(())
     }
 
     /// Set the image processor.
     pub(crate) fn set_image_processor(&mut self, proc: Qwen35VLImageProcessor) {
         self.image_processor = Some(Arc::new(proc));
+        self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
     }
 
     /// Set spatial merge size.
     pub(crate) fn set_spatial_merge_size(&mut self, size: i32) {
         self.spatial_merge_size = Some(size);
+        self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
     }
 
     /// Initialize M-RoPE on all full attention layers (VLM mode).
@@ -2128,6 +2454,7 @@ impl Qwen35MoeInner {
             &mut self.cached_rope_deltas,
             &mut self.caches,
         );
+        self.cached_paged_image_token_positions.clear();
 
         let performance = compute_performance_metrics(
             generation_start,
@@ -2172,10 +2499,10 @@ impl Qwen35MoeInner {
     /// [`super::paged_forward::run_paged_vlm_prefill_moe`] and runs the plain
     /// autoregressive decode loop.
     ///
-    /// SINGLE-TURN ONLY: the adapter is cold-started (no cache-hit, no warm
-    /// continue) and decode uses the scalar-offset RoPE path (the physical
-    /// token count), matching the flat path's decode RoPE. MTP is not
-    /// supported here — image-bearing MTP+paged turns are rejected upstream.
+    /// Same-image live histories continue in place; fresh histories look up
+    /// full blocks using per-image content keys and prefill only the uncached
+    /// suffix. Decode uses the image M-RoPE delta carried by the merged prompt.
+    /// MTP is not supported here; image-bearing turns decode autoregressively.
     #[allow(clippy::too_many_arguments)]
     fn vision_paged_turn_sync_core(
         &mut self,
@@ -2183,13 +2510,14 @@ impl Qwen35MoeInner {
         images: &[Vec<u8>],
         tokenizer: Arc<Qwen3Tokenizer>,
         eos_token_id: u32,
-        p: engine::ChatParams,
+        mut p: engine::ChatParams,
         report_perf: bool,
         thinking: ThinkingSetup,
     ) -> Result<ChatResult> {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
         }
+        self.preflight_paged_context(tokens.len(), &mut p)?;
 
         let (vision_encoder, img_proc) =
             match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
@@ -2221,7 +2549,15 @@ impl Qwen35MoeInner {
         let per_image_token_counts =
             compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
         let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
-        let image_cache_key = compute_image_cache_key(images);
+        self.preflight_paged_context(expanded_tokens.len(), &mut p)?;
+        let (image_cache_key, per_image_hashes) = engine::compute_image_cache_keys(images);
+        let image_token_positions = engine::map_expanded_image_token_positions(
+            &expanded_tokens,
+            IMAGE_TOKEN_ID as u32,
+            &per_image_token_counts,
+            &per_image_hashes,
+        )
+        .map_err(Error::from_reason)?;
         let prompt_token_count = expanded_tokens.len() as u32;
 
         let embed = self.embedding.clone();
@@ -2235,7 +2571,7 @@ impl Qwen35MoeInner {
 
         let merge = vlm_prepare_vision_features(
             &input_ids,
-            image_cache_key,
+            &per_image_hashes,
             &processed,
             &vision_encoder,
             sms,
@@ -2243,36 +2579,60 @@ impl Qwen35MoeInner {
             generation_stream,
             &self.vision_cache,
         )?;
+        drop(processed);
+        crate::array::clear_cache();
 
-        // === Cold-start the paged adapter on the expanded sequence ===
-        let seq_id: u32 = 0;
+        // === Image-aware paged-prefix lifecycle ===
         let total_budget = expanded_tokens.len() as u32;
-        {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+        let block_size = self
+            .paged_adapter
+            .as_ref()
+            .ok_or_else(|| {
                 Error::from_reason("vision_paged_turn_sync_core: paged_adapter is None")
-            })?;
-            adapter
-                .prepare_turn_with_max_cache_hit_tokens(
-                    seq_id,
-                    &expanded_tokens,
-                    total_budget,
-                    /* reuse_cache */ false,
-                    &[],
-                    /* cache_salt */ 0,
-                    /* skip_lookup */ true,
-                    /* max_cache_hit_tokens */ 0,
-                )
-                .map_err(Error::from_reason)?;
-        }
+            })?
+            .block_size();
+        let lookup_extra_keys = engine::build_paged_extra_keys(
+            expanded_tokens.len(),
+            block_size,
+            &image_token_positions,
+        );
+        let same_live_image = self.cached_image_key == Some(image_cache_key);
+        let prefix_resolution = self.prepare_moe_vlm_paged_prefix(
+            &expanded_tokens,
+            total_budget,
+            block_size,
+            &lookup_extra_keys,
+            p.reuse_cache,
+            p.reuse_cache && same_live_image,
+            image_cache_key,
+        )?;
+        let plan = prefix_resolution.effective_plan;
+        let cached_prefix_len = plan.cached_prefix_len;
+        tracing::info!(
+            target: "mlx_core::inference",
+            event = "vlm_prefix_plan",
+            model = "qwen3_5_moe",
+            prompt_tokens = expanded_tokens.len(),
+            image_count = images.len(),
+            image_tokens = image_token_positions.len(),
+            candidate_cached_prefix_tokens = prefix_resolution.candidate_cached_prefix_len,
+            effective_cached_prefix_tokens = cached_prefix_len,
+            cached_prefix_tokens = cached_prefix_len,
+            suffix_tokens = expanded_tokens.len() - cached_prefix_len as usize,
+            continued_live_prefix = plan.continued_live_prefix,
+            same_live_image,
+            gdn_prefix_already_primed = prefix_resolution.gdn_prefix_already_primed,
+            downgraded_to_cold = prefix_resolution.downgraded_to_cold,
+            "image-aware paged prefix planned"
+        );
+        let gdn_prefix_already_primed = prefix_resolution.gdn_prefix_already_primed;
         self.cached_token_history.clear();
         self.cached_image_key = None;
+        self.cached_paged_image_token_positions.clear();
         // Store the image prefill's compressed-position delta so a later text
         // warm-continuation rotates its queries at the same compressed M-RoPE
         // positions the image keys were written with.
         self.cached_rope_deltas = Some(merge.rope_deltas as i32);
-
-        // Fresh per-layer caches (GDN linear slots + empty full-attention slots).
-        self.caches = Some(fresh_moe_layer_caches(&self.config));
 
         let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
             self.config.num_layers as usize,
@@ -2292,6 +2652,8 @@ impl Qwen35MoeInner {
                 super::paged_forward::run_paged_vlm_prefill_moe(
                     &expanded_tokens,
                     &merge,
+                    cached_prefix_len,
+                    gdn_prefix_already_primed,
                     &embed,
                     &mut self.layers,
                     caches_ref,
@@ -2302,6 +2664,13 @@ impl Qwen35MoeInner {
                     adapter,
                 )?
             };
+            let (last_logits, gdn_checkpoint) = last_logits;
+            self.publish_moe_gdn_materialized_prefix_checkpoint(
+                &expanded_tokens,
+                &lookup_extra_keys,
+                0,
+                gdn_checkpoint,
+            );
 
             let mut token_history: Vec<u32> = expanded_tokens.clone();
             let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
@@ -2395,9 +2764,7 @@ impl Qwen35MoeInner {
         let (generated_tokens, finish_reason) = match forward_result {
             Ok(t) => t,
             Err(e) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.release_request();
-                }
+                self.invalidate_moe_paged_session("VLM sync prefill/decode failure");
                 return Err(e);
             }
         };
@@ -2416,44 +2783,47 @@ impl Qwen35MoeInner {
         // checkpoint. Any failure downgrades to NON-continuable rather than
         // discarding the already-successful generation output.
         let keep_live_ok = p.reuse_cache
-            && match self.paged_adapter.as_mut() {
-                Some(adapter) => {
-                    let total_for_finalize = adapter.request_tokens().len();
-                    let bs = adapter.block_size();
-                    let finalize_extra_keys =
-                        engine::build_paged_extra_keys(total_for_finalize, bs, &[]);
-                    adapter
-                        .finalize_turn_keep_live_per_block(&finalize_extra_keys, 0)
-                        .is_ok()
-                }
-                None => false,
-            };
+            && self
+                .finalize_moe_manual_paged_turn(&image_token_positions)
+                .is_ok();
         let continuable = if keep_live_ok {
             self.cached_token_history = full_history;
-            self.remember_moe_gdn_history_checkpoint().is_ok()
+            self.cached_image_key = Some(image_cache_key);
+            self.cached_paged_image_token_positions = image_token_positions.clone();
+            match self.remember_moe_gdn_history_checkpoint() {
+                Ok(_) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "mlx_core::qwen3_5_moe::paged",
+                        "MoE VLM GDN history checkpoint failed: {error}",
+                    );
+                    self.invalidate_moe_paged_session("VLM sync GDN history checkpoint failure");
+                    false
+                }
+            }
         } else {
             false
         };
 
         if continuable {
-            self.cached_image_key = Some(image_cache_key);
-        } else {
+        } else if self.caches.is_some() {
             // Non-continuable: release the request and reset to a pristine
             // non-live state so a follow-up continue is rejected instead of
             // cold-prefilling image-placeholder ids. `reset_caches_sync` nulls
             // `self.caches` (so `has_live_session()` is false) and clears token
             // history, image key, rope deltas, and GDN checkpoints.
-            if let Some(adapter) = self.paged_adapter.as_mut() {
-                let _ = adapter.release_request();
+            if p.reuse_cache {
+                self.invalidate_moe_paged_session("non-continuable VLM sync completion");
+            } else {
+                self.discard_moe_paged_session();
             }
-            let _ = self.reset_caches_sync();
         }
 
         let performance = if report_perf {
             compute_performance_metrics(
                 generation_start,
                 first_token_instant,
-                expanded_tokens.len(),
+                expanded_tokens.len() - cached_prefix_len as usize,
                 generated_tokens.len(),
             )
         } else {
@@ -2472,7 +2842,7 @@ impl Qwen35MoeInner {
             prompt_token_count,
             reasoning_tracker.reasoning_token_count(),
         )?;
-        result.cached_tokens = 0;
+        result.cached_tokens = cached_prefix_len;
         Ok(result)
     }
 
@@ -2488,7 +2858,7 @@ impl Qwen35MoeInner {
         images: &[Vec<u8>],
         tokenizer: Arc<Qwen3Tokenizer>,
         eos_token_id: u32,
-        p: engine::ChatParams,
+        mut p: engine::ChatParams,
         report_perf: bool,
         cb: &StreamSender<'_>,
         cancelled: &AtomicBool,
@@ -2497,6 +2867,7 @@ impl Qwen35MoeInner {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
         }
+        self.preflight_paged_context(tokens.len(), &mut p)?;
 
         let (vision_encoder, img_proc) =
             match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
@@ -2533,7 +2904,15 @@ impl Qwen35MoeInner {
         let per_image_token_counts =
             compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
         let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
-        let image_cache_key = compute_image_cache_key(images);
+        self.preflight_paged_context(expanded_tokens.len(), &mut p)?;
+        let (image_cache_key, per_image_hashes) = engine::compute_image_cache_keys(images);
+        let image_token_positions = engine::map_expanded_image_token_positions(
+            &expanded_tokens,
+            IMAGE_TOKEN_ID as u32,
+            &per_image_token_counts,
+            &per_image_hashes,
+        )
+        .map_err(Error::from_reason)?;
         let prompt_token_count = expanded_tokens.len() as u32;
 
         let embed = self.embedding.clone();
@@ -2547,7 +2926,7 @@ impl Qwen35MoeInner {
 
         let merge = vlm_prepare_vision_features(
             &input_ids,
-            image_cache_key,
+            &per_image_hashes,
             &processed,
             &vision_encoder,
             sms,
@@ -2555,35 +2934,60 @@ impl Qwen35MoeInner {
             generation_stream,
             &self.vision_cache,
         )?;
+        drop(processed);
+        crate::array::clear_cache();
 
-        // === Cold-start the paged adapter on the expanded sequence ===
-        let seq_id: u32 = 0;
+        // === Image-aware paged-prefix lifecycle ===
         let total_budget = expanded_tokens.len() as u32;
-        {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+        let block_size = self
+            .paged_adapter
+            .as_ref()
+            .ok_or_else(|| {
                 Error::from_reason("vision_paged_turn_stream_core: paged_adapter is None")
-            })?;
-            adapter
-                .prepare_turn_with_max_cache_hit_tokens(
-                    seq_id,
-                    &expanded_tokens,
-                    total_budget,
-                    /* reuse_cache */ false,
-                    &[],
-                    /* cache_salt */ 0,
-                    /* skip_lookup */ true,
-                    /* max_cache_hit_tokens */ 0,
-                )
-                .map_err(Error::from_reason)?;
-        }
+            })?
+            .block_size();
+        let lookup_extra_keys = engine::build_paged_extra_keys(
+            expanded_tokens.len(),
+            block_size,
+            &image_token_positions,
+        );
+        let same_live_image = self.cached_image_key == Some(image_cache_key);
+        let prefix_resolution = self.prepare_moe_vlm_paged_prefix(
+            &expanded_tokens,
+            total_budget,
+            block_size,
+            &lookup_extra_keys,
+            p.reuse_cache,
+            p.reuse_cache && same_live_image,
+            image_cache_key,
+        )?;
+        let plan = prefix_resolution.effective_plan;
+        let cached_prefix_len = plan.cached_prefix_len;
+        tracing::info!(
+            target: "mlx_core::inference",
+            event = "vlm_prefix_plan",
+            model = "qwen3_5_moe",
+            prompt_tokens = expanded_tokens.len(),
+            image_count = images.len(),
+            image_tokens = image_token_positions.len(),
+            candidate_cached_prefix_tokens = prefix_resolution.candidate_cached_prefix_len,
+            effective_cached_prefix_tokens = cached_prefix_len,
+            cached_prefix_tokens = cached_prefix_len,
+            suffix_tokens = expanded_tokens.len() - cached_prefix_len as usize,
+            continued_live_prefix = plan.continued_live_prefix,
+            same_live_image,
+            gdn_prefix_already_primed = prefix_resolution.gdn_prefix_already_primed,
+            downgraded_to_cold = prefix_resolution.downgraded_to_cold,
+            "image-aware paged prefix planned"
+        );
+        let gdn_prefix_already_primed = prefix_resolution.gdn_prefix_already_primed;
         self.cached_token_history.clear();
         self.cached_image_key = None;
+        self.cached_paged_image_token_positions.clear();
         // Store the image prefill's compressed-position delta so a later text
         // warm-continuation rotates its queries at the same compressed M-RoPE
         // positions the image keys were written with.
         self.cached_rope_deltas = Some(merge.rope_deltas as i32);
-
-        self.caches = Some(fresh_moe_layer_caches(&self.config));
 
         let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
             self.config.num_layers as usize,
@@ -2603,6 +3007,8 @@ impl Qwen35MoeInner {
                 super::paged_forward::run_paged_vlm_prefill_moe(
                     &expanded_tokens,
                     &merge,
+                    cached_prefix_len,
+                    gdn_prefix_already_primed,
                     &embed,
                     &mut self.layers,
                     caches_ref,
@@ -2613,6 +3019,13 @@ impl Qwen35MoeInner {
                     adapter,
                 )?
             };
+            let (last_logits, gdn_checkpoint) = last_logits;
+            self.publish_moe_gdn_materialized_prefix_checkpoint(
+                &expanded_tokens,
+                &lookup_extra_keys,
+                0,
+                gdn_checkpoint,
+            );
 
             let mut token_history: Vec<u32> = expanded_tokens.clone();
             let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
@@ -2739,9 +3152,7 @@ impl Qwen35MoeInner {
         let (generated_tokens, finish_reason) = match forward_result {
             Ok(t) => t,
             Err(e) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.release_request();
-                }
+                self.invalidate_moe_paged_session("VLM stream prefill/decode failure");
                 return Err(e);
             }
         };
@@ -2756,37 +3167,40 @@ impl Qwen35MoeInner {
         // checkpoint reads `cached_token_history`, so publish it first. Any
         // failure downgrades to NON-continuable rather than discarding output.
         let keep_live_ok = p.reuse_cache
-            && match self.paged_adapter.as_mut() {
-                Some(adapter) => {
-                    let total_for_finalize = adapter.request_tokens().len();
-                    let bs = adapter.block_size();
-                    let finalize_extra_keys =
-                        engine::build_paged_extra_keys(total_for_finalize, bs, &[]);
-                    adapter
-                        .finalize_turn_keep_live_per_block(&finalize_extra_keys, 0)
-                        .is_ok()
-                }
-                None => false,
-            };
+            && self
+                .finalize_moe_manual_paged_turn(&image_token_positions)
+                .is_ok();
         let continuable = if keep_live_ok {
             self.cached_token_history = full_history;
-            self.remember_moe_gdn_history_checkpoint().is_ok()
+            self.cached_image_key = Some(image_cache_key);
+            self.cached_paged_image_token_positions = image_token_positions.clone();
+            match self.remember_moe_gdn_history_checkpoint() {
+                Ok(_) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "mlx_core::qwen3_5_moe::paged",
+                        "MoE streaming VLM GDN history checkpoint failed: {error}",
+                    );
+                    self.invalidate_moe_paged_session("VLM stream GDN history checkpoint failure");
+                    false
+                }
+            }
         } else {
             false
         };
 
         if continuable {
-            self.cached_image_key = Some(image_cache_key);
-        } else {
+        } else if self.caches.is_some() {
             // Non-continuable: release the request and reset to a pristine
             // non-live state so a follow-up continue is rejected instead of
             // cold-prefilling image-placeholder ids. `reset_caches_sync` nulls
             // `self.caches` (so `has_live_session()` is false) and clears token
             // history, image key, rope deltas, and GDN checkpoints.
-            if let Some(adapter) = self.paged_adapter.as_mut() {
-                let _ = adapter.release_request();
+            if p.reuse_cache {
+                self.invalidate_moe_paged_session("non-continuable VLM stream completion");
+            } else {
+                self.discard_moe_paged_session();
             }
-            let _ = self.reset_caches_sync();
         }
 
         // Flush residual buffered bytes (mirrors flat / text paged streaming).
@@ -2823,7 +3237,7 @@ impl Qwen35MoeInner {
             compute_performance_metrics(
                 generation_start,
                 first_token_instant,
-                expanded_tokens.len(),
+                expanded_tokens.len() - cached_prefix_len as usize,
                 generated_tokens.len(),
             )
         } else {
@@ -2855,7 +3269,7 @@ impl Qwen35MoeInner {
                 prompt_tokens: Some(result.prompt_tokens),
                 reasoning_tokens: Some(result.reasoning_tokens),
                 raw_text: Some(result.raw_text.clone()),
-                cached_tokens: Some(0),
+                cached_tokens: Some(cached_prefix_len),
                 performance: result.performance.clone(),
                 is_reasoning: None,
             }),
@@ -2915,7 +3329,7 @@ impl Qwen35MoeInner {
                         ));
                     }
                 };
-            let image_cache_key = compute_image_cache_key(images);
+            let (image_cache_key, per_image_hashes) = engine::compute_image_cache_keys(images);
 
             // --- continuation attempt ---
             let k = self.cached_image_count;
@@ -2930,7 +3344,7 @@ impl Qwen35MoeInner {
             let prefix_images_ok = if k == 0 {
                 self.cached_image_key.is_none()
             } else {
-                self.cached_image_key == Some(compute_image_cache_key(&images[..k]))
+                self.cached_image_key == Some(engine::compute_image_cache_key(&images[..k]))
             };
             if reuse_cache
                 && prefix_images_ok
@@ -2972,12 +3386,11 @@ impl Qwen35MoeInner {
                         &grids_flat,
                         &[(grids_flat.len() / 3) as i64, 3],
                     )?;
-                    let new_key = compute_image_cache_key(new_images);
                     let embedding_weight = self.embedding.get_weight();
                     let cont = vlm_prepare_vision_continuation(
                         &expanded,
                         cached_len,
-                        new_key,
+                        &per_image_hashes[k..],
                         new_processed.as_ref(),
                         &full_grid,
                         &vision_encoder,
@@ -3017,7 +3430,7 @@ impl Qwen35MoeInner {
             let input_ids = MxArray::from_uint32(&expanded, &[1, expanded.len() as i64])?;
             let merge = vlm_prepare_vision_features(
                 &input_ids,
-                image_cache_key,
+                &per_image_hashes,
                 &processed,
                 &vision_encoder,
                 sms,
@@ -3577,13 +3990,14 @@ impl Qwen35MoeInner {
         tokens: Vec<u32>,
         tokenizer: Arc<Qwen3Tokenizer>,
         eos_token_id: u32,
-        p: engine::ChatParams,
+        mut p: engine::ChatParams,
         report_perf: bool,
         thinking: ThinkingSetup,
     ) -> Result<ChatResult> {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
         }
+        self.preflight_paged_context(tokens.len(), &mut p)?;
 
         let prompt_token_count = tokens.len() as u32;
         let trace_enabled = inference_trace_enabled();
@@ -3617,7 +4031,17 @@ impl Qwen35MoeInner {
             })?;
             adapter.block_size()
         };
-        let lookup_extra_keys = engine::build_paged_extra_keys(tokens.len(), block_size, &[]);
+        let carries_image_lineage = self.cached_image_key.is_some()
+            && !self.cached_paged_image_token_positions.is_empty()
+            && !self.cached_token_history.is_empty()
+            && tokens.starts_with(&self.cached_token_history);
+        let image_positions = if carries_image_lineage {
+            self.cached_paged_image_token_positions.as_slice()
+        } else {
+            &[]
+        };
+        let lookup_extra_keys =
+            engine::build_paged_extra_keys(tokens.len(), block_size, image_positions);
         let cache_salt = 0;
         // vLLM exact-prefix cap — see qwen3/model.rs:paged_turn_sync_core.
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
@@ -3646,21 +4070,28 @@ impl Qwen35MoeInner {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
         }
-        let plan = self
+        let plan_result = self
             .paged_adapter
             .as_mut()
             .ok_or_else(|| Error::from_reason("MoE paged_turn_sync_core: paged_adapter is None"))?
-            .prepare_turn_with_max_cache_hit_tokens(
+            .prepare_turn_per_block_with_max_cache_hit_tokens(
                 seq_id,
                 &tokens,
                 total_budget,
                 true,
-                &[],
+                &lookup_extra_keys,
                 cache_salt,
                 false,
                 max_cache_hit_tokens,
             )
-            .map_err(Error::from_reason)?;
+            .map_err(Error::from_reason);
+        let plan = match plan_result {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.invalidate_moe_paged_session("manual adapter preparation failure");
+                return Err(error);
+            }
+        };
         let cached_prefix_len = plan.cached_prefix_len;
         let continued_live_prefix = plan.continued_live_prefix;
         if trace_enabled {
@@ -3680,33 +4111,45 @@ impl Qwen35MoeInner {
             ));
         }
 
-        let gdn_prefix_preparation = self.prepare_moe_gdn_prefix_state(
+        let gdn_prefix_preparation = match self.prepare_moe_gdn_prefix_state(
             &tokens,
             cached_prefix_len,
             block_size,
             &lookup_extra_keys,
             cache_salt,
             continued_live_prefix,
-        )?;
+        ) {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                self.invalidate_moe_paged_session("manual GDN-prefix preparation failure");
+                return Err(error);
+            }
+        };
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
+        let preserves_image_lineage = carries_image_lineage && cached_prefix_len > 0;
         self.cached_token_history.clear();
-        self.cached_image_key = None;
+        if !preserves_image_lineage {
+            self.cached_image_key = None;
+            self.cached_paged_image_token_positions.clear();
+        }
         // Carry the cross-turn M-RoPE delta only when this turn extends the live
         // image sequence (continued_live_prefix); a cold start or a non-live
         // prefix-cache hit (text-only prefix) drops a stale image delta so the
         // text suffix prefill + decode rotate at the raw physical slot.
         self.cached_rope_deltas = crate::models::qwen3_5::paged_forward::rope_delta_for_paged_turn(
             self.cached_rope_deltas,
-            continued_live_prefix,
+            preserves_image_lineage,
         );
 
-        let suffix_len = prompt_token_count
-            .checked_sub(cached_prefix_len)
-            .ok_or_else(|| {
-                Error::from_reason(
+        let suffix_len = match prompt_token_count.checked_sub(cached_prefix_len) {
+            Some(suffix_len) => suffix_len,
+            None => {
+                self.invalidate_moe_paged_session("manual prefix length mismatch");
+                return Err(Error::from_reason(
                     "MoE paged_turn_sync_core: cached_prefix_len > total_prompt_tokens",
-                )
-            })?;
+                ));
+            }
+        };
 
         let forward_result = self.paged_turn_sync_core_inner(
             &tokens,
@@ -3719,22 +4162,18 @@ impl Qwen35MoeInner {
             report_perf,
             &mut first_token_instant,
             gdn_prefix_already_primed,
+            &lookup_extra_keys,
+            cache_salt,
         );
 
         let (generated_tokens, finish_reason) = match forward_result {
             Ok(t) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let total_for_finalize = adapter.request_tokens().len();
-                    let finalize_extra_keys =
-                        engine::build_paged_extra_keys(total_for_finalize, block_size, &[]);
-                    let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0);
-                }
+                let image_token_positions = self.cached_paged_image_token_positions.clone();
+                self.finalize_moe_manual_paged_turn(&image_token_positions)?;
                 t
             }
             Err(e) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.release_request();
-                }
+                self.invalidate_moe_paged_session("manual sync prefill/decode failure");
                 return Err(e);
             }
         };
@@ -3750,7 +4189,13 @@ impl Qwen35MoeInner {
             full_history.extend_from_slice(&generated_tokens[..upto]);
         }
         self.cached_token_history = full_history;
-        let gdn_history_checkpoint_store = self.remember_moe_gdn_history_checkpoint()?;
+        let gdn_history_checkpoint_store = match self.remember_moe_gdn_history_checkpoint() {
+            Ok(store) => store,
+            Err(error) => {
+                self.invalidate_moe_paged_session("manual sync GDN history checkpoint failure");
+                return Err(error);
+            }
+        };
         if inference_trace_enabled() {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] qwen3.5-moe gdn_history_checkpoint stored={} tokens={} \
@@ -3805,6 +4250,8 @@ impl Qwen35MoeInner {
         report_perf: bool,
         first_token_instant: &mut Option<std::time::Instant>,
         gdn_prefix_already_primed: bool,
+        checkpoint_extra_keys: &[Vec<u64>],
+        checkpoint_cache_salt: u64,
     ) -> Result<(Vec<u32>, String)> {
         // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
         debug_assert!(
@@ -3825,7 +4272,7 @@ impl Qwen35MoeInner {
         // the GDN linear caches in `Qwen3_5LayerCache::Linear(ArraysCache)`.
         // Both are exactly what the pure-Rust paged decode steps
         // (`paged_forward::run_paged_decode_step`) read as inputs.
-        let last_logits = {
+        let (last_logits, gdn_checkpoint) = {
             let embed = self.embedding.clone();
             let embedding_weight = embed.get_weight();
             let caches_ref = self.caches.as_mut().ok_or_else(|| {
@@ -3834,7 +4281,7 @@ impl Qwen35MoeInner {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("MoE paged_turn_sync_core_inner: paged_adapter dropped")
             })?;
-            super::paged_forward::run_paged_prefill_chunk(
+            super::paged_forward::run_paged_prefill_chunk_with_checkpoint(
                 tokens,
                 suffix,
                 cached_prefix_len,
@@ -3850,6 +4297,12 @@ impl Qwen35MoeInner {
                 self.cached_rope_deltas.unwrap_or(0),
             )?
         };
+        self.publish_moe_gdn_materialized_prefix_checkpoint(
+            tokens,
+            checkpoint_extra_keys,
+            checkpoint_cache_salt,
+            gdn_checkpoint,
+        );
 
         let mut token_history: Vec<u32> = tokens.to_vec();
         let last_logits = apply_all_penalties(last_logits, &token_history, p)?;
@@ -3950,7 +4403,7 @@ impl Qwen35MoeInner {
         tokens: Vec<u32>,
         tokenizer: Arc<Qwen3Tokenizer>,
         eos_token_id: u32,
-        p: engine::ChatParams,
+        mut p: engine::ChatParams,
         report_perf: bool,
         cb: &StreamSender<'_>,
         cancelled: &AtomicBool,
@@ -3959,6 +4412,7 @@ impl Qwen35MoeInner {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
         }
+        self.preflight_paged_context(tokens.len(), &mut p)?;
 
         let prompt_token_count = tokens.len() as u32;
         let trace_enabled = inference_trace_enabled();
@@ -3994,7 +4448,17 @@ impl Qwen35MoeInner {
             })?;
             adapter.block_size()
         };
-        let lookup_extra_keys = engine::build_paged_extra_keys(tokens.len(), block_size, &[]);
+        let carries_image_lineage = self.cached_image_key.is_some()
+            && !self.cached_paged_image_token_positions.is_empty()
+            && !self.cached_token_history.is_empty()
+            && tokens.starts_with(&self.cached_token_history);
+        let image_positions = if carries_image_lineage {
+            self.cached_paged_image_token_positions.as_slice()
+        } else {
+            &[]
+        };
+        let lookup_extra_keys =
+            engine::build_paged_extra_keys(tokens.len(), block_size, image_positions);
         let cache_salt = 0;
         // See `paged_turn_sync_core` for the vLLM exact-prefix cap rationale.
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
@@ -4018,21 +4482,28 @@ impl Qwen35MoeInner {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
         }
-        let plan = self
+        let plan_result = self
             .paged_adapter
             .as_mut()
             .ok_or_else(|| Error::from_reason("MoE paged_turn_stream_core: paged_adapter is None"))?
-            .prepare_turn_with_max_cache_hit_tokens(
+            .prepare_turn_per_block_with_max_cache_hit_tokens(
                 seq_id,
                 &tokens,
                 total_budget,
                 true,
-                &[],
+                &lookup_extra_keys,
                 cache_salt,
                 false,
                 max_cache_hit_tokens,
             )
-            .map_err(Error::from_reason)?;
+            .map_err(Error::from_reason);
+        let plan = match plan_result {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.invalidate_moe_paged_session("manual stream adapter preparation failure");
+                return Err(error);
+            }
+        };
         let cached_prefix_len = plan.cached_prefix_len;
         let continued_live_prefix = plan.continued_live_prefix;
         if trace_enabled {
@@ -4053,34 +4524,46 @@ impl Qwen35MoeInner {
         }
 
         let prefill_trace_start = trace_enabled.then(std::time::Instant::now);
-        let gdn_prefix_preparation = self.prepare_moe_gdn_prefix_state(
+        let gdn_prefix_preparation = match self.prepare_moe_gdn_prefix_state(
             &tokens,
             cached_prefix_len,
             block_size,
             &lookup_extra_keys,
             cache_salt,
             continued_live_prefix,
-        )?;
+        ) {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                self.invalidate_moe_paged_session("manual stream GDN-prefix preparation failure");
+                return Err(error);
+            }
+        };
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
         let gdn_prefix_state = gdn_prefix_preparation.state;
+        let preserves_image_lineage = carries_image_lineage && cached_prefix_len > 0;
         self.cached_token_history.clear();
-        self.cached_image_key = None;
+        if !preserves_image_lineage {
+            self.cached_image_key = None;
+            self.cached_paged_image_token_positions.clear();
+        }
         // Carry the cross-turn M-RoPE delta only when this turn extends the live
         // image sequence (continued_live_prefix); a cold start or a non-live
         // prefix-cache hit (text-only prefix) drops a stale image delta so the
         // text suffix prefill + decode rotate at the raw physical slot.
         self.cached_rope_deltas = crate::models::qwen3_5::paged_forward::rope_delta_for_paged_turn(
             self.cached_rope_deltas,
-            continued_live_prefix,
+            preserves_image_lineage,
         );
 
-        let suffix_len = prompt_token_count
-            .checked_sub(cached_prefix_len)
-            .ok_or_else(|| {
-                Error::from_reason(
+        let suffix_len = match prompt_token_count.checked_sub(cached_prefix_len) {
+            Some(suffix_len) => suffix_len,
+            None => {
+                self.invalidate_moe_paged_session("manual stream prefix length mismatch");
+                return Err(Error::from_reason(
                     "MoE paged_turn_stream_core: cached_prefix_len > total_prompt_tokens",
-                )
-            })?;
+                ));
+            }
+        };
 
         if trace_enabled {
             write_inference_trace(format_args!(
@@ -4117,6 +4600,8 @@ impl Qwen35MoeInner {
             cancelled,
             gdn_prefix_already_primed,
             prefill_trace_start,
+            &lookup_extra_keys,
+            cache_salt,
         );
 
         if let Some(start) = request_trace_start {
@@ -4142,18 +4627,12 @@ impl Qwen35MoeInner {
 
         let (generated_tokens, finish_reason) = match result {
             Ok(t) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let total_for_finalize = adapter.request_tokens().len();
-                    let finalize_extra_keys =
-                        engine::build_paged_extra_keys(total_for_finalize, block_size, &[]);
-                    let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0);
-                }
+                let image_token_positions = self.cached_paged_image_token_positions.clone();
+                self.finalize_moe_manual_paged_turn(&image_token_positions)?;
                 t
             }
             Err(e) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.release_request();
-                }
+                self.invalidate_moe_paged_session("manual stream prefill/decode failure");
                 return Err(e);
             }
         };
@@ -4169,7 +4648,13 @@ impl Qwen35MoeInner {
             full_history.extend_from_slice(&generated_tokens[..upto]);
         }
         self.cached_token_history = full_history;
-        let gdn_history_checkpoint_store = self.remember_moe_gdn_history_checkpoint()?;
+        let gdn_history_checkpoint_store = match self.remember_moe_gdn_history_checkpoint() {
+            Ok(store) => store,
+            Err(error) => {
+                self.invalidate_moe_paged_session("manual stream GDN history checkpoint failure");
+                return Err(error);
+            }
+        };
         if trace_enabled {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] qwen3.5-moe gdn_history_checkpoint stored={} tokens={} \
@@ -4290,6 +4775,8 @@ impl Qwen35MoeInner {
         cancelled: &AtomicBool,
         gdn_prefix_already_primed: bool,
         prefill_trace_start: Option<std::time::Instant>,
+        checkpoint_extra_keys: &[Vec<u64>],
+        checkpoint_cache_salt: u64,
     ) -> Result<(Vec<u32>, String)> {
         // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
         debug_assert!(
@@ -4307,7 +4794,7 @@ impl Qwen35MoeInner {
         // Pure-Rust paged prefill — see `paged_turn_sync_core_inner` for
         // the data-flow contract this populates (pool K/V + GDN linear
         // caches).
-        let last_logits = {
+        let (last_logits, gdn_checkpoint) = {
             let embed = self.embedding.clone();
             let embedding_weight = embed.get_weight();
             let caches_ref = self.caches.as_mut().ok_or_else(|| {
@@ -4316,7 +4803,7 @@ impl Qwen35MoeInner {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("MoE paged_turn_stream_core_inner: paged_adapter dropped")
             })?;
-            super::paged_forward::run_paged_prefill_chunk(
+            super::paged_forward::run_paged_prefill_chunk_with_checkpoint(
                 tokens,
                 suffix,
                 cached_prefix_len,
@@ -4332,6 +4819,12 @@ impl Qwen35MoeInner {
                 self.cached_rope_deltas.unwrap_or(0),
             )?
         };
+        self.publish_moe_gdn_materialized_prefix_checkpoint(
+            tokens,
+            checkpoint_extra_keys,
+            checkpoint_cache_salt,
+            gdn_checkpoint,
+        );
 
         let mut token_history: Vec<u32> = tokens.to_vec();
         let last_logits = apply_all_penalties(last_logits, &token_history, p)?;
@@ -4920,6 +5413,7 @@ impl Qwen35MoeInner {
             &mut self.cached_rope_deltas,
             &mut self.caches,
         );
+        self.cached_paged_image_token_positions.clear();
 
         let text = tokenizer_for_decode
             .decode_sync(&generated_tokens, true)
@@ -5802,6 +6296,33 @@ impl Qwen35MoeInner {
         })
     }
 
+    fn first_quantized_save_component(&self) -> Option<String> {
+        if self.embedding.is_quantized() {
+            return Some("embedding".to_string());
+        }
+        for (index, layer) in self.layers.iter().enumerate() {
+            if layer.is_quantized() {
+                return Some(format!("layers.{index}"));
+            }
+        }
+        if self
+            .lm_head
+            .as_ref()
+            .is_some_and(|head| head.is_quantized())
+        {
+            return Some("lm_head".to_string());
+        }
+        if self.mtp_weights_loaded
+            && self
+                .mtp
+                .as_ref()
+                .is_some_and(|mtp| mtp.has_quantized_weights())
+        {
+            return Some("mtp".to_string());
+        }
+        None
+    }
+
     /// Save model weights and configuration to a directory (synchronous).
     ///
     /// Runs on the dedicated model thread and serializes all weights owned
@@ -5810,6 +6331,15 @@ impl Qwen35MoeInner {
     /// MLP variant (per-layer dense vs sparse expert routing).
     pub(crate) fn save_model_sync(&self, save_path: &str) -> Result<()> {
         use super::decoder_layer::{AttentionType, MLPType};
+
+        if let Some(component) = self.first_quantized_save_component() {
+            return Err(Error::from_reason(format!(
+                "Cannot save model: save_model is dense/BF16-only, but main-model component \
+                 '{component}' contains quantized projections. Refusing before creating the \
+                 destination because packed weights require sidecars and quantization metadata \
+                 that this save format cannot preserve losslessly."
+            )));
+        }
 
         let mut params: HashMap<String, MxArray> = HashMap::new();
 
@@ -5983,20 +6513,10 @@ impl Qwen35MoeInner {
         if self.mtp_weights_loaded
             && let Some(ref mtp) = self.mtp
         {
-            // `save_model_sync` is dense/bf16-only. A quantized MTP head's
-            // dense slot is not a faithful bf16 copy of the quantized payload
-            // (packed uint32 for the per-layer linears, a lossy dequant for
-            // `fc`) — emitting it would masquerade as a valid bf16 head on
-            // reload, strictly worse than the clean-drop behavior. Skip + warn.
-            if mtp.has_quantized_weights() {
-                warn!(
-                    "Skipping MTP head serialization: the loaded MTP weights are quantized and \
-                     save_model_sync is dense/bf16-only. The reloaded checkpoint will run \
-                     autoregressive-only (no speculative MTP)."
-                );
-            } else {
-                params.extend(mtp.get_parameters());
-            }
+            // The early fail-closed quantized-state gate above guarantees this
+            // MTP head is dense; partial omission would make the saved model
+            // silently lose speculative decoding.
+            params.extend(mtp.get_parameters());
         }
 
         // Validate all parameters for NaN/Inf before writing to disk
@@ -7807,6 +8327,8 @@ pub(crate) struct Qwen35MoePrefixState {
     suffix_len: usize,
     full_tokens: Vec<u32>,
     gdn_prefix_already_primed: bool,
+    checkpoint_extra_keys: Vec<Vec<u64>>,
+    checkpoint_cache_salt: u64,
 }
 
 impl PagedPrefix for Qwen35MoePrefixState {
@@ -7835,6 +8357,7 @@ impl PagedBackend for Qwen35MoeInner {
     ) -> Result<Self::PrefixState> {
         // The `prepare_turn_…` + `prepare_moe_gdn_prefix_state` block that
         // opens a MoE paged turn.
+        self.paged_finalize_failed = false;
         let trace_enabled = inference_trace_enabled();
         let total_budget = plan.len() as u32;
         // vLLM exact-prefix cap: leave at least one prompt token to prefill so
@@ -7850,11 +8373,17 @@ impl PagedBackend for Qwen35MoeInner {
             })?;
             adapter.block_size()
         };
-        // Per-block extra_keys for the GDN prefix-checkpoint lookup. text-only
-        // paged dispatch builds an all-empty per-block vec which is bit-equal to
-        // passing `&[]` to the adapter's uniform `prepare_turn` API; VLM-paged
-        // would replace the empty positions with real (token_pos, image_hash).
-        let lookup_extra_keys = engine::build_paged_extra_keys(plan.len(), block_size, &[]);
+        let carries_image_lineage = self.cached_image_key.is_some()
+            && !self.cached_paged_image_token_positions.is_empty()
+            && !self.cached_token_history.is_empty()
+            && plan.starts_with(&self.cached_token_history);
+        let image_positions = if carries_image_lineage {
+            self.cached_paged_image_token_positions.as_slice()
+        } else {
+            &[]
+        };
+        let lookup_extra_keys =
+            engine::build_paged_extra_keys(plan.len(), block_size, image_positions);
 
         // Adapter-owned warm/cold lifecycle. The [MLX_TRACE] line below
         // reads the PRE-turn live state, so probe the adapter immutably FIRST
@@ -7885,12 +8414,12 @@ impl PagedBackend for Qwen35MoeInner {
             .paged_adapter
             .as_mut()
             .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?
-            .prepare_turn_with_max_cache_hit_tokens(
+            .prepare_turn_per_block_with_max_cache_hit_tokens(
                 seq_id,
                 plan,
                 total_budget,
                 true,
-                &[],
+                &lookup_extra_keys,
                 cache_salt,
                 false,
                 max_cache_hit_tokens,
@@ -7926,6 +8455,7 @@ impl PagedBackend for Qwen35MoeInner {
             continued_live_prefix,
         )?;
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
+        let preserves_image_lineage = carries_image_lineage && cached_prefix_len > 0;
         // Clear the per-turn session state here (history is re-set in
         // `save_paged_history`; image key is reset because the paged path does
         // not carry it across turns). The cross-turn M-RoPE delta is carried
@@ -7934,10 +8464,13 @@ impl PagedBackend for Qwen35MoeInner {
         // (text-only prefix) drops a stale image delta so the text suffix
         // rotates at the raw physical slot.
         self.cached_token_history.clear();
-        self.cached_image_key = None;
+        if !preserves_image_lineage {
+            self.cached_image_key = None;
+            self.cached_paged_image_token_positions.clear();
+        }
         self.cached_rope_deltas = crate::models::qwen3_5::paged_forward::rope_delta_for_paged_turn(
             self.cached_rope_deltas,
-            continued_live_prefix,
+            preserves_image_lineage,
         );
 
         let suffix_len = total_budget.checked_sub(cached_prefix_len).ok_or_else(|| {
@@ -7949,6 +8482,8 @@ impl PagedBackend for Qwen35MoeInner {
             suffix_len,
             full_tokens: plan.to_vec(),
             gdn_prefix_already_primed,
+            checkpoint_extra_keys: lookup_extra_keys,
+            checkpoint_cache_salt: cache_salt,
         })
     }
 
@@ -7975,29 +8510,38 @@ impl PagedBackend for Qwen35MoeInner {
         // continues an image prefill); aligns the suffix keys with the
         // compressed-position image keys.
         let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
-        let caches_ref = self
-            .caches
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("paged_prefill: caches not initialized"))?;
-        let adapter = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?;
-        super::paged_forward::run_paged_prefill_chunk(
+        let (logits, gdn_checkpoint) = {
+            let caches_ref = self
+                .caches
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("paged_prefill: caches not initialized"))?;
+            let adapter = self
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?;
+            super::paged_forward::run_paged_prefill_chunk_with_checkpoint(
+                &prefix.full_tokens,
+                suffix_tokens,
+                prefix.effective_cached_prefix_len as u32,
+                prefix.gdn_prefix_already_primed,
+                &embed,
+                &mut self.layers,
+                caches_ref,
+                &self.final_norm,
+                &self.lm_head,
+                &embedding_weight,
+                &layer_kinds,
+                adapter,
+                rope_deltas,
+            )?
+        };
+        self.publish_moe_gdn_materialized_prefix_checkpoint(
             &prefix.full_tokens,
-            suffix_tokens,
-            prefix.effective_cached_prefix_len as u32,
-            prefix.gdn_prefix_already_primed,
-            &embed,
-            &mut self.layers,
-            caches_ref,
-            &self.final_norm,
-            &self.lm_head,
-            &embedding_weight,
-            &layer_kinds,
-            adapter,
-            rope_deltas,
-        )
+            &prefix.checkpoint_extra_keys,
+            prefix.checkpoint_cache_salt,
+            gdn_checkpoint,
+        );
+        Ok(logits)
     }
 
     fn begin_paged_decode(&mut self, _setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
@@ -8012,29 +8556,51 @@ impl PagedBackend for Qwen35MoeInner {
         // live across turns when reuse is on, using PER-BLOCK extra keys (NOT
         // qwen3's empty `&[]`), so the next turn's continue builds on the
         // partial trailing block's live K/V; otherwise register full blocks
-        // for reuse + release. Infallible (`let _ =` every call — a teardown
-        // failure must not mask the turn result).
-        if let Some(adapter) = self.paged_adapter.as_mut() {
-            if reuse_cache {
+        // for reuse + release. The trait hook remains infallible, but an adapter
+        // error must downgrade the session before the engine's unconditional
+        // history save can publish image-placeholder history.
+        self.paged_finalize_failed = false;
+        let finalize_error = match self.paged_adapter.as_mut() {
+            Some(adapter) if reuse_cache => {
                 let total_for_finalize = adapter.request_tokens().len();
                 let block_size = adapter.block_size();
-                let finalize_extra_keys =
-                    engine::build_paged_extra_keys(total_for_finalize, block_size, &[]);
-                let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0);
-            } else {
-                let _ = adapter.register_full_blocks_for_reuse(&[], 0);
-                let _ = adapter.release_request();
+                let finalize_extra_keys = engine::build_paged_extra_keys(
+                    total_for_finalize,
+                    block_size,
+                    &self.cached_paged_image_token_positions,
+                );
+                adapter
+                    .finalize_turn_keep_live_per_block(&finalize_extra_keys, 0)
+                    .err()
             }
+            Some(adapter) => {
+                let total_for_finalize = adapter.request_tokens().len();
+                let block_size = adapter.block_size();
+                let finalize_extra_keys = engine::build_paged_extra_keys(
+                    total_for_finalize,
+                    block_size,
+                    &self.cached_paged_image_token_positions,
+                );
+                let register_error = adapter
+                    .register_full_blocks_for_reuse_per_block(&finalize_extra_keys, 0)
+                    .err();
+                // Always attempt the release, even when registration fails.
+                let release_error = adapter.release_request().err();
+                register_error.or(release_error)
+            }
+            None => Some("paged_adapter is None during MoE finalization".to_owned()),
+        };
+        if let Some(error) = finalize_error {
+            self.downgrade_failed_paged_finalize(&error);
         }
     }
 
     fn abort_paged_turn(&mut self) {
-        // Error-path teardown: release fully, partial block_table state is
-        // unsafe to keep. Release ONLY — never register / keep live. Infallible
-        // (`let _ =` — must not mask the turn's error).
-        if let Some(adapter) = self.paged_adapter.as_mut() {
-            let _ = adapter.release_request();
-        }
+        // Hybrid error-path teardown: K/V and GDN may have advanced by
+        // different amounts, so a bare adapter release would leave a false-live
+        // recurrent session behind. Never register / keep live; invalidate all
+        // model-local continuation state without masking the original error.
+        self.invalidate_moe_paged_session("generic paged turn abort");
     }
 
     fn paged_decode_stream(&self, _generation_stream: Stream) -> Stream {
@@ -8056,6 +8622,15 @@ impl PagedBackend for Qwen35MoeInner {
         _keep_all: bool,
         reuse_cache: bool,
     ) -> Result<()> {
+        if std::mem::take(&mut self.paged_finalize_failed) {
+            self.cached_token_history.clear();
+            self.cached_image_key = None;
+            self.cached_paged_image_token_positions.clear();
+            self.cached_rope_deltas = None;
+            self.gdn_last_history_checkpoint = None;
+            self.caches = None;
+            return Ok(());
+        }
         // moe paged ALWAYS drops the last token, regardless of the engine's
         // `keep_all` (length-exit) signal — the paged decode loop NEVER forwards
         // the LAST sampled token (the engine's forward gate skips it AND
@@ -8068,6 +8643,8 @@ impl PagedBackend for Qwen35MoeInner {
         if !reuse_cache {
             self.cached_token_history.clear();
             self.cached_image_key = None;
+            self.cached_paged_image_token_positions.clear();
+            self.cached_rope_deltas = None;
             return Ok(());
         }
         let mut full_history = save_tokens.to_vec();
@@ -8098,7 +8675,6 @@ impl PagedBackend for Qwen35MoeInner {
                 store.total_ms
             ));
         }
-        self.cached_image_key = None;
         Ok(())
     }
 
@@ -8153,6 +8729,18 @@ impl ChatBackend for Qwen35MoeInner {
 
     fn family_name(&self) -> &'static str {
         "qwen3_5_moe"
+    }
+
+    fn set_cache_owner_id(&mut self, owner_id: &str, root_owner_id: Option<&str>) {
+        self.active_cache_owner_id.clear();
+        self.active_cache_owner_id.push_str(owner_id);
+        if let Some(root_owner_id) = root_owner_id {
+            self.gdn_root_cache_owner_id = Some(root_owner_id.to_owned());
+            self.gdn_root_cache_owner_is_explicit = true;
+        } else {
+            self.gdn_root_cache_owner_id = Some(owner_id.to_owned());
+            self.gdn_root_cache_owner_is_explicit = false;
+        }
     }
 
     fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32> {
@@ -8295,6 +8883,7 @@ impl ChatBackend for Qwen35MoeInner {
                 &mut self.caches,
             );
         }
+        self.cached_paged_image_token_positions.clear();
     }
 
     fn eval_caches(&self) -> Result<()> {
@@ -8422,7 +9011,21 @@ impl ChatBackend for Qwen35MoeInner {
         debug_assert!(args.plan.use_paged_attention);
         debug_assert!(self.paged_adapter.is_some());
         debug_assert!(matches!(args.plan.decoder, DecoderPlan::Autoregressive));
-        crate::engine::paged_turn::run_paged_turn(self, args)
+        let mut constrained_params = args.params.clone();
+        self.preflight_paged_context(args.tokens.len(), &mut constrained_params)?;
+        let mut constrained_args = WholeTurnArgs {
+            tokens: args.tokens,
+            tokenizer: args.tokenizer,
+            eos_id: args.eos_id,
+            config: args.config,
+            params: &constrained_params,
+            thinking: args.thinking,
+            plan: args.plan,
+            sink: args.sink,
+            cancelled: args.cancelled,
+            media: args.media,
+        };
+        crate::engine::paged_turn::run_paged_turn(self, &mut constrained_args)
     }
 
     fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
@@ -8981,6 +9584,17 @@ pub struct Qwen3_5MoeModel {
     /// `enableMtp = true` for checkpoints that ship an MTP head without
     /// round-tripping through the model thread.
     pub(crate) mtp_active: bool,
+    /// Snapshot of the fully loaded image execution stack. `true` only when
+    /// the vision encoder and image processor were both installed and the
+    /// block-paged adapter required by MoE image turns is active. This must be
+    /// derived from loaded components rather than `vision_config`, because
+    /// sym8 deliberately strips its incompatible vision tower.
+    pub(crate) vision_active: bool,
+    /// Same loaded processor and merge-size snapshots used by the model thread,
+    /// retained for exact CPU-only image-token planning before SSE.
+    pub(crate) image_processor: Option<Arc<Qwen35VLImageProcessor>>,
+    pub(crate) spatial_merge_size: i32,
+    pub(crate) context_limits: Qwen3_5ContextLimits,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop.
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
@@ -9020,6 +9634,39 @@ impl Qwen3_5MoeModel {
         self.mtp_active
     }
 
+    /// Whether this loaded model instance can execute image-bearing turns.
+    ///
+    /// This is an authoritative load-time snapshot, not a model-family guess:
+    /// it requires the loaded vision encoder, image processor, and block-paged
+    /// KV adapter used by the MoE vision path.
+    #[napi]
+    pub fn supports_images(&self) -> bool {
+        self.vision_active
+    }
+
+    /// Synchronous active-context snapshot shared with the dense wrapper.
+    #[napi]
+    pub fn context_limits(&self) -> Qwen3_5ContextLimits {
+        self.context_limits.clone()
+    }
+
+    /// Exact, non-mutating Qwen image-placeholder expansion count for a fully
+    /// rendered prompt and complete message history.
+    #[napi]
+    pub async fn expanded_prompt_token_count(
+        &self,
+        prompt_tokens: Uint32Array,
+        messages: Vec<ChatMessage>,
+    ) -> Result<u32> {
+        qwen35_expanded_prompt_token_count(
+            self.image_processor.clone(),
+            self.spatial_merge_size,
+            prompt_tokens,
+            messages,
+        )
+        .await
+    }
+
     /// Load a pretrained model from a directory.
     #[napi]
     pub async fn load(path: String) -> Result<Qwen3_5MoeModel> {
@@ -9031,7 +9678,7 @@ impl Qwen3_5MoeModel {
     pub async fn generate(
         &self,
         prompt_tokens: &MxArray,
-        config: Qwen3_5MoeGenerationConfig,
+        mut config: Qwen3_5MoeGenerationConfig,
     ) -> Result<Qwen3_5MoeGenerationResult> {
         if config.max_new_tokens <= 0 {
             return Err(Error::from_reason(format!(
@@ -9046,6 +9693,16 @@ impl Qwen3_5MoeModel {
                 batch_size
             )));
         }
+        let prompt_len = prompt_tokens.shape_at(1)? as u32;
+        let capacity = self.context_limits.effective_window_tokens;
+        if prompt_len > capacity {
+            return Err(Error::from_reason(format!(
+                "context_length_exceeded: prompt has {prompt_len} tokens, effective active \
+                 context is {capacity} tokens"
+            )));
+        }
+        let max_output = capacity.saturating_sub(prompt_len).saturating_add(1);
+        config.max_new_tokens = config.max_new_tokens.min(max_output as i32);
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35MoeCmd::Generate {
             prompt_tokens: prompt_tokens.clone(),
             config,
@@ -9961,7 +10618,13 @@ mod paged_construction_tests {
     //! Construction-only smoke tests for the MoE block-paged adapter.
 
     use super::*;
+    use crate::array::DType;
     use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
+    use crate::models::qwen3_5_moe::decoder_layer::MLPType;
+    use crate::models::qwen3_5_moe::quantized_linear::{
+        MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE, QuantizedSwitchLinear,
+    };
+    use crate::models::qwen3_5_moe::switch_glu::SwitchGLU;
 
     fn tiny_moe_cfg(use_block_paged: bool) -> Qwen3_5MoeConfig {
         Qwen3_5MoeConfig {
@@ -10001,6 +10664,56 @@ mod paged_construction_tests {
         }
     }
 
+    fn inert_mxfp8_switch(out_features: i64, in_features: i64) -> QuantizedSwitchLinear {
+        QuantizedSwitchLinear::new(
+            MxArray::zeros(&[4, out_features, in_features / 4], Some(DType::Uint32)).unwrap(),
+            MxArray::zeros(
+                &[4, out_features, in_features / MXFP8_GROUP_SIZE as i64],
+                Some(DType::Uint8),
+            )
+            .unwrap(),
+            None,
+            MXFP8_GROUP_SIZE,
+            MXFP8_BITS,
+            MXFP8_MODE.to_string(),
+        )
+    }
+
+    #[test]
+    fn save_model_rejects_quantized_moe_experts_before_creating_destination() {
+        let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
+        let quantized_switch = SwitchGLU::new_quantized(
+            inert_mxfp8_switch(128, 64),
+            inert_mxfp8_switch(128, 64),
+            inert_mxfp8_switch(64, 128),
+        );
+        match &mut inner.layers[0].mlp {
+            MLPType::MoE(moe) => moe.set_switch_mlp(quantized_switch),
+            MLPType::Dense(_) => panic!("layer 0 must be MoE"),
+        }
+
+        let destination = std::env::temp_dir().join(format!(
+            "mlx_node_moe_quant_save_reject_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!destination.exists());
+        let err = inner
+            .save_model_sync(destination.to_str().unwrap())
+            .expect_err("quantized expert projections must reject dense-only save");
+        let message = err.reason.to_string();
+        assert!(message.contains("dense/BF16-only"), "{message}");
+        assert!(message.contains("layers.0"), "{message}");
+        assert!(message.contains("before creating"), "{message}");
+        assert!(
+            !destination.exists(),
+            "rejected save must not create its destination directory"
+        );
+    }
+
     #[test]
     fn test_moe_use_block_paged_cache_serde_default_none() {
         let json = serde_json::json!({
@@ -10030,6 +10743,60 @@ mod paged_construction_tests {
     fn test_moe_full_attention_layer_count() {
         let cfg = tiny_moe_cfg(false);
         assert_eq!(cfg.full_attention_layer_count(), 2);
+    }
+
+    #[test]
+    fn test_moe_gdn_root_rotation_retains_new_root() {
+        fn push_checkpoint(
+            inner: &mut Qwen35MoeInner,
+            owner_id: &str,
+            root_owner_id: &str,
+            marker: u32,
+        ) {
+            crate::engine::backend::ChatBackend::set_cache_owner_id(
+                inner,
+                owner_id,
+                Some(root_owner_id),
+            );
+            let tokens: Vec<u32> = (0..16).map(|offset| marker * 100 + offset).collect();
+            inner
+                .gdn_prefix_checkpoints
+                .push_back(MoeGdnPrefixCheckpoint {
+                    owner_id: inner.active_cache_owner_id.clone(),
+                    prefix_len: 16,
+                    block_size: 16,
+                    final_block_hash: marker as u64,
+                    block_hashes: vec![marker as u64],
+                    tokens,
+                    caches: Vec::new(),
+                });
+            inner.prune_moe_gdn_prefix_checkpoints();
+        }
+
+        let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
+        push_checkpoint(&mut inner, "root-0", "root-0", 1);
+        push_checkpoint(&mut inner, "root-1", "root-1", 2);
+        for (index, owner) in ["child-0", "child-1", "child-2", "child-3"]
+            .into_iter()
+            .enumerate()
+        {
+            push_checkpoint(&mut inner, owner, "root-1", 10 + index as u32);
+        }
+        assert_eq!(inner.gdn_root_cache_owner_id.as_deref(), Some("root-1"));
+        assert!(inner.gdn_root_cache_owner_is_explicit);
+        assert_eq!(inner.gdn_prefix_checkpoints.len(), 5);
+        assert!(
+            !inner
+                .gdn_prefix_checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.owner_id == "root-0")
+        );
+        assert!(
+            inner
+                .gdn_prefix_checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.owner_id == "root-1")
+        );
     }
 
     #[test]
@@ -10067,8 +10834,114 @@ mod paged_construction_tests {
     }
 
     #[test]
+    fn test_moe_paged_finalize_failure_cannot_republish_image_session() {
+        let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
+        inner.caches = Some(fresh_moe_layer_caches(&inner.config));
+        inner.cached_token_history = vec![7, 248_056, 248_056, 8];
+        inner.cached_image_key = Some(0xA30B);
+        inner.cached_paged_image_token_positions = vec![(1, 0xA11C), (2, 0xA11C)];
+        inner.cached_rope_deltas = Some(-2);
+
+        <Qwen35MoeInner as crate::engine::backend::PagedBackend>::finalize_paged_turn(
+            &mut inner, true,
+        );
+        assert!(inner.paged_finalize_failed);
+        assert!(inner.caches.is_none());
+        assert!(inner.cached_token_history.is_empty());
+        assert!(inner.cached_image_key.is_none());
+        assert!(inner.cached_paged_image_token_positions.is_empty());
+        assert!(inner.cached_rope_deltas.is_none());
+
+        <Qwen35MoeInner as crate::engine::backend::PagedBackend>::save_paged_history(
+            &mut inner,
+            &[7, 248_056, 248_056, 8],
+            &[9],
+            false,
+            true,
+        )
+        .expect("failed finalization must downgrade history save");
+        assert!(!inner.paged_finalize_failed);
+        assert!(inner.cached_token_history.is_empty());
+        assert!(!crate::engine::backend::ChatBackend::has_live_session(
+            &inner
+        ));
+        assert_eq!(
+            crate::engine::backend::ChatBackend::session_media(&inner),
+            MediaCapabilities::NONE
+        );
+    }
+
+    fn seed_moe_paged_image_session(inner: &mut Qwen35MoeInner) {
+        inner.caches = Some(fresh_moe_layer_caches(&inner.config));
+        inner.cached_token_history = vec![7, 248_056, 248_056, 8];
+        inner.cached_image_key = Some(0xA30B);
+        inner.cached_paged_image_token_positions = vec![(1, 0xA11C), (2, 0xA11C)];
+        inner.cached_rope_deltas = Some(-2);
+        inner.flat_mtp_caches_desynced = true;
+    }
+
+    #[test]
+    fn test_moe_manual_paged_finalize_failure_invalidates_session() {
+        let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
+        seed_moe_paged_image_session(&mut inner);
+
+        let error = inner
+            .finalize_moe_manual_paged_turn(&[(1, 0xA11C), (2, 0xA11C)])
+            .expect_err("missing adapter must fail manual finalization");
+        assert!(error.to_string().contains("paged finalization failed"));
+        assert!(inner.caches.is_none());
+        assert!(inner.cached_token_history.is_empty());
+        assert!(inner.cached_image_key.is_none());
+        assert!(inner.cached_paged_image_token_positions.is_empty());
+        assert!(inner.cached_rope_deltas.is_none());
+        assert!(!inner.flat_mtp_caches_desynced);
+    }
+
+    #[test]
+    fn test_moe_vlm_prefix_prepare_failure_invalidates_session() {
+        let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
+        seed_moe_paged_image_session(&mut inner);
+
+        inner
+            .prepare_moe_vlm_paged_prefix(
+                &[7, 248_056, 248_056, 8],
+                4,
+                16,
+                &[vec![0xA11C]],
+                true,
+                true,
+                0xA30B,
+            )
+            .expect_err("missing adapter must fail VLM prefix preparation");
+        assert!(inner.caches.is_none());
+        assert!(inner.cached_token_history.is_empty());
+        assert!(inner.cached_image_key.is_none());
+        assert!(inner.cached_paged_image_token_positions.is_empty());
+        assert!(inner.cached_rope_deltas.is_none());
+        assert!(!crate::engine::backend::ChatBackend::has_live_session(
+            &inner
+        ));
+    }
+
+    #[test]
+    fn test_moe_generic_paged_abort_invalidates_session() {
+        let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
+        seed_moe_paged_image_session(&mut inner);
+
+        <Qwen35MoeInner as crate::engine::backend::PagedBackend>::abort_paged_turn(&mut inner);
+        assert!(inner.caches.is_none());
+        assert!(inner.cached_token_history.is_empty());
+        assert!(inner.cached_image_key.is_none());
+        assert!(inner.cached_paged_image_token_positions.is_empty());
+        assert!(inner.cached_rope_deltas.is_none());
+        assert!(!inner.flat_mtp_caches_desynced);
+    }
+
+    #[test]
     fn test_qwen35_moe_planned_decoder_overrides_raw_mtp_flag() {
         let mut config = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             enable_mtp: Some(true),
             ..ChatConfig::default()
         };
@@ -10160,9 +11033,12 @@ mod paged_construction_tests {
             return;
         }
         let cfg = tiny_moe_cfg(true);
-        let inner = Qwen35MoeInner::new(cfg).expect(
+        let mut inner = Qwen35MoeInner::new(cfg).expect(
             "Qwen35MoeInner::new with use_block_paged_cache=true must succeed on Metal host",
         );
+        inner
+            .initialize_paged_adapter()
+            .expect("post-load paged adapter initialization must succeed");
         assert!(inner.paged_adapter.is_some());
     }
 }

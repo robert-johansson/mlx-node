@@ -1380,6 +1380,7 @@ impl Qwen3Inner {
                         tool_call_id: m.tool_call_id.clone(),
                         is_error: m.is_error,
                         reasoning_content: m.reasoning_content.clone(),
+                        thinking_enabled: m.thinking_enabled,
                         images: None,
                         audio: None,
                     })
@@ -1408,6 +1409,7 @@ impl Qwen3Inner {
                         tool_call_id: m.tool_call_id.clone(),
                         is_error: m.is_error,
                         reasoning_content: m.reasoning_content.clone(),
+                        thinking_enabled: m.thinking_enabled,
                         images: None,
                         audio: None,
                     })

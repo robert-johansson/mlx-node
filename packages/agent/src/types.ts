@@ -1,4 +1,4 @@
-import type { ChatConfig, ChatMessage, ChatStreamEvent, ModelType } from '@mlx-node/lm';
+import type { ChatConfig, ChatMessage, ChatStreamEvent, ModelType, SessionContextLimits } from '@mlx-node/lm';
 
 /** Structural mirror of the CLI's DiscoveredModel — avoids a cli↔agent dependency cycle. */
 export interface DiscoveredModelLike {
@@ -17,18 +17,17 @@ export interface DiscoveredModelLike {
 export interface StreamableSession {
   /** Full reset: native caches + JS history (the post-error rebuild path). */
   reset(): void | Promise<void>;
+  /** Load-time physical context snapshot, when the session exposes one. */
+  contextLimits(): SessionContextLimits | undefined;
+  /** Authoritative image-input capability of the resident model. */
+  supportsImages(): boolean;
   /** Replace the session's committed history wholesale (turnCount must be 0). */
   primeHistory(messages: ChatMessage[]): void;
   /**
    * Run one turn from the primed history as a ChatStreamEvent stream.
-   * `piSessionId` (pi's `options.sessionId`, genmlx-lin9) lets a session
-   * implementation key per-conversation engine state; the v1 `ChatSession`
-   * takes two parameters and satisfies this structurally (fewer-params
-   * assignability) — it simply never sees the id.
+   * Per-conversation identity travels inside `config` (`cacheOwnerId`,
+   * pi's `options.sessionId`), which is what lets a session implementation
+   * key engine state per conversation and honor fork hints (genmlx-lin9).
    */
-  startFromHistoryStream(
-    config?: ChatConfig,
-    signal?: AbortSignal,
-    piSessionId?: string,
-  ): AsyncGenerator<ChatStreamEvent>;
+  startFromHistoryStream(config?: ChatConfig, signal?: AbortSignal): AsyncGenerator<ChatStreamEvent>;
 }

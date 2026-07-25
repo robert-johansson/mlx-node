@@ -8,9 +8,17 @@ import type {
   Tool,
   TSchema,
 } from '@earendil-works/pi-ai';
-import type { ChatConfig, ChatMessage, ChatSession, ChatStreamEvent, ChatStreamFinal } from '@mlx-node/lm';
-import { describe, expect, it } from 'vite-plus/test';
+import type {
+  ChatConfig,
+  ChatMessage,
+  ChatSession,
+  ChatStreamEvent,
+  ChatStreamFinal,
+  SessionContextLimits,
+} from '@mlx-node/lm';
+import { describe, expect, it, vi } from 'vite-plus/test';
 
+import { contextToChatMessages } from '../src/provider/convert-messages.js';
 import { makeMlxStreamSimple, type StreamSimpleHost } from '../src/provider/stream-adapter.js';
 import type { DiscoveredModelLike } from '../src/types.js';
 
@@ -78,11 +86,22 @@ class FakeChatSession {
   resetCalls = 0;
   /** When set, `reset()` throws (post-error reset failure → resident invalidation). */
   resetShouldThrow = false;
+  /** Authoritative loaded-model media capability exposed through ChatSession. */
+  imageSupport = false;
 
   constructor(
     private readonly scripts: Script[],
     readonly log: string[] = [],
+    private readonly limits?: SessionContextLimits,
   ) {}
+
+  contextLimits(): SessionContextLimits | undefined {
+    return this.limits;
+  }
+
+  supportsImages(): boolean {
+    return this.imageSupport;
+  }
 
   /**
    * Full public reset — distinct from the JS-only warm-reuse wipe. The
@@ -211,6 +230,148 @@ function finalMessage(events: AssistantMessageEvent[]): AssistantMessage {
 }
 
 describe('makeMlxStreamSimple', () => {
+  it('publishes the loaded physical context limit on the shared pi model object', async () => {
+    const session = new FakeChatSession(
+      [
+        // eslint-disable-next-line @typescript-eslint/require-await
+        async function* () {
+          yield finalEvent();
+        },
+      ],
+      [],
+      {
+        trainedWindowTokens: 262144,
+        effectiveWindowTokens: 12288,
+        pagedBlockCapacity: 768,
+        pagedBlockSize: 16,
+      },
+    );
+    const sharedModel = { ...MODEL };
+    await collect(makeMlxStreamSimple(makeFakeHost(session))(sharedModel, CONTEXT));
+
+    expect(sharedModel.contextWindow).toBe(12288);
+    expect(sharedModel.maxTokens).toBe(12288);
+  });
+
+  it('publishes image capability and primes user/tool images with template-safe roles', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent();
+      },
+    ]);
+    session.imageSupport = true;
+    const sharedModel: Model<Api> = { ...MODEL, input: [...MODEL.input] };
+    const priorAssistant: AssistantMessage = {
+      role: 'assistant',
+      content: [{ type: 'toolCall', id: 'call_image', name: 'read', arguments: {} }],
+      api: 'mlx',
+      provider: 'mlx',
+      model: 'qwen-small',
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: 'toolUse',
+      timestamp: 2,
+    };
+    const imageContext: Context = {
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Describe this.' },
+            { type: 'image', data: 'AQID', mimeType: 'image/png' },
+          ],
+          timestamp: 1,
+        },
+        priorAssistant,
+        {
+          role: 'toolResult',
+          toolCallId: 'call_image',
+          toolName: 'read',
+          content: [{ type: 'image', data: 'BAU=', mimeType: 'image/png' }],
+          isError: false,
+          timestamp: 3,
+        },
+      ],
+    };
+
+    await collect(makeMlxStreamSimple(makeFakeHost(session))(sharedModel, imageContext));
+
+    expect(sharedModel.input).toEqual(['text', 'image']);
+    expect(session.primedWith).toHaveLength(4);
+    expect(session.primedWith?.[0]).toMatchObject({ role: 'user', content: 'Describe this.' });
+    expect(session.primedWith?.[0]?.images?.map((image) => [...image])).toEqual([[1, 2, 3]]);
+    expect(session.primedWith?.[2]).toEqual({
+      role: 'tool',
+      content: '(see attached image)',
+      toolCallId: 'call_image',
+      isError: false,
+    });
+    expect(session.primedWith?.[3]).toMatchObject({
+      role: 'user',
+      content: 'Attached image(s) from tool result:',
+    });
+    expect(session.primedWith?.[3]?.images?.map((image) => [...image])).toEqual([[4, 5]]);
+  });
+
+  it('removes a stale image advertisement when the loaded session is text-only', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent();
+      },
+    ]);
+    const sharedModel: Model<Api> = { ...MODEL, input: ['text', 'image'] };
+    const imageContext: Context = {
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Describe this.' },
+            { type: 'image', data: 'AQID', mimeType: 'image/png' },
+          ],
+          timestamp: 1,
+        },
+      ],
+    };
+
+    await collect(makeMlxStreamSimple(makeFakeHost(session))(sharedModel, imageContext));
+
+    expect(sharedModel.input).toEqual(['text']);
+    expect(session.primedWith).toEqual([{ role: 'user', content: 'Describe this.\n[image omitted]' }]);
+  });
+
+  it('contains frozen image metadata while retaining authoritative native conversion', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent();
+      },
+    ]);
+    session.imageSupport = true;
+    const frozenModel = Object.freeze({ ...MODEL, input: Object.freeze(['text']) }) as unknown as Model<Api>;
+    const imageContext: Context = {
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'image', data: 'AQID', mimeType: 'image/png' }],
+          timestamp: 1,
+        },
+      ],
+    };
+
+    await collect(makeMlxStreamSimple(makeFakeHost(session))(frozenModel, imageContext));
+
+    expect(frozenModel.input).toEqual(['text']);
+    expect(session.primedWith?.[0]?.images?.map((image) => [...image])).toEqual([[1, 2, 3]]);
+  });
+
   it('streams a happy text turn in order with stopReason stop', async () => {
     const session = new FakeChatSession([
       // eslint-disable-next-line @typescript-eslint/require-await
@@ -253,6 +414,116 @@ describe('makeMlxStreamSimple', () => {
     expect(session.configSeen?.maxNewTokens).toBe(64);
     expect(session.configSeen?.reasoningEffort).toBe('none');
     expect(session.configSeen?.tools).toBeUndefined();
+  });
+
+  it('persists the resolved native thinking mode for exact history replay', async () => {
+    const cases = [
+      [undefined, 'none', false],
+      ['minimal', 'low', false],
+      ['low', 'low', false],
+      ['medium', 'medium', true],
+      ['high', 'high', true],
+      ['xhigh', 'high', true],
+      ['max', 'high', true],
+    ] as const;
+
+    for (const [reasoning, expectedEffort, expectedEnabled] of cases) {
+      const session = new FakeChatSession([
+        // eslint-disable-next-line @typescript-eslint/require-await
+        async function* () {
+          yield delta('Answer');
+          yield finalEvent({ text: 'Answer' });
+        },
+      ]);
+      const options = reasoning === undefined ? undefined : { reasoning };
+      const message = finalMessage(
+        await collect(makeMlxStreamSimple(makeFakeHost(session))(MODEL, CONTEXT, options)),
+      ) as AssistantMessage & { mlxThinkingEnabled?: boolean };
+
+      expect(session.configSeen?.reasoningEffort, `reasoning=${String(reasoning)}`).toBe(expectedEffort);
+      expect(message.mlxThinkingEnabled, `reasoning=${String(reasoning)}`).toBe(expectedEnabled);
+      expect(contextToChatMessages({ messages: [message] })).toEqual([
+        {
+          role: 'assistant',
+          content: 'Answer',
+          thinkingEnabled: expectedEnabled,
+        },
+      ]);
+    }
+  });
+
+  it('associates terminal performance metrics with the exact Pi assistant message', async () => {
+    const performance = {
+      ttftMs: 125,
+      prefillTokensPerSecond: 812.5,
+      decodeTokensPerSecond: 47.25,
+    };
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent({ performance });
+      },
+    ]);
+    const record = vi.fn();
+
+    const events = await collect(makeMlxStreamSimple(makeFakeHost(session), record)(MODEL, CONTEXT));
+    const message = finalMessage(events);
+
+    expect(record).toHaveBeenCalledOnce();
+    expect(record).toHaveBeenCalledWith(message, performance);
+    expect(message.usage).toMatchObject({ input: 12, cacheRead: 8 });
+    expect(session.configSeen?.reportPerformance).toBe(true);
+  });
+
+  it('does not publish performance telemetry for a missing or error final', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent();
+      },
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent({
+          finishReason: 'error',
+          performance: {
+            ttftMs: 100,
+            prefillTokensPerSecond: 500,
+            decodeTokensPerSecond: 30,
+          },
+        });
+      },
+    ]);
+    const record = vi.fn();
+    const streamSimple = makeMlxStreamSimple(makeFakeHost(session), record);
+
+    await collect(streamSimple(MODEL, CONTEXT));
+    await collect(streamSimple(MODEL, CONTEXT));
+
+    expect(record).not.toHaveBeenCalled();
+  });
+
+  it('still completes the Pi stream when the best-effort performance recorder throws', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent({
+          performance: {
+            ttftMs: 100,
+            prefillTokensPerSecond: 500,
+            decodeTokensPerSecond: 30,
+          },
+        });
+      },
+    ]);
+    const record = vi.fn(() => {
+      throw new Error('status renderer failed');
+    });
+
+    const events = await collect(makeMlxStreamSimple(makeFakeHost(session), record)(MODEL, CONTEXT));
+
+    expect(record).toHaveBeenCalledOnce();
+    expect(events.at(-1)?.type).toBe('done');
+    expect(finalMessage(events).stopReason).toBe('stop');
   });
 
   it('does not prime a prior error/aborted partial assistant turn into the reset session (WB-4)', async () => {
@@ -525,6 +796,31 @@ describe('makeMlxStreamSimple', () => {
     expect(session.log).toEqual([]); // the host was never engaged
   });
 
+  it('contains a root-owner resolver failure without engaging the host', async () => {
+    let hostCalls = 0;
+    const host: StreamSimpleHost = {
+      modelInfo: () => DISCOVERED,
+      ...dirtyStubs(),
+      runWithResident: () => {
+        hostCalls += 1;
+        return Promise.reject(new Error('must not run'));
+      },
+    };
+    const streamSimple = makeMlxStreamSimple(host, undefined, () => {
+      throw new Error('root resolver failed');
+    });
+
+    let stream!: AssistantMessageEventStream;
+    expect(() => {
+      stream = streamSimple(MODEL, CONTEXT);
+    }).not.toThrow();
+    const events = await collect(stream);
+
+    expect(types(events)).toEqual(['error']);
+    expect(finalMessage(events).errorMessage).toBe('root resolver failed');
+    expect(hostCalls).toBe(0);
+  });
+
   it('falls back to a TurnEmitter-independent terminal when the error defeats coercion (null-prototype)', async () => {
     // String(err) throws for a null-prototype object, which blows up
     // TurnEmitter.onError itself — the failsafe must still terminalize.
@@ -682,6 +978,43 @@ describe('makeMlxStreamSimple', () => {
       'stream-done',
       'fn2-end:qwen-small',
     ]);
+  });
+
+  it('snapshots each root owner before a request waits on the serialized host', async () => {
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const firstStartedPromise = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+    const releaseFirstPromise = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const seenRoots: Array<string | undefined> = [];
+    const session = new FakeChatSession([
+      async function* (config) {
+        seenRoots.push(config?.cacheRootOwnerId);
+        firstStarted();
+        await releaseFirstPromise;
+        yield finalEvent({ text: 'first' });
+      },
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* (config) {
+        seenRoots.push(config?.cacheRootOwnerId);
+        yield finalEvent({ text: 'second' });
+      },
+    ]);
+    let currentRoot = 'root-0';
+    const streamSimple = makeMlxStreamSimple(makeFakeHost(session), undefined, () => currentRoot);
+
+    const first = collect(streamSimple(MODEL, CONTEXT, { sessionId: 'root-0' }));
+    await firstStartedPromise;
+    currentRoot = 'root-1';
+    const second = collect(streamSimple(MODEL, CONTEXT, { sessionId: 'child-1' }));
+    currentRoot = 'root-2';
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    expect(seenRoots).toEqual(['root-0', 'root-1']);
   });
 
   describe('post-error KV recovery (full reset instead of warm reuse)', () => {

@@ -11,51 +11,89 @@
 import type { Context, ImageContent, Message, TextContent, Tool } from '@earendil-works/pi-ai';
 import type { ChatMessage, ToolDefinition } from '@mlx-node/lm';
 
-/**
- * Fixed text of the synthetic user message that carries tool-result
- * images to the model (see {@link contextToChatMessages}). MUST stay
- * byte-stable and count-independent: it is replayed on every turn, so
- * any variation (image counts, tool names, timestamps) would change
- * the token prefix and kill native KV reuse for the rest of the
- * session.
- */
-const TOOL_IMAGE_HOIST_TEXT = 'The image output of the preceding tool result is attached.';
+const IMAGE_PLACEHOLDER = '[image omitted]';
+const PI_NON_VISION_IMAGE_NOTE =
+  '[Current model does not support images. The image will be omitted from this request.]';
+const TOOL_RESULT_IMAGE_PLACEHOLDER = '(see attached image)';
+const TOOL_RESULT_IMAGE_PROMPT = 'Attached image(s) from tool result:';
 
-/** Split pi content parts into joined text and decoded image bytes.
- * Within-message interleaving is NOT preserved: the native Jinja
- * serializer renders one text part followed by the image parts
- * (matching mlx-vlm's ordering), so text is joined first and images
- * follow. Cross-message ordering is exact. */
-function splitParts(parts: ReadonlyArray<TextContent | ImageContent>): { text: string; images: Uint8Array[] } {
-  const texts: string[] = [];
+interface ConvertedParts {
+  content: string;
+  images?: Uint8Array[];
+}
+
+interface ConvertedMessage {
+  message: ChatMessage;
+  toolResultImages?: Uint8Array[];
+}
+
+/**
+ * Convert Pi's mixed text/image blocks into the native message shape.
+ *
+ * Text-only models retain the historical byte-stable placeholder rendering.
+ * Image-capable models keep text order and image order independently — the
+ * most ordering the native `ChatMessage { content, images }` shape can express
+ * — while decoding Pi's base64 payloads into the bytes consumed by NAPI.
+ */
+function convertParts(
+  parts: ReadonlyArray<TextContent | ImageContent>,
+  supportsImages: boolean,
+  stripStaleToolImageNote = false,
+): ConvertedParts {
+  if (!supportsImages) {
+    return {
+      content: parts.map((part) => (part.type === 'image' ? IMAGE_PLACEHOLDER : part.text)).join('\n'),
+    };
+  }
+
+  const text: string[] = [];
   const images: Uint8Array[] = [];
   for (const part of parts) {
     if (part.type === 'image') {
-      images.push(new Uint8Array(Buffer.from(part.data, 'base64')));
+      images.push(Buffer.from(part.data, 'base64'));
     } else {
-      texts.push(part.text);
+      // Pi added this exact standalone line to image tool results before the
+      // loaded native capability could be published. A resumed pre-fix history
+      // still contains it; replaying the warning contradicts the now-loaded
+      // capability even when image processing failed before producing bytes.
+      // Scope cleanup to tool results: identical direct-user text is literal.
+      text.push(
+        stripStaleToolImageNote
+          ? part.text
+              .split('\n')
+              .filter((line) => line !== PI_NON_VISION_IMAGE_NOTE)
+              .join('\n')
+          : part.text,
+      );
     }
   }
-  return { text: texts.join('\n'), images };
+  return {
+    content: text.join('\n'),
+    ...(images.length > 0 ? { images } : {}),
+  };
 }
 
 /** Per-message conversion (byte-stable joins). Never drops — the drop / orphan
- * repair lives in {@link contextToChatMessages}, mirroring pi's transformMessages. */
-function convertMessage(message: Message): ChatMessage {
+ * repair and grouped tool-result image turn live in
+ * {@link contextToChatMessages}, mirroring pi's transformMessages and OpenAI
+ * provider conversion. */
+function convertMessage(message: Message, supportsImages: boolean): ConvertedMessage {
   switch (message.role) {
     case 'user': {
       if (typeof message.content === 'string') {
-        return { role: 'user', content: message.content };
+        return { message: { role: 'user', content: message.content } };
       }
-      const { text, images } = splitParts(message.content);
-      const converted: ChatMessage = { role: 'user', content: text };
-      if (images.length > 0) converted.images = images;
-      return converted;
+      return { message: { role: 'user', ...convertParts(message.content, supportsImages) } };
     }
     case 'assistant': {
-      // Thinking blocks are dropped: the native chat template re-renders
-      // reasoning through its own <think> handling, and replayed thinking
-      // would invalidate the KV prefix of every later turn.
+      // Preserve the parser's reasoning body so thinking-capable templates can
+      // reconstruct the exact channel/tag sequence generated on the prior
+      // turn. The native Gemma4 parser already removes its fixed `thought\n`
+      // channel label; the template adds that label back during replay.
+      const reasoningContent = message.content
+        .filter((part) => part.type === 'thinking')
+        .map((part) => part.thinking)
+        .join('');
       const text = message.content
         .filter((part): part is TextContent => part.type === 'text')
         .map((part) => part.text)
@@ -64,31 +102,31 @@ function convertMessage(message: Message): ChatMessage {
         .filter((part) => part.type === 'toolCall')
         .map((part) => ({ id: part.id, name: part.name, arguments: JSON.stringify(part.arguments) }));
       const converted: ChatMessage = { role: 'assistant', content: text };
+      if (reasoningContent.length > 0) converted.reasoningContent = reasoningContent;
+      const thinkingEnabled = (message as typeof message & { mlxThinkingEnabled?: boolean }).mlxThinkingEnabled;
+      if (thinkingEnabled !== undefined) converted.thinkingEnabled = thinkingEnabled;
       if (toolCalls.length > 0) converted.toolCalls = toolCalls;
-      return converted;
+      return { message: converted };
     }
     case 'toolResult': {
-      // Images are NOT attached here: the native Jinja serializer emits
-      // image parts only for user-role messages, matching the model's
-      // trained format (Qwen-VL vision tokens live in user turns; tool
-      // responses are text inside <tool_response>). Tool-result images
-      // are hoisted onto a synthetic user message by
-      // {@link contextToChatMessages} instead.
-      const { text } = splitParts(message.content);
+      const converted = convertParts(message.content, supportsImages, true);
+      const images = converted.images ?? [];
       return {
-        role: 'tool',
-        content: text,
-        toolCallId: message.toolCallId,
-        isError: message.isError,
+        message: {
+          role: 'tool',
+          content:
+            converted.content.length > 0
+              ? converted.content
+              : images.length > 0
+                ? TOOL_RESULT_IMAGE_PLACEHOLDER
+                : converted.content,
+          toolCallId: message.toolCallId,
+          isError: message.isError,
+        },
+        ...(images.length > 0 ? { toolResultImages: images } : {}),
       };
     }
   }
-}
-
-/** Decoded image bytes of a pi tool result, or `null` when it has none. */
-function toolResultImages(parts: ReadonlyArray<TextContent | ImageContent>): Uint8Array[] | null {
-  const { images } = splitParts(parts);
-  return images.length > 0 ? images : null;
 }
 
 /**
@@ -96,22 +134,13 @@ function toolResultImages(parts: ReadonlyArray<TextContent | ImageContent>): Uin
  * `ChatSession.primeHistory()`.
  *
  * - `systemPrompt` becomes the leading `system` message.
- * - USER image parts ride the converted message's `images` field: the
- *   native session start extracts them in message order and the Jinja
- *   serializer emits one vision part per image at the message's position,
- *   so multiple images and images at multiple history positions both work.
- * - TOOL-RESULT image parts are HOISTED onto a synthetic user message
- *   (fixed text {@link TOOL_IMAGE_HOIST_TEXT}) pushed directly after the
- *   tool message. The native serializer emits image parts only for
- *   user-role messages — the model's trained format (Qwen-VL vision
- *   tokens live in user turns) — so attaching them to the tool message
- *   would render zero placeholders while the engine still extracted the
- *   bytes: a feature/placeholder count mismatch. The hoist is
- *   provider-internal; pi extensions keep returning images in tool
- *   results per the pi content model.
- * - Text-only models: an image-bearing history is rejected by the engine
- *   with a typed `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error
- *   before rendering (no silent placeholder substitution).
+ * - For text-only models (the default), image parts become literal
+ *   `[image omitted]` lines.
+ * - For an image-capable loaded model, user images stay on their native user
+ *   message. Images from a consecutive tool-result run are decoded, collected
+ *   in source order, and emitted on one synthetic user message after every
+ *   textual tool message in that run. This mirrors pi's OpenAI conversion and
+ *   avoids templates that ignore images attached to the `tool` role.
  *
  * Two-pass mirror of pi's canonical `transformMessages` (pi-ai
  * `dist/api/transform-messages.js`). That transform normally sanitizes the
@@ -136,7 +165,7 @@ function toolResultImages(parts: ReadonlyArray<TextContent | ImageContent>): Uin
  * untouched, so the byte-stable joins that keep the replayed KV prefix stable
  * are preserved.
  */
-export function contextToChatMessages(context: Context): ChatMessage[] {
+export function contextToChatMessages(context: Context, supportsImages = false): ChatMessage[] {
   const messages: ChatMessage[] = [];
   if (context.systemPrompt) {
     messages.push({ role: 'system', content: context.systemPrompt });
@@ -146,6 +175,7 @@ export function contextToChatMessages(context: Context): ChatMessage[] {
   // recent RETAINED assistant, and the result ids seen since.
   let pendingToolCallIds: string[] = [];
   let seenToolResultIds = new Set<string>();
+  let pendingToolResultImages: Uint8Array[] = [];
 
   const flushOrphans = (): void => {
     if (pendingToolCallIds.length === 0) return;
@@ -158,18 +188,36 @@ export function contextToChatMessages(context: Context): ChatMessage[] {
     seenToolResultIds = new Set();
   };
 
+  const flushToolResultImages = (): void => {
+    if (pendingToolResultImages.length === 0) return;
+    messages.push({
+      role: 'user',
+      content: TOOL_RESULT_IMAGE_PROMPT,
+      images: pendingToolResultImages,
+    });
+    pendingToolResultImages = [];
+  };
+
+  const flushToolResultBoundary = (): void => {
+    // A grouped image attachment is logically a user turn. Repair any missing
+    // sibling tool result before that boundary, then append the single image
+    // turn after every real/synthetic tool result.
+    flushOrphans();
+    flushToolResultImages();
+  };
+
   for (const message of context.messages) {
     switch (message.role) {
       case 'user':
-        flushOrphans();
-        messages.push(convertMessage(message));
+        flushToolResultBoundary();
+        messages.push(convertMessage(message, supportsImages).message);
         break;
       case 'assistant': {
-        flushOrphans();
+        flushToolResultBoundary();
         if (message.stopReason === 'error' || message.stopReason === 'aborted') {
           break; // dropped: not primed, and its tool calls are NOT tracked
         }
-        const converted = convertMessage(message);
+        const converted = convertMessage(message, supportsImages).message;
         messages.push(converted);
         if (converted.toolCalls && converted.toolCalls.length > 0) {
           // Native ToolCall.id is optional; only ids can be matched against a
@@ -181,22 +229,16 @@ export function contextToChatMessages(context: Context): ChatMessage[] {
       }
       case 'toolResult': {
         seenToolResultIds.add(message.toolCallId);
-        messages.push(convertMessage(message));
-        // Tool-image hoist: the image bytes ride a synthetic user message
-        // DIRECTLY after the tool result, preserving temporal order across
-        // multiple image-bearing tool calls. Pushed without flushing orphan
-        // state — sibling tool calls from the same assistant fan-out may
-        // still be awaiting results, and the hoist must not trigger
-        // synthetic "No result provided" entries for them.
-        const images = toolResultImages(message.content);
-        if (images) {
-          messages.push({ role: 'user', content: TOOL_IMAGE_HOIST_TEXT, images });
+        const converted = convertMessage(message, supportsImages);
+        messages.push(converted.message);
+        if (converted.toolResultImages) {
+          pendingToolResultImages.push(...converted.toolResultImages);
         }
         break;
       }
     }
   }
-  flushOrphans();
+  flushToolResultBoundary();
   return messages;
 }
 

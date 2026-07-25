@@ -1,15 +1,33 @@
 /**
- * `runAgent` boot-shell contract, via the `mainImpl` seam (pi itself is
- * never imported here): env seeding with `??=` semantics, the exact
- * extension pair, and verbatim argv forwarding.
+ * `runAgent` boot-shell contract, via the `piImpl` seam: env seeding with
+ * `??=` semantics, the exact extension set (both in-process local providers),
+ * registry-policy lifecycle, and verbatim argv forwarding.
  */
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import type { InlineExtension } from '@earendil-works/pi-coding-agent';
-import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
+import { AuthStorage, type InlineExtension, ModelRegistry } from '@earendil-works/pi-coding-agent';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
-import { runAgent, type RunAgentMain } from '../src/run-agent.js';
+import {
+  agentGemmaDraftEnabled,
+  agentPagedCacheSupported,
+  runAgent,
+  type AgentPagedConfigOverrides,
+  type RunAgentMain,
+  type RunAgentPi,
+} from '../src/run-agent.js';
+
+const FAKE_MODEL = {
+  discovered: { name: 'local', path: '/models/local', modelType: 'qwen3' },
+  piModel: {},
+} as never;
+
+/** Owned-forward inventory served by the `genmlx` provider (genmlx-djw6). */
+const FAKE_GENMLX_MODEL = {
+  discovered: { name: 'owned', path: '/models/owned', modelType: 'qwen3_5' },
+  piModel: {},
+} as never;
 
 const ENV_KEYS = ['PI_CODING_AGENT_DIR', 'PI_SKIP_VERSION_CHECK', 'MLX_PAGED_PREFILL_CHUNK_SIZE'] as const;
 
@@ -37,6 +55,21 @@ function makeSeam(): { main: RunAgentMain; calls: SeamCapture[] } {
   return { main, calls };
 }
 
+function piImpl(main: RunAgentMain): RunAgentPi {
+  return { main, ModelRegistry };
+}
+
+function pagedConfigOverrides(): AgentPagedConfigOverrides & { cleanup: ReturnType<typeof vi.fn> } {
+  return {
+    resolve: vi.fn(async (path: string) => `/paged${path}`),
+    cleanup: vi.fn(async () => undefined),
+  };
+}
+
+function extensionNames(factories: InlineExtension[]): string[] {
+  return factories.map((entry) => (typeof entry === 'function' ? '<anonymous>' : entry.name));
+}
+
 describe('runAgent', () => {
   let savedEnv: Record<EnvKey, string | undefined>;
 
@@ -54,7 +87,7 @@ describe('runAgent', () => {
 
   it('seeds the three env vars before invoking main when they are absent', async () => {
     const { main, calls } = makeSeam();
-    await runAgent({ modelsDir: '/models', models: [], argv: [], mainImpl: main });
+    await runAgent({ modelsDir: '/models', models: [], argv: [], piImpl: piImpl(main) });
 
     expect(calls).toHaveLength(1);
     const env = calls[0]!.envAtCall;
@@ -69,7 +102,7 @@ describe('runAgent', () => {
     process.env.MLX_PAGED_PREFILL_CHUNK_SIZE = '512';
 
     const { main, calls } = makeSeam();
-    await runAgent({ modelsDir: '/models', models: [], argv: [], mainImpl: main });
+    await runAgent({ modelsDir: '/models', models: [], argv: [], piImpl: piImpl(main) });
 
     const env = calls[0]!.envAtCall;
     expect(env.PI_CODING_AGENT_DIR).toBe('/custom/agent-home');
@@ -77,26 +110,89 @@ describe('runAgent', () => {
     expect(env.MLX_PAGED_PREFILL_CHUNK_SIZE).toBe('512');
   });
 
-  it('passes exactly the two provider extensions and the permission gate, in order', async () => {
+  it('passes exactly the built-in mlx extensions, in order', async () => {
     const { main, calls } = makeSeam();
-    await runAgent({ modelsDir: '/models', models: [], argv: [], mainImpl: main });
+    await runAgent({ modelsDir: '/models', models: [], argv: [], piImpl: piImpl(main) });
 
     const factories = calls[0]!.extensionFactories;
     const names = factories.map((entry) => {
-      // Both mlx extensions use the named `{ name, factory }` form, never
+      // All mlx extensions use the named `{ name, factory }` form, never
       // the bare-function InlineExtension variant.
       expect(typeof entry).toBe('object');
       const named = entry as Extract<InlineExtension, { name: string; factory: unknown }>;
       expect(typeof named.factory).toBe('function');
       return named.name;
     });
-    expect(names).toEqual(['mlx-provider', 'genmlx-provider', 'mlx-permission-gate']);
+    // The genmlx provider registers unconditionally and strictly next to the
+    // v1 one — with no genmlx models pi simply treats it as unavailable
+    // (genmlx-djw6 rider 2: v1 stays the baseline arm).
+    expect(names).toEqual(['mlx-provider', 'genmlx-provider', 'mlx-permission-gate', 'mlx-terminal-title']);
+  });
+
+  it('adds subagents only for a real parent model session', async () => {
+    const { main, calls } = makeSeam();
+    await runAgent({ modelsDir: '/models', models: [FAKE_MODEL], argv: [], piImpl: piImpl(main) });
+
+    expect(extensionNames(calls[0]!.extensionFactories)).toEqual([
+      'mlx-provider',
+      'genmlx-provider',
+      'mlx-permission-gate',
+      'mlx-subagent',
+      'mlx-terminal-title',
+    ]);
+  });
+
+  it('leaves subagents off for a genmlx-only inventory', async () => {
+    const { main, calls } = makeSeam();
+    await runAgent({
+      modelsDir: '/models',
+      models: [],
+      genmlxModels: [FAKE_GENMLX_MODEL],
+      argv: [],
+      piImpl: piImpl(main),
+    });
+
+    // Subagents resolve `mlx/<id>` against the parent's MlxModelHost, so they
+    // are a v1-provider feature; a genmlx-only session gets the provider pair
+    // and the gate, nothing that would dead-end on an mlx model id.
+    expect(extensionNames(calls[0]!.extensionFactories)).toEqual([
+      'mlx-provider',
+      'genmlx-provider',
+      'mlx-permission-gate',
+      'mlx-terminal-title',
+    ]);
+  });
+
+  it('adds a TUI trace notice only when the CLI supplies a log path', async () => {
+    const { main, calls } = makeSeam();
+    await runAgent({
+      modelsDir: '/models',
+      models: [FAKE_MODEL],
+      argv: [],
+      traceLogFile: '/logs/inference.log',
+      piImpl: piImpl(main),
+    });
+
+    expect(extensionNames(calls[0]!.extensionFactories)).toEqual([
+      'mlx-provider',
+      'genmlx-provider',
+      'mlx-permission-gate',
+      'mlx-subagent',
+      'mlx-trace-notice',
+      'mlx-terminal-title',
+    ]);
+  });
+
+  it.each([['--no-extensions'], ['-ne']])('respects the extension opt-out %s', async (...argv) => {
+    const { main, calls } = makeSeam();
+    await runAgent({ modelsDir: '/models', models: [FAKE_MODEL], argv, piImpl: piImpl(main) });
+    expect(extensionNames(calls[0]!.extensionFactories)).not.toContain('mlx-subagent');
   });
 
   it('forwards argv verbatim', async () => {
     const argv = ['--mode', 'json', '--no-session', '-p', 'Reply with exactly: hi'];
     const { main, calls } = makeSeam();
-    await runAgent({ modelsDir: '/models', models: [], argv, mainImpl: main });
+    await runAgent({ modelsDir: '/models', models: [], argv, piImpl: piImpl(main) });
 
     expect(calls[0]!.argv).toBe(argv);
     expect(calls[0]!.argv).toEqual(['--mode', 'json', '--no-session', '-p', 'Reply with exactly: hi']);
@@ -104,15 +200,137 @@ describe('runAgent', () => {
 
   it('propagates a rejection from main', async () => {
     const boom = new Error('pi main failed');
+    const paged = pagedConfigOverrides();
     await expect(
       runAgent({
         modelsDir: '/models',
         models: [],
         argv: [],
-        mainImpl: async () => {
+        pagedConfigOverrides: paged,
+        piImpl: piImpl(async () => {
           throw boom;
-        },
+        }),
       }),
     ).rejects.toBe(boom);
+    expect(paged.cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('cleans up paged config overlays when main returns', async () => {
+    const paged = pagedConfigOverrides();
+    await runAgent({
+      modelsDir: '/models',
+      models: [],
+      argv: [],
+      pagedConfigOverrides: paged,
+      piImpl: piImpl(async () => undefined),
+    });
+
+    expect(paged.cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('applies the registry policy while main runs and restores it afterward', async () => {
+    const authStorage = AuthStorage.inMemory({ groq: { type: 'api_key', key: 'test-groq-key' } });
+    const registry = ModelRegistry.inMemory(authStorage);
+    const groq = registry.getAll().find((model) => model.provider === 'groq');
+    expect(groq).toBeDefined();
+
+    await runAgent({
+      modelsDir: '/models',
+      models: [FAKE_MODEL],
+      argv: [],
+      piImpl: piImpl(async () => {
+        expect(registry.find('groq', groq!.id)).toBeUndefined();
+        expect(registry.getAll()).toEqual([]);
+      }),
+    });
+
+    expect(registry.find('groq', groq!.id)).toBeDefined();
+  });
+
+  it('allowlists genmlx models too, so the second provider stays visible', async () => {
+    // Silent when broken: an id missing from the policy is not an error, the
+    // model simply disappears from Tab, `/models`, RPC enumeration and session
+    // restore — a genmlx-only inventory would look like no models at all.
+    const authStorage = AuthStorage.inMemory({ groq: { type: 'api_key', key: 'test-groq-key' } });
+    const registry = ModelRegistry.inMemory(authStorage);
+    const groq = registry.getAll().find((model) => model.provider === 'groq');
+    expect(groq).toBeDefined();
+
+    await runAgent({
+      modelsDir: '/models',
+      models: [FAKE_MODEL],
+      genmlxModels: [FAKE_GENMLX_MODEL],
+      argv: [],
+      piImpl: piImpl(async () => {
+        registry.registerProvider('mlx', {
+          api: 'mlx',
+          baseUrl: 'mlx://local',
+          apiKey: 'mlx-local',
+          models: [
+            {
+              id: 'local',
+              name: 'local',
+              reasoning: true,
+              input: ['text'],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 4096,
+              maxTokens: 1024,
+            },
+          ],
+        });
+        registry.registerProvider('genmlx', {
+          api: 'mlx',
+          baseUrl: 'genmlx://local',
+          apiKey: 'genmlx-local',
+          models: [
+            {
+              id: 'owned',
+              name: 'owned',
+              reasoning: true,
+              input: ['text'],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 4096,
+              maxTokens: 1024,
+            },
+            {
+              id: 'undiscovered',
+              name: 'undiscovered',
+              reasoning: true,
+              input: ['text'],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 4096,
+              maxTokens: 1024,
+            },
+          ],
+        });
+
+        expect(new Set(registry.getAll().map((model) => `${model.provider}/${model.id}`))).toEqual(
+          new Set(['mlx/local', 'genmlx/owned']),
+        );
+        expect(registry.find('genmlx', 'owned')).toBeDefined();
+        // Still an exact allowlist, not a blanket second-provider pass.
+        expect(registry.find('genmlx', 'undiscovered')).toBeUndefined();
+        expect(registry.find('groq', groq!.id)).toBeUndefined();
+      }),
+    });
+
+    expect(registry.find('groq', groq!.id)).toBeDefined();
+  });
+});
+
+describe('agentGemmaDraftEnabled', () => {
+  it('requires the explicit value 1', () => {
+    expect(agentGemmaDraftEnabled({ MLX_AGENT_ENABLE_GEMMA_DRAFT: '1' })).toBe(true);
+    expect(agentGemmaDraftEnabled({ MLX_AGENT_ENABLE_GEMMA_DRAFT: 'true' })).toBe(false);
+    expect(agentGemmaDraftEnabled({ MLX_AGENT_ENABLE_GEMMA_DRAFT: '0' })).toBe(false);
+    expect(agentGemmaDraftEnabled({})).toBe(false);
+  });
+});
+
+describe('agentPagedCacheSupported', () => {
+  it('is Metal-only — no other build can activate a paged adapter', () => {
+    expect(agentPagedCacheSupported('darwin')).toBe(true);
+    expect(agentPagedCacheSupported('linux')).toBe(false);
+    expect(agentPagedCacheSupported('win32')).toBe(false);
   });
 });
