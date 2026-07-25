@@ -3344,7 +3344,14 @@ impl Qwen35MoeInner {
             let prefix_images_ok = if k == 0 {
                 self.cached_image_key.is_none()
             } else {
-                self.cached_image_key == Some(engine::compute_image_cache_key(&images[..k]))
+                // `k <= images.len()` is re-checked in the `if` below, but the
+                // slice happens HERE: a session that cached k images followed by
+                // a turn carrying fewer would panic on `&images[..k]` before the
+                // guard ran. A cached prefix longer than this turn's image list
+                // can never match anyway, so short-circuiting to false is the
+                // same decision, just without the panic.
+                k <= images.len()
+                    && self.cached_image_key == Some(engine::compute_image_cache_key(&images[..k]))
             };
             if reuse_cache
                 && prefix_images_ok
