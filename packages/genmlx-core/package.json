@@ -1,6 +1,7 @@
 {
   "name": "@genmlx/core",
   "version": "0.0.0",
+  "private": true,
   "main": "./index.node",
   "scripts": {
     "build": "node ./build.mjs"
