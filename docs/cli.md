@@ -47,28 +47,40 @@ mlx convert --input ./model --output ./model-bf16 --dtype bf16
 mlx convert --input ./model --output ./model-q --quantize --q-recipe mixed_4_6
 ```
 
-### Official Unsloth MXFP and DGX recipes for Qwen3.5
+### Unsloth MXFP and DGX tensor-class recipes for Qwen3.5
 
 For verified dense and MoE Qwen3.5/Qwen3.6-family checkpoints, the fixed
-[official Unsloth class map](https://unsloth.ai/docs/models/qwen3.6#nvfp4) is
-available in two forms. Both keep FP8-class weights as MXFP8 and use the same
-AWQ imatrix pre-scaling:
+[Unsloth class map](https://unsloth.ai/docs/models/qwen3.6#nvfp4) is
+available in two forms. The Apple map translates FP8-class weights to MXFP8;
+the DGX map retains NVFP4 weight storage and stores plain E4M3 FP8 weights with
+one scale per output channel.
+Both use the same AWQ imatrix pre-scaling when calibration is provided. The imatrix is optional
+for these fixed maps: without it, AWQ pre-scaling is skipped and quality may be
+lower, while the class map remains unchanged. Plain affine Unsloth still
+requires an imatrix. Matching calibration remains preferred when available;
+add `--imatrix-path ./imatrix_unsloth.gguf_file` to either command below.
 
 ```bash
 # Apple MXFP variant: replace NVFP4 with MXFP4
 mlx convert -m qwen3_5_moe -q --q-recipe unsloth --q-mxfp \
-  --imatrix-path ./imatrix_unsloth.gguf_file \
   -i ./qwen3.5-35b-a3b -o ./qwen3.5-35b-a3b-unsloth-mxfp4-mlx
 
-# Official DGX variant: retain NVFP4
+# DGX weight variant: retain NVFP4
 mlx convert -m qwen3_5_moe -q --q-mode nvfp4 --q-recipe unsloth \
-  --imatrix-path ./imatrix_unsloth.gguf_file \
   -i ./qwen3.5-35b-a3b -o ./qwen3.5-35b-a3b-unsloth-nvfp4-mlx
 ```
 
 Early FFNs use MXFP4 4/32 with `--q-mxfp`, or NVFP4 4/16 with
 `--q-mode nvfp4`. The final eight FFNs, attention q/k/v/o, GDN qkv/z/out, and
-`lm_head` use MXFP8 8/32 in both. Embeddings, routers, GDN a/b, vision, MTP,
+`lm_head` use MXFP8 8/32 on Apple and `fp8_e4m3` (raw E4M3 `[N,K]` weights +
+BF16 `[N,1]` dequant scales, extended to `[E,N,K]` / `[E,N,1]` for experts) in
+the DGX artifact. Runtime activations remain A16 for both DGX weight classes:
+NVFP4 uses standard MLX weight-only quantized matmul, while plain FP8 weights
+are reconstructed to BF16 once at load. This is a data-free tensor-class and
+serialized-weight-format port when no imatrix is supplied. It does not include
+Unsloth's calibrated NVFP4 global scales, W4A4/W8A8 activation execution, or
+calibrated FP8 KV-cache scales, and it does not claim upstream numerical or
+performance parity. Embeddings, routers, GDN a/b, vision, MTP,
 norms, and recurrent parameters remain BF16. Plain affine Unsloth alone keeps
 the legacy Dynamic 2.0 recipe.
 
@@ -130,7 +142,7 @@ split). `--q-mtp split` (alias `drafter`) emits a body checkpoint with **no
 | `-q`, `--quantize` | Enable quantization                                                                       |
 | `--q-recipe`       | One of `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`, `qwen3_5`, `unsloth`, `nvidia` |
 | `--q-mode`         | `affine` (default), `mxfp4`, `mxfp8`, `nvfp4`, or `sym8`                                  |
-| `--q-mxfp`         | Select Unsloth's fixed MXFP map, or upgrade eligible decisions for other recipes          |
+| `--q-mxfp`         | Select Unsloth's fixed MXFP tensor-class map, or upgrade eligible decisions for other recipes |
 | `--q-mtp`          | Qwen MTP-quant policy: `off`, `cyankiwi`, `all`, or `split` (alias `drafter`)             |
 | `--imatrix-path`   | Path to imatrix file for AWQ pre-scaling                                                  |
 | `--mmproj`         | Vision-encoder conversion path                                                            |
@@ -238,6 +250,8 @@ A more compact Gemma-4-12B entry (mxfp4 MLP + mxfp8 attention, ~9 GB, for smalle
 
 pi's config home is `~/.mlx-node/agent` (override with `PI_CODING_AGENT_DIR`) — it holds `settings.json`, saved sessions, extensions, skills, prompts, and themes. A project-local `.pi/` directory still works for per-repo overrides. `mlx agent` also seeds `PI_SKIP_VERSION_CHECK=1` and `MLX_PAGED_PREFILL_CHUNK_SIZE=2048` (both only when unset) so long prompts keep bounded time-to-first-token on the default paged path.
 
+Gemma4 also uses paged autoregressive decoding by default, even when the checkpoint contains an embedded `draft/`: the agent's temporary config overlay hides that directory without modifying the checkpoint. Set `MLX_AGENT_ENABLE_GEMMA_DRAFT=1` to explicitly use the embedded DSpark/assistant draft instead; that opt-in currently uses flat KV cache and may be slower for quantized agent workloads.
+
 ### Permission gate
 
 pi has no permission system of its own, so `mlx agent` installs a safety gate: every `bash`, `write`, and `edit` tool call must be approved before it runs. In an interactive session it prompts (`Yes` / `Always (this session)` / `No`). Without an attached UI — headless print or `--mode json` runs — it blocks those tools unless you opt in with `MLX_AGENT_AUTO_APPROVE=1`:
@@ -254,7 +268,7 @@ A pi extension file can define its own tools with `defineTool` + `pi.registerToo
 - Custom tools are never gated: the permission gate intercepts `bash`/`write`/`edit` by name, so extension tools run without prompts and without `MLX_AGENT_AUTO_APPROVE`, headless included. A tool needing its own approval flow implements it inside `execute`.
 - Headless `-p` runs drive multi-turn tool loops to completion (call → result → continuation), not just one turn.
 
-A tool result may carry images: return `{ type: 'image', data: <base64>, mimeType: 'image/png' }` parts alongside text. On a VLM the provider delivers the pixels to the model (internally hoisted onto a synthetic user turn to match the Qwen-VL trained format); text-only models reject image-bearing turns with a typed error.
+A tool result may carry images: return `{ type: 'image', data: <base64>, mimeType: 'image/png' }` parts alongside text. On a VLM the provider delivers the pixels to the model, collecting them onto a following user turn introduced by `Attached image(s) from tool result:`. On a text-only model the image parts are replaced by `[image omitted]` text and never reach the engine.
 
 ```bash
 mlx agent --model mlx/<model> --no-builtin-tools --extension examples/echo-tool.ts \
