@@ -545,13 +545,15 @@ describe('selectPagedMetallib / assertPagedMetallibIntegrity', () => {
 
 /**
  * MTLB container header with the given min-OS stamp (u16 LE major @12,
- * minor @14) in the recognized layout: platform tag 0x8001 @4, container
- * version 2 @6, library type 0x00 @10, macOS tag 0x81 @11. `opts` corrupts
- * individual fields to model future/unknown container revisions.
+ * u8 minor @14, u8 patch @15) in the recognized layout: platform tag
+ * 0x8001 @4, container version 2 @6, library type 0x00 @10, macOS tag
+ * 0x81 @11. `opts` corrupts individual fields to model future/unknown
+ * container revisions.
  */
 function mtlbHeader(
   major: number,
   minor: number,
+  patch = 0,
   opts?: { magic?: string; platform?: number; containerVersion?: number; libraryType?: number; osTag?: number },
 ): Buffer {
   const header = Buffer.alloc(24);
@@ -562,7 +564,8 @@ function mtlbHeader(
   header[10] = opts?.libraryType ?? 0x00;
   header[11] = opts?.osTag ?? 0x81;
   header.writeUInt16LE(major, 12);
-  header.writeUInt16LE(minor, 14);
+  header[14] = minor;
+  header[15] = patch;
   return header;
 }
 
@@ -576,8 +579,23 @@ describe('parseMetallibMinOs / assertMetallibFloor', () => {
     expect(parseMetallibMinOs(real)).toBe('26.0');
   });
 
+  it('reads minor and patch as SEPARATE bytes — a u16 minor folds a nonzero patch into "26.517"', () => {
+    // Regression: a default deployment target on a macOS 26.5.2 host stamps
+    // minor=5 patch=2 (bytes `05 02`); the old u16 read at offset 14 parsed
+    // 0x0205 = 517 and spuriously failed the floor gate on a correct build
+    // (air-vtool: PlatformMajor 26 / PlatformMinor 5 / PlatformUpdate 2).
+    expect(parseMetallibMinOs(mtlbHeader(26, 5, 2))).toBe('26.5.2');
+    // The exact header bytes of the failing 2026-07-26 M4 build.
+    const real = Buffer.from('4d544c420180020009000081' + '1a000502', 'hex');
+    expect(parseMetallibMinOs(real)).toBe('26.5.2');
+    expect(() => assertMetallibFloor(real, { path: 'x', deploymentFloor: '26.5.2' })).not.toThrow();
+    expect(() => assertMetallibFloor(real, { path: 'x', deploymentFloor: '26.5.1' })).toThrow(
+      /stamps min-OS 26\.5\.2, above the intended deployment floor 26\.5\.1/,
+    );
+  });
+
   it('returns undefined on unknown layouts instead of guessing', () => {
-    expect(parseMetallibMinOs(mtlbHeader(26, 0, { magic: 'NOPE' }))).toBeUndefined();
+    expect(parseMetallibMinOs(mtlbHeader(26, 0, 0, { magic: 'NOPE' }))).toBeUndefined();
     expect(parseMetallibMinOs(Buffer.from('MTLB'))).toBeUndefined();
     expect(parseMetallibMinOs(mtlbHeader(0, 0))).toBeUndefined();
     expect(parseMetallibMinOs(mtlbHeader(4242, 0))).toBeUndefined();
@@ -587,10 +605,10 @@ describe('parseMetallibMinOs / assertMetallibFloor', () => {
     // Each fixture stamps a would-fail min-OS 26.2 under floor 26.0, but a
     // single unrecognized layout field must downgrade enforcement to a skip.
     const futureLayouts = [
-      mtlbHeader(26, 2, { containerVersion: 3 }),
-      mtlbHeader(26, 2, { platform: 0x8002 }),
-      mtlbHeader(26, 2, { libraryType: 0x01 }),
-      mtlbHeader(26, 2, { osTag: 0x82 }),
+      mtlbHeader(26, 2, 0, { containerVersion: 3 }),
+      mtlbHeader(26, 2, 0, { platform: 0x8002 }),
+      mtlbHeader(26, 2, 0, { libraryType: 0x01 }),
+      mtlbHeader(26, 2, 0, { osTag: 0x82 }),
     ];
     for (const fixture of futureLayouts) {
       expect(parseMetallibMinOs(fixture)).toBeUndefined();
@@ -613,13 +631,13 @@ describe('parseMetallibMinOs / assertMetallibFloor', () => {
     expect(() => assertMetallibFloor(mtlbHeader(15, 0), { path: 'x', deploymentFloor: '26.0' })).not.toThrow();
     expect(() => assertMetallibFloor(mtlbHeader(26, 0), { path: 'x', deploymentFloor: '26.5.2' })).not.toThrow();
     expect(() =>
-      assertMetallibFloor(mtlbHeader(26, 2, { magic: 'NOPE' }), { path: 'x', deploymentFloor: '26.0' }),
+      assertMetallibFloor(mtlbHeader(26, 2, 0, { magic: 'NOPE' }), { path: 'x', deploymentFloor: '26.0' }),
     ).not.toThrow();
   });
 
   it('STRICT (publish): throws instead of warn-skip when the MTLB header layout is unrecognized', () => {
     // A publish build must not ship a metallib whose floor cannot be verified.
-    const future = mtlbHeader(26, 2, { containerVersion: 3 }); // parses to undefined
+    const future = mtlbHeader(26, 2, 0, { containerVersion: 3 }); // parses to undefined
     expect(parseMetallibMinOs(future)).toBeUndefined();
     const warnings: string[] = [];
     expect(() =>
@@ -629,7 +647,7 @@ describe('parseMetallibMinOs / assertMetallibFloor', () => {
   });
 
   it('non-strict (local dev): still warns and skips on an unrecognized MTLB header layout', () => {
-    const future = mtlbHeader(26, 2, { platform: 0x8002 });
+    const future = mtlbHeader(26, 2, 0, { platform: 0x8002 });
     const warnings: string[] = [];
     expect(() =>
       assertMetallibFloor(future, { path: 'x', deploymentFloor: '26.0', strict: false, warn: (m) => warnings.push(m) }),
