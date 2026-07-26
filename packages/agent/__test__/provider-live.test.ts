@@ -8,7 +8,7 @@
  * no candidate exists. Turns run strictly sequentially on one shared
  * host — GPU work is never concurrent.
  */
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 
@@ -31,13 +31,69 @@ import { MlxModelHost } from '../src/provider/model-host.js';
 import { makeMlxStreamSimple } from '../src/provider/stream-adapter.js';
 import type { DiscoveredModelLike } from '../src/types.js';
 
+/**
+ * Resolve a Hugging Face hub snapshot directory (`.../snapshots/<sha>/`). The
+ * sha is content-addressed, so it cannot be hard-coded.
+ */
+function hfSnapshot(repo: string): string | undefined {
+  const root = join(homedir(), '.cache', 'huggingface', 'hub', repo, 'snapshots');
+  if (!existsSync(root)) return undefined;
+  for (const sha of readdirSync(root)) {
+    const dir = join(root, sha);
+    if (existsSync(join(dir, 'config.json'))) return dir;
+  }
+  return undefined;
+}
+
+/**
+ * Prefer the GENUINELY bf16 Qwen3.5-0.8B.
+ *
+ * The `qwen3.5-0.8b-mlx-bf16` directories under ~/.mlx-node/models and
+ * ~/.cache/models are misnamed: both report
+ * `quantization: {bits: 4, group_size: 64}` in their own config.json. Running
+ * this suite against 4-bit weights under a bf16 name is how the tool
+ * round-trip came to be permanently red here — a 4-bit 0.8B does not reliably
+ * emit the qwen3.5 `<tool_call><function=…>` form, so it returned stopReason
+ * 'stop' and looked like a provider defect for months. They stay as fallbacks
+ * so the suite still runs where the real checkpoint is absent, but they are
+ * no longer the default.
+ */
 const CANDIDATES = [
   process.env.MLX_AGENT_TEST_MODEL,
+  hfSnapshot('models--mlx-community--Qwen3.5-0.8B-bf16'),
   join(homedir(), '.mlx-node', 'models', 'qwen3.5-0.8b-mlx-bf16'),
   join(homedir(), '.cache', 'models', 'qwen3.5-0.8b-mlx-bf16'),
 ].filter((p): p is string => typeof p === 'string' && p.length > 0);
 
 const MODEL_PATH = CANDIDATES.find((p) => existsSync(join(p, 'config.json')));
+
+/**
+ * The tool round-trip needs a checkpoint that can actually EMIT a tool call —
+ * a strictly stronger requirement than the text turn, and one the default
+ * candidates do not meet on this box.
+ *
+ * Every locally available `qwen3.5-0.8b-mlx-bf16` reports
+ * `quantization: {bits: 4, group_size: 64}` in its own config.json: the
+ * `-bf16` suffix is a lie (the same trap recorded for this checkpoint
+ * elsewhere in the project). A 4-bit 0.8B does not reliably produce the
+ * qwen3.5 `<tool_call><function=…>` form, so the round-trip returns
+ * stopReason 'stop'. That is model weakness, not a provider defect — it was
+ * recorded as such the day this file landed (genmlx-rhuk), the suite is
+ * local-only (CI resolves models to a repo-relative path this test never
+ * searches, so `skipIf` always fires there), and it has therefore never been
+ * green on Linux/CUDA.
+ *
+ * So the round-trip resolves its OWN model and skips when none is present,
+ * rather than the assertion being relaxed to accept 'stop'. Set
+ * MLX_AGENT_TOOL_TEST_MODEL to point at any tool-capable checkpoint.
+ */
+const TOOL_CANDIDATES = [
+  process.env.MLX_AGENT_TOOL_TEST_MODEL,
+  hfSnapshot('models--mlx-community--Qwen3.5-0.8B-bf16'),
+  join(homedir(), '.mlx-node', 'models', 'qwen3.6-35b-a3b-4bit'),
+].filter((p): p is string => typeof p === 'string' && p.length > 0);
+
+const TOOL_MODEL_PATH = TOOL_CANDIDATES.find((p) => existsSync(join(p, 'config.json')));
 
 const TURN_TIMEOUT = 240_000;
 const OPTIONS: SimpleStreamOptions = { maxTokens: 128, temperature: 0 }; // no `reasoning` → reasoningEffort 'none'
@@ -63,19 +119,27 @@ function visibleText(message: AssistantMessage): string {
     .join('\n');
 }
 
-describe.skipIf(!MODEL_PATH)('mlx provider live smoke', () => {
-  let streamSimple: ReturnType<typeof makeMlxStreamSimple>;
-  let model: Model<Api>;
-
-  beforeAll(async () => {
-    const discovered: DiscoveredModelLike = {
-      name: basename(MODEL_PATH!),
-      path: MODEL_PATH!,
-      modelType: await detectModelType(MODEL_PATH!),
-    };
-    const host = new MlxModelHost([discovered]);
-    streamSimple = makeMlxStreamSimple(host);
-    model = {
+async function bindHost(modelPath: string): Promise<{
+  streamSimple: ReturnType<typeof makeMlxStreamSimple>;
+  model: Model<Api>;
+}> {
+  const discovered: DiscoveredModelLike = {
+    name: basename(modelPath),
+    path: modelPath,
+    modelType: await detectModelType(modelPath),
+  };
+  // Name the weights that produced the result: a green run must never be
+  // attributable to a checkpoint nobody can identify afterwards.
+  const cfg = JSON.parse(readFileSync(join(modelPath, 'config.json'), 'utf8')) as {
+    quantization?: unknown;
+  };
+  console.log(
+    `[provider-live] ${discovered.name} type=${discovered.modelType} ` +
+      `quantization=${cfg.quantization ? JSON.stringify(cfg.quantization).slice(0, 60) : 'none'}`,
+  );
+  return {
+    streamSimple: makeMlxStreamSimple(new MlxModelHost([discovered])),
+    model: {
       id: discovered.name,
       name: discovered.name,
       api: 'mlx',
@@ -86,7 +150,16 @@ describe.skipIf(!MODEL_PATH)('mlx provider live smoke', () => {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: 262144,
       maxTokens: 128,
-    };
+    },
+  };
+}
+
+describe.skipIf(!MODEL_PATH)('mlx provider live smoke', () => {
+  let streamSimple: ReturnType<typeof makeMlxStreamSimple>;
+  let model: Model<Api>;
+
+  beforeAll(async () => {
+    ({ streamSimple, model } = await bindHost(MODEL_PATH!));
   });
 
   it(
@@ -116,6 +189,21 @@ describe.skipIf(!MODEL_PATH)('mlx provider live smoke', () => {
     },
     TURN_TIMEOUT,
   );
+
+});
+
+
+// Separate describe: the round-trip binds a TOOL-CAPABLE checkpoint, not the
+// smallest one. Gating on capability keeps `expect(stopReason).toBe('toolUse')`
+// exactly as written instead of relaxing it to accept the 'stop' a 4-bit 0.8B
+// actually returns.
+describe.skipIf(!TOOL_MODEL_PATH)('mlx provider live smoke — tool round-trip', () => {
+  let streamSimple: ReturnType<typeof makeMlxStreamSimple>;
+  let model: Model<Api>;
+
+  beforeAll(async () => {
+    ({ streamSimple, model } = await bindHost(TOOL_MODEL_PATH!));
+  });
 
   it(
     'completes a tool round-trip: toolUse final, then a continuation quoting the fabricated result',
