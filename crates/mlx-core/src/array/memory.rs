@@ -360,23 +360,32 @@ pub fn get_peak_memory() -> f64 {
 }
 
 /// Number of live GPU resource objects (the Metal simultaneous-buffer count).
-/// CUDA has no per-buffer resource analogue, so on the CUDA backend this
-/// returns `0.0`. This is an honest sentinel, not a lying stub: `0.0` means
-/// "not tracked on this backend." The CLJS membrane is explicitly designed for
-/// it — its proactive buffer-count sweep no-ops at count 0 (bean genmlx-ste5).
+/// Live GPU buffer resource count (active + cached), from
+/// `mlx::core::get_num_resources` (fork accessor over the Metal allocator's
+/// `num_resources_` — the tracker of the OS ~499000-buffer cap). On backends
+/// without a per-buffer cap (CUDA, no_gpu) the accessor returns 0 — the
+/// honest "not tracked here" sentinel the CLJS membrane's proactive
+/// buffer-count sweep is designed around (bean genmlx-ste5). NOTE: this was
+/// a hardcoded `0.0` on EVERY backend from the fork-min convergence until
+/// genmlx-lr9c (2026-07-27), which silently disabled the Metal count sweep
+/// and let 4-way test batteries hit the real 499000 wall.
 /// Consumed by `genmlx-core`'s `memory_napi::get_num_resources`.
 pub fn get_num_resources() -> f64 {
-    0.0
+    let mut v: u64 = 0;
+    let rc = unsafe { sys::mlx_get_num_resources(&mut v) };
+    if rc != 0 { 0.0 } else { v as f64 }
 }
 
 /// The GPU resource limit (Metal's ~499000 simultaneous-buffer cap, at which
-/// allocations begin to fail). CUDA has no such per-buffer cap, so on the CUDA
-/// backend this returns `0.0`. Honest sentinel: the CLJS membrane falls back to
-/// its hard-coded default whenever the limit is not positive
-/// (`(if (pos? l) l 499000)`, bean genmlx-ste5). Consumed by `genmlx-core`'s
-/// `memory_napi::get_resource_limit`.
+/// allocations begin to fail), from `mlx::core::get_resource_limit` (fork
+/// accessor). Backends without a per-buffer cap (CUDA, no_gpu) return `0.0`;
+/// the CLJS membrane falls back to its hard-coded default whenever the limit
+/// is not positive (`(if (pos? l) l 499000)`, bean genmlx-ste5). Consumed by
+/// `genmlx-core`'s `memory_napi::get_resource_limit`.
 pub fn get_resource_limit() -> f64 {
-    0.0
+    let mut v: u64 = 0;
+    let rc = unsafe { sys::mlx_get_resource_limit(&mut v) };
+    if rc != 0 { 0.0 } else { v as f64 }
 }
 
 /// Reset peak memory counter to zero.

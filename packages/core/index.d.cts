@@ -1278,8 +1278,16 @@ export declare class Qwen35Model {
    * - config.json
    * - model.safetensors (or model-*.safetensors)
    * - tokenizer.json + tokenizer_config.json
+   * `paged_override`: force the block-paged KV adapter ON (`true`) or OFF
+   * (`false`) for this load, overriding the config/VLM default — the same
+   * gate as `MLX_QWEN35_PAGED_OVERRIDE`, reachable from runtimes (Bun)
+   * whose `process.env` writes never hit the real environ (genmlx-lr9c).
+   * Implemented via that env gate, so it is PROCESS-WIDE for the duration
+   * of the load: concurrent loads with different overrides race. Loads are
+   * serialized in practice (model-thread startup); callers that need both
+   * modes load sequentially.
    */
-  static load(path: string): Promise<Qwen35Model>;
+  static load(path: string, pagedOverride?: boolean | undefined | null): Promise<Qwen35Model>;
   /** Generate text from a prompt token sequence. */
   generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Promise<Qwen35GenerationResult>;
   /**

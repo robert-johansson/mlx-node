@@ -388,6 +388,7 @@ int32_t from_mlx_dtype(mlx::core::Dtype dtype) {
 }
 
 bool copy_to_buffer(const array& arr, float* out, size_t len) {
+  MLX_GUARD_BOOL("copy_to_buffer",
   // Force materialization by adding zeros - this ensures broadcast values are
   // expanded
   auto zeros_arr = zeros(arr.shape(), arr.dtype());
@@ -407,9 +408,11 @@ bool copy_to_buffer(const array& arr, float* out, size_t len) {
   const float* data = host.data<float>();
   std::copy(data, data + len, out);
   return true;
+  )
 }
 
 bool copy_to_buffer(const array& arr, int32_t* out, size_t len) {
+  MLX_GUARD_BOOL("copy_to_buffer",
   // Force materialization by adding zeros - this ensures broadcast values are
   // expanded
   auto zeros_arr = zeros(arr.shape(), arr.dtype());
@@ -429,9 +432,11 @@ bool copy_to_buffer(const array& arr, int32_t* out, size_t len) {
   const int32_t* data = host.data<int32_t>();
   std::copy(data, data + len, out);
   return true;
+  )
 }
 
 bool copy_to_buffer(const array& arr, uint32_t* out, size_t len) {
+  MLX_GUARD_BOOL("copy_to_buffer",
   // Force materialization by adding zeros - this ensures broadcast values are
   // expanded
   auto zeros_arr = zeros(arr.shape(), arr.dtype());
@@ -451,6 +456,7 @@ bool copy_to_buffer(const array& arr, uint32_t* out, size_t len) {
   const uint32_t* data = host.data<uint32_t>();
   std::copy(data, data + len, out);
   return true;
+  )
 }
 
 }  // namespace

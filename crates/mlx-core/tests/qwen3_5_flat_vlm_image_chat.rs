@@ -178,7 +178,7 @@ async fn qwen3_5_flat_vlm_image_t0() {
 
     // Force the flat (non-paged) path on ANY host via a config-only clone.
     let flat_dir = clone_model_dir_flat(Path::new(&model_path)).expect("clone flat model dir");
-    let model = Qwen3_5Model::load(flat_dir.to_string_lossy().to_string())
+    let model = Qwen3_5Model::load(flat_dir.to_string_lossy().to_string(), None)
         .await
         .expect("failed to load flat (paging-off) Qwen3.5-VL model");
 

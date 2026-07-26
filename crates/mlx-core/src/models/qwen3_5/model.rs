@@ -10397,8 +10397,24 @@ impl Qwen3_5Model {
     /// - config.json
     /// - model.safetensors (or model-*.safetensors)
     /// - tokenizer.json + tokenizer_config.json
+    /// `paged_override`: force the block-paged KV adapter ON (`true`) or OFF
+    /// (`false`) for this load, overriding the config/VLM default — the same
+    /// gate as `MLX_QWEN35_PAGED_OVERRIDE`, reachable from runtimes (Bun)
+    /// whose `process.env` writes never hit the real environ (genmlx-lr9c).
+    /// Implemented via that env gate, so it is PROCESS-WIDE for the duration
+    /// of the load: concurrent loads with different overrides race. Loads are
+    /// serialized in practice (model-thread startup); callers that need both
+    /// modes load sequentially.
     #[napi]
-    pub async fn load(path: String) -> Result<Qwen3_5Model> {
+    pub async fn load(path: String, paged_override: Option<bool>) -> Result<Qwen3_5Model> {
+        if let Some(v) = paged_override {
+            // SAFETY: env mutation is process-global; this runs on the napi
+            // worker before the model thread spawns, and the only reader is
+            // this load's own config resolution (documented race caveat above).
+            unsafe {
+                std::env::set_var("MLX_QWEN35_PAGED_OVERRIDE", if v { "1" } else { "0" });
+            }
+        }
         persistence::load_with_thread(&path).await
     }
 

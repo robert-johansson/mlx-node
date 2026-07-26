@@ -1,4 +1,4 @@
-use super::handle::MxHandle;
+use super::handle::{error_from_slot, MxHandle};
 use super::{DType, MxArray};
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
@@ -336,7 +336,7 @@ impl MxArray {
         if ok {
             Ok(buffer.into())
         } else {
-            Err(Error::from_reason("Failed to copy array to float32 buffer"))
+            Err(error_from_slot("to_float32", "Failed to copy array to float32 buffer"))
         }
     }
 
@@ -354,7 +354,7 @@ impl MxArray {
         if ok {
             Ok(buffer.into())
         } else {
-            Err(Error::from_reason("Failed to copy array to int32 buffer"))
+            Err(error_from_slot("to_int32", "Failed to copy array to int32 buffer"))
         }
     }
 
@@ -371,7 +371,7 @@ impl MxArray {
         if ok {
             Ok(buffer.into())
         } else {
-            Err(Error::from_reason("Failed to copy array to uint32 buffer"))
+            Err(error_from_slot("to_uint32", "Failed to copy array to uint32 buffer"))
         }
     }
     /// Extract raw uint8 values from uint8 arrays.

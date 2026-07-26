@@ -30,6 +30,25 @@ pub(crate) fn check_handle(
     }
 }
 
+/// Error for a bool/sentinel-failure shim path: consume the thread-local
+/// error slot (recorded by the MLX_GUARD_* C++ guards) so the ORIGINAL MLX
+/// message survives — e.g. `[metal::malloc] Resource limit (499000)
+/// exceeded.`, which the CLJS membrane's reactive recovery matches on.
+/// Falls back to `fallback` when the slot is empty (a non-throw failure
+/// such as a length mismatch). Same contract as check_handle above
+/// (genmlx-lr9c: the guarded copy_to_buffer family previously surfaced a
+/// generic message, hiding the wall from the membrane).
+pub(crate) fn error_from_slot(context: &str, fallback: &str) -> Error {
+    let p = unsafe { sys::mlx_take_last_error() };
+    if p.is_null() {
+        Error::from_reason(fallback.to_string())
+    } else {
+        // Copy immediately — the pointer is only valid until the next shim call.
+        let detail = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
+        Error::from_reason(format!("MLX error in {}: {}", context, detail))
+    }
+}
+
 /// Internal handle wrapper that owns the MLX C++ array pointer
 /// and ensures proper cleanup via Drop
 pub(crate) struct MxHandle(pub(crate) *mut sys::mlx_array);
