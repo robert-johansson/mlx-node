@@ -30,7 +30,15 @@ _Static_assert(offsetof(block_q6_K, d) == GGML_Q6K_D_OFFSET, "q6_K d");
 #define GGML_FP16_TO_FP32(x) ggml_ref_fp16_to_fp32(x)
 
 float ggml_ref_fp16_to_fp32(ggml_half h) {
+    // __fp16 is an ARM/clang extension; GCC on x86_64 only has the C23
+    // _Float16 (present since GCC 12 whenever SSE2 is available, advertised
+    // via __FLT16_MANT_DIG__). Both convert through hardware half-precision,
+    // so the decode stays bit-exact on every target.
+#if defined(__FLT16_MANT_DIG__)
+    _Float16 tmp;
+#else
     __fp16 tmp;
+#endif
     memcpy(&tmp, &h, sizeof(ggml_half));
     return (float)tmp;
 }
