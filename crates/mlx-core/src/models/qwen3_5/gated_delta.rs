@@ -1098,6 +1098,10 @@ mod tests {
 
     /// Diagnostic: does a per-step T=1 kernel loop (= AR decode) match
     /// recording during a windowed kernel then replaying per-step?
+    // Metal-only: requires the Metal gated-delta kernel. On a CUDA build the call returns
+    // "only supported on macOS (Metal backend)" before the behaviour under
+    // test is reached, so the assertion can never hold there (genmlx-nhvg).
+    #[cfg(target_os = "macos")]
     #[test]
     fn tape_replay_matches_per_step_ar_loop() {
         let b = 1i64;

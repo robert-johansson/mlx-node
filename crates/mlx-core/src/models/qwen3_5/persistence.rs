@@ -2996,6 +2996,10 @@ mod tests {
     /// forward/as_linear numerical equivalence itself is already covered by
     /// `crate::nn::embedding::tests::packed_affine_2bit_lookup_byte_identical_to_legacy_dense`
     /// and `packed_affine_as_linear_matches_dense_matmul`.
+    // Metal-only: the packed-load gate requires use_block_paged_cache, which is Metal-only. On a CUDA build the call returns
+    // "only supported on macOS (Metal backend)" before the behaviour under
+    // test is reached, so the assertion can never hold there (genmlx-nhvg).
+    #[cfg(target_os = "macos")]
     #[test]
     fn tied_quantized_embedding_loads_via_packed_path() {
         let label = "tied_quantized_embedding_loads_via_packed_path";

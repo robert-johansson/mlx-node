@@ -2011,6 +2011,10 @@ mod tests {
     /// `as_linear` on the paged path) — NOT the legacy full-table pre-dequant
     /// `Embedding::load_quantized`. Guards `apply_weights_moe_inner`'s gated
     /// load branch directly.
+    // Metal-only: the packed-load gate requires use_block_paged_cache, which is Metal-only. On a CUDA build the call returns
+    // "only supported on macOS (Metal backend)" before the behaviour under
+    // test is reached, so the assertion can never hold there (genmlx-nhvg).
+    #[cfg(target_os = "macos")]
     #[test]
     fn tied_quantized_embedding_loads_via_packed_path_moe() {
         let label = "tied_quantized_embedding_loads_via_packed_path_moe";

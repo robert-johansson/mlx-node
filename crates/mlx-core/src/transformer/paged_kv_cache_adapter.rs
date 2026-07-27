@@ -6587,6 +6587,10 @@ mod tests {
     /// `update_keys_values` must reject calls before any request is
     /// active. Otherwise we would compute slot indices against a
     /// missing block_table and panic.
+    // Metal-only: update_keys_values is macOS-only. On a CUDA build the call returns
+    // "only supported on macOS (Metal backend)" before the behaviour under
+    // test is reached, so the assertion can never hold there (genmlx-nhvg).
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_update_keys_values_no_active_request() {
         let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
@@ -6606,6 +6610,10 @@ mod tests {
 
     /// Out-of-range `layer_idx` must return a descriptive error rather
     /// than triggering UB inside the kernel.
+    // Metal-only: update_keys_values is macOS-only. On a CUDA build the call returns
+    // "only supported on macOS (Metal backend)" before the behaviour under
+    // test is reached, so the assertion can never hold there (genmlx-nhvg).
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_update_keys_values_layer_out_of_bounds() {
         let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
@@ -6628,6 +6636,10 @@ mod tests {
     }
 
     /// Mismatched leading dim between `keys` and `values` must error.
+    // Metal-only: update_keys_values is macOS-only. On a CUDA build the call returns
+    // "only supported on macOS (Metal backend)" before the behaviour under
+    // test is reached, so the assertion can never hold there (genmlx-nhvg).
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_update_keys_values_shape_mismatch() {
         let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
@@ -6650,6 +6662,10 @@ mod tests {
 
     /// `first_logical_position` must align with the recorded suffix.
     /// Otherwise the chunk would be written to the wrong slots.
+    // Metal-only: update_keys_values is macOS-only. On a CUDA build the call returns
+    // "only supported on macOS (Metal backend)" before the behaviour under
+    // test is reached, so the assertion can never hold there (genmlx-nhvg).
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_update_keys_values_misaligned_first_position() {
         let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
@@ -7137,6 +7153,10 @@ mod tests {
     /// `gather_kv_for_decode` must reject calls before any request is active.
     /// The early return fires before any layer / metal access — uses the
     /// validation-test pool (graceful skip on no-Metal hosts).
+    // Metal-only: the active-request guard sits BEHIND the macOS gate. On a CUDA build the call returns
+    // "only supported on macOS (Metal backend)" before the behaviour under
+    // test is reached, so the assertion can never hold there (genmlx-nhvg).
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_gather_kv_no_active_request() {
         let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
@@ -7158,6 +7178,10 @@ mod tests {
     /// `gather_kv_for_decode` must reject calls before any tokens have been
     /// recorded (`block_table.num_tokens() == 0`). Attending to nothing
     /// would dispatch a zero-context kernel and produce garbage.
+    // Metal-only: the zero-tokens guard sits BEHIND the macOS gate. On a CUDA build the call returns
+    // "only supported on macOS (Metal backend)" before the behaviour under
+    // test is reached, so the assertion can never hold there (genmlx-nhvg).
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_gather_kv_zero_tokens() {
         let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
@@ -7917,6 +7941,10 @@ mod tests {
     // `LayerKVPool` and skips when Metal is unavailable.
 
     /// `read_kv_range` must reject calls before any request is active.
+    // Metal-only: read_kv_range is macOS-only. On a CUDA build the call returns
+    // "only supported on macOS (Metal backend)" before the behaviour under
+    // test is reached, so the assertion can never hold there (genmlx-nhvg).
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_read_kv_range_no_active_request() {
         let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
@@ -7933,6 +7961,10 @@ mod tests {
     }
 
     /// Out-of-range layer index must error.
+    // Metal-only: read_kv_range is macOS-only. On a CUDA build the call returns
+    // "only supported on macOS (Metal backend)" before the behaviour under
+    // test is reached, so the assertion can never hold there (genmlx-nhvg).
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_read_kv_range_layer_out_of_bounds() {
         let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
@@ -7954,6 +7986,10 @@ mod tests {
 
     /// Range exceeding recorded token count must error rather than reading
     /// uninitialized cache slots.
+    // Metal-only: read_kv_range is macOS-only. On a CUDA build the call returns
+    // "only supported on macOS (Metal backend)" before the behaviour under
+    // test is reached, so the assertion can never hold there (genmlx-nhvg).
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_read_kv_range_exceeds_recorded() {
         let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
