@@ -16,8 +16,11 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
+use crate::engine::persistence::expand_symmetric_affine_biases;
 use crate::models::paddleocr_vl::persistence::load_paddleocr_vl_weights;
 use crate::models::qianfan_ocr::persistence::load_qianfan_ocr_weights;
+use crate::models::quant_dispatch::SYMMETRIC_ZERO_POINT_KEY;
+use crate::utils::gguf_kquant::{KQuantFormat, QK_K};
 use crate::utils::safetensors::load_safetensors_lazy;
 
 /// RAII guard that pins the MLX default device + stream to CPU for one
@@ -366,7 +369,11 @@ pub(crate) mod recipe {
                 bits: top_level_bits,
                 group_size: top_level_group_size,
             },
-            PerLayerMode::Fp8E4m3 | PerLayerMode::Sym8 => {
+            PerLayerMode::Fp8E4m3
+            | PerLayerMode::Sym8
+            | PerLayerMode::Q6K
+            | PerLayerMode::Q4K
+            | PerLayerMode::Q5K => {
                 return Err(Error::from_reason(format!(
                     "Qwen vision source mode {mode:?} is not a uniform packed mode supported by the dense vision sanitizer; dequantize the vision tower before conversion"
                 )));
@@ -1907,6 +1914,36 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
     result
 }
 
+/// Drop every `symmetric_zero_point` claim from a config carried over from the
+/// source checkpoint.
+///
+/// The field means "this checkpoint stores no `.biases`; derive them from the
+/// scales". Only the GGUF importer can honour that, because only it knows the
+/// source block format; this converter rebuilds the companions at its input
+/// boundary and the writer then stores them. Copying the claim through would
+/// emit a checkpoint whose config says derived while its payload says stored —
+/// which the loader rejects outright, so a plain re-convert of a symmetric
+/// import would produce an unloadable model.
+///
+/// Applies to both aliases and to every per-tensor entry, since a mixed source
+/// names each symmetric tensor individually.
+fn strip_symmetric_zero_point(config: &mut serde_json::Value) {
+    for alias in ["quantization", "quantization_config"] {
+        let Some(block) = config
+            .get_mut(alias)
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        block.remove(SYMMETRIC_ZERO_POINT_KEY);
+        for entry in block.values_mut() {
+            if let Some(entry) = entry.as_object_mut() {
+                entry.remove(SYMMETRIC_ZERO_POINT_KEY);
+            }
+        }
+    }
+}
+
 async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionResult> {
     let input_dir = PathBuf::from(&options.input_dir);
     let output_dir = PathBuf::from(&options.output_dir);
@@ -2407,6 +2444,22 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         )));
     }
 
+    // A source checkpoint whose config.json declares symmetric affine groups
+    // stores no `.biases` companions. Rebuilding them here, at the boundary,
+    // means the whole conversion pipeline downstream — including the guards that
+    // reject an affine group missing its mandatory `.biases` — keeps seeing the
+    // one tensor shape it has always seen. The rebuilt arrays carry no source
+    // provenance, so the passthrough snapshot below simply skips them and they
+    // take the ordinary MLX writer path.
+    //
+    // Paired with `strip_symmetric_zero_point` on the emitted config: once the
+    // companions are rebuilt here they are also written out, so the output is a
+    // stored-bias checkpoint and must not repeat the source's derived-bias
+    // claim.
+    let mut tensors = tensors;
+    expand_symmetric_affine_biases(&input_dir, &mut tensors)?;
+    let tensors = tensors;
+
     // Snapshot source-file provenance for every loaded bf16/f16 tensor, keyed by
     // the loaded MLX array's raw handle pointer. A dest tensor that still carries
     // one of these handles after sanitize/quant is a proven unmodified
@@ -2489,6 +2542,12 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         }
     }
 
+    let kquant_biases_keys = if has_custom_sanitizer {
+        HashSet::new()
+    } else {
+        kquant_biases_to_preserve(&tensors)?
+    };
+
     let mut gemma_pre_overrides: Option<HashMap<String, serde_json::Value>> = None;
     let converted_tensors = if is_gemma_e2b_import {
         let dtype = match target_dtype.as_str() {
@@ -2542,7 +2601,12 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             // packed Uint32 weights, Uint8 FP8/MXFP scales) must NEVER be astype'd
             // — a numeric cast corrupts the packed/quantized bit layout. Pass them
             // through unchanged.
-            if matches!(current_dtype, DType::Int8 | DType::Uint32 | DType::Uint8) {
+            // A K-quant `.biases` is storage that happens to be Float16 (ggml's
+            // `d`), so the dtype rule above cannot see it — see
+            // `kquant_biases_to_preserve`.
+            if matches!(current_dtype, DType::Int8 | DType::Uint32 | DType::Uint8)
+                || kquant_biases_keys.contains(&name)
+            {
                 converted_tensors.insert(name.clone(), array);
                 tensor_names.push(name);
                 continue;
@@ -3056,6 +3120,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // Write config.json — clean and sort keys to match mlx-lm/mlx-vlm save_config
     let output_config_path = output_dir.join("config.json");
     let mut output_config = config.clone();
+    strip_symmetric_zero_point(&mut output_config);
 
     // Inject quantization metadata if quantized
     if do_quantize || is_gemma_e2b_import {
@@ -3606,6 +3671,7 @@ fn write_mtp_drafter_dir(
             obj.insert("quantization".to_string(), quant.clone());
             obj.insert("quantization_config".to_string(), quant.clone());
         }
+        strip_symmetric_zero_point(&mut draft_config);
     }
 
     // Sort keys + indent 2 to match split.py's json.dump(sorted(...), indent=2).
@@ -5386,6 +5452,36 @@ enum Sym8ScalesCastAction {
     NormalizeToF32,
 }
 
+/// `.biases` keys the dtype pass must not cast: they hold ggml's `d`, which is
+/// storage, but are `Float16`, so the pass's dtype rule (`Int8`/`Uint32`/
+/// `Uint8` never cast, float follows `--dtype`) misses them and
+/// `resolve_kquant_group` then rejects the result.
+///
+/// Keyed on the same signature the loader guards on — int8 scales (q6k) or
+/// uint8 scales (q4k/q5k) beside a float16 `.biases` — not on the `.biases`
+/// suffix, which would freeze affine biases that must keep following `--dtype`.
+fn kquant_biases_to_preserve(tensors: &HashMap<String, MxArray>) -> Result<HashSet<String>> {
+    let mut preserved = HashSet::new();
+    for (name, scales) in tensors {
+        let Some(base) = name.strip_suffix(".scales") else {
+            continue;
+        };
+        if !matches!(scales.dtype()?, DType::Int8 | DType::Uint8) {
+            continue;
+        }
+        let biases_key = format!("{base}.biases");
+        if tensors
+            .get(&biases_key)
+            .map(|b| b.dtype())
+            .transpose()?
+            .is_some_and(|d| d == DType::Float16)
+        {
+            preserved.insert(biases_key);
+        }
+    }
+    Ok(preserved)
+}
+
 /// Classify a tensor for the sym8-sidecar rule in the dtype-conversion passes.
 ///
 /// sym8 loader contract: an Int8 `[N, K]` `.weight` carries a MANDATORY
@@ -5606,6 +5702,21 @@ fn validate_existing_quantized_entry(
                 )));
             }
         }
+        // K-quant sidecars carry ggml's own geometry: a uint32 code stream, an
+        // int8 (q6k) / uint8 (q4k, q5k) sub-scale array, and an f16 `.biases`
+        // holding `d` (a scale, not a bias). The last dims are set by the format,
+        // including the interleave factor of 2 the q4k/q5k `(sc, m)` / `(d, dmin)`
+        // pairs carry, so the generic affine shape check below cannot describe
+        // them — this arm validates in full and returns.
+        "q4k" | "q5k" | "q6k" => {
+            let format = match entry.mode.as_str() {
+                "q4k" => KQuantFormat::Q4K,
+                "q5k" => KQuantFormat::Q5K,
+                _ => KQuantFormat::Q6K,
+            };
+            validate_existing_kquant_entry(weight, scales, weights, prefix, entry, format)?;
+            return Ok(());
+        }
         other => {
             return Err(Error::from_reason(format!(
                 "cannot preserve already-quantized group '{prefix}': unsupported resolved mode '{other}'"
@@ -5658,6 +5769,125 @@ fn validate_existing_quantized_entry(
     Ok(())
 }
 
+/// Validate an already-quantized K-quant group against the geometry its mode
+/// mandates. Called only from `validate_existing_quantized_entry`'s K-quant arm,
+/// which has already fetched `.weight` / `.scales`.
+///
+/// K is derived from the `.weight` packing (`cols * 32 / bits`), NOT from
+/// `32 / bits`: integer-dividing 32 by 5 or 6 loses the remainder and yields a
+/// bogus K for exactly the two widths Q5_K / Q6_K need, which would then reject
+/// a valid checkpoint or accept a malformed one. `.scales` / `.biases` last dims
+/// are read straight off the format so the q4k/q5k interleave factor of 2 is
+/// applied without restating it here.
+fn validate_existing_kquant_entry(
+    weight: &MxArray,
+    scales: &MxArray,
+    weights: &HashMap<String, MxArray>,
+    prefix: &str,
+    entry: &QuantEntry,
+    format: KQuantFormat,
+) -> Result<()> {
+    let mode = format.mlx_mode();
+    // Guard against a config whose recorded bits/group_size disagree with the
+    // mode string that drives the geometry — the mode is the source of truth.
+    if entry.bits != format.bits() as i32 || entry.group_size != format.group_size() as i32 {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' has inconsistent metadata \
+             bits={}/group_size={}; {mode} requires bits={}/group_size={}",
+            entry.bits,
+            entry.group_size,
+            format.bits(),
+            format.group_size()
+        )));
+    }
+
+    if weight.dtype()? != DType::Uint32 {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' does not match {mode} storage: \
+             weight={:?} (expected uint32)",
+            weight.dtype()?
+        )));
+    }
+    let expected_scales_dtype = if format.scales_are_signed() {
+        DType::Int8
+    } else {
+        DType::Uint8
+    };
+    if scales.dtype()? != expected_scales_dtype {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' does not match {mode} storage: \
+             scales={:?} (expected {expected_scales_dtype:?})",
+            scales.dtype()?
+        )));
+    }
+    let biases = weights.get(&format!("{prefix}.biases")).ok_or_else(|| {
+        Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' is missing mandatory .biases"
+        ))
+    })?;
+    if biases.dtype()? != DType::Float16 {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' has non-float16 .biases {:?} \
+             (the array holds ggml's f16 `d`, a raw bit pattern)",
+            biases.dtype()?
+        )));
+    }
+
+    let weight_shape = weight.shape()?.to_vec();
+    let scale_shape = scales.shape()?.to_vec();
+    let bias_shape = biases.shape()?.to_vec();
+    let ndim = weight_shape.len();
+    if ndim < 2 || scale_shape.len() != ndim || bias_shape.len() != ndim {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' has mismatched ranks: \
+             weight {weight_shape:?}, scales {scale_shape:?}, biases {bias_shape:?}"
+        )));
+    }
+    if weight_shape[..ndim - 1] != scale_shape[..ndim - 1]
+        || weight_shape[..ndim - 1] != bias_shape[..ndim - 1]
+    {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' has mismatched leading dims: \
+             weight {weight_shape:?}, scales {scale_shape:?}, biases {bias_shape:?}"
+        )));
+    }
+
+    let weight_cols = weight_shape[ndim - 1];
+    let bits = format.bits() as i64;
+    if weight_cols <= 0 || (weight_cols * 32) % bits != 0 {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' .weight last dim {weight_cols} is not a \
+             whole {bits}-bit code packing"
+        )));
+    }
+    let k = weight_cols * 32 / bits;
+    if k % QK_K as i64 != 0 {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' decodes to K={k}, not a multiple of the \
+             {QK_K}-value ggml super-block"
+        )));
+    }
+    let k = k as usize;
+
+    let expected_scale_cols = format.scales_cols(k) as i64;
+    if scale_shape[ndim - 1] != expected_scale_cols {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' .scales last dim {} does not match {mode} \
+             K={k} expectation {expected_scale_cols}",
+            scale_shape[ndim - 1]
+        )));
+    }
+    let expected_bias_cols = format.biases_cols(k) as i64;
+    if bias_shape[ndim - 1] != expected_bias_cols {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' .biases last dim {} does not match {mode} \
+             K={k} expectation {expected_bias_cols}",
+            bias_shape[ndim - 1]
+        )));
+    }
+    Ok(())
+}
+
 /// The emission-loop quantizability gates, hoisted into ONE place so the sym8
 /// group-coherence pass (`enforce_sym8_group_coherence`) and the emission loop
 /// in `quantize_weights_inner` can never diverge: a `QuantEntry` actually
@@ -5677,6 +5907,11 @@ fn quant_entry_emits(array: &MxArray, mode: &str, group_size: i32) -> Result<boo
         ndim == 2 || ndim == 3
     } else if mode == "sym8" {
         last_dim % 16 == 0
+    } else if matches!(mode, "q4k" | "q5k" | "q6k") {
+        // K-quants are packed in 256-value ggml super-blocks; the sub-scale
+        // group_size (16 or 32) is a within-block subdivision, so the emission
+        // gate is the super-block, not the group.
+        last_dim % (QK_K as i32) == 0
     } else {
         last_dim % group_size == 0
     })
@@ -5973,6 +6208,163 @@ fn enforce_sym8_group_coherence(
     Ok(())
 }
 
+/// The no-recipe (legacy) per-key quantization decision: `should_quantize`, the
+/// sym8-scoped dense exclusions, the affine-only force, the router-gate pin, and
+/// the sym8 eligibility fallback, in that order. `None` means the key stays
+/// dense.
+///
+/// Both callers in `quantize_weights_inner` resolve through here — the fresh
+/// float path and the arm that skips an already-quantized group — so the two can
+/// never disagree about what a key's parameters are. The skip arm needs the same
+/// answer for two reasons: it validates the stored sidecar against the resolved
+/// triple (validating against the raw top-level defaults rejects every key the
+/// ladder moves off them, starting with the router gates a first conversion
+/// pinned to 8/64 affine), and it re-emits the per-layer override that decision
+/// carried. Dropping the override leaves the config writer stamping the
+/// top-level triple over a router gate whose bytes are 8-bit, which dies at
+/// first decode as `null handle returned: quantized_matmul`.
+///
+/// `for_existing` marks the already-packed call site. `sym8_eligible` reads the
+/// ARRAY, and its `ndim == 2 && K % 16 == 0` test is satisfied by a packed
+/// affine tensor (`U32 [256, 512]`) just as well as by a float one, so on packed
+/// input it answers a question about the packing rather than about the source
+/// weight. What the stored dtype does say is which arm the first conversion
+/// took: sym8 stores int8 `[N, K]`, every fallback stores a packed `U32`.
+fn resolve_legacy_entry(
+    key: &str,
+    weights: &HashMap<String, MxArray>,
+    default_bits: i32,
+    default_group_size: i32,
+    default_mode: &str,
+    embed_quantizable: bool,
+    for_existing: bool,
+) -> Result<Option<QuantEntry>> {
+    // Gate quantization defaults (8-bit affine, group 64).
+    const GATE_BITS: i32 = 8;
+    const GATE_GROUP_SIZE: i32 = 64;
+
+    if !should_quantize(key, embed_quantizable) {
+        return Ok(None);
+    }
+
+    // sym8-scoped exclusions (legacy path only — recipes reject sym8):
+    // gemma4 PLE linears (`per_layer_model_projection`, `per_layer_input_gate`,
+    // `per_layer_projection`) load DENSE-ONLY (`Linear::set_weight`), and the
+    // Rust loader skips audio-tower weights entirely. A sym8 PLE entry would
+    // keep the [N,K] shape (int8) so no shape guard trips at load — silent
+    // garbage; a forced-affine entry fails the dense-only loader too. Keep them
+    // bf16 under a sym8 default.
+    if default_mode == "sym8"
+        && (key.contains("per_layer_model_projection")
+            || key.contains("per_layer_input_gate")
+            || key.contains("per_layer_projection")
+            || key.contains("audio_tower")
+            || key.contains("audio_encoder")
+            || key.contains("embed_audio"))
+    {
+        return Ok(None);
+    }
+
+    // EXCEPTION (lfm2/lfm2_moe): when `embed_quantizable`, the lfm2 PACKED
+    // embedding backend (`load_quantized_packed`) DOES support mxfp4/mxfp8/nvfp4
+    // (mode threaded through gather-dequant + quantized matmul), so the
+    // embedding keys must NOT be force-downgraded to affine below — they keep
+    // the global non-affine mode.
+    let is_lfm2_packed_embed =
+        embed_quantizable && (key.contains("embed_tokens") || key.contains("embedding."));
+    // sym8 is the EXCEPTION-to-the-exception: keep the lfm2 embedding DENSE bf16
+    // (NO QuantEntry at all) under a sym8 default. The packed backend has no
+    // sym8 gather-dequant, and the previous forced-affine-8 downgrade emitted
+    // `embed_tokens.scales`, which bars the ENTIRE lfm2 compiled path at load
+    // time (`quant_embed_supported` in lfm2/persistence.rs keys on that tensor —
+    // the compiled forwards do a dense `take()` over the raw embedding table).
+    // Dense bf16 keeps sym8 checkpoints compiled-eligible, matching main-branch
+    // quantized-lfm2 behavior (every other quantized lfm2 recipe leaves the
+    // compiled path on).
+    if default_mode == "sym8" && is_lfm2_packed_embed {
+        return Ok(None);
+    }
+
+    // Mirror `apply_mxfp_upgrade`'s exclusions for affine-only loader keys:
+    // those keys load through affine-only `Linear::load_quantized` /
+    // `Embedding::load_quantized` helpers (dense Qwen3.5 lm_head, Gemma4 MoE
+    // `router.proj`, Gemma4 `embed_tokens` and `embed_tokens_per_layer`, Gemma4
+    // `embed_vision.embedding_projection`), so emitting MXFP / NVFP weights for
+    // them would be silently mis-dequantized at load time. Force a safe 8-bit
+    // affine (group_size 64) override and let the loader pick up the per-layer
+    // override via mode-aware dispatch.
+    //
+    // Note: `lm_head` is already filtered out by `should_quantize` above (the
+    // legacy path never quantizes the output head), so in practice this branch
+    // fires for `router.proj`, `embed_tokens*`, and `embedding_projection` keys.
+    // The `lm_head` arm is kept for defense-in-depth: if a future edit ever
+    // relaxes `should_quantize`, the MXFP/NVFP-mode safety net still holds.
+    //
+    // `embed_tokens` matches both the top-level Gemma4 embedding and the PLE
+    // `embed_tokens_per_layer` via substring.
+    let is_non_affine_default = default_mode == "mxfp4"
+        || default_mode == "mxfp8"
+        || default_mode == "nvfp4"
+        || default_mode == "sym8";
+    // (`is_lfm2_packed_embed` under a sym8 default already returned above, so
+    // here it always means "keeps the non-affine default".)
+    if is_non_affine_default && is_affine_only_key(key) && !is_lfm2_packed_embed {
+        return Ok(Some(QuantEntry {
+            key: key.to_string(),
+            bits: 8,
+            group_size: GATE_GROUP_SIZE,
+            mode: "affine".to_string(),
+        }));
+    }
+
+    if is_router_gate(key) {
+        // Router gates ALWAYS stay at 8-bit affine, regardless of the top-level
+        // default mode. MXFP8 (E8M0 per-group power-of-two scales, group_size
+        // 32) has ~10x the round-trip error of affine 8-bit on small-magnitude
+        // gate weights — too much noise for top-K expert routing. This matches
+        // Python mlx-lm's `quant_predicate` in `qwen3_5.py` which hardcodes
+        // gates to `{group_size: 64, bits: 8}` affine.
+        //
+        // See also the matching gate exclusion in `apply_mxfp_upgrade`, which
+        // fires for the recipe (`-q --q-mxfp --q-recipe ...`) path; this branch
+        // handles the no-recipe legacy path.
+        return Ok(Some(QuantEntry {
+            key: key.to_string(),
+            bits: GATE_BITS,
+            group_size: GATE_GROUP_SIZE,
+            mode: "affine".to_string(),
+        }));
+    }
+
+    if default_mode == "sym8" {
+        // sym8 requires a 2D [N,K] weight with K % 16 == 0 (the int8 kernel
+        // operand gate). Everything else — stacked-expert 3D [E,N,K] tensors
+        // (MoE is out of sym8 v1 scope) and odd-K linears — is FORCED to 8-bit
+        // affine; the mode difference vs the sym8 default makes the caller
+        // record a per-layer override so the loader dispatches per-layer.
+        let stays_sym8 = match weights.get(key) {
+            Some(array) if for_existing => array.dtype()? == DType::Int8,
+            Some(array) => sym8_eligible(array)?,
+            None => false,
+        };
+        if !stays_sym8 {
+            return Ok(Some(QuantEntry {
+                key: key.to_string(),
+                bits: GATE_BITS,
+                group_size: GATE_GROUP_SIZE,
+                mode: "affine".to_string(),
+            }));
+        }
+    }
+
+    Ok(Some(QuantEntry {
+        key: key.to_string(),
+        bits: default_bits,
+        group_size: default_group_size,
+        mode: default_mode.to_string(),
+    }))
+}
+
 /// Quantize weights in-place using MLX's quantize operation.
 ///
 /// Replaces qualifying `.weight` tensors with quantized (uint32 packed) versions
@@ -6003,10 +6395,6 @@ fn quantize_weights_inner(
     if predicate.is_some() && default_mode == "sym8" {
         return Err(Error::from_reason(SYM8_RECIPE_ERROR.to_string()));
     }
-
-    // Gate quantization defaults (used when no predicate)
-    let gate_bits: i32 = 8;
-    let gate_group_size: i32 = 64;
 
     // Collect quantization decisions for each weight key (see the
     // module-level `QuantEntry`).
@@ -6090,6 +6478,61 @@ fn quantize_weights_inner(
                              requested top-level mode"
                         )));
                     }
+                    // Skipping the group keeps its packed bytes on disk, so this
+                    // arm has to reproduce the decision that packed them —
+                    // `resolve_legacy_entry`, the same ladder the fresh path
+                    // walks — and then do BOTH halves of what the recipe branch
+                    // above does with it.
+                    //
+                    // Validate: the request has to describe what is on disk.
+                    // Group-32 data relabelled group-64, or K-quant bytes
+                    // relabelled affine, otherwise survive the write and surface
+                    // at first decode as `null handle returned:
+                    // quantized_matmul`, naming neither the layer nor the shape.
+                    //
+                    // Record: a key the ladder moves off the top-level triple
+                    // (every router gate, pinned to 8-bit affine) needs its
+                    // per-layer override re-emitted. Without it the config
+                    // writer stamps the top-level triple over 8-bit bytes and
+                    // the same nameless decode failure comes back — validating
+                    // alone would only have proved the bytes were fine.
+                    let Some(entry) = resolve_legacy_entry(
+                        key,
+                        weights,
+                        default_bits,
+                        default_group_size,
+                        default_mode,
+                        embed_quantizable,
+                        /* for_existing */ true,
+                    )?
+                    else {
+                        return Err(Error::from_reason(format!(
+                            "cannot safely re-convert already-quantized group '{base}': \
+                             the default predicate does not quantize this key"
+                        )));
+                    };
+                    // Members of a co-quantized group under a sym8 default are
+                    // left to `enforce_sym8_group_coherence`, which runs after
+                    // this loop under the same no-recipe condition and reports
+                    // the whole group — which member is orphaned, which is still
+                    // float — where this check can only name the one tensor it
+                    // was handed. Every other key (router gates, attention/GDN
+                    // projections, embeddings, and every co-quantized member
+                    // under a non-sym8 default, which no coherence pass covers)
+                    // is validated here.
+                    let deferred_to_group_coherence =
+                        default_mode == "sym8" && coquant_group_members(base).is_some();
+                    if !deferred_to_group_coherence {
+                        validate_existing_quantized_entry(weights, base, &entry)?;
+                    }
+                    record_quant_override_if_non_default(
+                        &mut preexisting_overrides,
+                        base,
+                        &entry,
+                        default_bits,
+                        default_group_size,
+                        default_mode,
+                    );
                 }
                 info!(
                     "skipping quantization of '{}': already quantized (sidecar present)",
@@ -6139,131 +6582,22 @@ fn quantize_weights_inner(
                 }
             }
         } else {
-            // Legacy path: use should_quantize + is_router_gate
-            if !should_quantize(key, embed_quantizable) {
+            // Legacy path: `should_quantize` + the affine-only / router-gate /
+            // sym8 ladder, shared with the already-quantized skip arm above so
+            // the two cannot drift. See `resolve_legacy_entry`.
+            let Some(entry) = resolve_legacy_entry(
+                key,
+                weights,
+                default_bits,
+                default_group_size,
+                default_mode,
+                embed_quantizable,
+                /* for_existing */ false,
+            )?
+            else {
                 continue;
-            }
-            // Mirror `apply_mxfp_upgrade`'s exclusions for affine-only
-            // loader keys: those keys load through affine-only
-            // `Linear::load_quantized` / `Embedding::load_quantized` helpers
-            // (dense Qwen3.5 lm_head, Gemma4 MoE `router.proj`, Gemma4
-            // `embed_tokens` and `embed_tokens_per_layer`, Gemma4
-            // `embed_vision.embedding_projection`), so emitting MXFP / NVFP
-            // weights for them would be silently mis-dequantized at load
-            // time. Force a safe 8-bit affine (group_size 64) override and
-            // let the loader pick up the per-layer override via mode-aware
-            // dispatch.
-            //
-            // Note: `lm_head` is already filtered out by `should_quantize`
-            // above (the legacy path never quantizes the output head), so
-            // in practice this branch fires for `router.proj`,
-            // `embed_tokens*`, and `embedding_projection` keys. The
-            // `lm_head` arm is kept for defense-in-depth: if a future edit
-            // ever relaxes `should_quantize`, the MXFP/NVFP-mode safety net
-            // still holds.
-            //
-            // `embed_tokens` matches both the top-level Gemma4 embedding
-            // and the PLE `embed_tokens_per_layer` via substring.
-            //
-            // sym8-scoped exclusions (legacy path only — recipes reject sym8):
-            // gemma4 PLE linears (`per_layer_model_projection`,
-            // `per_layer_input_gate`, `per_layer_projection`) load DENSE-ONLY
-            // (`Linear::set_weight`), and the Rust loader skips audio-tower
-            // weights entirely. A sym8 PLE entry would keep the [N,K] shape
-            // (int8) so no shape guard trips at load — silent garbage; a
-            // forced-affine entry fails the dense-only loader too. Keep them
-            // bf16 under a sym8 default.
-            if default_mode == "sym8"
-                && (key.contains("per_layer_model_projection")
-                    || key.contains("per_layer_input_gate")
-                    || key.contains("per_layer_projection")
-                    || key.contains("audio_tower")
-                    || key.contains("audio_encoder")
-                    || key.contains("embed_audio"))
-            {
-                continue;
-            }
-            // EXCEPTION (lfm2/lfm2_moe): when `embed_quantizable`, the lfm2
-            // PACKED embedding backend (`load_quantized_packed`) DOES support
-            // mxfp4/mxfp8/nvfp4 (mode threaded through gather-dequant +
-            // quantized matmul), so the embedding keys must NOT be force-
-            // downgraded to affine here — they keep the global non-affine mode.
-            let is_lfm2_packed_embed =
-                embed_quantizable && (key.contains("embed_tokens") || key.contains("embedding."));
-            // sym8 is the EXCEPTION-to-the-exception: keep the lfm2 embedding
-            // DENSE bf16 (NO QuantEntry at all) under a sym8 default. The
-            // packed backend has no sym8 gather-dequant, and the previous
-            // forced-affine-8 downgrade emitted `embed_tokens.scales`, which
-            // bars the ENTIRE lfm2 compiled path at load time
-            // (`quant_embed_supported` in lfm2/persistence.rs keys on that
-            // tensor — the compiled forwards do a dense `take()` over the raw
-            // embedding table). Dense bf16 keeps sym8 checkpoints
-            // compiled-eligible, matching main-branch quantized-lfm2 behavior
-            // (every other quantized lfm2 recipe leaves the compiled path on).
-            if default_mode == "sym8" && is_lfm2_packed_embed {
-                continue;
-            }
-            let is_non_affine_default = default_mode == "mxfp4"
-                || default_mode == "mxfp8"
-                || default_mode == "nvfp4"
-                || default_mode == "sym8";
-            // (`is_lfm2_packed_embed` under a sym8 default already `continue`d
-            // above, so here it always means "keeps the non-affine default".)
-            if is_non_affine_default && is_affine_only_key(key) && !is_lfm2_packed_embed {
-                entries.push(QuantEntry {
-                    key: key.clone(),
-                    bits: 8,
-                    group_size: gate_group_size,
-                    mode: "affine".to_string(),
-                });
-                continue;
-            }
-            if is_router_gate(key) {
-                // Router gates ALWAYS stay at 8-bit affine, regardless of the
-                // top-level default mode. MXFP8 (E8M0 per-group power-of-two
-                // scales, group_size 32) has ~10x the round-trip error of
-                // affine 8-bit on small-magnitude gate weights — too much
-                // noise for top-K expert routing. This matches Python
-                // mlx-lm's `quant_predicate` in `qwen3_5.py` which hardcodes
-                // gates to `{group_size: 64, bits: 8}` affine.
-                //
-                // See also the matching gate exclusion in
-                // `apply_mxfp_upgrade`, which fires for the recipe (`-q
-                // --q-mxfp --q-recipe ...`) path; this branch handles the
-                // no-recipe legacy path.
-                entries.push(QuantEntry {
-                    key: key.clone(),
-                    bits: gate_bits,
-                    group_size: gate_group_size,
-                    mode: "affine".to_string(),
-                });
-            } else if default_mode == "sym8"
-                && !weights
-                    .get(key)
-                    .map(sym8_eligible)
-                    .transpose()?
-                    .unwrap_or(false)
-            {
-                // sym8 requires a 2D [N,K] weight with K % 16 == 0 (the int8
-                // kernel operand gate). Everything else — stacked-expert 3D
-                // [E,N,K] tensors (MoE is out of sym8 v1 scope) and odd-K
-                // linears — is FORCED to 8-bit affine; the mode difference vs
-                // the sym8 default makes the emission loop record a per-layer
-                // override so the loader dispatches per-layer.
-                entries.push(QuantEntry {
-                    key: key.clone(),
-                    bits: gate_bits,
-                    group_size: gate_group_size,
-                    mode: "affine".to_string(),
-                });
-            } else {
-                entries.push(QuantEntry {
-                    key: key.clone(),
-                    bits: default_bits,
-                    group_size: default_group_size,
-                    mode: default_mode.to_string(),
-                });
-            }
+            };
+            entries.push(entry);
         }
     }
 
@@ -6911,6 +7245,67 @@ pub(crate) fn infer_num_layers_from_weights(weights: &HashMap<String, MxArray>) 
 mod tests {
     use super::*;
     use crate::convert::recipe::{self, ConversionRecipe};
+
+    /// Re-converting a symmetric GGUF import must not emit a config that still
+    /// claims the `.biases` are derived. The input boundary rebuilds them and
+    /// the writer stores them, so an output that kept the claim would describe
+    /// a checkpoint that does not exist and the loader would refuse it — a
+    /// plain `mlx convert` of an imported model producing an unloadable model.
+    #[test]
+    fn carried_over_config_drops_the_symmetric_zero_point() {
+        let mut config = serde_json::json!({
+            "model_type": "gemma4_unified",
+            "quantization": {
+                "bits": 4,
+                "group_size": 32,
+                "mode": "affine",
+                SYMMETRIC_ZERO_POINT_KEY: 8,
+                "language_model.model.layers.0.mlp.down_proj": {
+                    "bits": 4, "group_size": 32, "mode": "affine",
+                    SYMMETRIC_ZERO_POINT_KEY: 8,
+                },
+                "language_model.model.embed_tokens": {
+                    "bits": 6, "group_size": 16, "mode": "q6k",
+                },
+            },
+            "quantization_config": {
+                "bits": 8, "group_size": 32, "mode": "affine",
+                SYMMETRIC_ZERO_POINT_KEY: 128,
+            },
+        });
+        strip_symmetric_zero_point(&mut config);
+
+        assert_eq!(
+            config["quantization"],
+            serde_json::json!({
+                "bits": 4,
+                "group_size": 32,
+                "mode": "affine",
+                "language_model.model.layers.0.mlp.down_proj": {
+                    "bits": 4, "group_size": 32, "mode": "affine",
+                },
+                "language_model.model.embed_tokens": {
+                    "bits": 6, "group_size": 16, "mode": "q6k",
+                },
+            }),
+            "the geometry must survive; only the derived-bias claim goes"
+        );
+        assert_eq!(
+            config["quantization_config"],
+            serde_json::json!({ "bits": 8, "group_size": 32, "mode": "affine" }),
+            "the legacy alias is carried over too and must be stripped alike"
+        );
+        assert_eq!(config["model_type"], "gemma4_unified");
+
+        // A config that never carried the field is returned untouched.
+        let plain = serde_json::json!({
+            "model_type": "qwen3_5",
+            "quantization": { "bits": 4, "group_size": 64, "mode": "affine" },
+        });
+        let mut untouched = plain.clone();
+        strip_symmetric_zero_point(&mut untouched);
+        assert_eq!(untouched, plain);
+    }
 
     #[test]
     fn imatrix_rejects_prequantized_body_before_mutating_packed_weight_or_norm() {
@@ -9563,6 +9958,159 @@ mod tests {
         );
     }
 
+    /// Build a valid already-quantized K-quant group into `weights`, matching
+    /// the array contract for `format` at `rows` rows of `k` values.
+    fn insert_valid_kquant_group(
+        weights: &mut HashMap<String, MxArray>,
+        prefix: &str,
+        format: KQuantFormat,
+        rows: usize,
+        k: usize,
+    ) {
+        let (wc, sc, bc) = (
+            format.weight_cols(k),
+            format.scales_cols(k),
+            format.biases_cols(k),
+        );
+        weights.insert(
+            format!("{prefix}.weight"),
+            MxArray::from_uint32(&vec![0u32; rows * wc], &[rows as i64, wc as i64]).unwrap(),
+        );
+        let scales = if format.scales_are_signed() {
+            MxArray::from_int8(&vec![1i8; rows * sc], &[rows as i64, sc as i64]).unwrap()
+        } else {
+            MxArray::from_uint8(&vec![1u8; rows * sc], &[rows as i64, sc as i64]).unwrap()
+        };
+        weights.insert(format!("{prefix}.scales"), scales);
+        weights.insert(
+            format!("{prefix}.biases"),
+            MxArray::from_float16(&vec![0u16; rows * bc], &[rows as i64, bc as i64]).unwrap(),
+        );
+    }
+
+    /// Both directions: a K-quant `.biases` must skip the cast, an affine one
+    /// must not (freezing those would stop honouring `--dtype` everywhere).
+    ///
+    /// Pins the classifier only. Replacing the cast loop's
+    /// `|| kquant_biases_keys.contains(&name)` with `|| false` stays green —
+    /// `convert_model_inner` has no test entry point, so the skip itself,
+    /// `expand_symmetric_affine_biases` and `strip_symmetric_zero_point` are
+    /// reachable only through the CLI.
+    #[test]
+    fn the_dtype_pass_preserves_kquant_biases_and_only_those() {
+        for format in [KQuantFormat::Q4K, KQuantFormat::Q5K, KQuantFormat::Q6K] {
+            let mut weights: HashMap<String, MxArray> = HashMap::new();
+            insert_valid_kquant_group(&mut weights, "model.layers.0.mlp.gate_proj", format, 4, 512);
+
+            // An affine group: float scales AND a float bias that must keep
+            // following `--dtype`.
+            weights.insert(
+                "model.layers.1.mlp.gate_proj.weight".to_string(),
+                MxArray::from_uint32(&[0u32; 256], &[4, 64]).unwrap(),
+            );
+            weights.insert(
+                "model.layers.1.mlp.gate_proj.scales".to_string(),
+                MxArray::from_float16(&[0u16; 64], &[4, 16]).unwrap(),
+            );
+            weights.insert(
+                "model.layers.1.mlp.gate_proj.biases".to_string(),
+                MxArray::from_float16(&[0u16; 64], &[4, 16]).unwrap(),
+            );
+
+            // mxfp-shaped: uint8 scales, no `.biases` at all.
+            weights.insert(
+                "model.layers.2.mlp.gate_proj.weight".to_string(),
+                MxArray::from_uint32(&[0u32; 256], &[4, 64]).unwrap(),
+            );
+            weights.insert(
+                "model.layers.2.mlp.gate_proj.scales".to_string(),
+                MxArray::from_uint8(&[1u8; 64], &[4, 16]).unwrap(),
+            );
+
+            let preserved = kquant_biases_to_preserve(&weights).expect("classify");
+            assert_eq!(
+                preserved,
+                HashSet::from(["model.layers.0.mlp.gate_proj.biases".to_string()]),
+                "{}: only the K-quant .biases may skip the cast",
+                format.mlx_mode()
+            );
+        }
+    }
+
+    fn kquant_entry(prefix: &str, format: KQuantFormat) -> QuantEntry {
+        QuantEntry {
+            key: format!("{prefix}.weight"),
+            bits: format.bits() as i32,
+            group_size: format.group_size() as i32,
+            mode: format.mlx_mode().to_string(),
+        }
+    }
+
+    #[test]
+    fn validate_existing_kquant_entry_accepts_every_width() {
+        // W4 gate. The old `weight_cols * (32 / bits)` derivation integer-divides
+        // 32 by the width: 32/5 = 6, 32/6 = 5. For q5k (weight_cols 80 at K=512)
+        // that gives 480, for q6k (weight_cols 96) it gives 480 — neither a
+        // super-block multiple — so the buggy path would REJECT these valid
+        // groups. The correct `weight_cols * 32 / bits` recovers K=512. Covering
+        // 4-, 5- and 6-bit proves the fix across every width the feature adds.
+        for format in [KQuantFormat::Q4K, KQuantFormat::Q5K, KQuantFormat::Q6K] {
+            let prefix = "model.layers.0.mlp.gate_proj";
+            let mut weights: HashMap<String, MxArray> = HashMap::new();
+            insert_valid_kquant_group(&mut weights, prefix, format, 4, 512);
+            let entry = kquant_entry(prefix, format);
+            validate_existing_quantized_entry(&weights, prefix, &entry).unwrap_or_else(|e| {
+                panic!(
+                    "{} valid group must validate: {}",
+                    format.mlx_mode(),
+                    e.reason
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn validate_existing_kquant_entry_rejects_wrong_scales_dtype() {
+        // q6k sub-scales are SIGNED int8; the q4k/q5k uint8 dtype is a format
+        // mismatch, not an alias.
+        let prefix = "model.layers.0.mlp.gate_proj";
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        insert_valid_kquant_group(&mut weights, prefix, KQuantFormat::Q6K, 2, 256);
+        let sc = KQuantFormat::Q6K.scales_cols(256);
+        weights.insert(
+            format!("{prefix}.scales"),
+            MxArray::from_uint8(&vec![1u8; 2 * sc], &[2, sc as i64]).unwrap(),
+        );
+        let entry = kquant_entry(prefix, KQuantFormat::Q6K);
+        let err = validate_existing_quantized_entry(&weights, prefix, &entry)
+            .expect_err("q6k with uint8 scales must be rejected");
+        assert!(err.reason.contains("expected Int8"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn validate_existing_kquant_entry_rejects_missing_scale_interleave() {
+        // A q5k `.scales` that drops the `(sc, m)` interleave factor of 2 (K/32
+        // instead of 2*K/32) is malformed and must be rejected; the format's own
+        // `scales_cols` carries the factor so the check cannot forget it.
+        let prefix = "model.layers.0.mlp.gate_proj";
+        let format = KQuantFormat::Q5K;
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        insert_valid_kquant_group(&mut weights, prefix, format, 2, 256);
+        let wrong = 256 / 32; // 8 — half of the required 16
+        weights.insert(
+            format!("{prefix}.scales"),
+            MxArray::from_uint8(&vec![1u8; 2 * wrong], &[2, wrong as i64]).unwrap(),
+        );
+        let entry = kquant_entry(prefix, format);
+        let err = validate_existing_quantized_entry(&weights, prefix, &entry)
+            .expect_err("q5k missing the scale interleave must be rejected");
+        assert!(
+            err.reason.contains(".scales last dim"),
+            "got: {}",
+            err.reason
+        );
+    }
+
     #[test]
     fn quantize_skips_already_quantized_group() {
         // Regression: feeding an ALREADY-quantized checkpoint back through
@@ -9576,20 +10124,23 @@ mod tests {
         let mut weights: HashMap<String, MxArray> = HashMap::new();
 
         // (1) An already-quantized affine group: packed `Uint32` `.weight` of
-        // shape [out, packed]. Both dims chosen so the shape/divisibility gate
-        // would otherwise ACCEPT it — proving the SKIP fires in the new guard,
-        // not as an unrelated shape rejection. Distinct values prove identity.
+        // shape [out, packed]. The sidecars describe the SAME 4-bit group-64
+        // geometry the call below requests, so nothing here can be rejected as a
+        // metadata mismatch — proving the SKIP fires in the new guard, not as an
+        // unrelated shape rejection. Distinct values prove identity.
         let out = 8i64;
-        let packed = h; // 64, divisible by group_size 64
+        let packed = h; // 64 uint32 words → K = 64 * (32/4) = 512 at 4 bits
+        let groups = 512 / 64; // 8 groups of 64 per row
         let packed_key = "model.layers.1.feed_forward.switch_mlp.gate_proj.weight";
         let scales_key = "model.layers.1.feed_forward.switch_mlp.gate_proj.scales";
+        let biases_key = "model.layers.1.feed_forward.switch_mlp.gate_proj.biases";
         let packed_data: Vec<u32> = (0..(out * packed) as u32).collect();
         weights.insert(
             packed_key.into(),
             MxArray::from_uint32(&packed_data, &[out, packed]).expect("from_uint32 packed"),
         );
-        // group_size 64 over last dim 64 → 1 group per row.
-        weights.insert(scales_key.into(), lfm2_bf16(&[out, 1], 0.5));
+        weights.insert(scales_key.into(), lfm2_bf16(&[out, groups], 0.5));
+        weights.insert(biases_key.into(), lfm2_bf16(&[out, groups], -0.25));
 
         // Snapshot the packed input bytes for an identity assertion afterwards.
         let input_packed: Vec<u32> = weights
@@ -9632,11 +10183,20 @@ mod tests {
             weights.contains_key(scales_key),
             "pre-existing scales sidecar must be preserved"
         );
-        // The skip must NOT have inserted a fresh affine `.biases` for this group.
-        let gate_biases_key = "model.layers.1.feed_forward.switch_mlp.gate_proj.biases";
-        assert!(
-            !weights.contains_key(gate_biases_key),
-            "skipped group must not gain a new biases sidecar"
+        // The skip must have left the group's own `.biases` untouched rather
+        // than overwriting it with a freshly computed one.
+        let out_biases = weights
+            .get(biases_key)
+            .expect("pre-existing biases sidecar must be preserved");
+        assert_eq!(
+            out_biases.shape().unwrap().to_vec(),
+            vec![out, groups],
+            "skipped group must keep its own biases sidecar"
+        );
+        assert_eq!(
+            out_biases.dtype().unwrap(),
+            DType::BFloat16,
+            "skipped group must keep its own biases dtype"
         );
 
         // Positive control: the float weight WAS quantized (now Uint32 packed,
@@ -9656,6 +10216,202 @@ mod tests {
 
         // The default 4-bit affine control needs no per-layer override.
         let _ = overrides;
+    }
+
+    /// Re-quantizing an already-converted directory without a recipe must reject
+    /// a group whose stored geometry is not the requested one.
+    ///
+    /// `mlx convert -i <converted-dir> -o out2 -q` skips every group that
+    /// already carries `.scales` and records no per-layer override, so the
+    /// config writer then stamps the requested top-level triple — bare `-q`
+    /// means 4-bit group-64 — over data packed at group 32. The result loads and
+    /// dies inside `mlx_quantized_matmul` as `null handle returned:
+    /// quantized_matmul`, naming neither the layer nor the shape.
+    ///
+    /// Mutation this catches: delete the `validate_existing_quantized_entry`
+    /// call from the no-recipe `has_scales` arm and the call below returns
+    /// `Ok`, failing the `expect_err`.
+    #[test]
+    fn quantize_rejects_an_already_quantized_group_at_another_group_size() {
+        let out = 8i64;
+        let packed = 64i64; // K = 512 at 4 bits
+        let prefix = "model.layers.1.feed_forward.switch_mlp.gate_proj";
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        weights.insert(
+            format!("{prefix}.weight"),
+            MxArray::from_uint32(&vec![0u32; (out * packed) as usize], &[out, packed]).unwrap(),
+        );
+        // Packed at group 32: 512 / 32 = 16 groups per row, not the 8 that the
+        // requested group_size of 64 implies.
+        weights.insert(format!("{prefix}.scales"), lfm2_bf16(&[out, 16], 0.5));
+        weights.insert(format!("{prefix}.biases"), lfm2_bf16(&[out, 16], -0.25));
+
+        let err = quantize_weights(&mut weights, 4, 64, "affine", false)
+            .expect_err("group-32 data relabelled group-64 must be rejected at convert time");
+        assert!(err.reason.contains(prefix), "{}", err.reason);
+        assert!(err.reason.contains("group_size=64"), "{}", err.reason);
+        assert!(err.reason.contains("[8, 16]"), "{}", err.reason);
+    }
+
+    /// The same re-conversion must ACCEPT a group whose stored geometry is the
+    /// one the no-recipe ladder resolves for it, and re-emit the per-layer
+    /// override that geometry needs. Router gates are the reachable case: the
+    /// first conversion pins them to 8-bit affine group-64 whatever the
+    /// top-level default is, so on the way back in they match neither the
+    /// requested bits nor (via the packing) the requested scale shape.
+    ///
+    /// The group-size test above cannot cover this — `switch_mlp.gate_proj` is
+    /// an expert projection, not a router, so it resolves to the plain default.
+    ///
+    /// Mutations this catches: (1) validate against the raw top-level defaults
+    /// instead of the resolved entry — 4 bits reads the [8, 128] packing as
+    /// K=1024 and demands [8, 16] scales, so the conversion fails outright;
+    /// (2) drop the `record_quant_override_if_non_default` call — the
+    /// conversion succeeds but the returned map is empty, and the config writer
+    /// then stamps 4/64 over 8-bit bytes.
+    #[test]
+    fn quantize_preserves_a_pre_quantized_router_gate_and_its_override() {
+        // 8-bit affine of a [8, 512] gate: U32 [8, 128] + [8, 8] sidecars.
+        let out = 8i64;
+        let packed = 128i64;
+        let groups = 8i64;
+        for gate in [
+            "model.layers.0.mlp.gate",
+            "model.layers.0.mlp.shared_expert_gate",
+            "model.layers.0.feed_forward.gate",
+        ] {
+            let mut weights: HashMap<String, MxArray> = HashMap::new();
+            weights.insert(
+                format!("{gate}.weight"),
+                MxArray::from_uint32(&vec![0u32; (out * packed) as usize], &[out, packed]).unwrap(),
+            );
+            weights.insert(format!("{gate}.scales"), lfm2_bf16(&[out, groups], 0.5));
+            weights.insert(format!("{gate}.biases"), lfm2_bf16(&[out, groups], -0.25));
+
+            let overrides = quantize_weights(&mut weights, 4, 64, "affine", false)
+                .unwrap_or_else(|e| panic!("re-converting a pinned router gate: {}", e.reason));
+            assert_eq!(
+                overrides.get(gate),
+                Some(&serde_json::json!({
+                    "bits": 8,
+                    "group_size": 64,
+                    "mode": "affine",
+                })),
+                "{gate} must carry its 8/64 affine override into the new config"
+            );
+            assert_eq!(
+                weights[&format!("{gate}.weight")].dtype().unwrap(),
+                DType::Uint32,
+                "{gate} packed bytes must be passed through untouched"
+            );
+        }
+    }
+
+    /// `sym8_eligible` reads the ARRAY (`ndim == 2 && K % 16 == 0`), which a
+    /// PACKED affine tensor satisfies just as well as a float one. Re-converting
+    /// an affine checkpoint under `--q-mode sym8` therefore must not ask it:
+    /// U32 [8, 128] would answer "eligible", resolve to sym8, and be rejected by
+    /// the sym8 storage check (int8 only) — a conversion that should succeed.
+    /// The stored dtype is the honest witness, and the affine override it
+    /// resolves is what lets the loader decode these bytes under a sym8 config.
+    ///
+    /// Mutation this catches: pass `for_existing = false` from the skip arm (or
+    /// call `sym8_eligible` unconditionally) and the conversion fails with
+    /// "does not match resolved sym8 storage".
+    #[test]
+    fn quantize_under_a_sym8_default_keeps_a_pre_quantized_affine_tensor_affine() {
+        let out = 8i64;
+        let packed = 128i64;
+        let groups = 8i64;
+        let prefix = "model.layers.0.self_attn.q_proj";
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        weights.insert(
+            format!("{prefix}.weight"),
+            MxArray::from_uint32(&vec![0u32; (out * packed) as usize], &[out, packed]).unwrap(),
+        );
+        weights.insert(format!("{prefix}.scales"), lfm2_bf16(&[out, groups], 0.5));
+        weights.insert(format!("{prefix}.biases"), lfm2_bf16(&[out, groups], -0.25));
+
+        let overrides = quantize_weights(&mut weights, 8, 64, "sym8", false).unwrap_or_else(|e| {
+            panic!(
+                "re-converting affine bytes under a sym8 default: {}",
+                e.reason
+            )
+        });
+        assert_eq!(
+            overrides.get(prefix),
+            Some(&serde_json::json!({
+                "bits": 8,
+                "group_size": 64,
+                "mode": "affine",
+            })),
+            "the stored affine geometry must be recorded against the sym8 default"
+        );
+    }
+
+    /// Converting a converted directory again with identical flags must be a
+    /// fixed point: same weights, same per-layer overrides. The second pass sees
+    /// every group already sidecarred, so it exercises the skip arm for every
+    /// key at once — including the router gate the first pass moved off the
+    /// top-level triple.
+    ///
+    /// Mutation this catches: drop the override recording from the skip arm and
+    /// the second map comes back empty while the first still carries the gate.
+    #[test]
+    fn requantizing_an_already_converted_map_reproduces_the_same_overrides() {
+        let float = |shape: &[i64]| {
+            let a = MxArray::random_normal(shape, 0.0, 0.02, Some(DType::Float32)).unwrap();
+            a.eval();
+            a
+        };
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        weights.insert("model.layers.0.mlp.gate.weight".into(), float(&[8, 512]));
+        weights.insert(
+            "model.layers.0.self_attn.q_proj.weight".into(),
+            float(&[64, 512]),
+        );
+
+        let first = quantize_weights(&mut weights, 4, 64, "affine", false).expect("first pass");
+        assert_eq!(
+            first.get("model.layers.0.mlp.gate"),
+            Some(&serde_json::json!({
+                "bits": 8,
+                "group_size": 64,
+                "mode": "affine",
+            })),
+            "the first pass must pin the router gate to 8/64 affine"
+        );
+
+        let second =
+            quantize_weights(&mut weights, 4, 64, "affine", false).expect("second pass on output");
+        assert_eq!(
+            second, first,
+            "re-converting with identical flags must reproduce the same quantization block"
+        );
+    }
+
+    /// The same guard covers a `--gguf-kquant` import directory, whose config
+    /// carries `mode: q4k/q5k/q6k` plus a per-tensor entry for every K-quant
+    /// group. Bare `-q` would replace all of it with affine/4/64 while leaving
+    /// ggml's packed blocks on disk untouched.
+    ///
+    /// Mutation this catches: the same deleted call — the K-quant sidecars are
+    /// int8/uint8, which the affine arm's float-scale test rejects, so without
+    /// the call the group is silently skipped and relabelled.
+    #[test]
+    fn quantize_rejects_an_imported_kquant_group_without_a_recipe() {
+        for format in [KQuantFormat::Q4K, KQuantFormat::Q5K, KQuantFormat::Q6K] {
+            let prefix = "model.layers.0.mlp.gate_proj";
+            let mut weights: HashMap<String, MxArray> = HashMap::new();
+            insert_valid_kquant_group(&mut weights, prefix, format, 4, 512);
+            let mode = format.mlx_mode();
+            let err = quantize_weights(&mut weights, 4, 64, "affine", false)
+                .err()
+                .unwrap_or_else(|| panic!("{mode} bytes relabelled affine must be rejected"))
+                .reason;
+            assert!(err.contains(prefix), "{mode}: {err}");
+            assert!(err.contains("affine storage"), "{mode}: {err}");
+        }
     }
 
     #[test]

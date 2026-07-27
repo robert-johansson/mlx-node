@@ -133,6 +133,11 @@ Quantization Arguments:
                         Required for legacy affine "unsloth". Optional for its
                         fixed --q-mxfp / --q-mode nvfp4 maps, but preferred
                         when matching calibration data is available.
+  --gguf-kquant         Import ggml Q4_K / Q5_K / Q6_K tensors as MLX K-quant
+                        arrays instead of rejecting them. Blocks are repacked
+                        bit-for-bit, never dequantized, so the output keeps the
+                        source weights and byte size. Cannot be combined with
+                        --quantize / --q-recipe / --q-mxfp / --imatrix-path.
 
 Model Types:
   (default)             SafeTensors dtype conversion (HuggingFace models)
@@ -150,6 +155,14 @@ GGUF Support:
   GGUF binary format and converts tensors to SafeTensors. Supports BF16, F16,
   F32, Q4_0, Q4_1, and Q8_0 tensor types. Tokenizer files are copied from
   alongside the GGUF file if present.
+
+  Q4_0 and Q8_0 are symmetric: ggml derives the offset from the scale rather
+  than storing it, so the import records a symmetric_zero_point in config.json
+  and leaves the .biases companion off disk, rebuilding it at load. That keeps
+  ggml's own byte size (Q4_0 4.5 bpw, Q8_0 8.5) instead of paying 0.5 bpw for
+  an array of derived values. The weights are unchanged. The output is NOT
+  mlx-lm-loadable, since mlx-lm requires a stored .biases for affine groups —
+  Q4_1 stores a real per-block minimum, keeps its .biases, and stays portable.
 
 Examples:
   mlx convert -i .cache/models/qwen3-0.6b -o .cache/models/qwen3-0.6b-mlx
@@ -184,6 +197,7 @@ export async function run(argv: string[]) {
       'imatrix-path': { type: 'string' },
       'config-dir': { type: 'string' },
       mmproj: { type: 'string' },
+      'gguf-kquant': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
   });
@@ -481,6 +495,19 @@ export async function run(argv: string[]) {
       );
       process.exit(1);
     }
+    // K-quant import (--gguf-kquant) repacks ggml Q4_K/Q5_K/Q6_K bit-for-bit and
+    // never dequantizes, so any re-quantization flag both contradicts it and
+    // forces whole-model float residency. Reject upfront (mirrors the native
+    // guard in crates/mlx-core/src/utils/gguf.rs::convert_gguf_to_safetensors).
+    if (
+      args['gguf-kquant'] &&
+      (args.quantize || quantRecipe !== undefined || args['q-mxfp'] || imatrixPath !== undefined)
+    ) {
+      console.error(
+        'Error: --gguf-kquant cannot be combined with re-quantization (--quantize / --q-recipe / --q-mxfp / --imatrix-path); ggml K-quant blocks are imported bit-for-bit and never dequantized',
+      );
+      process.exit(1);
+    }
 
     const dtype = args.dtype || 'bfloat16';
     console.log(`Converting GGUF to SafeTensors`);
@@ -518,6 +545,7 @@ export async function run(argv: string[]) {
         quantMxfp: args['q-mxfp'],
         quantRecipe,
         imatrixPath,
+        importKQuants: args['gguf-kquant'],
         configSourceDir,
         vlmKeyPrefix: !!mmprojPath,
       });
@@ -544,6 +572,10 @@ export async function run(argv: string[]) {
           dtype: 'bfloat16',
           verbose,
           quantize: false,
+          // Does NOT make a K-quant mmproj work — a secondary output owns no
+          // config.json to record mode/bits/group_size, so it is refused either
+          // way. Forwarding just picks the accurate error of the two.
+          importKQuants: args['gguf-kquant'],
           configSourceDir,
           outputFilename: 'vision.safetensors',
         });
@@ -557,6 +589,12 @@ export async function run(argv: string[]) {
       process.exit(1);
     }
     return;
+  }
+
+  // Below here the input is SafeTensors, where --gguf-kquant has no meaning.
+  if (args['gguf-kquant']) {
+    console.error('Error: --gguf-kquant applies only to GGUF input; ' + `'${inputPath}' is not a .gguf file`);
+    process.exit(1);
   }
 
   // Auto-detect model type from config.json if not specified

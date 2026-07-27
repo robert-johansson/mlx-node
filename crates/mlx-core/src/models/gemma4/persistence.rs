@@ -13,9 +13,10 @@ use crate::engine::persistence::{
     prewarm_checkpoint_pages,
 };
 use crate::models::quant_dispatch::{
-    default_per_layer_quant, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
-    ensure_plain_fp8_storage_resolves_fp8_e4m3, load_quant_settings_from_disk, merge_per_layer,
-    resolve_default_mode,
+    default_per_layer_quant, ensure_affine_biases_present, ensure_dense_weight_floating,
+    ensure_int8_storage_resolves_sym8, ensure_kquant_storage_resolves_kquant,
+    ensure_plain_fp8_storage_resolves_fp8_e4m3, kquant_mode_params, load_quant_settings_from_disk,
+    merge_per_layer, resolve_default_mode,
 };
 use crate::tokenizer::Qwen3Tokenizer;
 
@@ -24,6 +25,7 @@ use super::model::{Gemma4Draft, Gemma4Inner, Gemma4Model, warmup_forward};
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
     PerLayerMode, PerLayerQuant, is_mxfp8_checkpoint, is_quantized_checkpoint,
+    try_build_kquant_quantized_linear, try_build_kquant_quantized_switch_linear,
     try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
     try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
     try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
@@ -1065,6 +1067,17 @@ fn widen_bf16_affine_text_qmm_sidecars(
             continue;
         }
 
+        // Integer `.scales` means the storage is not affine-float whatever the
+        // mode says. Widening such a group's float16 `.biases` would erase the
+        // uint8-scales-beside-float16-biases signature
+        // `ensure_kquant_storage_resolves_kquant` keys on, so drifted Q4_K/Q5_K
+        // metadata would pass that guard. Float scales are unaffected.
+        if let Some(scales) = params.get(&format!("{prefix}.scales"))
+            && matches!(scales.dtype()?, DType::Int8 | DType::Uint8)
+        {
+            continue;
+        }
+
         let mut widened_projection = false;
         for suffix in ["scales", "biases"] {
             let sidecar_key = format!("{prefix}.{suffix}");
@@ -1273,9 +1286,66 @@ fn resolve_packed_embed_params<'a>(
                 biases,
             })
         }
+        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+            // Real gemma4 UD GGUFs ship `token_embd` as a K-quant (e.g. Q6_K).
+            // A K-quant group is a uint32 `.weight`, integer sub-block `.scales`
+            // (int8 for Q6_K, uint8 for Q4_K/Q5_K), and a MANDATORY float16
+            // `.biases` holding ggml's `d` super-block SCALE (not an additive
+            // bias). `plq.group_size`/`plq.bits` were resolved by the fail-closed
+            // parse tables (q6k=16/6, q4k=32/4, q5k=32/5) — pass them through.
+            // The packed backend hands all three arrays to the mode-aware K-quant
+            // `mlx_dequantize`/`mlx_quantized_matmul`, so nothing is dequantized
+            // to bf16 here and the tied lm_head stays a true K-quant matmul.
+            // `kquant_mode_params` is the single mirror of the MLX FFI's
+            // mode/dtype contract, so the mode string and expected `.scales`
+            // dtype cannot drift from the kernel. It returns `None` for every
+            // non-K-quant mode, which this arm has already excluded — the `else`
+            // keeps that unreachable-today branch fail-closed instead of
+            // defaulting a future K-quant family to the wrong bit width.
+            let Some((mode_str, _, _, want_scales)) = kquant_mode_params(plq.mode) else {
+                return Err(Error::from_reason(format!(
+                    "gemma4 {key} load: quant mode {:?} reached the K-quant embedding arm but has \
+                     no K-quant FFI parameters — refusing to load",
+                    plq.mode
+                )));
+            };
+            // Fail closed on any storage that contradicts the resolved K-quant
+            // mode, mirroring the affine/mxfp8 arms: the `.biases` super-block
+            // scale is required and holds a raw ggml f16 `d` bit pattern, and
+            // the sub-block `.scales` dtype must match.
+            if biases.is_none() {
+                return Err(Error::from_reason(format!(
+                    "gemma4 {key} load: quant mode resolves to {mode_str} but '{key}.biases' \
+                     (the ggml `d` super-block scale) is missing — K-quants require it, \
+                     refusing to load"
+                )));
+            }
+            let biases_dtype = biases.and_then(|b| b.dtype().ok());
+            if biases_dtype != Some(DType::Float16) {
+                return Err(Error::from_reason(format!(
+                    "gemma4 {key} load: quant mode resolves to {mode_str} but '{key}.biases' is \
+                     {biases_dtype:?}, expected Float16 (the ggml `d` super-block scale) — \
+                     config/tensor disagreement, refusing to load"
+                )));
+            }
+            let scales_dtype = scales.dtype().ok();
+            if scales_dtype != Some(want_scales) {
+                return Err(Error::from_reason(format!(
+                    "gemma4 {key} load: quant mode resolves to {mode_str} but '{key}.scales' is \
+                     {scales_dtype:?}, expected {want_scales:?} — config/tensor disagreement, \
+                     refusing to load"
+                )));
+            }
+            Ok(PackedEmbedParams {
+                group_size: plq.group_size,
+                bits: plq.bits,
+                mode_str,
+                biases,
+            })
+        }
         other => Err(Error::from_reason(format!(
             "gemma4 {key} load: quant mode {other:?} is not supported for the embedding/tied \
-             lm_head; only affine and mxfp8 are supported"
+             lm_head; only affine, mxfp8, and K-quant (q6k/q4k/q5k) are supported"
         ))),
     }
 }
@@ -1287,6 +1357,8 @@ fn build_gemma_ql(
 ) -> Result<Option<super::quantized_linear::QuantizedLinear>> {
     ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
     ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "gemma4")?;
+    ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "gemma4")?;
+    ensure_affine_biases_present(params, prefix, plq.mode, "gemma4")?;
     Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
@@ -1301,6 +1373,9 @@ fn build_gemma_ql(
             try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
         }
         PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
+        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+            try_build_kquant_quantized_linear(params, prefix, plq.mode, "gemma4")?
+        }
     })
 }
 
@@ -1311,6 +1386,8 @@ fn build_gemma_qsl(
 ) -> Result<Option<super::quantized_linear::QuantizedSwitchLinear>> {
     ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
     ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "gemma4")?;
+    ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "gemma4")?;
+    ensure_affine_biases_present(params, prefix, plq.mode, "gemma4")?;
     Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
@@ -1323,6 +1400,9 @@ fn build_gemma_qsl(
         }
         PerLayerMode::Affine => {
             try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
+        }
+        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+            try_build_kquant_quantized_switch_linear(params, prefix, plq.mode, "gemma4")?
         }
         PerLayerMode::Sym8 => {
             return Err(Error::from_reason(format!(
@@ -1503,6 +1583,12 @@ fn apply_weights(
                         "Missing embed_tokens_per_layer.scales for quantized PLE embedding",
                     )
                 })?;
+                ensure_affine_biases_present(
+                    params,
+                    "embed_tokens_per_layer",
+                    ple_embed_plq.mode,
+                    "gemma4",
+                )?;
                 let biases = params.get("embed_tokens_per_layer.biases");
                 // Keep the PLE table PACKED (gather-then-dequant only the looked-up
                 // rows in `forward`) instead of pre-dequantizing the whole table into
@@ -1761,6 +1847,7 @@ fn apply_weights(
                             router_prefix
                         ))
                     })?;
+                ensure_affine_biases_present(params, &router_prefix, router_plq.mode, "gemma4")?;
                 let biases = params.get(&format!("{}.biases", router_prefix));
                 layer.set_router_proj_quantized(
                     w,
@@ -2050,6 +2137,7 @@ fn apply_embed_vision_projection(
             proj_prefix, vision_plq.mode
         )));
     }
+    ensure_affine_biases_present(params, proj_prefix, vision_plq.mode, "gemma4")?;
     if params.contains_key(&format!("{}.scales", proj_prefix))
         && let Some(w) = params.get(&format!("{}.weight", proj_prefix))
     {
@@ -2114,6 +2202,7 @@ fn apply_audio_weights(
             proj_prefix, audio_plq.mode
         )));
     }
+    ensure_affine_biases_present(params, proj_prefix, audio_plq.mode, "gemma4")?;
     if params.contains_key(&format!("{}.scales", proj_prefix))
         && let Some(w) = params.get(&format!("{}.weight", proj_prefix))
     {
@@ -3329,6 +3418,56 @@ mod tests {
         }
     }
 
+    /// The widener runs before `apply_weights`, and a K-quant group passes its
+    /// filters (uint32 `.weight`, drifted `Affine` mode). Widening the float16
+    /// `.biases` would erase the signature
+    /// `ensure_kquant_storage_resolves_kquant` needs, turning a named refusal
+    /// into an anonymous shape error on the first forward.
+    ///
+    /// Q6_K was never at risk (int8 scales are not float16); asserted so a
+    /// change to either dtype table has to face both.
+    #[test]
+    fn affine_sidecar_widen_leaves_kquant_storage_alone() {
+        for (label, scales) in [
+            ("q4k/q5k", MxArray::zeros(&[2, 32], Some(DType::Uint8))),
+            ("q6k", MxArray::zeros(&[2, 16], Some(DType::Int8))),
+        ] {
+            let mut params = HashMap::new();
+            params.insert(
+                "layers.0.self_attn.q_proj.weight".to_string(),
+                MxArray::zeros(&[2, 64], Some(DType::Uint32)).expect("packed weight"),
+            );
+            params.insert(
+                "layers.0.self_attn.q_proj.scales".to_string(),
+                scales.expect("kquant scales"),
+            );
+            params.insert(
+                "layers.0.self_attn.q_proj.biases".to_string(),
+                MxArray::zeros(&[2, 2], Some(DType::Float16)).expect("ggml d"),
+            );
+
+            let stats = widen_bf16_affine_text_qmm_sidecars(
+                &mut params,
+                true,
+                4,
+                32,
+                Some(PerLayerMode::Affine),
+                &HashMap::new(),
+            )
+            .expect("widen");
+
+            assert_eq!(stats.arrays, 0, "{label}: K-quant storage must not widen");
+            assert_eq!(stats.projections, 0, "{label}: no projection may count");
+            assert_eq!(
+                params["layers.0.self_attn.q_proj.biases"]
+                    .dtype()
+                    .expect("biases dtype"),
+                DType::Float16,
+                "{label}: the float16 .biases is the guard's signature and must survive"
+            );
+        }
+    }
+
     #[test]
     fn affine_sidecar_widen_gate_requires_explicit_nested_bfloat16() {
         let cases = [
@@ -3715,9 +3854,11 @@ mod tests {
                 .astype(DType::BFloat16)
                 .expect("bf16")
         };
-        // Affine-SHAPED quant group (packed Uint32 weight + scales). The
-        // affine builder stores tensors as-is, so dummies are sufficient for
-        // this loader-seam test.
+        // Affine-SHAPED quant group (packed Uint32 weight + both companions).
+        // The affine builder stores tensors as-is, so dummies are sufficient
+        // for this loader-seam test — but the group must be complete, or the
+        // missing-bias guard fires first and this stops testing partial
+        // quantization at all.
         let quant_group = |p: &mut HashMap<String, MxArray>, base: &str| {
             let w = MxArray::from_float32(&[0.0f32; 4 * 2], &[4, 2])
                 .expect("from_float32")
@@ -3725,6 +3866,7 @@ mod tests {
                 .expect("uint32");
             p.insert(format!("{base}.weight"), w);
             p.insert(format!("{base}.scales"), bf16_w(&[4, 1]));
+            p.insert(format!("{base}.biases"), bf16_w(&[4, 1]));
         };
         let run = |params: &HashMap<String, MxArray>| {
             // lm_head.weight is required for untied configs; inject a valid bf16
@@ -3928,6 +4070,124 @@ mod tests {
             .expect("bf16");
         params.insert("embed_vision.embedding_projection.weight".into(), dense);
         run(&params).expect("bf16 dense projection must keep loading");
+    }
+
+    /// The vision and audio embedding projections name the tensor when their
+    /// affine `.biases` companion is missing, instead of handing the `None`
+    /// straight to `mlx_dequantize`.
+    ///
+    /// Affine decode is `scale * q + bias`, so a null bias is rejected inside
+    /// MLX — but that rejection prints to stderr and comes back as a null
+    /// handle, so the Rust error names only `dequantize_linear`: neither the
+    /// tensor nor `symmetric_zero_point`, the marker whose absence from
+    /// config.json is the reachable cause.
+    ///
+    /// Six gemma4 sites read `.biases` as an `Option` and all are guarded: the
+    /// two linear builders, these two projections, the PLE embedding and
+    /// `router.proj`. The last two fail differently — `router.proj` dequantizes
+    /// eagerly and throws at load, the PLE defers to the first forward.
+    ///
+    /// Mutation this catches: delete either `ensure_affine_biases_present` call
+    /// and the load still fails, but with the anonymous handle error — the
+    /// assertions on the tensor name and the marker fail.
+    #[test]
+    fn embedding_projections_name_a_missing_affine_bias() {
+        use crate::models::quant_dispatch::SYMMETRIC_ZERO_POINT_KEY;
+
+        let json = serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 64,
+            "use_block_paged_cache": false,
+            "has_audio": true,
+            "audio_samples_per_token": 64,
+            "vision_config": {
+                "hidden_size": 16,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-6,
+                "patch_size": 2,
+                "position_embedding_size": 4,
+                "default_output_length": 4,
+                "pooling_kernel_size": 1,
+                "use_clipped_linears": false,
+                "rope_theta": 100.0,
+                "standardize": false,
+            },
+        });
+        let config: Gemma4Config =
+            serde_json::from_value(json).expect("minimal Gemma4Config with vision + audio");
+
+        // Correctly shaped 4-bit affine groups so nothing but the absent
+        // `.biases` can be what rejects them: `load_quantized` checks
+        // out_features, and a shape error would pass this test for the wrong
+        // reason. Vision projects 16 → 16, audio 64 → 16, at group_size 16.
+        let packed = |cols: i64| {
+            MxArray::from_float32(&vec![0.0f32; 16 * cols as usize], &[16, cols])
+                .expect("from_float32")
+                .astype(DType::Uint32)
+                .expect("uint32")
+        };
+        let scales = |cols: i64| {
+            MxArray::from_float32(&vec![0.5f32; 16 * cols as usize], &[16, cols])
+                .expect("from_float32")
+                .astype(DType::Float16)
+                .expect("f16")
+        };
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("embed_vision.embedding_projection.weight".into(), packed(2));
+        params.insert("embed_vision.embedding_projection.scales".into(), scales(1));
+        params.insert("embed_audio.embedding_projection.weight".into(), packed(8));
+        params.insert("embed_audio.embedding_projection.scales".into(), scales(4));
+
+        let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
+        let err = format!(
+            "{}",
+            apply_embed_vision_projection(
+                &mut inner,
+                &params,
+                &HashMap::new(),
+                default_per_layer_quant(4, 16, PerLayerMode::Affine),
+            )
+            .expect_err("an affine vision projection with no .biases must fail loud")
+        );
+        assert!(err.contains("embed_vision.embedding_projection"), "{err}");
+        assert!(err.contains(SYMMETRIC_ZERO_POINT_KEY), "{err}");
+
+        let err = format!(
+            "{}",
+            apply_audio_weights(&mut inner, &params, 4, 16, None, &HashMap::new())
+                .expect_err("an affine audio projection with no .biases must fail loud")
+        );
+        assert!(err.contains("embed_audio.embedding_projection"), "{err}");
+        assert!(err.contains(SYMMETRIC_ZERO_POINT_KEY), "{err}");
+
+        // Control: with the companion present both projections load, so the
+        // guard is scoped to the missing-bias case and not rejecting every
+        // quantized projection.
+        params.insert("embed_vision.embedding_projection.biases".into(), scales(1));
+        params.insert("embed_audio.embedding_projection.biases".into(), scales(4));
+        let mut inner = Gemma4Inner::new(config).expect("Gemma4Inner::new");
+        apply_embed_vision_projection(
+            &mut inner,
+            &params,
+            &HashMap::new(),
+            default_per_layer_quant(4, 16, PerLayerMode::Affine),
+        )
+        .expect("a complete affine vision group must load");
+        apply_audio_weights(&mut inner, &params, 4, 16, None, &HashMap::new())
+            .expect("a complete affine audio group must load");
     }
 
     /// Validator side: `validate_required_weights`' `has()` does not treat a
@@ -4903,6 +5163,141 @@ mod tests {
             "error mentions affine: {}",
             err.reason
         );
+    }
+
+    /// Q6_K mode (int8 sub-block scales + mandatory f16 `d` super-block scale)
+    /// threads the PLQ's resolved 6-bit / group_size-16 params through, tags the
+    /// static "q6k" mode string, and passes the `.biases` tensor. Real gemma4 UD
+    /// GGUFs ship `token_embd` as Q6_K, so this is the load that previously hit
+    /// the `other => Err` arm and could not resolve.
+    #[test]
+    fn resolve_packed_embed_q6k_passes_kquant_params_and_biases() {
+        let weight = MxArray::zeros(&[4, 48], Some(DType::Uint32)).expect("q6k packed weight");
+        let scales = MxArray::zeros(&[4, 16], Some(DType::Int8)).expect("int8 sub-scales");
+        let biases = MxArray::zeros(&[4, 1], Some(DType::Float16)).expect("f16 d");
+        let plq = PerLayerQuant {
+            bits: 6,
+            group_size: 16,
+            mode: PerLayerMode::Q6K,
+            input_amax: None,
+        };
+        let packed =
+            resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, Some(&biases))
+                .expect("q6k embedding must resolve");
+        assert_eq!(packed.bits, 6);
+        assert_eq!(packed.group_size, 16);
+        assert_eq!(packed.mode_str, "q6k");
+        assert!(packed.biases.is_some(), "q6k `d` biases must pass through");
+    }
+
+    /// Q4_K mode (uint8 (sc, m) sub-scales + f16 (d, dmin) biases) threads the
+    /// resolved 4-bit / group_size-32 params through and tags "q4k".
+    #[test]
+    fn resolve_packed_embed_q4k_passes_kquant_params_and_biases() {
+        let weight = MxArray::zeros(&[4, 32], Some(DType::Uint32)).expect("q4k packed weight");
+        let scales = MxArray::zeros(&[4, 16], Some(DType::Uint8)).expect("uint8 (sc,m) scales");
+        let biases = MxArray::zeros(&[4, 2], Some(DType::Float16)).expect("f16 (d,dmin)");
+        let plq = PerLayerQuant {
+            bits: 4,
+            group_size: 32,
+            mode: PerLayerMode::Q4K,
+            input_amax: None,
+        };
+        let packed =
+            resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, Some(&biases))
+                .expect("q4k embedding must resolve");
+        assert_eq!(packed.bits, 4);
+        assert_eq!(packed.group_size, 32);
+        assert_eq!(packed.mode_str, "q4k");
+        assert!(packed.biases.is_some(), "q4k biases must pass through");
+    }
+
+    /// A K-quant embedding with no `.biases` is malformed — the ggml `d`
+    /// super-block scale is mandatory — so it is rejected loud rather than fed to
+    /// the K-quant kernel with a null biases pointer.
+    #[test]
+    fn resolve_packed_embed_q6k_without_biases_fails_loud() {
+        let weight = MxArray::zeros(&[4, 48], Some(DType::Uint32)).expect("q6k packed weight");
+        let scales = MxArray::zeros(&[4, 16], Some(DType::Int8)).expect("int8 sub-scales");
+        let plq = PerLayerQuant {
+            bits: 6,
+            group_size: 16,
+            mode: PerLayerMode::Q6K,
+            input_amax: None,
+        };
+        let err = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, None)
+            .err()
+            .expect("q6k without biases must fail loud");
+        assert!(
+            err.reason.contains("q6k") && err.reason.contains("biases"),
+            "error names the missing q6k biases: {}",
+            err.reason
+        );
+    }
+
+    /// Q6_K storage requires int8 sub-scales; a uint8-scale table under a Q6_K
+    /// mode is a config/tensor contradiction and is rejected loud.
+    #[test]
+    fn resolve_packed_embed_q6k_with_uint8_scales_fails_loud() {
+        let weight = MxArray::zeros(&[4, 48], Some(DType::Uint32)).expect("q6k packed weight");
+        let scales = MxArray::zeros(&[4, 16], Some(DType::Uint8)).expect("wrong uint8 scales");
+        let biases = MxArray::zeros(&[4, 1], Some(DType::Float16)).expect("f16 d");
+        let plq = PerLayerQuant {
+            bits: 6,
+            group_size: 16,
+            mode: PerLayerMode::Q6K,
+            input_amax: None,
+        };
+        let err = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, Some(&biases))
+            .err()
+            .expect("q6k + uint8 scales must fail loud");
+        assert!(
+            err.reason.contains("q6k") && err.reason.contains("Uint8"),
+            "error names the q6k/uint8 scale mismatch: {}",
+            err.reason
+        );
+    }
+
+    /// `.biases` on a K-quant embedding is a raw ggml f16 `d` bit pattern that
+    /// the kernel reads as float16; any other dtype means it is not that array.
+    /// Presence alone is not enough — an upcast/recast sidecar must be rejected
+    /// loud, the same way `resolve_kquant_group` and convert's
+    /// `validate_existing_kquant_entry` reject it on the linear/switch paths.
+    #[test]
+    fn resolve_packed_embed_kquant_with_non_f16_biases_fails_loud() {
+        for (mode, bits, group_size, scales_dtype, weight_cols, scale_cols) in [
+            (PerLayerMode::Q6K, 6, 16, DType::Int8, 48, 16),
+            (PerLayerMode::Q4K, 4, 32, DType::Uint8, 32, 16),
+            (PerLayerMode::Q5K, 5, 32, DType::Uint8, 40, 16),
+        ] {
+            for wrong in [DType::BFloat16, DType::Float32, DType::Uint8] {
+                let weight =
+                    MxArray::zeros(&[4, weight_cols], Some(DType::Uint32)).expect("packed weight");
+                let scales =
+                    MxArray::zeros(&[4, scale_cols], Some(scales_dtype)).expect("sub-scales");
+                let biases = MxArray::zeros(&[4, 2], Some(wrong)).expect("wrong-dtype biases");
+                let plq = PerLayerQuant {
+                    bits,
+                    group_size,
+                    mode,
+                    input_amax: None,
+                };
+                let err = resolve_packed_embed_params(
+                    "embed_tokens",
+                    plq,
+                    &weight,
+                    &scales,
+                    Some(&biases),
+                )
+                .err()
+                .unwrap_or_else(|| panic!("{mode:?} with {wrong:?} biases must fail loud"));
+                assert!(
+                    err.reason.contains("biases") && err.reason.contains("Float16"),
+                    "error names the biases dtype contract for {mode:?}/{wrong:?}: {}",
+                    err.reason
+                );
+            }
+        }
     }
 
     #[test]

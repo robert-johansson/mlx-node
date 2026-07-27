@@ -24,6 +24,25 @@ use crate::array::{DType, MxArray};
 
 const SYM8_GROUP_SIZE_SENTINEL: i32 = -1;
 
+/// `config.json` field naming the zero point a symmetric affine group subtracts
+/// from every code.
+///
+/// A ggml Q4_0 block is `w = d * (q - 8)` and a Q8_0 block is `w = d * (q - 128)`:
+/// one f16 scale per 32 weights and no stored offset. MLX affine is
+/// `w = scale * q + bias`, so the GGUF importer used to write a `.biases` array
+/// whose every entry was `-Z * scale` — 0.5 bpw of pure redundancy. It now omits
+/// that array and records `Z` here instead;
+/// [`expand_symmetric_affine_biases`](crate::engine::persistence::expand_symmetric_affine_biases)
+/// rebuilds the companion at load, before any builder runs, so everything
+/// downstream sees the historical `(weight, scales, biases)` shape.
+///
+/// Deliberately a field on `mode: "affine"` rather than a new mode string: an
+/// unrecognised mode makes [`parse_mode_str`] return `None`, which sends an
+/// older build into a checkpoint-content heuristic that would GUESS a decoder.
+/// Keeping the mode string stable instead routes an older build onto MLX's
+/// deterministic "Biases must be provided for affine quantization" throw.
+pub const SYMMETRIC_ZERO_POINT_KEY: &str = "symmetric_zero_point";
+
 /// Per-layer quantization mode discriminator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PerLayerMode {
@@ -52,6 +71,22 @@ pub enum PerLayerMode {
     /// gather path (qwen3_5_moe, lfm2_moe) has no sym8 kernel and always
     /// resolves to a forced-affine per-layer override instead.
     Sym8,
+    /// ggml Q6_K: 6-bit symmetric super-block (SUPER=256, sub group_size=16).
+    /// Imported from an Unsloth Dynamic GGUF bit-identically to llama.cpp:
+    /// uint32 LSB-first 6-bit `.weight`, int8 (SIGNED ggml `sc`) `.scales`, and
+    /// float16 (ggml `d`) `.biases`. `.biases` holds a per-super-block SCALE,
+    /// not an additive bias — the K-quant kernel recomputes `scale = d[g>>4]*sc[g]`
+    /// and `bias = -32*scale` from the two companions. Consumed by
+    /// `mlx_quantized_matmul` / `mlx_gather_qmm` with mode string `"q6k"`.
+    Q6K,
+    /// ggml Q4_K: 4-bit asymmetric super-block (SUPER=256, sub group_size=32).
+    /// uint32 `.weight`, uint8 `.scales` holding interleaved `(sc, m)` pairs,
+    /// float16 `.biases` holding interleaved `(d, dmin)` pairs. `.biases` holds
+    /// scales, not additive biases. Mode string `"q4k"`.
+    Q4K,
+    /// ggml Q5_K: identical layout to `Q4K` with a 5-bit weight plane. Mode
+    /// string `"q5k"`.
+    Q5K,
 }
 
 /// Per-layer quantization metadata parsed from `config.json`.
@@ -93,8 +128,48 @@ pub fn parse_mode_str(s: Option<&str>) -> Option<PerLayerMode> {
         Some("fp8_e4m3") => Some(PerLayerMode::Fp8E4m3),
         Some("affine") => Some(PerLayerMode::Affine),
         Some("sym8") => Some(PerLayerMode::Sym8),
+        Some("q6k") => Some(PerLayerMode::Q6K),
+        Some("q4k") => Some(PerLayerMode::Q4K),
+        Some("q5k") => Some(PerLayerMode::Q5K),
         _ => None,
     }
+}
+
+/// Encode a `PerLayerMode` back into its `quantization.mode` string — the exact
+/// inverse of [`parse_mode_str`], and the string every mode-aware MLX entry
+/// point is handed.
+///
+/// Three consumers:
+///  - `mlx_quantize` (the MTPLX draft-lm-head quantize helper). C++ has no
+///    `sym8` mode at all, and rejects the K-quant strings outright ("can be read
+///    but not produced", `ops.cpp:5233`), so a nonsensical draft-head spec in
+///    either mode fails loud there instead of mis-packing.
+///  - `mlx_dequantize` (the MTPLX source-head dequantize helper). `sym8` still
+///    fails loud, but the K-quant strings are IMPLEMENTED (`kq_dequantize`,
+///    `ops.cpp:5494`), so a K-quant source head dequantizes rather than throwing.
+///  - the mode-aware `Embedding` load in the dense and MoE loaders, which threads
+///    the on-disk packing mode of `token_embd` / the tied lm_head through to
+///    `mlx_quantized_matmul` so a K-quant embedding is not misread as affine.
+pub(crate) fn mode_to_str(mode: PerLayerMode) -> &'static str {
+    match mode {
+        PerLayerMode::Affine => "affine",
+        PerLayerMode::Mxfp8 => "mxfp8",
+        PerLayerMode::Mxfp4 => "mxfp4",
+        PerLayerMode::Nvfp4 => "nvfp4",
+        PerLayerMode::Fp8E4m3 => crate::quant::fp8_weight::FP8_E4M3_MODE,
+        PerLayerMode::Sym8 => "sym8",
+        PerLayerMode::Q6K => "q6k",
+        PerLayerMode::Q4K => "q4k",
+        PerLayerMode::Q5K => "q5k",
+    }
+}
+
+/// True when `mode` is one of the ggml K-quant families (Q6_K / Q4_K / Q5_K).
+pub fn is_kquant_mode(mode: PerLayerMode) -> bool {
+    matches!(
+        mode,
+        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K
+    )
 }
 
 /// True when the resolved quantization settings reference sym8 anywhere
@@ -117,6 +192,22 @@ pub fn has_sym8_mode(
 ) -> bool {
     top_level_mode == Some(PerLayerMode::Sym8)
         || per_layer.values().any(|p| p.mode == PerLayerMode::Sym8)
+}
+
+/// True when the resolved quantization settings reference a ggml K-quant mode
+/// (Q6_K / Q4_K / Q5_K) anywhere — top-level default OR any per-layer override.
+///
+/// Used by the LM loaders to scope-gate a K-quant checkpoint the same way
+/// `has_sym8_mode` scopes sym8: the speculative MTP head is disabled (the MTP
+/// builders map every K-quant mode to `None`, and an imported GGUF never ships
+/// an MTP head), so the loader fail-softs to plain AR decode. K-quants pack
+/// their weights as uint32 like affine, so — unlike sym8 — the paged KV cache
+/// and vision encoders stay supported.
+pub fn has_kquant_mode(
+    top_level_mode: Option<PerLayerMode>,
+    per_layer: &HashMap<String, PerLayerQuant>,
+) -> bool {
+    top_level_mode.is_some_and(is_kquant_mode) || per_layer.values().any(|p| is_kquant_mode(p.mode))
 }
 
 /// Fail-loud guard for the DENSE (unquantized) weight fallbacks of
@@ -203,6 +294,186 @@ pub fn ensure_plain_fp8_storage_resolves_fp8_e4m3(
     Ok(())
 }
 
+/// Fail-loud guard for K-quant storage whose metadata resolves to another
+/// mode. A K-quant group is `uint32` `.weight` + `int8` (Q6_K) / `uint8`
+/// (Q4_K/Q5_K) `.scales` + mandatory `float16` `.biases`. `int8` scales are
+/// unique to Q6_K, and `uint8` scales paired with a `float16` `.biases` sidecar
+/// are unique to Q4_K/Q5_K (MXFP8/NVFP4 also use `uint8` scales but never a
+/// `.biases` companion; affine uses `float16` scales). So if that signature is
+/// present while the per-layer mode resolves to a NON-K-quant mode, the config
+/// is stale/skewed and handing the group to the affine/mxfp builders would
+/// misdecode it. Call BEFORE dispatching on `plq.mode` in every per-layer
+/// builder, paired with the int8/fp8 storage guards.
+pub fn ensure_kquant_storage_resolves_kquant(
+    params: &HashMap<String, MxArray>,
+    base: &str,
+    mode: PerLayerMode,
+    family: &str,
+) -> Result<()> {
+    if is_kquant_mode(mode) {
+        return Ok(());
+    }
+    let Some(scales) = params.get(&format!("{base}.scales")) else {
+        return Ok(());
+    };
+    let scales_dtype = scales.dtype().ok();
+    let biases_dtype = params
+        .get(&format!("{base}.biases"))
+        .and_then(|b| b.dtype().ok());
+    let looks_q6k = scales_dtype == Some(DType::Int8);
+    let looks_q4k_or_q5k =
+        scales_dtype == Some(DType::Uint8) && biases_dtype == Some(DType::Float16);
+    if looks_q6k || looks_q4k_or_q5k {
+        return Err(Error::from_reason(format!(
+            "{family}: '{base}' carries K-quant storage ('{base}.scales' is {scales_dtype:?} with \
+             a float16 .biases super-block scale) but its per-layer quant mode resolves to \
+             {mode:?} — config drift / stale quantization metadata, refusing to load"
+        )));
+    }
+    Ok(())
+}
+
+/// Fail-loud guard for an affine group whose `.biases` companion is missing.
+///
+/// MLX affine decode is `scale * q + bias` and its `validate_mode_with_type`
+/// throws "Biases must be provided for affine quantization" on a null bias, so
+/// an affine `.scales` with no `.biases` is never loadable — but the builders
+/// take the companion as an `Option` and would carry the `None` all the way to
+/// that generic C++ throw, long after the model appeared to load.
+///
+/// The reachable cause is a checkpoint written by a build that omits the derived
+/// companion for symmetric groups (see [`SYMMETRIC_ZERO_POINT_KEY`]) being read
+/// through a path that never ran
+/// [`expand_symmetric_affine_biases`](crate::engine::persistence::expand_symmetric_affine_biases).
+/// Naming the tensor at load beats decoding garbage or throwing anonymously
+/// later. Call BEFORE dispatching on `plq.mode`, beside the storage guards.
+///
+/// Scoped to a group that has both a `.weight` and a `.scales`, which is exactly
+/// the shape a symmetric checkpoint has on disk. A `.scales` with no `.weight`
+/// is an orphaned sidecar, not a truncated group, and the families already
+/// report those by name — this must not preempt that with a vaguer message.
+pub fn ensure_affine_biases_present(
+    params: &HashMap<String, MxArray>,
+    base: &str,
+    mode: PerLayerMode,
+    family: &str,
+) -> Result<()> {
+    if mode != PerLayerMode::Affine {
+        return Ok(());
+    }
+    if !params.contains_key(&format!("{base}.weight"))
+        || !params.contains_key(&format!("{base}.scales"))
+    {
+        return Ok(());
+    }
+    if params.contains_key(&format!("{base}.biases")) {
+        return Ok(());
+    }
+    Err(Error::from_reason(format!(
+        "{family}: affine group '{base}' has '{base}.scales' but no '{base}.biases' — affine \
+         decode is `scale * q + bias` and cannot run without it. A checkpoint whose \
+         config.json declares '{SYMMETRIC_ZERO_POINT_KEY}' stores the companion implicitly and \
+         needs a build that rebuilds it at load; otherwise the checkpoint is truncated"
+    )))
+}
+
+/// A validated ggml K-quant sidecar group ready to hand to `QuantizedLinear` /
+/// `QuantizedSwitchLinear`. `biases` holds the float16 ggml `d` super-block
+/// SCALE (not an additive bias); the K-quant kernel recombines it with the
+/// integer `scales` sub-block codes.
+pub struct KQuantGroup {
+    pub weight: MxArray,
+    pub scales: MxArray,
+    pub biases: MxArray,
+    pub bits: i32,
+    pub group_size: i32,
+    pub mode_str: &'static str,
+}
+
+/// The `(mode_str, bits, group_size, scales_dtype)` a resolved K-quant mode
+/// demands. Mirrors the MLX FFI's `quantization_params_from_mode` +
+/// `validate_mode_with_type` (`ops.cpp`) so the Rust load-time validation and
+/// the C++ kernel contract cannot drift. Returns `None` for non-K-quant modes.
+pub(crate) fn kquant_mode_params(mode: PerLayerMode) -> Option<(&'static str, i32, i32, DType)> {
+    match mode {
+        PerLayerMode::Q6K => Some(("q6k", 6, 16, DType::Int8)),
+        PerLayerMode::Q4K => Some(("q4k", 4, 32, DType::Uint8)),
+        PerLayerMode::Q5K => Some(("q5k", 5, 32, DType::Uint8)),
+        _ => None,
+    }
+}
+
+/// Resolve and validate a K-quant `.weight`/`.scales`/`.biases` group under
+/// `key_prefix`, the fail-loud template shared by the dense and switch (expert)
+/// K-quant builders across all LM families.
+///
+/// `Ok(None)` ONLY when `{key_prefix}.scales` is absent — the shared "this
+/// projection is not quantized" signal (a mixed-precision UD GGUF legitimately
+/// carries bf16 tensors with no sidecar). Every other shape is FAIL-LOUD `Err`:
+/// a `.weight` or the mandatory `.biases` missing, a wrong companion dtype
+/// (`weight` uint32; `scales` int8 for Q6_K / uint8 for Q4_K/Q5_K; `biases`
+/// float16), or a rank mismatch (`expected_ndim` is 2 for dense projections, 3
+/// for stacked experts). A silent fallback would decode garbage.
+pub fn resolve_kquant_group(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+    mode: PerLayerMode,
+    expected_ndim: usize,
+    family: &str,
+) -> Result<Option<KQuantGroup>> {
+    let Some((mode_str, bits, group_size, scales_dtype)) = kquant_mode_params(mode) else {
+        return Err(Error::from_reason(format!(
+            "{family}: K-quant builder called for non-K-quant mode {mode:?} at '{key_prefix}'"
+        )));
+    };
+    let Some(scales) = params.get(&format!("{key_prefix}.scales")) else {
+        return Ok(None);
+    };
+    let Some(weight) = params.get(&format!("{key_prefix}.weight")) else {
+        return Err(Error::from_reason(format!(
+            "{family} {mode_str} layer '{key_prefix}': .scales present but .weight missing (corrupt checkpoint)"
+        )));
+    };
+    let Some(biases) = params.get(&format!("{key_prefix}.biases")) else {
+        return Err(Error::from_reason(format!(
+            "{family} {mode_str} layer '{key_prefix}': .biases missing — K-quants store the ggml \
+             `d` super-block scale in .biases and it is mandatory"
+        )));
+    };
+    let w_dtype = weight.dtype()?;
+    if w_dtype != DType::Uint32 {
+        return Err(Error::from_reason(format!(
+            "{family} {mode_str} layer '{key_prefix}': expected uint32 packed .weight, got {w_dtype:?}"
+        )));
+    }
+    let s_dtype = scales.dtype()?;
+    if s_dtype != scales_dtype {
+        return Err(Error::from_reason(format!(
+            "{family} {mode_str} layer '{key_prefix}': expected {scales_dtype:?} .scales, got {s_dtype:?}"
+        )));
+    }
+    let b_dtype = biases.dtype()?;
+    if b_dtype != DType::Float16 {
+        return Err(Error::from_reason(format!(
+            "{family} {mode_str} layer '{key_prefix}': expected float16 .biases (ggml `d`), got {b_dtype:?}"
+        )));
+    }
+    let w_ndim = weight.shape()?.len();
+    if w_ndim != expected_ndim {
+        return Err(Error::from_reason(format!(
+            "{family} {mode_str} layer '{key_prefix}': expected {expected_ndim}-D packed .weight, got {w_ndim}-D"
+        )));
+    }
+    Ok(Some(KQuantGroup {
+        weight: weight.clone(),
+        scales: scales.clone(),
+        biases: biases.clone(),
+        bits,
+        group_size,
+        mode_str,
+    }))
+}
+
 /// Build the fallback `PerLayerQuant` used when no per-layer override exists.
 ///
 /// Honors the top-level `quantization.mode` (passed in as `default_mode`)
@@ -270,7 +541,7 @@ fn parse_explicit_mode(value: Option<&Value>, context: &str) -> Result<Option<Pe
     parse_mode_str(Some(mode)).map(Some).ok_or_else(|| {
         Error::from_reason(format!(
             "Unknown quantization mode '{mode}' at {context}; supported modes are affine, \
-             mxfp4, mxfp8, nvfp4, fp8_e4m3, and sym8"
+             mxfp4, mxfp8, nvfp4, fp8_e4m3, sym8, q6k, q4k, and q5k"
         ))
     })
 }
@@ -328,16 +599,20 @@ fn parse_i32(value: &Value, context: &str) -> Result<i32> {
 fn parse_bits(value: &Value, mode: Option<PerLayerMode>, context: &str) -> Result<i32> {
     let bits = parse_i32(value, context)?;
     let valid = match mode {
-        Some(PerLayerMode::Mxfp4) | Some(PerLayerMode::Nvfp4) => bits == 4,
+        Some(PerLayerMode::Mxfp4) | Some(PerLayerMode::Nvfp4) | Some(PerLayerMode::Q4K) => {
+            bits == 4
+        }
         Some(PerLayerMode::Mxfp8) | Some(PerLayerMode::Fp8E4m3) | Some(PerLayerMode::Sym8) => {
             bits == 8
         }
+        Some(PerLayerMode::Q6K) => bits == 6,
+        Some(PerLayerMode::Q5K) => bits == 5,
         Some(PerLayerMode::Affine) | None => matches!(bits, 2 | 3 | 4 | 5 | 6 | 8),
     };
     if !valid {
         return Err(Error::from_reason(format!(
             "Invalid {context}={bits} for mode {mode:?}; affine supports bits 2, 3, 4, 5, 6, or 8, \
-             while mxfp4/nvfp4 require 4 and mxfp8/fp8_e4m3/sym8 require 8"
+             while mxfp4/nvfp4/q4k require 4, mxfp8/fp8_e4m3/sym8 require 8, q6k requires 6, and q5k requires 5"
         )));
     }
     Ok(bits)
@@ -358,13 +633,15 @@ fn parse_group_size(value: &Value, mode: Option<PerLayerMode>, context: &str) ->
     let valid = match mode {
         Some(PerLayerMode::Mxfp4) | Some(PerLayerMode::Mxfp8) => group_size == 32,
         Some(PerLayerMode::Nvfp4) => group_size == 16,
+        Some(PerLayerMode::Q6K) => group_size == 16,
+        Some(PerLayerMode::Q4K) | Some(PerLayerMode::Q5K) => group_size == 32,
         Some(PerLayerMode::Fp8E4m3) | Some(PerLayerMode::Sym8) => false,
         Some(PerLayerMode::Affine) | None => matches!(group_size, 32 | 64 | 128),
     };
     if !valid {
         return Err(Error::from_reason(format!(
             "Invalid {context}={group_size} for mode {mode:?}; affine supports 32, 64, or 128, \
-             mxfp4/mxfp8 require 32, nvfp4 requires 16, and fp8_e4m3/sym8 require null"
+             mxfp4/mxfp8/q4k/q5k require 32, nvfp4/q6k require 16, and fp8_e4m3/sym8 require null"
         )));
     }
     Ok(group_size)
@@ -397,13 +674,130 @@ fn parse_input_amax(
     Ok(Some(cast))
 }
 
+/// Validate a `symmetric_zero_point` field and return the zero point it names.
+///
+/// Legal only on `mode: "affine"`, and only at the one value the algebra
+/// permits: a `bits`-wide unsigned code centred at `1 << (bits - 1)`, which is 8
+/// for ggml Q4_0 and 128 for Q8_0. Any other value would rebuild every bias in
+/// the tensor at the wrong offset — silently, since the shapes still match — so
+/// it is rejected rather than clamped.
+fn parse_symmetric_zero_point(
+    value: Option<&Value>,
+    mode: PerLayerMode,
+    bits: i32,
+    context: &str,
+) -> Result<Option<i32>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if mode != PerLayerMode::Affine {
+        return Err(Error::from_reason(format!(
+            "Invalid {context}: {SYMMETRIC_ZERO_POINT_KEY} describes an affine group whose \
+             derived .biases companion was omitted, got mode {mode:?}"
+        )));
+    }
+    let zero_point = parse_i32(value, context)?;
+    let expected = 1i32 << (bits - 1);
+    if zero_point != expected {
+        return Err(Error::from_reason(format!(
+            "Invalid {context}={zero_point} for {bits}-bit affine; a symmetric group subtracts \
+             {expected}"
+        )));
+    }
+    Ok(Some(zero_point))
+}
+
+/// The zero points a checkpoint's `quantization` block declares, resolved the
+/// way the loaders resolve any other per-layer setting.
+///
+/// `per_layer` maps a [`normalize_per_layer_key`]-normalized tensor prefix to
+/// its declared zero point; an entry present with value `None` means that
+/// tensor has an override which is NOT symmetric, and must therefore shadow the
+/// top-level `default` rather than inherit it.
+#[derive(Debug, Default, Clone)]
+pub struct SymmetricZeroPoints {
+    pub default: Option<i32>,
+    pub per_layer: HashMap<String, Option<i32>>,
+}
+
+impl SymmetricZeroPoints {
+    /// The zero point in force for an already-normalized tensor prefix.
+    pub fn for_key(&self, normalized_prefix: &str) -> Option<i32> {
+        match self.per_layer.get(normalized_prefix) {
+            Some(entry) => *entry,
+            None => self.default,
+        }
+    }
+
+    /// True when nothing in the block declares symmetry, so no companion needs
+    /// rebuilding and the checkpoint behaves exactly as it did before the field
+    /// existed.
+    pub fn is_empty(&self) -> bool {
+        self.default.is_none() && self.per_layer.values().all(Option::is_none)
+    }
+}
+
+/// Read the `symmetric_zero_point` declarations out of a `quantization` block.
+///
+/// Shares [`parse_per_layer_entries`] with the ordinary settings parse, so the
+/// two readers cannot disagree about which children are quantization entries or
+/// which zero points are legal.
+pub fn parse_symmetric_zero_points(
+    quant_cfg: Option<&Value>,
+    fallback_group_size: i32,
+) -> Result<SymmetricZeroPoints> {
+    let obj = quant_object(quant_cfg)?;
+    let top_level_mode = parse_explicit_mode(
+        obj.and_then(|q| q.get("mode")),
+        "top-level quantization.mode",
+    )?;
+    let default = top_level_symmetric_zero_point(obj, top_level_mode)?;
+    let (_, per_layer) = parse_per_layer_entries(obj, fallback_group_size)?;
+    Ok(SymmetricZeroPoints { default, per_layer })
+}
+
+/// Validate the block-level `symmetric_zero_point`, which every tensor without
+/// its own override inherits.
+fn top_level_symmetric_zero_point(
+    obj: Option<&serde_json::Map<String, Value>>,
+    top_level_mode: Option<PerLayerMode>,
+) -> Result<Option<i32>> {
+    let Some(value) = obj.and_then(|q| q.get(SYMMETRIC_ZERO_POINT_KEY)) else {
+        return Ok(None);
+    };
+    let bits_value = obj.and_then(|q| q.get("bits")).ok_or_else(|| {
+        Error::from_reason(format!(
+            "Invalid top-level quantization.{SYMMETRIC_ZERO_POINT_KEY}: a symmetric group must \
+             also declare integer bits"
+        ))
+    })?;
+    let bits = parse_bits(bits_value, top_level_mode, "top-level quantization.bits")?;
+    parse_symmetric_zero_point(
+        Some(value),
+        top_level_mode.unwrap_or(PerLayerMode::Affine),
+        bits,
+        &format!("top-level quantization.{SYMMETRIC_ZERO_POINT_KEY}"),
+    )
+}
+
 fn parse_per_layer_overrides(
     obj: Option<&serde_json::Map<String, Value>>,
     fallback_group_size: i32,
 ) -> Result<HashMap<String, PerLayerQuant>> {
+    Ok(parse_per_layer_entries(obj, fallback_group_size)?.0)
+}
+
+/// Walk the per-tensor children of a `quantization` block once, yielding both
+/// the `PerLayerQuant` overrides and the `symmetric_zero_point` declarations.
+#[allow(clippy::type_complexity)]
+fn parse_per_layer_entries(
+    obj: Option<&serde_json::Map<String, Value>>,
+    fallback_group_size: i32,
+) -> Result<(HashMap<String, PerLayerQuant>, HashMap<String, Option<i32>>)> {
     let mut per_layer = HashMap::new();
+    let mut zero_points = HashMap::new();
     let Some(obj) = obj else {
-        return Ok(per_layer);
+        return Ok((per_layer, zero_points));
     };
 
     for (key, value) in obj {
@@ -425,7 +819,8 @@ fn parse_per_layer_overrides(
         let looks_quantized = child.contains_key("bits")
             || child.contains_key("group_size")
             || child.contains_key("mode")
-            || child.contains_key("input_amax");
+            || child.contains_key("input_amax")
+            || child.contains_key(SYMMETRIC_ZERO_POINT_KEY);
         if !looks_quantized {
             // Compatibility: unrelated nested metadata objects with no quant
             // schema fields remain outside the per-layer override map.
@@ -445,6 +840,8 @@ fn parse_per_layer_overrides(
             Some(value) => parse_group_size(value, Some(mode), &format!("{context}.group_size"))?,
             None if matches!(mode, PerLayerMode::Mxfp4 | PerLayerMode::Mxfp8) => 32,
             None if mode == PerLayerMode::Nvfp4 => 16,
+            None if mode == PerLayerMode::Q6K => 16,
+            None if matches!(mode, PerLayerMode::Q4K | PerLayerMode::Q5K) => 32,
             None if mode == PerLayerMode::Fp8E4m3 => crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
             None if mode == PerLayerMode::Sym8 => SYM8_GROUP_SIZE_SENTINEL,
             None => {
@@ -462,8 +859,16 @@ fn parse_per_layer_overrides(
             mode,
             &format!("{context}.input_amax"),
         )?;
+        let zero_point = parse_symmetric_zero_point(
+            child.get(SYMMETRIC_ZERO_POINT_KEY),
+            mode,
+            bits,
+            &format!("{context}.{SYMMETRIC_ZERO_POINT_KEY}"),
+        )?;
+        let normalized = normalize_per_layer_key(key);
+        zero_points.insert(normalized.clone(), zero_point);
         per_layer.insert(
-            normalize_per_layer_key(key),
+            normalized,
             PerLayerQuant {
                 bits,
                 group_size,
@@ -472,7 +877,7 @@ fn parse_per_layer_overrides(
             },
         );
     }
-    Ok(per_layer)
+    Ok((per_layer, zero_points))
 }
 
 /// Parse the `quantization` (or legacy `quantization_config`) block from a
@@ -506,6 +911,7 @@ pub fn parse_quant_block(
                 .to_string(),
         ));
     }
+    top_level_symmetric_zero_point(obj, top_level_mode)?;
     let per_layer = parse_per_layer_overrides(obj, fallback_group_size)?;
     Ok((top_level_mode, per_layer))
 }
@@ -545,6 +951,7 @@ pub fn parse_quant_settings(
                 .to_string(),
         ));
     }
+    top_level_symmetric_zero_point(obj, top_level_mode)?;
     let per_layer = parse_per_layer_overrides(obj, group_size)?;
     Ok((bits, group_size, top_level_mode, per_layer))
 }
@@ -663,6 +1070,13 @@ pub fn merge_per_layer(
 ) -> Option<PerLayerQuant> {
     fn mode_rank(m: PerLayerMode) -> u8 {
         match m {
+            // K-quants are ggml-native lossless imports; rank them above the
+            // requantized affine/MX/NV modes. `mode_rank` is only consulted on
+            // EQUAL bits, and the two K-quant families never share a bit width
+            // (6 / 5 / 4), so the ordering among them is nominal.
+            PerLayerMode::Q6K => 8,
+            PerLayerMode::Q5K => 7,
+            PerLayerMode::Q4K => 6,
             PerLayerMode::Affine => 5,
             PerLayerMode::Fp8E4m3 => 4,
             PerLayerMode::Sym8 => 3,
@@ -756,6 +1170,74 @@ mod tests {
         assert_eq!(parse_mode_str(Some("sym8")), Some(PerLayerMode::Sym8));
         assert_eq!(parse_mode_str(Some("bogus")), None);
         assert_eq!(parse_mode_str(None), None);
+    }
+
+    /// `mode_to_str` is the exact inverse of `parse_mode_str`. Nothing else
+    /// pins the two tables together, so a mode added to one and not the other
+    /// (or spelled differently) would only surface as a checkpoint that writes
+    /// a string it cannot read back. Enumerating every variant also makes a new
+    /// `PerLayerMode` a compile error here rather than a silent gap.
+    #[test]
+    fn mode_to_str_round_trips_through_parse_mode_str() {
+        for mode in [
+            PerLayerMode::Affine,
+            PerLayerMode::Mxfp8,
+            PerLayerMode::Mxfp4,
+            PerLayerMode::Nvfp4,
+            PerLayerMode::Fp8E4m3,
+            PerLayerMode::Sym8,
+            PerLayerMode::Q6K,
+            PerLayerMode::Q4K,
+            PerLayerMode::Q5K,
+        ] {
+            let encoded = mode_to_str(mode);
+            assert_eq!(
+                parse_mode_str(Some(encoded)),
+                Some(mode),
+                "mode {mode:?} encodes to '{encoded}' which parse_mode_str does not decode back"
+            );
+        }
+    }
+
+    /// The K-quant `(mode_str, bits, group_size, scales_dtype)` table is the
+    /// single mirror of the MLX FFI contract, consumed by `resolve_kquant_group`
+    /// and by gemma4's packed-embedding arm. Pin it, including that it returns
+    /// `None` for every non-K-quant mode, and that its mode string agrees with
+    /// `mode_to_str`.
+    #[test]
+    fn kquant_mode_params_pins_the_ffi_contract() {
+        assert_eq!(
+            kquant_mode_params(PerLayerMode::Q6K),
+            Some(("q6k", 6, 16, DType::Int8))
+        );
+        assert_eq!(
+            kquant_mode_params(PerLayerMode::Q4K),
+            Some(("q4k", 4, 32, DType::Uint8))
+        );
+        assert_eq!(
+            kquant_mode_params(PerLayerMode::Q5K),
+            Some(("q5k", 5, 32, DType::Uint8))
+        );
+        for mode in [
+            PerLayerMode::Affine,
+            PerLayerMode::Mxfp8,
+            PerLayerMode::Mxfp4,
+            PerLayerMode::Nvfp4,
+            PerLayerMode::Fp8E4m3,
+            PerLayerMode::Sym8,
+        ] {
+            assert!(
+                kquant_mode_params(mode).is_none(),
+                "non-K-quant mode {mode:?} must have no K-quant FFI parameters"
+            );
+        }
+        for mode in [PerLayerMode::Q6K, PerLayerMode::Q4K, PerLayerMode::Q5K] {
+            assert_eq!(
+                kquant_mode_params(mode).map(|(s, ..)| s),
+                Some(mode_to_str(mode)),
+                "K-quant FFI mode string must agree with mode_to_str for {mode:?}"
+            );
+        }
     }
 
     #[test]
@@ -1190,6 +1672,313 @@ mod tests {
         );
         assert!(has_sym8_mode(None, &overrides));
         assert!(has_sym8_mode(Some(PerLayerMode::Affine), &overrides));
+    }
+
+    /// Minimal well-typed K-quant sidecar group: uint32 `.weight`, int8 (Q6_K)
+    /// or uint8 (Q4_K/Q5_K) `.scales`, and float16 `.biases` (the ggml `d`
+    /// super-block scale). Shapes are token-sized — the resolver only checks
+    /// dtypes and rank, not the packing arithmetic (that is the FFI's job).
+    fn kquant_group_params(prefix: &str, mode: PerLayerMode) -> HashMap<String, MxArray> {
+        let scales = match mode {
+            PerLayerMode::Q6K => MxArray::from_float32(&[1.0, -1.0], &[1, 2])
+                .unwrap()
+                .astype(DType::Int8)
+                .unwrap(),
+            _ => MxArray::from_float32(&[1.0, 2.0], &[1, 2])
+                .unwrap()
+                .astype(DType::Uint8)
+                .unwrap(),
+        };
+        let biases = MxArray::from_float16(&[half::f16::from_f32(0.5).to_bits()], &[1, 1]).unwrap();
+        let weight = MxArray::from_uint32(&[0u32; 4], &[1, 4]).unwrap();
+        HashMap::from([
+            (format!("{prefix}.weight"), weight),
+            (format!("{prefix}.scales"), scales),
+            (format!("{prefix}.biases"), biases),
+        ])
+    }
+
+    #[test]
+    fn parse_mode_str_recognises_kquant() {
+        assert_eq!(parse_mode_str(Some("q6k")), Some(PerLayerMode::Q6K));
+        assert_eq!(parse_mode_str(Some("q4k")), Some(PerLayerMode::Q4K));
+        assert_eq!(parse_mode_str(Some("q5k")), Some(PerLayerMode::Q5K));
+        assert!(is_kquant_mode(PerLayerMode::Q6K));
+        assert!(is_kquant_mode(PerLayerMode::Q4K));
+        assert!(is_kquant_mode(PerLayerMode::Q5K));
+        assert!(!is_kquant_mode(PerLayerMode::Affine));
+    }
+
+    /// The fail-closed `(bits, group_size)` tables accept exactly each K-quant's
+    /// width — the W4 gate: a naive `32 / bits` derivation is wrong for
+    /// `32/5` and `32/6`, so the parser MUST key on the mode, not arithmetic.
+    #[test]
+    fn kquant_bits_and_group_size_validate_per_mode() {
+        for (m, bits, gs) in [("q6k", 6, 16), ("q4k", 4, 32), ("q5k", 5, 32)] {
+            let cfg = serde_json::json!({"mode": m, "bits": bits, "group_size": gs});
+            let (b, g, mode, _) = parse_quant_settings(Some(&cfg), 4, 64).unwrap();
+            assert_eq!((b, g), (bits, gs), "{m} defaults");
+            assert_eq!(mode, parse_mode_str(Some(m)));
+        }
+        for bad in [
+            serde_json::json!({"mode":"q6k","bits":4,"group_size":16}),
+            serde_json::json!({"mode":"q4k","bits":6,"group_size":32}),
+            serde_json::json!({"mode":"q5k","bits":4,"group_size":32}),
+            serde_json::json!({"mode":"q6k","bits":6,"group_size":32}),
+            serde_json::json!({"mode":"q4k","bits":4,"group_size":16}),
+            serde_json::json!({"mode":"q6k","bits":6,"group_size":null}),
+        ] {
+            assert!(
+                parse_quant_settings(Some(&bad), 4, 64).is_err(),
+                "must reject: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn has_kquant_mode_detects_top_level_and_per_layer() {
+        let empty: HashMap<String, PerLayerQuant> = HashMap::new();
+        assert!(has_kquant_mode(Some(PerLayerMode::Q6K), &empty));
+        assert!(!has_kquant_mode(Some(PerLayerMode::Affine), &empty));
+        assert!(!has_kquant_mode(None, &empty));
+        let mut overrides: HashMap<String, PerLayerQuant> = HashMap::new();
+        overrides.insert(
+            "layers.0.mlp.up_proj".into(),
+            PerLayerQuant {
+                bits: 4,
+                group_size: 32,
+                mode: PerLayerMode::Q4K,
+                input_amax: None,
+            },
+        );
+        assert!(has_kquant_mode(None, &overrides));
+        assert!(has_kquant_mode(Some(PerLayerMode::Affine), &overrides));
+        assert!(!has_sym8_mode(None, &overrides));
+    }
+
+    #[test]
+    fn resolve_kquant_group_fail_loud_contract() {
+        // Absent .scales → Ok(None): a bf16 fallback tensor in a mixed GGUF.
+        let mut p = kquant_group_params("l", PerLayerMode::Q6K);
+        p.remove("l.scales");
+        assert!(matches!(
+            resolve_kquant_group(&p, "l", PerLayerMode::Q6K, 2, "t"),
+            Ok(None)
+        ));
+
+        // Well-formed → Some carrying the mode's fixed bits/group/mode string.
+        let p = kquant_group_params("l", PerLayerMode::Q4K);
+        let g = resolve_kquant_group(&p, "l", PerLayerMode::Q4K, 2, "t")
+            .unwrap()
+            .unwrap();
+        assert_eq!((g.bits, g.group_size, g.mode_str), (4, 32, "q4k"));
+
+        // .scales present but .weight missing → Err.
+        let mut p = kquant_group_params("l", PerLayerMode::Q6K);
+        p.remove("l.weight");
+        assert!(resolve_kquant_group(&p, "l", PerLayerMode::Q6K, 2, "t").is_err());
+
+        // Mandatory .biases missing → Err (K-quants always carry `d`).
+        let mut p = kquant_group_params("l", PerLayerMode::Q6K);
+        p.remove("l.biases");
+        assert!(resolve_kquant_group(&p, "l", PerLayerMode::Q6K, 2, "t").is_err());
+
+        // Wrong scales dtype for the mode (q6k wants int8; hand it uint8) → Err.
+        let p = kquant_group_params("l", PerLayerMode::Q4K);
+        assert!(resolve_kquant_group(&p, "l", PerLayerMode::Q6K, 2, "t").is_err());
+
+        // Wrong rank (dense expects 2-D, ask for 3-D) → Err.
+        let p = kquant_group_params("l", PerLayerMode::Q6K);
+        assert!(resolve_kquant_group(&p, "l", PerLayerMode::Q6K, 3, "t").is_err());
+
+        // Non-K-quant mode into the K-quant resolver → Err.
+        let p = kquant_group_params("l", PerLayerMode::Q6K);
+        assert!(resolve_kquant_group(&p, "l", PerLayerMode::Affine, 2, "t").is_err());
+    }
+
+    #[test]
+    fn ensure_kquant_storage_guard_catches_skewed_metadata() {
+        // Q6_K storage (int8 scales + f16 biases) under a resolved affine mode.
+        let p = kquant_group_params("proj", PerLayerMode::Q6K);
+        assert!(
+            ensure_kquant_storage_resolves_kquant(&p, "proj", PerLayerMode::Affine, "t").is_err()
+        );
+        // Same storage under the correct K mode passes.
+        ensure_kquant_storage_resolves_kquant(&p, "proj", PerLayerMode::Q6K, "t").unwrap();
+
+        // Q4_K storage (uint8 scales + f16 biases) under mxfp8 (which has no
+        // biases companion) is skewed → Err.
+        let p = kquant_group_params("proj", PerLayerMode::Q4K);
+        assert!(
+            ensure_kquant_storage_resolves_kquant(&p, "proj", PerLayerMode::Mxfp8, "t").is_err()
+        );
+        // A genuine mxfp8 group (uint8 scales, NO biases) is NOT K storage → Ok.
+        let mut mx = kquant_group_params("proj", PerLayerMode::Q4K);
+        mx.remove("proj.biases");
+        ensure_kquant_storage_resolves_kquant(&mx, "proj", PerLayerMode::Mxfp8, "t").unwrap();
+    }
+
+    /// An affine group in the shape a symmetric checkpoint has on disk:
+    /// float16 scales, no `.biases`.
+    fn affine_group_without_bias(prefix: &str) -> HashMap<String, MxArray> {
+        let scales =
+            MxArray::from_float16(&[half::f16::from_f32(0.125).to_bits(); 2], &[1, 2]).unwrap();
+        HashMap::from([
+            (
+                format!("{prefix}.weight"),
+                MxArray::from_uint32(&[0u32; 4], &[1, 4]).unwrap(),
+            ),
+            (format!("{prefix}.scales"), scales),
+        ])
+    }
+
+    #[test]
+    fn ensure_affine_biases_present_names_the_truncated_tensor() {
+        // The reachable cause: a checkpoint whose config declares a symmetric
+        // zero point, read through a path that never rebuilt the companion.
+        // Without this the `None` rides all the way to MLX's anonymous
+        // "Biases must be provided for affine quantization" throw.
+        let p = affine_group_without_bias("layers.0.mlp.down_proj");
+        let err =
+            ensure_affine_biases_present(&p, "layers.0.mlp.down_proj", PerLayerMode::Affine, "t")
+                .expect_err("an affine group with no .biases must not load");
+        assert!(
+            err.reason.contains("layers.0.mlp.down_proj")
+                && err.reason.contains(SYMMETRIC_ZERO_POINT_KEY),
+            "the error must name the tensor and the field: {}",
+            err.reason
+        );
+
+        // The same group once the companion is present → Ok.
+        let mut ok = affine_group_without_bias("layers.0.mlp.down_proj");
+        ok.insert(
+            "layers.0.mlp.down_proj.biases".to_string(),
+            MxArray::from_float16(&[half::f16::from_f32(-1.0).to_bits(); 2], &[1, 2]).unwrap(),
+        );
+        ensure_affine_biases_present(&ok, "layers.0.mlp.down_proj", PerLayerMode::Affine, "t")
+            .unwrap();
+    }
+
+    #[test]
+    fn ensure_affine_biases_present_leaves_the_biasless_modes_alone() {
+        // Weakening this guard into "a missing bias means synthesise one" would
+        // hand a fabricated companion to every one-companion mode, so it must
+        // stay silent for all of them and for an unquantized prefix.
+        let p = affine_group_without_bias("proj");
+        for mode in [
+            PerLayerMode::Mxfp4,
+            PerLayerMode::Mxfp8,
+            PerLayerMode::Nvfp4,
+            PerLayerMode::Fp8E4m3,
+            PerLayerMode::Sym8,
+            PerLayerMode::Q4K,
+            PerLayerMode::Q5K,
+            PerLayerMode::Q6K,
+        ] {
+            ensure_affine_biases_present(&p, "proj", mode, "t")
+                .unwrap_or_else(|e| panic!("{mode:?} must not be judged by the affine rule: {e}"));
+        }
+        // No `.scales` at all is a dense tensor, not a truncated affine group.
+        let dense = HashMap::from([(
+            "proj.weight".to_string(),
+            MxArray::from_uint32(&[0u32; 4], &[1, 4]).unwrap(),
+        )]);
+        ensure_affine_biases_present(&dense, "proj", PerLayerMode::Affine, "t").unwrap();
+
+        // A `.scales` with no `.weight` is an orphaned sidecar. The families
+        // name those precisely (gemma4's MLP orphan scan, qwen3_5_moe's dense
+        // fallback dtype guard); this guard must stay out of the way so the
+        // better message is the one the user sees.
+        let mut orphan = affine_group_without_bias("proj");
+        orphan.remove("proj.weight");
+        ensure_affine_biases_present(&orphan, "proj", PerLayerMode::Affine, "t").unwrap();
+    }
+
+    #[test]
+    fn symmetric_zero_point_is_rejected_outside_its_one_legal_shape() {
+        let block = |v: Value| -> Result<()> { parse_quant_settings(Some(&v), 4, 32).map(|_| ()) };
+        // The legal pair for each width.
+        block(serde_json::json!({
+            "bits": 4, "group_size": 32, "mode": "affine", SYMMETRIC_ZERO_POINT_KEY: 8,
+        }))
+        .expect("4-bit affine subtracts 8");
+        block(serde_json::json!({
+            "bits": 8, "group_size": 32, "mode": "affine", SYMMETRIC_ZERO_POINT_KEY: 128,
+        }))
+        .expect("8-bit affine subtracts 128");
+
+        // Off-by-one, cross-width, and a non-affine mode all fail.
+        for bad in [
+            serde_json::json!({
+                "bits": 4, "group_size": 32, "mode": "affine", SYMMETRIC_ZERO_POINT_KEY: 7,
+            }),
+            serde_json::json!({
+                "bits": 4, "group_size": 32, "mode": "affine", SYMMETRIC_ZERO_POINT_KEY: 128,
+            }),
+            serde_json::json!({
+                "bits": 8, "group_size": 32, "mode": "affine", SYMMETRIC_ZERO_POINT_KEY: 8,
+            }),
+            serde_json::json!({
+                "bits": 4, "group_size": 32, "mode": "mxfp4", SYMMETRIC_ZERO_POINT_KEY: 8,
+            }),
+            serde_json::json!({
+                "bits": 6, "group_size": 16, "mode": "q6k", SYMMETRIC_ZERO_POINT_KEY: 32,
+            }),
+            serde_json::json!({ "group_size": 32, "mode": "affine", SYMMETRIC_ZERO_POINT_KEY: 8 }),
+        ] {
+            let err = block(bad.clone()).expect_err(&format!("{bad} must be rejected"));
+            assert!(
+                err.reason.contains(SYMMETRIC_ZERO_POINT_KEY),
+                "{bad}: unexpected message {}",
+                err.reason
+            );
+        }
+
+        // A per-tensor override is held to the same rule.
+        let err = block(serde_json::json!({
+            "bits": 4,
+            "group_size": 32,
+            "mode": "affine",
+            "model.layers.0.mlp.down_proj": {
+                "bits": 4, "group_size": 32, "mode": "affine", SYMMETRIC_ZERO_POINT_KEY: 4,
+            },
+        }))
+        .expect_err("an override may not declare its own wrong zero point");
+        assert!(
+            err.reason.contains(SYMMETRIC_ZERO_POINT_KEY),
+            "{}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn symmetric_zero_points_shadow_the_default_per_tensor() {
+        let quant = serde_json::json!({
+            "bits": 4,
+            "group_size": 32,
+            "mode": "affine",
+            SYMMETRIC_ZERO_POINT_KEY: 8,
+            "language_model.model.embed_tokens": { "bits": 6, "group_size": 16, "mode": "q6k" },
+            "language_model.model.layers.1.mlp.down_proj": {
+                "bits": 4, "group_size": 32, "mode": "affine",
+            },
+        });
+        let z = parse_symmetric_zero_points(Some(&quant), 32).expect("parse");
+        assert!(!z.is_empty());
+        // Unlisted tensors inherit the block default.
+        assert_eq!(z.for_key("layers.0.self_attn.q_proj"), Some(8));
+        // A listed tensor takes its own answer, symmetric or not — inheriting
+        // here would collide with the q6k super-block `d` stored in `.biases`.
+        assert_eq!(z.for_key("embed_tokens"), None);
+        assert_eq!(z.for_key("layers.1.mlp.down_proj"), None);
+
+        // No marker anywhere → nothing to rebuild.
+        let plain = serde_json::json!({ "bits": 4, "group_size": 32, "mode": "affine" });
+        assert!(
+            parse_symmetric_zero_points(Some(&plain), 32)
+                .expect("parse")
+                .is_empty()
+        );
     }
 
     #[test]

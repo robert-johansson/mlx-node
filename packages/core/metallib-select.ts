@@ -540,12 +540,15 @@ export function assertMetallibIntegrity(
  *   offset 10: u8 library type, 0x00 (executable)
  *   offset 11: u8 target-OS tag, 0x81 (macOS)
  *   offset 12: u16 LE min-OS major, offset 14: u8 min-OS minor,
- *              offset 15: u8 min-OS patch (air-vtool `PlatformUpdate`)
- *              (`0f00 0000` / `1a00 0000` / `1a00 0200` / `1a00 0502` for
- *              15.0/26.0/26.2/26.5.2). Minor and patch are SEPARATE bytes:
- *              a u16 read at 14 folds a nonzero patch into the minor
- *              (26.5.2 -> "26.517") and spuriously fails the floor gate on
- *              any host whose macOS version has a patch component.
+ *              offset 15: u8 min-OS update/patch
+ *              (`0f00 0000` / `1a00 0000` / `1a00 0200` / `1a00 0502`
+ *              for 15.0 / 26.0 / 26.2 / 26.5.2)
+ *
+ * The minor and update are two separate bytes, NOT one u16 minor. Every
+ * target used to validate this layout happened to have update == 0, where
+ * the two readings coincide; a non-zero update (macOS 26.5.2 -> `0502`)
+ * makes the u16 reading report minor 517. Cross-checked against
+ * `xcrun air-vtool -show`, which prints PlatformMajor/Minor/Update.
  */
 export function parseMetallibMinOs(metallib: Buffer): string | undefined {
   if (metallib.byteLength < 16) return undefined;
@@ -555,11 +558,11 @@ export function parseMetallibMinOs(metallib: Buffer): string | undefined {
   if (metallib[10] !== 0x00 || metallib[11] !== 0x81) return undefined;
   const major = metallib.readUInt16LE(12);
   const minor = metallib[14];
-  const patch = metallib[15];
+  const update = metallib[15];
   // macOS majors run 10 (Yosemite era) through the year-based 26+; anything
   // outside a generous bound means the offset no longer holds a version.
   if (major < 10 || major > 99) return undefined;
-  return patch === 0 ? `${major}.${minor}` : `${major}.${minor}.${patch}`;
+  return update === 0 ? `${major}.${minor}` : `${major}.${minor}.${update}`;
 }
 
 /**
