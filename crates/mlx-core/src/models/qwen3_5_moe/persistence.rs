@@ -2335,7 +2335,8 @@ mod tests {
             }
         }
 
-        let out = sanitize_weights(params, &config).expect("K-quant expert stacking must succeed");
+        let (out, _merged_qkvz) =
+            sanitize_weights(params, &config).expect("K-quant expert stacking must succeed");
 
         for proj in ["gate_proj", "up_proj", "down_proj"] {
             let w = out

@@ -11697,8 +11697,11 @@ mod tests {
     /// group_size 32) has materially worse round-trip error than affine
     /// 8-bit (per-group scale + bias, group_size 64) on the gate-shaped
     /// tensor. The check is loose: we only require MXFP8 error to exceed
-    /// affine error by at least 5x. Tightening this further would risk
-    /// flakiness across MLX backend changes.
+    /// affine error by at least 4x. Tightening this further would risk
+    /// flakiness across MLX backend changes. (The bound was 5x when Metal's
+    /// e8m0 encode rounded the exponent to nearest, saturating the largest
+    /// weights and inflating the ratio to ~10x; with round-up encode all
+    /// backends measure ~4.9x — genmlx-ny70.)
     #[test]
     fn router_gate_shape_mxfp8_vs_affine_error() {
         // Router gate shape from Qwen3.6-35B-A3B MoE: 256 experts, hidden 2048.
@@ -11713,7 +11716,7 @@ mod tests {
             err_mxfp8 / err_affine.max(1e-9)
         );
         assert!(
-            err_mxfp8 > err_affine * 5.0,
+            err_mxfp8 > err_affine * 4.0,
             "expected MXFP8 error to be much larger than affine 8-bit on router-gate-shaped tensor; \
              got mxfp8={err_mxfp8}, affine8={err_affine}"
         );
