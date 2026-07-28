@@ -494,6 +494,81 @@ pub fn compiled_call(
         .collect()
 }
 
+/// Captured-replay call (genmlx-7prh): like `compiledCall`, but the outputs
+/// come back EVALUATED, and after the first successful capture every later
+/// call is launch-only in the CUDA backend (retained graph execs + retained
+/// buffers — no tape clone, no per-op scheduler walk). On Metal, on CPU-only
+/// builds, or when the tape cannot be captured (a CPU-stream op, a graph
+/// fallback), the handle permanently falls back to trace-cache replay +
+/// eval — behaviorally identical, just slower. `compiledIsCaptured` reports
+/// which path a handle is on.
+#[napi(js_name = "compiledCallCaptured")]
+pub fn compiled_call_captured(
+    env: Env,
+    handle: &mut External<CompiledFnHandle>,
+    inputs: Vec<&MxArray>,
+) -> Result<Vec<MxArray>> {
+    let h = handle.as_mut();
+    if h.disposed {
+        return Err(Error::from_reason("compiledCallCaptured: handle already freed"));
+    }
+    if inputs.is_empty() {
+        return Err(Error::from_reason("compiledCallCaptured: inputs cannot be empty"));
+    }
+
+    let raw_env = env.raw();
+    let mut func_val: napi::sys::napi_value = std::ptr::null_mut();
+    let status =
+        unsafe { napi::sys::napi_get_reference_value(raw_env, h.func_ref, &mut func_val) };
+    if status != napi::sys::Status::napi_ok || func_val.is_null() {
+        return Err(Error::from_reason("compiledCallCaptured: builder function is gone"));
+    }
+    h.ctx.env = raw_env;
+    h.ctx.func = func_val;
+    h.ctx.error = None;
+
+    let input_handles: Vec<*mut sys::mlx_array> =
+        inputs.iter().map(|a| a.as_raw_ptr()).collect();
+
+    const MAX_OUTPUTS: usize = 16;
+    let mut output_handles: Vec<*mut sys::mlx_array> =
+        vec![std::ptr::null_mut(); MAX_OUTPUTS];
+
+    let num_outputs = unsafe {
+        sys::mlx_compiled_call_captured(
+            h.handle,
+            input_handles.as_ptr(),
+            input_handles.len(),
+            output_handles.as_mut_ptr(),
+            MAX_OUTPUTS,
+        )
+    };
+
+    if let Some(error) = &h.ctx.error {
+        return Err(Error::from_reason(format!("compiledCallCaptured: {}", error)));
+    }
+    if num_outputs == 0 {
+        return Err(Error::from_reason("compiledCallCaptured: returned 0 outputs"));
+    }
+
+    output_handles[..num_outputs]
+        .iter()
+        .map(|&hd| MxArray::from_handle(hd, "compiled_call_captured_output"))
+        .collect()
+}
+
+/// True when the handle completed a replay capture and its
+/// `compiledCallCaptured` calls are launch-only (the honesty probe — no
+/// silent path ambiguity in tests or benches).
+#[napi(js_name = "compiledIsCaptured")]
+pub fn compiled_is_captured(handle: &External<CompiledFnHandle>) -> bool {
+    let h = handle.as_ref();
+    if h.disposed || h.handle.is_null() {
+        return false;
+    }
+    unsafe { sys::mlx_compiled_is_captured(h.handle) }
+}
+
 /// Free a persistent compiled function: destroys the cached graph and
 /// releases the JS builder reference. Idempotent; returns false if already
 /// freed.

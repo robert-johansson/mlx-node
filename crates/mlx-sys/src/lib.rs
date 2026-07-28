@@ -2080,5 +2080,17 @@ unsafe extern "C-unwind" {
         outputs: *mut *mut mlx_array,
         max_outputs: usize,
     ) -> usize;
+    // Captured replay (genmlx-7prh): returns EVALUATED outputs; after the
+    // first successful capture, calls are launch-only (retained CUDA graph
+    // execs). Falls back permanently to trace-cache replay + eval when the
+    // backend or the tape cannot capture.
+    pub fn mlx_compiled_call_captured(
+        handle: *mut std::ffi::c_void,
+        inputs: *const *mut mlx_array,
+        input_count: usize,
+        outputs: *mut *mut mlx_array,
+        max_outputs: usize,
+    ) -> usize;
+    pub fn mlx_compiled_is_captured(handle: *mut std::ffi::c_void) -> bool;
     pub fn mlx_compiled_free(handle: *mut std::ffi::c_void);
 }
