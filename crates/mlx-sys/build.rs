@@ -486,6 +486,39 @@ fn main() {
         }
     }
 
+    // The CUDA analogue of the metallib colocation above (genmlx-24gy). MLX's
+    // NVRTC JIT resolves its bundled cute/cutlass/cccl headers relative to the
+    // RUNNING binary — `current_binary_dir()/../include`
+    // (jit_module.cpp include_path_args). packages/genmlx-core/build.mjs does
+    // this for the addon, but a cargo TEST binary lives at
+    // `target/<profile>/deps/`, whose `../include` nothing ever created — so
+    // the first cute-dependent kernel (any quantized matmul) died at NVRTC
+    // with `catastrophic error: cannot open source file
+    // "cute/numeric/numeric_types.hpp"`, surfacing as a GenericFailure inside
+    // eval_arrays. Any box running `cargo test` against a real model hit it.
+    //
+    // A symlink, not a copy: the tree is ~39MB and must not go stale.
+    // Best-effort — a failure here only restores the old broken-JIT state, and
+    // must not fail an otherwise good build.
+    if target_os == "linux" {
+        let include_src = dst.join("include");
+        let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+        if include_src.is_dir()
+            && let Some(profile_dir) = find_ancestor_with_name(&out_path, "build")
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        {
+            let link = profile_dir.join("include");
+            // Replace only a symlink we (or the manual workaround) made; never
+            // clobber a real directory someone else put there.
+            if std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()) {
+                let _ = std::fs::remove_file(&link);
+            }
+            if !link.exists() {
+                let _ = std::os::unix::fs::symlink(&include_src, &link);
+            }
+        }
+    }
+
     println!("cargo:rustc-link-lib=static=mlx");
 
     if is_macos {
