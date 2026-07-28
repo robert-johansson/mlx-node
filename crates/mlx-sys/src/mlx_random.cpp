@@ -20,6 +20,7 @@
 
 #include "mlx_common.h"
 #include "mlx/random.h"
+#include "mlx/transforms_impl.h"  // detail::InTracing (genmlx-vjnn)
 
 namespace rng = mlx::core::random;
 
@@ -70,9 +71,21 @@ void mlx_random_split(mlx_array* key_handle,
   *k2_out = nullptr;
   MLX_GUARD_VOID("random_split",
   auto key = reinterpret_cast<array*>(key_handle);
-  auto [k1, k2] = rng::split(*key, cpu_stream());
-  k1.eval();
-  k2.eval();
+  // genmlx-vjnn: eager cpu-stream eval is the normal (cheap-threading) path,
+  // but MLX forbids eval during transform traces. While tracing, the split
+  // stays LAZY and on the DEFAULT stream: a cpu-stream op inside a traced
+  // graph costs a cpu<->gpu hop on every replay (~13 splits ~ 0.8 ms/call,
+  // measured on the vgenerate-compiled sweep) — single-stream keeps replays
+  // on-device. Semantics unchanged: subkeys derived from the traced key.
+  const bool tracing = mlx::core::detail::InTracing::in_tracing();
+  auto [k1, k2] = rng::split(
+      *key,
+      tracing ? mlx::core::default_stream(mlx::core::default_device())
+              : cpu_stream());
+  if (!tracing) {
+    k1.eval();
+    k2.eval();
+  }
   *k1_out = reinterpret_cast<mlx_array*>(new array(std::move(k1)));
   *k2_out = reinterpret_cast<mlx_array*>(new array(std::move(k2)));
   )
@@ -83,8 +96,15 @@ void mlx_random_split(mlx_array* key_handle,
 mlx_array* mlx_random_split_n(mlx_array* key_handle, int n) {
   MLX_GUARD_PTR("random_split_n",
   auto key = reinterpret_cast<array*>(key_handle);
-  array result = rng::split(*key, n, cpu_stream());
-  result.eval();
+  // genmlx-vjnn: see mlx_random_split — lazy + default-stream while tracing.
+  const bool tracing = mlx::core::detail::InTracing::in_tracing();
+  array result = rng::split(
+      *key, n,
+      tracing ? mlx::core::default_stream(mlx::core::default_device())
+              : cpu_stream());
+  if (!tracing) {
+    result.eval();
+  }
   result = mlx::core::stop_gradient(result);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
   )
