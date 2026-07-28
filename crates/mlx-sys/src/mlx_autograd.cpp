@@ -1,4 +1,5 @@
 #include "mlx_common.h"
+#include "mlx/transforms_impl.h"  // detail::InTracing (genmlx-cqgx)
 
 // ============================================================================
 // Gradient Computation
@@ -227,15 +228,24 @@ extern "C" size_t mlx_value_and_gradients(LossFunctionPtr loss_fn,
   // Force evaluation AND synchronization to prevent command buffer overflow
   // Note: the Rust caller also evals, but doing it here ensures the graph is
   // materialized before we extract handles (avoiding lazy-graph-across-FFI issues)
-  try {
-    value.eval();
-    for (auto& grad : gradients) {
-      grad.eval();
+  //
+  // genmlx-cqgx: SKIPPED while a function transform (compile/vmap) is tracing —
+  // tracer arrays fill no command buffer, and MLX forbids eval during traces
+  // ("[eval] Attempting to eval an array during function transformations").
+  // Without the guard, value_and_grad inside a persistent-compile trace
+  // (mlx_compile_create) dies here; with it, the traced graph simply stays
+  // lazy, which is exactly what the trace wants.
+  if (!mlx::core::detail::InTracing::in_tracing()) {
+    try {
+      value.eval();
+      for (auto& grad : gradients) {
+        grad.eval();
+      }
+      mlx::core::synchronize();
+    } catch (const std::exception& e) {
+      std::cerr << "[MLX AUTOGRAD ERROR] eval/sync failed: " << e.what() << std::endl;
+      return 0;
     }
-    mlx::core::synchronize();
-  } catch (const std::exception& e) {
-    std::cerr << "[MLX AUTOGRAD ERROR] eval/sync failed: " << e.what() << std::endl;
-    return 0;
   }
 
   // Store loss value (for scalar functions, value is directly an array)

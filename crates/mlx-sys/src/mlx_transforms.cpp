@@ -104,26 +104,15 @@ typedef size_t (*CompileFunctionPtr)(mlx_array* const* inputs,
                                       size_t max_outputs,
                                       void* context);
 
-// Returns the number of outputs written, 0 on failure (the Rust caller
-// treats 0 outputs as an error). compile() traces and evaluates the inner
-// function, so Metal/GPU allocation throws can surface here.
-size_t mlx_compile_apply(CompileFunctionPtr fn_ptr,
-                          void* context,
-                          mlx_array* const* input_handles,
-                          size_t input_count,
-                          bool shapeless,
-                          mlx_array** output_handles,
-                          size_t max_outputs) {
-  MLX_GUARD_VAL("compile_apply", 0,
-  // Convert input handles
-  std::vector<array> inputs;
-  inputs.reserve(input_count);
-  for (size_t i = 0; i < input_count; i++) {
-    inputs.emplace_back(*reinterpret_cast<array*>(input_handles[i]));
-  }
-
-  // Create C++ function wrapper
-  auto cpp_fn = [fn_ptr, context](const std::vector<array>& args)
+// The trace trampoline: bridges mlx::core::compile's trace calls back to the
+// caller's callback (Rust -> JS). Shared by the one-shot mlx_compile_apply
+// and the persistent mlx_compile_create below. The (fn_ptr, context) pair
+// must stay valid for as long as the returned std::function may trace —
+// one call for the one-shot path, the handle's whole lifetime for the
+// persistent path (shape-change retraces call back in).
+static std::function<std::vector<array>(const std::vector<array>&)>
+make_compile_trampoline(CompileFunctionPtr fn_ptr, void* context) {
+  return [fn_ptr, context](const std::vector<array>& args)
       -> std::vector<array> {
     std::vector<mlx_array*> handles;
     handles.reserve(args.size());
@@ -149,6 +138,31 @@ size_t mlx_compile_apply(CompileFunctionPtr fn_ptr,
     }
     return outputs;
   };
+}
+
+// Returns the number of outputs written, 0 on failure (the Rust caller
+// treats 0 outputs as an error). compile() traces and evaluates the inner
+// function, so Metal/GPU allocation throws can surface here.
+//
+// NOTE (genmlx-z2gt): this one-shot form creates a FRESH closure identity per
+// call, so mlx::core::compile re-traces every invocation — it cannot amortize.
+// For trace-once/replay-many use mlx_compile_create/mlx_compiled_call below.
+size_t mlx_compile_apply(CompileFunctionPtr fn_ptr,
+                          void* context,
+                          mlx_array* const* input_handles,
+                          size_t input_count,
+                          bool shapeless,
+                          mlx_array** output_handles,
+                          size_t max_outputs) {
+  MLX_GUARD_VAL("compile_apply", 0,
+  // Convert input handles
+  std::vector<array> inputs;
+  inputs.reserve(input_count);
+  for (size_t i = 0; i < input_count; i++) {
+    inputs.emplace_back(*reinterpret_cast<array*>(input_handles[i]));
+  }
+
+  auto cpp_fn = make_compile_trampoline(fn_ptr, context);
 
   // Compile and apply
   auto compiled = mlx::core::compile(cpp_fn, shapeless);
@@ -161,6 +175,63 @@ size_t mlx_compile_apply(CompileFunctionPtr fn_ptr,
   }
   return count;
   )
+}
+
+// ============================================================================
+// Persistent compile (genmlx-z2gt Phase 1): trace once, replay in C++.
+//
+// mlx::core::compile keys its trace cache by closure identity. Holding the
+// RETURNED compiled closure in a heap handle keeps one stable identity for
+// the handle's lifetime: the first call per input-shape traces (invoking the
+// trampoline back into the caller's runtime); every other call replays the
+// cached graph without touching the callback. The (fn_ptr, context) pair
+// must therefore outlive the handle — freeing the context before
+// mlx_compiled_free is use-after-free on the next shape-change retrace.
+// ============================================================================
+
+struct mlx_compiled_fn {
+  std::function<std::vector<array>(const std::vector<array>&)> fn;
+};
+
+// Returns an opaque handle, or nullptr on failure. Destroying the handle
+// (mlx_compiled_free) destroys the compiled closure, which releases the
+// cached trace via MLX's own compile-cache cleanup.
+void* mlx_compile_create(CompileFunctionPtr fn_ptr,
+                         void* context,
+                         bool shapeless) {
+  MLX_GUARD_VAL("compile_create", nullptr,
+  auto* handle = new mlx_compiled_fn{
+      mlx::core::compile(make_compile_trampoline(fn_ptr, context), shapeless)};
+  return reinterpret_cast<void*>(handle);
+  )
+}
+
+size_t mlx_compiled_call(void* handle,
+                         mlx_array* const* input_handles,
+                         size_t input_count,
+                         mlx_array** output_handles,
+                         size_t max_outputs) {
+  MLX_GUARD_VAL("compiled_call", 0,
+  auto* h = reinterpret_cast<mlx_compiled_fn*>(handle);
+  std::vector<array> inputs;
+  inputs.reserve(input_count);
+  for (size_t i = 0; i < input_count; i++) {
+    inputs.emplace_back(*reinterpret_cast<array*>(input_handles[i]));
+  }
+
+  auto results = h->fn(inputs);
+
+  size_t count = std::min(results.size(), max_outputs);
+  for (size_t i = 0; i < count; i++) {
+    output_handles[i] =
+        reinterpret_cast<mlx_array*>(new array(std::move(results[i])));
+  }
+  return count;
+  )
+}
+
+void mlx_compiled_free(void* handle) {
+  delete reinterpret_cast<mlx_compiled_fn*>(handle);
 }
 
 }  // extern "C"

@@ -352,3 +352,161 @@ pub fn compile_fn(
         .collect();
     results
 }
+
+// ============================================================================
+// Persistent compile (genmlx-z2gt Phase 1): trace once, replay in C++.
+//
+// `compileFn` above creates a fresh closure identity per call, so
+// mlx::core::compile re-traces every invocation. The trio below holds the
+// compiled closure in a native handle: `compileCreate` builds it (no trace
+// yet), the first `compiledCall` per input-shape traces by calling the JS
+// builder synchronously, and every later call replays the cached graph
+// entirely in C++. The JS builder is kept alive via a persistent napi
+// reference because shape-change retraces call back into it; it is released
+// by `compiledFree`. Main-thread synchronous use only.
+// ============================================================================
+
+pub struct CompiledFnHandle {
+    handle: *mut c_void, // mlx_compiled_fn* (owned; freed on dispose/Drop)
+    func_ref: napi::sys::napi_ref,
+    ctx: Box<CompileContext>, // stable address — the C++ closure captures it
+    disposed: bool,
+}
+
+impl Drop for CompiledFnHandle {
+    fn drop(&mut self) {
+        // GC-finalizer path: free the native closure. The napi_ref cannot be
+        // deleted here (no env in Drop) — explicit compiledFree releases it;
+        // a leaked handle leaks one JS function reference, nothing native.
+        if !self.disposed && !self.handle.is_null() {
+            unsafe { sys::mlx_compiled_free(self.handle) };
+            self.handle = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Create a persistent compiled function handle.
+///
+/// ```js
+/// const cf = compileCreate((x) => x.square().sum(), false);
+/// const [r1] = compiledCall(cf, [a]);   // traces + compiles + runs
+/// const [r2] = compiledCall(cf, [b]);   // replays the cached graph
+/// compiledFree(cf);
+/// ```
+#[napi(js_name = "compileCreate")]
+pub fn compile_create(
+    env: Env,
+    #[napi(ts_arg_type = "(...args: MxArray[]) => MxArray | MxArray[]")]
+    func: napi::bindgen_prelude::Function<'static>,
+    shapeless: Option<bool>,
+) -> Result<External<CompiledFnHandle>> {
+    let raw_env = env.raw();
+    let raw_func = unsafe {
+        napi::bindgen_prelude::ToNapiValue::to_napi_value(raw_env, func)?
+    };
+
+    let mut func_ref: napi::sys::napi_ref = std::ptr::null_mut();
+    let status =
+        unsafe { napi::sys::napi_create_reference(raw_env, raw_func, 1, &mut func_ref) };
+    if status != napi::sys::Status::napi_ok {
+        return Err(Error::from_reason("compileCreate: could not reference function"));
+    }
+
+    // env/func are refreshed at every compiledCall before the C++ side may
+    // trace; the Box gives the C++ closure a stable context address.
+    let mut ctx = Box::new(CompileContext {
+        env: raw_env,
+        func: std::ptr::null_mut(),
+        error: None,
+    });
+    let ctx_ptr = &mut *ctx as *mut CompileContext as *mut c_void;
+
+    let handle = unsafe {
+        sys::mlx_compile_create(compile_callback, ctx_ptr, shapeless.unwrap_or(false))
+    };
+    if handle.is_null() {
+        unsafe { napi::sys::napi_delete_reference(raw_env, func_ref) };
+        return Err(Error::from_reason("compileCreate: native create failed"));
+    }
+
+    Ok(External::new(CompiledFnHandle {
+        handle,
+        func_ref,
+        ctx,
+        disposed: false,
+    }))
+}
+
+/// Call a persistent compiled function. First call per input-shape traces
+/// (invoking the JS builder); later calls replay the cached graph in C++.
+#[napi(js_name = "compiledCall")]
+pub fn compiled_call(
+    env: Env,
+    handle: &mut External<CompiledFnHandle>,
+    inputs: Vec<&MxArray>,
+) -> Result<Vec<MxArray>> {
+    let h = handle.as_mut();
+    if h.disposed {
+        return Err(Error::from_reason("compiledCall: handle already freed"));
+    }
+    if inputs.is_empty() {
+        return Err(Error::from_reason("compiledCall: inputs cannot be empty"));
+    }
+
+    let raw_env = env.raw();
+    let mut func_val: napi::sys::napi_value = std::ptr::null_mut();
+    let status =
+        unsafe { napi::sys::napi_get_reference_value(raw_env, h.func_ref, &mut func_val) };
+    if status != napi::sys::Status::napi_ok || func_val.is_null() {
+        return Err(Error::from_reason("compiledCall: builder function is gone"));
+    }
+    h.ctx.env = raw_env;
+    h.ctx.func = func_val;
+    h.ctx.error = None;
+
+    let input_handles: Vec<*mut sys::mlx_array> =
+        inputs.iter().map(|a| a.as_raw_ptr()).collect();
+
+    const MAX_OUTPUTS: usize = 16;
+    let mut output_handles: Vec<*mut sys::mlx_array> =
+        vec![std::ptr::null_mut(); MAX_OUTPUTS];
+
+    let num_outputs = unsafe {
+        sys::mlx_compiled_call(
+            h.handle,
+            input_handles.as_ptr(),
+            input_handles.len(),
+            output_handles.as_mut_ptr(),
+            MAX_OUTPUTS,
+        )
+    };
+
+    if let Some(error) = &h.ctx.error {
+        return Err(Error::from_reason(format!("compiledCall: {}", error)));
+    }
+    if num_outputs == 0 {
+        return Err(Error::from_reason("compiledCall: returned 0 outputs"));
+    }
+
+    output_handles[..num_outputs]
+        .iter()
+        .map(|&hd| MxArray::from_handle(hd, "compiled_call_output"))
+        .collect()
+}
+
+/// Free a persistent compiled function: destroys the cached graph and
+/// releases the JS builder reference. Idempotent; returns false if already
+/// freed.
+#[napi(js_name = "compiledFree")]
+pub fn compiled_free(env: Env, handle: &mut External<CompiledFnHandle>) -> Result<bool> {
+    let h = handle.as_mut();
+    if h.disposed {
+        return Ok(false);
+    }
+    unsafe { sys::mlx_compiled_free(h.handle) };
+    h.handle = std::ptr::null_mut();
+    h.disposed = true;
+    unsafe { napi::sys::napi_delete_reference(env.raw(), h.func_ref) };
+    h.func_ref = std::ptr::null_mut();
+    Ok(true)
+}

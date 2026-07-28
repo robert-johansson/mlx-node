@@ -2059,4 +2059,26 @@ unsafe extern "C-unwind" {
         outputs: *mut *mut mlx_array,
         max_outputs: usize,
     ) -> usize;
+    // Persistent compile (genmlx-z2gt Phase 1): trace once, replay in C++.
+    // The (fn_ptr, context) pair must outlive the handle — shape-change
+    // retraces call back through it. Free with mlx_compiled_free.
+    pub fn mlx_compile_create(
+        fn_ptr: extern "C-unwind" fn(
+            *const *mut mlx_array,
+            usize,
+            *mut *mut mlx_array,
+            usize,
+            *mut std::ffi::c_void,
+        ) -> usize,
+        context: *mut std::ffi::c_void,
+        shapeless: bool,
+    ) -> *mut std::ffi::c_void;
+    pub fn mlx_compiled_call(
+        handle: *mut std::ffi::c_void,
+        inputs: *const *mut mlx_array,
+        input_count: usize,
+        outputs: *mut *mut mlx_array,
+        max_outputs: usize,
+    ) -> usize;
+    pub fn mlx_compiled_free(handle: *mut std::ffi::c_void);
 }
