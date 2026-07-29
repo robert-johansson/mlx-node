@@ -775,10 +775,108 @@ impl ColdRoot {
     }
 }
 
-/// Fix the tier root BEFORE any model load. The manager is a process-global
-/// `OnceLock` initialized once from this env, so a later change is ignored.
+/// Fail loudly when a SINGLE capture turn can reach the prompt's END.
+///
+/// This is the invariant the whole `restore_prompt` fixture rests on and the
+/// one that silently rotted: a turn anchors ONE sidecar, at the deepest rung it
+/// reached, so a turn that covers the full prompt writes only the deepest rung
+/// — the one a diverged restore prompt can never name — and instance 2 restores
+/// zero. That surfaces as "restore did not engage", pointing the reader at the
+/// restore path, when the cause is that nothing shallow was ever written.
+///
+/// Checked against the LADDER rather than the raw block count because the
+/// deepest rung, not the prompt's end, is what a restore can address.
+///
+/// The bound is on ONE turn, not on all of them together — see the comment in
+/// the body for why the cumulative form rejected working fixtures.
+fn assert_capture_reach_leaves_room(spec: &ColdTierParitySpec, ladder: &[u32], prompt_tokens: u32) {
+    let Some(&deepest) = ladder.last() else {
+        return;
+    };
+    // The FIRST turn's reach, not the cumulative reach of all of them.
+    //
+    // Reach ratchets across turns — `paged_kv_cache_adapter.rs` charges the
+    // budget only for blocks it actually enqueues (`outcome.enqueued`), while
+    // already-persisted blocks are re-walked for free — so turn N reaches
+    // roughly `N x CAPTURE_BLOCKS_PER_TURN`. But each turn anchors its sidecar
+    // at the deepest rung ITS OWN reach allows, under a key derived from that
+    // boundary, so the turns write DISTINCT shallow rungs rather than
+    // overwriting one. Turn 1 landing below `deepest` is therefore what
+    // guarantees a shallow sidecar exists.
+    //
+    // The cumulative form this replaces was strictly stronger, and wrong in the
+    // rejecting direction: with `capture_warmup_turns >= 6` it fires on a
+    // fixture whose shallow rungs are on disk and restorable.
+    let reach_tokens = CAPTURE_BLOCKS_PER_TURN as u32 * spec.block_size;
+    assert!(
+        reach_tokens < deepest,
+        "[{}] FIXTURE, not a product fault: one capture turn reaches {} blocks x {} tok = {} tok, \
+         which already covers this prompt's deepest ladder rung ({} tok of {} prompt tok). That \
+         turn anchors its ONE sidecar at the deepest rung, so the shallow rungs instance 2 needs \
+         after its prompt diverges are never written and the restore necessarily finds nothing. \
+         Lengthen the capture prompt or lower CAPTURE_BLOCKS_PER_TURN — do NOT relax the restore \
+         assertions below, which would leave this gate green against a real regression.",
+        spec.family,
+        CAPTURE_BLOCKS_PER_TURN,
+        spec.block_size,
+        reach_tokens,
+        deepest,
+        prompt_tokens
+    );
+}
+
+/// Blocks one capture turn may persist, forced by [`prepare_cold_root`].
+///
+/// The fixture needs the chain to reach its frontier over SEVERAL turns: a turn
+/// anchors exactly one sidecar, at the deepest rung it reached, so a turn that
+/// walks the whole prompt writes only the deepest rung and leaves the ladder's
+/// shallow rungs empty — which is precisely what instance 2 needs after its
+/// prompt diverges. That used to happen for free, because the walk stopped
+/// wherever the bounded writer queue refused (~12 blocks here). It is now a
+/// policy defaulting to 128 blocks, so on any machine whose disk keeps up, one
+/// turn covers a fixture-sized prompt and the gate fails by construction.
+///
+/// Pinned rather than left to the default so the stop condition is ARITHMETIC.
+/// With this below the prompt's block count the walk always stops on `Budget`,
+/// so no disk or CPU speed can change which rung gets written. [`LADDER_RATIO`]
+/// governs how far apart the rungs are; this only has to be shallow enough that
+/// `(warm-up turns + 1) x this` stays under the deepest rung, which
+/// [`assert_capture_reach_leaves_room`] enforces.
+const CAPTURE_BLOCKS_PER_TURN: usize = 12;
+
+/// Wall-clock ceiling forced alongside [`CAPTURE_BLOCKS_PER_TURN`].
+///
+/// NOT a lengthened timeout hiding a race: with the block budget below the
+/// prompt's block count the walk stops on blocks every time, so this exists
+/// only to take the clock OUT of the outcome. A walk that would trip a 60 s
+/// deadline is a real hang, not a slow runner.
+const CAPTURE_BUDGET_MS: u64 = 60_000;
+
+/// Fix the tier root and the capture budget BEFORE any model load. Both are
+/// process-global `OnceLock`s resolved on first use, so a later change is
+/// silently ignored.
+///
+/// Set through `install_*` rather than `std::env::set_var`. Every caller is an
+/// `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]` and the body
+/// runs ON a pool worker, so at least three other threads are alive here;
+/// `--test-threads=1` serializes test CASES, not runtime threads, so it never
+/// made `setenv` safe. The installers write the `OnceLock` directly, which is
+/// thread-safe, and they RETURN whether they won — turning "the harness thinks
+/// it pinned a depth but the run used the default" from a silent wrong-green
+/// into an assertion.
 fn prepare_cold_root() -> ColdRoot {
-    match std::env::var("MLX_COLD_CACHE_DIR") {
+    assert!(
+        mlx_core::cold_tier::install_cold_capture_budget(
+            CAPTURE_BLOCKS_PER_TURN,
+            std::time::Duration::from_millis(CAPTURE_BUDGET_MS),
+        ),
+        "the capture budget was already resolved before the harness pinned it, so this run used \
+         the {}-block DEFAULT and the ladder arithmetic below is meaningless. Something loaded a \
+         model or touched the cold tier before prepare_cold_root().",
+        128,
+    );
+
+    let root = match std::env::var("MLX_COLD_CACHE_DIR") {
         Ok(dir) if !dir.trim().is_empty() => {
             let path = PathBuf::from(dir);
             fs::create_dir_all(&path).expect("create caller-supplied MLX_COLD_CACHE_DIR");
@@ -786,15 +884,32 @@ fn prepare_cold_root() -> ColdRoot {
         }
         _ => {
             let path = std::env::temp_dir().join(format!("mlx-cold-parity-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&path);
+            // Wipe it ONLY on the first gate in this process.
+            //
+            // The path is pid-scoped, so a second gate in the same binary
+            // computes the SAME one — and the tier manager installed by the
+            // first gate holds a DESCRIPTOR for that directory, not its name.
+            // Unlinking and recreating the pathname therefore leaves the live
+            // manager pointed at an unlinked directory, where every name lookup
+            // is ENOENT: the second gate stores nothing, restores nothing, and
+            // fails at "cold restore did not engage" while the real fault is
+            // this line. Sharing the root across gates is what the module doc
+            // already assumes — the cold keys are content-derived, so different
+            // prompts occupy disjoint chains.
+            if mlx_core::cold_tier::installed_cold_cache_root() != Some(path.as_path()) {
+                let _ = fs::remove_dir_all(&path);
+            }
             fs::create_dir_all(&path).expect("create cold-cache temp root");
-            // SAFETY: set before any model load and thus before any thread
-            // reads the env or the process-global tier; `#[ignore]` +
-            // `--test-threads=1` keep this the sole toucher in the process.
-            unsafe { std::env::set_var("MLX_COLD_CACHE_DIR", &path) };
             ColdRoot::Created(path)
         }
-    }
+    };
+    assert!(
+        mlx_core::cold_tier::install_cold_cache_root(root.path()),
+        "the cold tier was already opened before the harness pinned its root, so this run wrote \
+         to the DEFAULT location instead of {}",
+        root.path().display(),
+    );
+    root
 }
 
 /// Run the three-instance cold-tier restart-parity gate for one family.
@@ -1001,10 +1116,42 @@ where
             ladder,
             result_b.cached_tokens
         );
+        assert_capture_reach_leaves_room(&spec, &ladder, result_a.prompt_tokens);
         ladder
     } else {
         Vec::new()
     };
+
+    // ---- 0. The WRITE path worked ----------------------------------------
+    //
+    // Ordered ahead of every restore assertion deliberately. A capture that
+    // could not store what it enqueued makes each read assertion below
+    // downstream noise, and the read ones have the longer, more specific
+    // messages — so whichever fires first is where the next reader starts
+    // looking. Proven, not assumed: a torn tier root produced exactly this run,
+    //
+    //     [gemma4-sub-window] cold restore did not engage across restart:
+    //     cached_tokens=0 (expected >= 32)
+    //
+    // which sent the reader to the restore path for a fault in `prepare_cold_root`.
+    //
+    // A torn root is the usual cause: the directory unlinked out from under the
+    // live manager, which retains a descriptor rather than a pathname, so every
+    // `openat`/`renameat`/`unlinkat` returns ENOENT while `fsync` and `getdents`
+    // still succeed — the cache stores nothing and reads nothing, quietly.
+    //
+    // A missing snapshot is NOT silently skipped here: assertion 2 below panics
+    // on it explicitly.
+    if let Some(stats) = stats_after.as_ref() {
+        assert_eq!(
+            stats.write_errors, 0,
+            "[{}] cold tier recorded {} write error(s): the capture path could not store what it \
+             enqueued, so everything below about restore is downstream of a broken WRITE. The \
+             usual cause is a tier root that no longer exists at the descriptor the manager \
+             holds — check that nothing deleted or recreated it between gates.",
+            spec.family, stats.write_errors
+        );
+    }
 
     // ---- 1. Restore engaged at all ---------------------------------------
     let min_restored = spec.min_restored();
@@ -1229,11 +1376,21 @@ where
     // Best-effort cleanup; only touches what this run created.
     let _ = fs::remove_dir_all(&persist_dir);
     let _ = fs::remove_dir_all(&nopersist_dir);
-    if let ColdRoot::Created(path) = &cold_root {
-        // SAFETY: single-threaded teardown, no other reader.
-        unsafe { std::env::remove_var("MLX_COLD_CACHE_DIR") };
-        let _ = fs::remove_dir_all(path);
-    }
+
+    // The tier ROOT is deliberately left in place.
+    //
+    // It used to be deleted here, alongside a `remove_var("MLX_COLD_CACHE_DIR")`
+    // that undid the `set_var` this harness no longer does. Deleting it is
+    // actively wrong now that a second gate in the same binary reuses the
+    // installed tier: `ColdRoot::Created` is `temp_dir()/mlx-cold-parity-{pid}`,
+    // so the next gate recreates the SAME pathname while the live manager still
+    // holds a descriptor for the directory this line unlinked. `install_cold_cache_root`
+    // sees a matching path and correctly reports the tier installed, but the two
+    // no longer refer to the same directory.
+    //
+    // It is pid-scoped and under the OS temp directory, and the per-instance
+    // model clones above — the actual bulk — are still removed. `--test-threads=1`
+    // plus one root per process means nothing else collides with it.
 }
 
 /// Offline cover for [`expected_checkpoint_ladder`].
@@ -1251,8 +1408,56 @@ where
 mod harness_tests {
     use super::{
         DEFAULT_BLOCK_SIZE, expected_checkpoint_ladder, ladder_capture_prompt,
-        ladder_restore_prompt,
+        ladder_restore_prompt, prepare_cold_root,
     };
+
+    /// A second gate in the same binary must not replace the tier directory the
+    /// first gate's manager is already holding open.
+    ///
+    /// `ColdRoot::Created` is `temp_dir()/mlx-cold-parity-{pid}`, so both gates
+    /// compute the SAME path, and `prepare_cold_root` used to `remove_dir_all`
+    /// it unconditionally. The live manager holds a DESCRIPTOR, not a name: once
+    /// that directory is unlinked, every `openat`/`renameat`/`unlinkat`/`statat`
+    /// through it returns ENOENT (measured; `fsync` and `getdents` still work,
+    /// which is why it fails quietly). The second gate then stores nothing,
+    /// restores nothing, and trips "cold restore did not engage" — blaming the
+    /// restore path for a setup fault two functions away.
+    ///
+    /// Asserted on the INODE rather than on existence, because the broken
+    /// version left a directory at the same pathname; only the identity differs.
+    ///
+    /// Costs microseconds and needs no checkpoint, so unlike the gates it guards
+    /// it runs on the ordinary `cargo test` leg — where those gates never run at
+    /// all (`ci.yml` names only the qwen3 and qwen3_5 cold-tier binaries, both
+    /// single-gate, so nothing in CI exercises two gates in one process).
+    #[test]
+    fn preparing_the_root_twice_keeps_the_same_directory() {
+        use std::os::unix::fs::MetadataExt;
+
+        let first = prepare_cold_root();
+        let ino_first = std::fs::metadata(first.path())
+            .expect("tier root must exist after the first prepare")
+            .ino();
+
+        // Second gate in the same process.
+        let second = prepare_cold_root();
+        let ino_second = std::fs::metadata(second.path())
+            .expect("tier root must exist after the second prepare")
+            .ino();
+
+        assert_eq!(
+            first.path(),
+            second.path(),
+            "both gates must resolve the same pid-scoped root, or this test is not exercising \
+             the shared-root case at all"
+        );
+        assert_eq!(
+            ino_first, ino_second,
+            "the second prepare replaced the tier directory ({ino_first} -> {ino_second}): the \
+             manager installed by the first gate still holds a descriptor for the unlinked one, \
+             so every cache write and read in the second gate fails with ENOENT"
+        );
+    }
 
     /// The fixture's whole R-independence argument rests on the two prompts
     /// parting company far enough before the end that instance 2's chain

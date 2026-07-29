@@ -12,6 +12,192 @@ import { resolveHuggingFaceToken, setToken } from './hf-token.js';
 
 const DEFAULT_CACHE_DIR = join(homedir(), '.cache', 'huggingface');
 
+/** Attempts per file before a download gives up. */
+const MAX_FETCH_ATTEMPTS = 4;
+
+/** Base backoff; attempt N waits `BASE << (N - 1)` ms (1s, 2s, 4s). */
+const RETRY_BASE_MS = 1_000;
+
+/** Node errno values no retry can fix: the LOCAL filesystem said no. */
+const PERMANENT_FS_CODES = new Set([
+  'ENOSPC', // disk full
+  'EDQUOT', // over quota
+  'EACCES', // not permitted
+  'EPERM',
+  'EROFS', // read-only filesystem
+  'EISDIR',
+  'ENOTDIR',
+  'ENAMETOOLONG',
+  'EFBIG',
+  'EXDEV',
+]);
+
+/**
+ * Hub-client PROTOCOL refusals: the bytes arrived and the parser rejected
+ * them. `XetBlob` throws these from inside the chunk reader
+ * (`XetBlob.ts:387,395`) after part of the shard has already streamed, and
+ * they carry no status and no errno — so without this they land on the
+ * default-retry branch and cost three more full multi-GB transfers to fail
+ * identically. Deterministic in the payload, so a retry cannot change them.
+ *
+ * Deliberately NOT here: `Failed to fetch all data for term …`
+ * (`XetBlob.ts:473`), which means the transfer was TRUNCATED. That is the
+ * transient case, and it must keep retrying.
+ */
+const PERMANENT_PROTOCOL_MESSAGES = ['Unsupported chunk version', 'Unsupported compression scheme'];
+
+/** The human-readable text of a failure, whatever shape it arrived in. */
+function failureText(error: unknown): string {
+  if (typeof error === 'string') return error;
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+/**
+ * A hub error flattened to text; see {@link isRetriableFetchError}.
+ *
+ * Only matches when the failing response had a NON-JSON body. `createApiError`
+ * (`@huggingface/hub@2.13.2`, `src/error.ts:9-26`) builds this exact prefix and
+ * then REPLACES the whole message with `json.error || json.message` whenever
+ * the response is `application/json`, keeping only a `. URL: …` trailer. The
+ * status is not recoverable from that text — it survives only on the error
+ * OBJECT, which the blob-stream path throws away. So a JSON-bodied failure on
+ * the content GET reaches the default-retry branch regardless of its status.
+ * That is a known looseness, not an oversight: it errs toward retrying, which
+ * is the safe direction here (see the harm asymmetry below).
+ */
+const FLATTENED_STATUS = /^Api error with status (\d{3})\b/;
+
+/**
+ * 408 is transient by definition (RFC 9110 §15.5.9 — the server did not get a
+ * complete request in time, and "the client MAY repeat that request"), so it
+ * belongs with 429 and 5xx rather than with the settled 4xx answers.
+ *
+ * Included as hardening, not as a fix for an observed failure: nothing in
+ * `@huggingface/hub@2.13.2` filters, branches on, or internally retries 408
+ * (its only repeat-a-request logic is a one-shot 403 token refresh in
+ * `XetBlob.ts:307`), so if a CDN ever emits one it lands here and aborts a
+ * multi-GB download for free. Costs one comparison.
+ *
+ * 425 Too Early is deliberately NOT here: it requires TLS 0-RTT early data,
+ * which this client never sends. Adding it would be speculation, and the
+ * default-retry branch already covers anything unmodelled.
+ */
+function isRetriableStatus(status: number): boolean {
+  return status >= 500 || status === 429 || status === 408;
+}
+
+/**
+ * Whether a failed download step is worth repeating.
+ *
+ * Three shapes reach here, because the hub client does not normalize them:
+ *
+ *  - A `HubApiError` with a numeric `statusCode`. This is what CI hit (a 500
+ *    from the Xet CDN), thrown by `createApiError` and carried out through the
+ *    stream's async-iterator `pull`, so the object survives intact.
+ *  - A bare STRING. `WebBlob.stream()` and `XetBlob.stream()` abort their
+ *    writable with `error.message` rather than the error, so a failure on the
+ *    content GET — the multi-GB shard itself — arrives with no type at all
+ *    (verified: `typeof e === 'string'`, `e instanceof Error === false`). A
+ *    predicate that only understands `Error` refuses to retry the single most
+ *    important case, so the status is read back out of the text.
+ *  - A plain `Error` with a Node errno and no status. This is BOTH a transport
+ *    failure and a local filesystem failure, which is why the errno matters:
+ *    `downloadFileToCacheDir` mkdirs, streams to `<blob>.incomplete`, renames,
+ *    then symlinks, and wraps none of it.
+ *
+ * Unknown status-less failures default to RETRY, deliberately. The transport
+ * failure space is open-ended and library-version-dependent — `fetch` rejects
+ * `TypeError: fetch failed` on connect but `TypeError: terminated` on a
+ * mid-body reset, and a timeout is a `DOMException` with a NUMERIC code — so an
+ * allowlist of known network errors turns every unmodelled one into a hard
+ * abort of a 30 GB download, which is the failure this retry exists to prevent.
+ * The harm is asymmetric, but NOT as cheaply as "7 s of backoff": because each
+ * attempt truncates `<blob>.incomplete` and re-GETs without a Range header, a
+ * wrongly-retried failure also re-transfers the shard up to three more times.
+ * That is why the two categories which are deterministic AND status-less —
+ * {@link PERMANENT_FS_CODES} and {@link PERMANENT_PROTOCOL_MESSAGES} — are
+ * named explicitly instead of being left to the default. Refusing to retry
+ * something transient still costs the whole download, so everything else
+ * unmodelled keeps defaulting to retry.
+ *
+ * Never retried: 4xx other than 429 and 408 (401/403 is no token or no access,
+ * 404 is the wrong repo or revision) and the filesystem refusals above. Those
+ * are settled answers, and repeating them only buries the message the user
+ * needs.
+ *
+ * That last paragraph holds for the ERROR-OBJECT shape, which keeps its
+ * `statusCode`. It does NOT hold for the flattened-string shape when the
+ * response body was JSON: the hub client overwrites the message with the
+ * server's own text and the status is gone, so such a failure takes the
+ * default-retry branch whatever it was. See {@link FLATTENED_STATUS}. Closing
+ * that would mean pattern-matching human-readable server prose, which is the
+ * allowlist this function exists to avoid.
+ */
+export function isRetriableFetchError(error: unknown): boolean {
+  if (typeof error !== 'string' && !(error instanceof Error)) return false;
+
+  // Checked on BOTH shapes: the chunk reader's refusals reach us as a bare
+  // string through the blob stream, but as an Error when awaited directly.
+  const text = failureText(error);
+  if (PERMANENT_PROTOCOL_MESSAGES.some((m) => text.includes(m))) return false;
+
+  if (typeof error === 'string') {
+    const status = FLATTENED_STATUS.exec(error);
+    return status ? isRetriableStatus(Number(status[1])) : true;
+  }
+
+  const status = (error as { statusCode?: unknown }).statusCode;
+  if (typeof status === 'number') return isRetriableStatus(status);
+
+  const code = (error as NodeJS.ErrnoException).code;
+  // EMFILE/ENFILE ("too many open files") are deliberately absent: those do
+  // clear on their own, so they stay retriable.
+  if (typeof code === 'string' && PERMANENT_FS_CODES.has(code)) return false;
+
+  return true;
+}
+
+/**
+ * Run `attempt`, repeating it while the failure looks transient.
+ *
+ * A checkpoint is tens of files and tens of gigabytes pulled from a CDN, so a
+ * single 5xx somewhere in the set is ordinary — and without this ONE of them
+ * aborted the whole multi-GB download, discarding every completed file. This
+ * is what CI hit:
+ *
+ *   HubApiError: Api error with status 500
+ *     data: { message: 'Key service error: Timeout occurred while creating a new object' }
+ *
+ * Safe to repeat, but NOT free: `downloadFileToCacheDir` short-circuits on a
+ * blob that is already COMPLETE, so finished files are never re-fetched — a
+ * PARTIAL one is not resumed. It reopens `<blob>.incomplete` with `'w'`
+ * (truncating it) and re-issues the GET without a Range header, so an
+ * interrupted shard restarts from byte 0. That is what bounds the attempts at
+ * {@link MAX_FETCH_ATTEMPTS} rather than retrying indefinitely, and it is why
+ * a local disk-full failure must not be retried at all.
+ */
+export async function withRetries<T>(what: string, attempt: () => Promise<T>): Promise<T> {
+  for (let n = 1; ; n++) {
+    try {
+      return await attempt();
+    } catch (error) {
+      if (n >= MAX_FETCH_ATTEMPTS || !isRetriableFetchError(error)) throw error;
+      const waitMs = RETRY_BASE_MS << (n - 1);
+      // The status when there is one, else the failure's text — never the error
+      // object itself, which stringifies to `[object Object]` and would make the
+      // one line explaining the pause useless. `failureText` rather than
+      // `.message` because the content-GET failures this retry exists for
+      // arrive as bare STRINGS, on which `.message` is `undefined` — printing
+      // `failed (undefined)` for exactly the case that matters most.
+      const status = (error as { statusCode?: unknown }).statusCode;
+      const reason = typeof status === 'number' ? `HTTP ${status}` : failureText(error);
+      console.warn(`    ${what} failed (${reason}); retry ${n}/${MAX_FETCH_ATTEMPTS - 1} in ${waitMs}ms`);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+  }
+}
+
 const DEFAULT_MODEL = 'Qwen/Qwen3-0.6B';
 
 function printHelp(): void {
@@ -73,7 +259,19 @@ function matchesAnyGlob(filename: string, patterns: RegExp[]): boolean {
   return patterns.some((re) => re.test(filename));
 }
 
+/**
+ * List the repo's files, retrying a transient listing failure.
+ *
+ * Retried as a WHOLE call: every accumulator below is local to one invocation,
+ * so a second attempt starts from an empty set rather than appending to a
+ * half-walked one. `listFiles` is paginated, so a 5xx can land part-way through
+ * a large repo's walk.
+ */
 async function getModelFiles(modelName: string, accessToken?: string, globPatterns?: string[]) {
+  return withRetries(`listing ${modelName}`, () => listModelFilesOnce(modelName, accessToken, globPatterns));
+}
+
+async function listModelFilesOnce(modelName: string, accessToken?: string, globPatterns?: string[]) {
   let totalSize = 0;
   const filesToDownload: ListFileEntry[] = [];
   const allFiles: ListFileEntry[] = [];
@@ -562,12 +760,14 @@ export async function run(argv: string[]) {
       );
     } else {
       console.log(`  [${i + 1}/${total}] ${file.path}${fileSizeStr ? ` (${fileSizeStr})` : ''}...`);
-      const snapshotPath = await downloadFileToCacheDir({
-        repo: { type: 'model', name: modelName },
-        path: file.path,
-        cacheDir,
-        accessToken: HUGGINGFACE_TOKEN,
-      });
+      const snapshotPath = await withRetries(file.path, () =>
+        downloadFileToCacheDir({
+          repo: { type: 'model', name: modelName },
+          path: file.path,
+          cacheDir,
+          accessToken: HUGGINGFACE_TOKEN,
+        }),
+      );
       await ensureDir(dirname(destPath));
       await copyFile(snapshotPath, destPath);
     }
