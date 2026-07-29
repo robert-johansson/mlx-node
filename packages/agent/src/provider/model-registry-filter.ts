@@ -11,10 +11,25 @@
  * serves. Patching the runtime (not the extension-only facade) is what keeps
  * the mlx-only guarantee across the selector / listing / resolution paths.
  *
- * The guarantee is an ALLOWLIST across three surfaces, all keyed on the `mlx`
- * provider id:
- *  1. Model reads (`getModels`/`getAvailable*`/`getModel`) — exact local-model
- *     identity (`api === 'mlx' && baseUrl === 'mlx://local'`).
+ * FORK DIVERGENCE (CONFLICT-LEDGER §3) — read before "simplifying" any gate
+ * below back to `providerId === MLX_PROVIDER_ID`. This fork serves TWO local
+ * providers: `mlx` and `genmlx` (the owned-forward one, genmlx-djw6). The
+ * model-visibility and composition gates are therefore keyed on
+ * {@link LOCAL_PROVIDER_BASE_URLS} — provider AND baseUrl must both match an
+ * entry — not on the bare `mlx` id. That map holds only `mlx` and `genmlx`, so
+ * every CLOUD provider is still excluded exactly as upstream intends; the
+ * widening costs nothing security-wise. Narrowing them back is SILENT: an
+ * omitted id is not an error, the model just vanishes from Tab, `/models`, RPC
+ * enumeration and session restore. It has already happened once — upstream's
+ * d0b608fa added `recomposeProvider` gated on `mlx` alone, which made every
+ * `genmlx` model invisible with no marker and a clean typecheck. Pinned by the
+ * "allowlists genmlx models too" test in `__test__/run-agent.test.ts`.
+ *
+ * The guarantee is an ALLOWLIST across three surfaces:
+ *  1. Model reads + composition (`getModels`/`getAvailable*`/`getModel`/
+ *     `recomposeProvider`/`getProvider`) — exact local-model identity
+ *     (`api === 'mlx'` AND the provider's registered baseUrl), for EVERY
+ *     provider in LOCAL_PROVIDER_BASE_URLS.
  *  2. Provider/auth reads (`getProviders`/`getProvider`/`checkAuth`/`getAuth`/
  *     `isUsingOAuth`/`hasConfiguredAuth`/`listCredentials`/`getProviderAuthStatus`)
  *     — never surface, report configured, resolve auth for, or enumerate a
