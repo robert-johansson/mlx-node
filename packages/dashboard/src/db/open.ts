@@ -1,10 +1,35 @@
 import { existsSync, renameSync, rmSync } from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
+import type { DatabaseSync } from 'node:sqlite';
 
 import { getTableColumns } from 'drizzle-orm';
-import { drizzle, type NodeSQLiteDatabase } from 'drizzle-orm/node-sqlite';
+import type { NodeSQLiteDatabase } from 'drizzle-orm/node-sqlite';
 
 import { sessions, traceFiles, traces, turns } from './schema.js';
+
+/**
+ * Runtime-selected synchronous SQLite driver. Node provides `node:sqlite`
+ * (the reason for the package's Node >= 22.19 floor); Bun does not implement
+ * that compat alias but ships its own `bun:sqlite`, whose `Database` is
+ * structurally identical across everything this package touches:
+ * `constructor(path)` incl. `':memory:'`, multi-statement `exec`,
+ * `prepare().get()/.all()` with positional params, `close()`. The one
+ * observable difference — no-row `.get()` returns `null` on Bun vs
+ * `undefined` on Node — is absorbed by optional chaining at every call site
+ * that can see no row (the remaining raw `.get()` calls are single-row
+ * aggregates). Types stay on the Node driver's names (erased at compile
+ * time); each driver module is imported only on its own runtime, because
+ * importing either one on the other runtime throws at resolve time.
+ */
+type SqliteCtor = new (path: string) => DatabaseSync;
+type DrizzleInit = (config: { client: DatabaseSync }) => NodeSQLiteDatabase;
+
+const isBun = typeof process !== 'undefined' && Boolean(process.versions?.bun);
+const SqliteDriver: SqliteCtor = isBun
+  ? ((await import('bun:sqlite')).Database as unknown as SqliteCtor)
+  : (await import('node:sqlite')).DatabaseSync;
+const drizzle: DrizzleInit = isBun
+  ? ((await import('drizzle-orm/bun-sqlite')).drizzle as unknown as DrizzleInit)
+  : ((await import('drizzle-orm/node-sqlite')).drizzle as unknown as DrizzleInit);
 
 export interface DashboardDb {
   db: NodeSQLiteDatabase;
@@ -204,7 +229,7 @@ function openWithSchema(path: string): DatabaseSync {
   // Only validate a file that already existed; a fresh (or quarantined-then-
   // reopened) path starts empty and is bootstrapped below.
   const preExisting = path !== ':memory:' && existsSync(path);
-  const sqlite = new DatabaseSync(path);
+  const sqlite = new SqliteDriver(path);
   try {
     // Validate the UNTOUCHED pre-existing db BEFORE any DDL: `CREATE TABLE IF NOT
     // EXISTS` would recreate a dropped table empty (masking data loss) or no-op
