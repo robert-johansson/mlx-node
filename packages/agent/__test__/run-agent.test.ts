@@ -282,70 +282,77 @@ describe('runAgent', () => {
     // Silent when broken: an id missing from the policy is not an error, the
     // model simply disappears from Tab, `/models`, RPC enumeration and session
     // restore — a genmlx-only inventory would look like no models at all.
-    const authStorage = AuthStorage.inMemory({ groq: { type: 'api_key', key: 'test-groq-key' } });
-    const registry = ModelRegistry.inMemory(authStorage);
-    const groq = registry.getAll().find((model) => model.provider === 'groq');
-    expect(groq).toBeDefined();
+    // Ported to upstream's ModelRuntime API (the in-memory AuthStorage /
+    // ModelRegistry constructors are gone): isolated runtime, empty temp auth
+    // file, no models.json. The builtin catalog still carries cloud providers.
+    const dir = await mkdtemp(join(tmpdir(), 'mlx-run-agent-genmlx-'));
+    try {
+      const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null });
+      const groq = runtime.getModels().find((model) => model.provider === 'groq');
+      expect(groq).toBeDefined();
 
-    await runAgent({
-      modelsDir: '/models',
-      models: [FAKE_MODEL],
-      genmlxModels: [FAKE_GENMLX_MODEL],
-      argv: [],
-      piImpl: piImpl(async () => {
-        registry.registerProvider('mlx', {
-          api: 'mlx',
-          baseUrl: 'mlx://local',
-          apiKey: 'mlx-local',
-          models: [
-            {
-              id: 'local',
-              name: 'local',
-              reasoning: true,
-              input: ['text'],
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-              contextWindow: 4096,
-              maxTokens: 1024,
-            },
-          ],
-        });
-        registry.registerProvider('genmlx', {
-          api: 'mlx',
-          baseUrl: 'genmlx://local',
-          apiKey: 'genmlx-local',
-          models: [
-            {
-              id: 'owned',
-              name: 'owned',
-              reasoning: true,
-              input: ['text'],
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-              contextWindow: 4096,
-              maxTokens: 1024,
-            },
-            {
-              id: 'undiscovered',
-              name: 'undiscovered',
-              reasoning: true,
-              input: ['text'],
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-              contextWindow: 4096,
-              maxTokens: 1024,
-            },
-          ],
-        });
+      await runAgent({
+        modelsDir: '/models',
+        models: [FAKE_MODEL],
+        genmlxModels: [FAKE_GENMLX_MODEL],
+        argv: [],
+        piImpl: piImpl(async () => {
+          runtime.registerProvider('mlx', {
+            api: 'mlx',
+            baseUrl: 'mlx://local',
+            apiKey: 'mlx-local',
+            models: [
+              {
+                id: 'local',
+                name: 'local',
+                reasoning: true,
+                input: ['text'],
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                contextWindow: 4096,
+                maxTokens: 1024,
+              },
+            ],
+          });
+          runtime.registerProvider('genmlx', {
+            api: 'mlx',
+            baseUrl: 'genmlx://local',
+            apiKey: 'genmlx-local',
+            models: [
+              {
+                id: 'owned',
+                name: 'owned',
+                reasoning: true,
+                input: ['text'],
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                contextWindow: 4096,
+                maxTokens: 1024,
+              },
+              {
+                id: 'undiscovered',
+                name: 'undiscovered',
+                reasoning: true,
+                input: ['text'],
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                contextWindow: 4096,
+                maxTokens: 1024,
+              },
+            ],
+          });
 
-        expect(new Set(registry.getAll().map((model) => `${model.provider}/${model.id}`))).toEqual(
-          new Set(['mlx/local', 'genmlx/owned']),
-        );
-        expect(registry.find('genmlx', 'owned')).toBeDefined();
-        // Still an exact allowlist, not a blanket second-provider pass.
-        expect(registry.find('genmlx', 'undiscovered')).toBeUndefined();
-        expect(registry.find('groq', groq!.id)).toBeUndefined();
-      }),
-    });
+          expect(new Set(runtime.getModels().map((model) => `${model.provider}/${model.id}`))).toEqual(
+            new Set(['mlx/local', 'genmlx/owned']),
+          );
+          expect(runtime.getModel('genmlx', 'owned')).toBeDefined();
+          // Still an exact allowlist, not a blanket second-provider pass.
+          expect(runtime.getModel('genmlx', 'undiscovered')).toBeUndefined();
+          expect(runtime.getModel('groq', groq!.id)).toBeUndefined();
+        }),
+      });
 
-    expect(registry.find('groq', groq!.id)).toBeDefined();
+      expect(runtime.getModel('groq', groq!.id)).toBeDefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

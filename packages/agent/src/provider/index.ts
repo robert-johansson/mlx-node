@@ -15,8 +15,10 @@
  * `ExtensionAPI` value arrives as the factory argument.
  */
 
+import { createRequire } from 'node:module';
+
 import type { ExtensionAPI, InlineExtension } from '@earendil-works/pi-coding-agent';
-import { coldCacheStats, coldSidecarStats, type ColdCacheStats, type ColdSidecarStats } from '@mlx-node/core';
+import type { ColdCacheStats, ColdSidecarStats } from '@mlx-node/core';
 
 import { canonicalCacheRoot } from '../cold-tier.js';
 import { MetricsTrace, type MetricsTraceRecord } from './metrics-trace.js';
@@ -26,10 +28,22 @@ import type { MlxModelInfo } from './models.js';
 import { PerformanceStatus } from './performance-status.js';
 import { makeMlxStreamSimple, type TurnRecorder } from './stream-adapter.js';
 
+/**
+ * Lazy, SYNC reach into the addon (genmlx-djw6 §2c, pinned by
+ * `__test__/native-import-graph.test.ts`). Upstream statically imports
+ * `coldCacheStats`/`coldSidecarStats` from '@mlx-node/core' here, which
+ * dlopens the addon at module load for EVERY agent run — including a
+ * `--model genmlx/*` run that must never touch `@mlx-node/core`. Both readers
+ * below are synchronous, so the latch is a CJS require rather than a dynamic
+ * `import()`; the type-only import above is erased in dist and does not count.
+ */
+const requireNative = createRequire(import.meta.url);
+type ColdStatsNative = { coldCacheStats(): ColdCacheStats; coldSidecarStats(): ColdSidecarStats };
+
 /** Read the process-wide cold-tier snapshot; the native addon may be absent (unit tests). */
 function safeColdStats(): ColdCacheStats | undefined {
   try {
-    return coldCacheStats();
+    return (requireNative('@mlx-node/core') as ColdStatsNative).coldCacheStats();
   } catch {
     return undefined;
   }
@@ -44,7 +58,7 @@ function safeColdStats(): ColdCacheStats | undefined {
  */
 function safeSidecarStats(): ColdSidecarStats | undefined {
   try {
-    return coldSidecarStats();
+    return (requireNative('@mlx-node/core') as ColdStatsNative).coldSidecarStats();
   } catch {
     return undefined;
   }

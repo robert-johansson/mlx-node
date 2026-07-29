@@ -220,8 +220,10 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
       ...originals.getProvider,
       // Streaming uses `this.models.getProvider` (a different object); this only
       // gates external reads (e.g. `/logout`). Non-mlx must never surface.
+      // WIDENED (ledger §3) to the local providers: `genmlx` must resolve here
+      // or session restore and RPC enumeration lose it. Cloud stays excluded.
       value(this: FilterableModelRuntime<TModel>, providerId: string): RuntimeProvider | undefined {
-        return providerId === MLX_PROVIDER_ID ? getProvider.call(this, providerId) : undefined;
+        return LOCAL_PROVIDER_BASE_URLS.has(providerId) ? getProvider.call(this, providerId) : undefined;
       },
     },
     hasConfiguredAuth: {
@@ -335,8 +337,15 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
       // getAuth and catalog-refresh paths. Requires install before the runtime is
       // created (runAgent installs before pi.main constructs it); the mlx provider
       // registers later via its own `recomposeProvider('mlx')`, allowed through.
+      // WIDENED (ledger §3): compose every LOCAL provider, not just `mlx`.
+      // Upstream's `providerId !== MLX_PROVIDER_ID` arrived in this drop with no
+      // conflict marker and typechecks perfectly, but because this is the single
+      // funnel into `this.models`, it made every `genmlx` model invisible to
+      // getModels/getModel — the exact silent failure ledger §3 describes. The
+      // security property is unchanged: LOCAL_PROVIDER_BASE_URLS contains only
+      // `mlx` and `genmlx`, so every CLOUD provider is still excluded here.
       value(this: object, providerId: string): void {
-        if (providerId !== MLX_PROVIDER_ID) return;
+        if (!LOCAL_PROVIDER_BASE_URLS.has(providerId)) return;
         recomposeProvider.call(this, providerId);
       },
     },

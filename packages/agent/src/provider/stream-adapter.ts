@@ -69,7 +69,12 @@ export interface StreamSimpleHost {
    * `fn` receives a `resident` boolean: `true` when the model was already warm
    * (reused), `false` when this turn had to load/swap it.
    */
-  runWithResident<T>(modelId: string, fn: (session: ChatSession, resident: boolean) => Promise<T>): Promise<T>;
+  // `StreamableSession`, NOT upstream's concrete `ChatSession`: the `genmlx`
+  // owned-forward provider (genmlx-djw6) serves a `GenmlxSession` that is not a
+  // `ChatSession`, and narrowing this to the concrete type makes
+  // `GenmlxModelHost` unassignable to `StreamSimpleHost` (ledger §3).
+  // The `resident` second argument IS upstream's and is carried through.
+  runWithResident<T>(modelId: string, fn: (session: StreamableSession, resident: boolean) => Promise<T>): Promise<T>;
   /** Flag the resident as post-error so the next turn does a full reset (see `MlxModelHost`). */
   markResidentDirty(modelId: string): void;
   /** Read-and-clear the resident's post-error flag; `true` ⇒ full-reset this turn. */

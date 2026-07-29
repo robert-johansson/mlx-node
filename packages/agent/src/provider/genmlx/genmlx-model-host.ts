@@ -46,7 +46,7 @@ export class GenmlxModelHost {
     return this.byName.get(modelId);
   }
 
-  runWithResident<T>(modelId: string, fn: (session: GenmlxSession) => Promise<T>): Promise<T> {
+  runWithResident<T>(modelId: string, fn: (session: GenmlxSession, resident: boolean) => Promise<T>): Promise<T> {
     const entry = this.byName.get(modelId);
     if (!entry) {
       const known = [...this.byName.keys()].join(', ');
@@ -54,9 +54,14 @@ export class GenmlxModelHost {
     }
     return this.runSerialized(async () => {
       let session: GenmlxSession;
+      // Mirrors MlxModelHost: `true` when the model was already warm, `false`
+      // when this turn had to load/swap it (upstream's runWithResident shape).
+      let resident: boolean;
       if (this.resident?.id === modelId) {
         session = this.resident.session;
+        resident = true;
       } else {
+        resident = false;
         // Swap: drop the old session first (its engine branches go with the
         // engine-side model swap), then point the engine at the new checkpoint.
         this.resident?.session.reset();
@@ -66,7 +71,7 @@ export class GenmlxModelHost {
         session = new GenmlxSession(engine);
         this.resident = { id: modelId, session, dirty: false };
       }
-      return await fn(session);
+      return await fn(session, resident);
     });
   }
 
