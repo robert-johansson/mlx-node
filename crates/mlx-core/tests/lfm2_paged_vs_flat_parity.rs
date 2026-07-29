@@ -763,10 +763,265 @@ async fn lfm2_paged_vs_flat_prefix_reuse_parity() {
 // (`ContinuedLivePrefix`) and did not silently re-prefill from scratch.
 // ---------------------------------------------------------------------------
 
-/// Memory-probe config: budget 128 force-closes a looping `<think>`
-/// deterministically; max_new 512 leaves the post-`</think>` span free to
-/// state the actual number (every probe turn ends `finish=stop` well below
-/// the cap on this checkpoint).
+/// The surface a memory-probe answer is asserted against.
+///
+/// MUST NOT be `ChatResult.text`. lfm2 is `ThinkingPolicy::AlwaysOnBudgetFromEffort`,
+/// so `thinking_enabled` is ALWAYS true and
+/// `engine::finalize::parse_thinking_and_tools` routes every turn through the
+/// reasoning scrubber. That scrubber has two branches which return
+/// `text == ""` for a turn whose generation is perfectly correct:
+///
+///  (A) `finalize.rs:103-119` — no `</think>` TOKEN (id 64401) among the
+///      generated ids ⇒ `(String::new(), vec![], thinking)`, i.e. the ENTIRE
+///      output is reclassified as reasoning. Reached whenever the turn ends
+///      before the think-budget force arms (a short direct answer, or EOS on
+///      the same step that would have consumed the force — the force is gated
+///      behind `!is_terminal` at `engine/decode.rs:317`).
+///  (B) `tools/mod.rs:993-1012` — `</think>` present but `after_tag` trims to
+///      empty, i.e. the turn stopped immediately after the injected close.
+///
+/// Both are REACHABLE on this checkpoint with real weights (verified: (A)
+/// `num_tokens=512 reasoning_tokens=512 text=""` with a 2079-byte `raw_text`;
+/// (B) `num_tokens=130 reasoning_tokens=129 text=""` with a 493-byte
+/// `raw_text`). Neither says anything about cache correctness — which is all
+/// this test exists to check — so asserting on `text` makes the probe fail for
+/// a reason unrelated to what it guards.
+///
+/// It must ALSO not be the whole `raw_text`. That is the verbatim decode here
+/// (`include_reasoning: Some(true)` makes `raw_text_with_reasoning_suppressed`
+/// at `finalize.rs:166-169` return the generation unmodified), so it carries
+/// the chain of thought — and the chain of thought is where the model does its
+/// arithmetic out loud. A `.contains("18")` over the whole decode therefore
+/// passes on a turn that *computes* 18 mid-`<think>` and then concludes with
+/// something else, and it passes on an incidental "18" anywhere in a 500-1800
+/// byte ramble. Measured spans on this checkpoint: `raw_text` 501-1817 B
+/// against a 77-125 B answer, i.e. up to 23x more text to match by accident.
+///
+/// So: assert against the span after `</think>`, which is the answer the model
+/// actually commits to, and fall back to the whole decode only when that span
+/// is empty — which is exactly branches (A) and (B) above, where there is no
+/// committed answer to read and the verbatim decode is all the evidence that
+/// exists. `raw_text` is empty ONLY when `num_tokens == 0`, which IS a real
+/// failure and stays fatal.
+///
+/// FIRST occurrence, matching the engine rather than inventing a second rule.
+/// `finalize.rs:171` ("keep everything after the FIRST occurrence verbatim")
+/// and `tools/mod.rs:990-992` both use `find` and both say why: `</think>` is
+/// a special token, so the first text match is the real boundary, and content
+/// after it may mention `</think>` literally — on which `rfind` splits at the
+/// later occurrence and throws the answer away. A test helper that split at
+/// the last one would assert against a boundary the product never uses, and
+/// would fail on a correct answer that quotes the tag.
+///
+/// Measured on real weights (all five probe call sites, one run): every turn
+/// emitted a literal `</think>` with a 77-125 B answer after it, and every
+/// answer stated the number — `\boxed{7}`, `\boxed{18}`, `\boxed{31}`. The
+/// tightened surface is what the assertions actually read; the fallback did
+/// not fire. See [`answer_surface_prefers_the_committed_answer`] for the
+/// masking case this closes.
+fn answer_surface(r: &mlx_core::engine::types::ChatResult) -> &str {
+    match r.raw_text.split_once("</think>") {
+        Some((_, after)) if !after.trim().is_empty() => after,
+        _ => &r.raw_text,
+    }
+}
+
+/// Whether `haystack` states `number` as a number, rather than merely
+/// containing its digits inside a longer run.
+///
+/// `str::contains("18")` is satisfied by `318`, `1.18`, and `2018`. Over the
+/// fallback surface — the whole 500-1800 B decode, which is what the two
+/// no-committed-answer branches degrade to — that is a weak enough oracle to
+/// pass on reasoning that never reached the right total. Requiring a
+/// non-digit on both sides costs nothing and removes the whole class.
+///
+/// Deliberately only NUMERIC boundaries, not `\b`: the measured answers write
+/// `\boxed{18}`, `= 18**.` and `is 18.`, all of which must keep matching, and
+/// a full word boundary buys nothing extra here.
+///
+/// A decimal point counts as part of the number on either side, so `1.18` and
+/// `18.5` are rejected while a sentence-final `is 18.` is not. That case is
+/// not hypothetical — it is what the unit test caught in the first version of
+/// this function, which only looked at digits.
+fn states_number(haystack: &str, number: &str) -> bool {
+    haystack.match_indices(number).any(|(at, _)| {
+        let mut before = haystack[..at].chars().rev();
+        // `.` and `-` are part of the literal when DIRECTLY attached: `1.18` is
+        // a decimal and `-18` is a negative, and neither states 18. A bare
+        // `.18` is rejected for the same reason; a sentence boundary is not.
+        //
+        // Attachment is what makes this safe to tighten. `31 - 18 = 13` and a
+        // markdown `- 18` both keep a space before the digits, so they still
+        // count — only a sign glued to the number is treated as part of it.
+        // `+18` is deliberately absent: it is still positive 18.
+        let joined_left =
+            matches!(before.next(), Some(c) if c.is_ascii_digit() || c == '.' || c == '-');
+
+        let mut after = haystack[at + number.len()..].chars();
+        let joined_right = match after.next() {
+            Some(c) if c.is_ascii_digit() => true,
+            // `18.5` continues; `is 18.` ends.
+            Some('.') => after.next().is_some_and(|c| c.is_ascii_digit()),
+            _ => false,
+        };
+
+        !joined_left && !joined_right
+    })
+}
+
+/// Pins [`answer_surface`] against the way it can go blind, and against the
+/// way tightening it could go wrong.
+///
+/// Deliberately NOT `#[ignore]`d: it is pure string handling, needs no
+/// checkpoint and no Metal, and so runs on the ordinary `cargo test` leg. The
+/// e2e leg is opt-in on PRs, which would make the e2e run the only guard —
+/// and this repo's recurring defect is a gate that is green because it never
+/// executed.
+///
+/// The `raw_text` bodies are abbreviated from a real measured run; the shapes
+/// (a `<think>` that does the arithmetic out loud, then a `\boxed{}` answer)
+/// are verbatim.
+#[test]
+fn answer_surface_prefers_the_committed_answer() {
+    fn with_raw(raw: &str) -> mlx_core::engine::types::ChatResult {
+        mlx_core::engine::types::ChatResult {
+            text: String::new(),
+            tool_calls: Vec::new(),
+            thinking: None,
+            num_tokens: 1,
+            prompt_tokens: 0,
+            reasoning_tokens: 0,
+            finish_reason: "stop".to_string(),
+            raw_text: raw.to_string(),
+            cached_tokens: 0,
+            performance: None,
+        }
+    }
+
+    // THE MUTATION THIS EXISTS FOR. Reasoning reaches 18, the committed answer
+    // says 19. Against the whole decode `.contains("18")` passes and the probe
+    // reports a correct answer that was never given; against the committed
+    // span it fails, which is the point.
+    let masked = with_raw("<think> 7 + 11 = 18, so the sum is 18.</think>\n\n**Answer:** 19");
+    assert!(
+        masked.raw_text.contains("18"),
+        "fixture is wrong: the whole decode must contain the masked number, or this test \
+         proves nothing about the surface"
+    );
+    assert!(
+        !answer_surface(&masked).contains("18"),
+        "answer_surface let a number that appears only in the reasoning satisfy the probe: {:?}",
+        answer_surface(&masked),
+    );
+    assert!(answer_surface(&masked).contains("19"));
+
+    // The measured happy shape: the answer span carries the number.
+    let good = with_raw(
+        "<think> amber is 7, cobalt is 11, so 7 + 11 = 18. But let</think>\n\nThe sum of amber \
+         (7) and cobalt (11) is **7 + 11 = 18**. \n\n**Answer:** \\boxed{18}",
+    );
+    assert!(answer_surface(&good).contains("18"));
+
+    // Branch (A): the turn never emitted `</think>` (a length exit mid-think —
+    // observed in CI as `num_tokens=512 finish=length`). There is no committed
+    // answer, so the verbatim decode is all the evidence there is.
+    let no_close = with_raw("<think> amber is 7 and cobalt is 11, so the sum is 18");
+    assert_eq!(answer_surface(&no_close), no_close.raw_text);
+
+    // Branch (B): `</think>` present but the turn stopped right after it.
+    let empty_tail = with_raw("<think> the sum is 18</think>\n  \n");
+    assert_eq!(answer_surface(&empty_tail), empty_tail.raw_text);
+
+    // The FIRST close is the boundary, matching `finalize.rs:171` and
+    // `tools/mod.rs:990-992`. The engine's own stated reason is that committed
+    // content may mention `</think>` literally; splitting at the last one then
+    // discards the answer and fails a correct turn — the exact flake class this
+    // file exists to remove. `split_once` is what makes this hold.
+    let quotes_the_tag = with_raw(
+        "<think> 7 + 11</think>\n\nThe sum is 18. Everything before the </think> marker was \
+         scratch work.",
+    );
+    assert!(
+        answer_surface(&quotes_the_tag).contains("18"),
+        "answer_surface split at a `</think>` the model QUOTED inside its answer and threw the \
+         answer away: {:?}",
+        answer_surface(&quotes_the_tag),
+    );
+
+    // `num_tokens == 0` stays fatal by being empty rather than by panicking
+    // here: an empty surface fails every assertion at the call site.
+    assert!(answer_surface(&with_raw("")).is_empty());
+}
+
+/// Pins [`states_number`], which is what the probe reads the surface WITH.
+///
+/// Matters most on the fallback surface: when no answer was committed, the
+/// oracle is the whole 500-1800 B decode, and a bare substring test over that
+/// much text is where an accidental match lives.
+#[test]
+fn states_number_rejects_digits_inside_a_longer_number() {
+    // The measured answer shapes. All five must keep matching, or the
+    // tightening has broken a correct run instead of a wrong one.
+    for good in [
+        "The sum of amber (7) and cobalt (11) is **7 + 11 = 18**. \n\n**Answer:** \\boxed{18}",
+        "The sum of amber (7) and cobalt (11) is 7 + 11 = 18. \n\n**Answer:** \\boxed{18}",
+        "the answer is 18",
+        "18",
+        "(18)",
+    ] {
+        assert!(states_number(good, "18"), "rejected a stated 18: {good:?}");
+    }
+
+    // THE MUTATION THIS EXISTS FOR: digits of 18 inside a longer number.
+    for bad in [
+        "318",
+        "1.18",
+        ".18",
+        "2018",
+        "180",
+        "18.5 is not it",
+        "x=118",
+        // NEGATIVES. A corrupted turn that concludes `-18` is mathematically
+        // wrong — 7 + 11 is not -18 — and a sign glued to the digits used to
+        // read as a clean boundary, so the oracle accepted it.
+        "-18",
+        "the sum is -18",
+        "**Answer:** \\boxed{-18}",
+        "17-18",
+    ] {
+        assert!(!states_number(bad, "18"), "accepted a non-answer: {bad:?}");
+    }
+    assert!(!states_number("\\boxed{-31}", "31"));
+    assert!(!states_number("amber is -7", "7"));
+
+    // Over-correction guard on the minus rule: only a sign ATTACHED to the
+    // digits disqualifies. A subtraction and a markdown bullet both keep a
+    // space, and both still state the number.
+    assert!(states_number("31 - 18 = 13", "18"));
+    assert!(states_number("- 18", "18"));
+    // `+18` is still positive 18.
+    assert!(states_number("+18", "18"));
+
+    // A wrong total that merely contains the right digits is now rejected,
+    // which is the whole point over the fallback surface.
+    assert!(!states_number("the total is 3118", "18"));
+    // …but a wrong total sitting NEXT to a correct statement still passes, and
+    // that is fine: the probe asks whether the number was stated, not whether
+    // the model also said other things.
+    assert!(states_number("first I get 318, correcting to 18", "18"));
+
+    // Multi-occurrence: one standalone hit anywhere is enough.
+    assert!(states_number("318 ... 18", "18"));
+    // Single digits get the same treatment — turn 1 asserts on "7".
+    assert!(states_number("amber is 7.", "7"));
+    assert!(!states_number("amber is 77.", "7"));
+}
+
+/// Memory-probe config: budget 128 force-closes a looping `<think>`;
+/// max_new 512 leaves the post-`</think>` span free to state the actual number.
+///
+/// NOTE: neither knob makes the ANSWER land in `ChatResult.text` — see
+/// [`answer_surface`]. The budget bounds reasoning length, nothing more.
 fn memory_probe_chat_config() -> ChatConfig {
     ChatConfig {
         cache_owner_id: None,
@@ -804,13 +1059,13 @@ async fn lfm2_paged_delta_memory_probe_parity() {
     // checkpoint over-thinks meta-instructions and drags them into later
     // turns, poisoning the arithmetic probes.
     let prompt1 = "Here are values to remember: amber = 7 and cobalt = 11. What is amber?";
-    let r1_flat = flat_model
-        .chat_session_start(
-            vec![user_message(prompt1)],
-            Some(memory_probe_chat_config()),
-        )
-        .await
-        .expect("turn 1 flat chat_session_start failed");
+    // No flat turn 1. Once the control is rebuilt from the paged transcript
+    // below, a flat turn 1 is a 2.9s decode (of a 12s test) whose output and
+    // session state are both discarded — A/B'd: the turn-2 and turn-3 controls
+    // come out byte-identical with and without it, at `cached_tokens=0` either
+    // way, because a fresh `chat_session_start` prompt does not prefix-match
+    // the abandoned turn-1 history. It only adds a surface on which an
+    // unrelated inference error can fail the gate.
     let r1_paged = paged_model
         .chat_session_start(
             vec![user_message(prompt1)],
@@ -819,26 +1074,71 @@ async fn lfm2_paged_delta_memory_probe_parity() {
         .await
         .expect("turn 1 paged chat_session_start failed");
     eprintln!(
-        "[mem-probe] turn1: flat cached={} text={:?} | paged cached={} text={:?}",
-        r1_flat.cached_tokens, r1_flat.text, r1_paged.cached_tokens, r1_paged.text,
+        "[mem-probe] turn1: paged cached={} finish={} text={:?}",
+        r1_paged.cached_tokens, r1_paged.finish_reason, r1_paged.text,
     );
     assert!(
-        r1_paged.text.contains('7'),
+        states_number(answer_surface(&r1_paged), "7"),
         "paged turn 1 could not even recall the just-planted value: {:?}",
-        r1_paged.text,
+        r1_paged.raw_text,
     );
 
     // ---- Turn 2 (DELTA): sum of the planted values ----
     let user2 = "Add amber and cobalt together. What is the sum?";
+    // The flat CONTROL is driven over the PAGED arm's transcript, not over its
+    // own. Both arms are independent greedy decodes, and greedy trajectories on
+    // this checkpoint are hardware-dependent (a 1-ULP kernel difference flips a
+    // near-tie argmax — the file header documents one at token ~93 of turn 1).
+    // Letting each arm generate its own turn-1/turn-2 replies gave the control a
+    // DIFFERENT conversation by turn 3, so "flat says 31" was a second
+    // independent lottery rather than a control: on the CI failure that
+    // motivated this shape the arms' turn-3 prompts differed by 102 tokens.
+    //
+    // It is an EQUIVALENT-INFORMATION control, NOT a same-context one, and the
+    // difference is measurable. Two known, DETERMINISTIC gaps — neither of which
+    // reintroduces the compounding lottery above, since both are fixed given the
+    // paged transcript:
+    //
+    //  - +1 token on this turn: `save_paged_history` drops the last generated
+    //    token (it is never forwarded through the paged decode step, so keeping
+    //    it would desync the KV), while the jinja template re-emits the
+    //    `<|im_end|>` the paged delta builder never re-renders.
+    //  - -423 tokens on turn 3: `chat_template.jinja` defaults
+    //    `keep_past_thinking` to false and strips `content.split("</think>")[-1]`
+    //    from every assistant that is not the LAST one. So a rebuilt turn-3
+    //    prompt loses this turn's reasoning entirely (1817 B -> 125 B measured),
+    //    where the paged arm keeps it in KV. The control still carries every
+    //    FACT the probe asks about — the values live in the user turns and in
+    //    the post-`</think>` answer — which is what "answer agreement" needs.
+    //
+    // Byte-level paged-vs-flat parity — including a short DELTA turn — stays
+    // pinned by tests (a)/(a2)/(b2)/(c); this test's control exists for ANSWER
+    // agreement only (see the header). Same idiom as
+    // `lfm2_paged_prefill_bridge_cache_hit_ab_probe` below.
+    //
+    // On a `length` exit the +1 above is a real word piece rather than
+    // `<|im_end|>`, because `save_paged_history` drops the last generated token
+    // (never forwarded through the paged decode step) while `raw_text` keeps it.
+    // NOT asserted against: whether this turn ends on `stop` or `length` is a
+    // property of the RUNNER — this machine stops at 463 tokens, CI rambles past
+    // the 512 cap on the same weights — so a `finish_reason` gate here fails the
+    // suite on hardware rather than on behaviour. It is also incoherent to police
+    // one token while accepting the 423-token strip above by design. Both are
+    // bounded and deterministic given the transcript, and neither removes a FACT
+    // the probe asks about, which is all an equivalent-information control owes.
+    // `finish_reason` is logged instead, so a cap exit is visible when reading a
+    // failure rather than silent.
     let r2_flat = flat_model
-        .chat_session_continue(
-            user2.to_string(),
-            None,
-            None,
+        .chat_session_start(
+            vec![
+                user_message(prompt1),
+                assistant_message(&r1_paged.raw_text),
+                user_message(user2),
+            ],
             Some(memory_probe_chat_config()),
         )
         .await
-        .expect("turn 2 flat chat_session_continue failed");
+        .expect("turn 2 flat control chat_session_start failed");
     let r2_paged = paged_model
         .chat_session_continue(
             user2.to_string(),
@@ -865,29 +1165,38 @@ async fn lfm2_paged_delta_memory_probe_parity() {
     // pre-fix corrupted continuation (empty flat attention KV) cannot
     // produce it.
     assert!(
-        r2_paged.text.contains("18"),
+        states_number(answer_surface(&r2_paged), "18"),
         "paged delta turn 2 lost the turn-1 context: expected the sum 18 in {:?}",
-        r2_paged.text,
+        r2_paged.raw_text,
     );
     // Answer-level parity with the forced-flat control (byte parity is
     // pinned at short lengths by tests (a)/(c) — see the header).
     assert!(
-        r2_flat.text.contains("18"),
-        "flat control turn 2 disagrees with the paged answer (expected 18): {:?}",
-        r2_flat.text,
+        states_number(answer_surface(&r2_flat), "18"),
+        "flat control turn 2 disagrees with the paged answer (expected 18) on the SAME \
+         context: finish={} num_tokens={} raw_text={:?}",
+        r2_flat.finish_reason,
+        r2_flat.num_tokens,
+        r2_flat.raw_text,
     );
 
     // ---- Turn 3 (DELTA): extend the context and re-derive ----
     let user3 = "One more value: jade = 13. What is amber + cobalt + jade in total?";
+    // Control over the PAGED transcript again — see the turn-2 comment for both
+    // known gaps and why neither is asserted against.
     let r3_flat = flat_model
-        .chat_session_continue(
-            user3.to_string(),
-            None,
-            None,
+        .chat_session_start(
+            vec![
+                user_message(prompt1),
+                assistant_message(&r1_paged.raw_text),
+                user_message(user2),
+                assistant_message(&r2_paged.raw_text),
+                user_message(user3),
+            ],
             Some(memory_probe_chat_config()),
         )
         .await
-        .expect("turn 3 flat chat_session_continue failed");
+        .expect("turn 3 flat control chat_session_start failed");
     let r3_paged = paged_model
         .chat_session_continue(
             user3.to_string(),
@@ -909,20 +1218,128 @@ async fn lfm2_paged_delta_memory_probe_parity() {
         r3_paged.cached_tokens,
     );
     assert!(
-        r3_paged.text.contains("31"),
+        states_number(answer_surface(&r3_paged), "31"),
         "paged delta turn 3 lost accumulated context: expected the sum 31 in {:?}",
-        r3_paged.text,
+        r3_paged.raw_text,
     );
     assert!(
-        r3_flat.text.contains("31"),
-        "flat control turn 3 disagrees with the paged answer (expected 31): {:?}",
-        r3_flat.text,
+        states_number(answer_surface(&r3_flat), "31"),
+        "flat control turn 3 disagrees with the paged answer (expected 31) on the SAME \
+         context: finish={} num_tokens={} raw_text={:?}",
+        r3_flat.finish_reason,
+        r3_flat.num_tokens,
+        r3_flat.raw_text,
     );
 
     eprintln!(
         "[PASS] lfm2 paged-delta memory probe: paged answers correct (18, 31), flat control \
          agrees; paged cached {} -> {}",
         r2_paged.cached_tokens, r3_paged.cached_tokens,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test (d2): the same memory probe driven entirely on the FLAT path, through
+// `chat_session_continue`.
+//
+// THE COVERAGE HOLE THIS FILLS. Test (d) above rebuilds its flat control with
+// `chat_session_start` — deliberately, because two independent greedy decodes
+// diverge on this checkpoint and made the comparison a second lottery rather
+// than a control. The side effect is that (d) no longer drives the flat
+// warm-continue path with a CONTENT-sensitive prompt. What remains is test (c),
+// which does exercise flat `chat_session_continue` but asserts flat == paged on
+// "Say hi in one short word." — a prompt whose answer does not depend on turn-1
+// context, so a regression that corrupted flat continuation in the same way on
+// both arms would satisfy it.
+//
+// This closes that with a SINGLE-ARM content assertion: the flat path alone
+// must still derive 18 and 31 from context it can only have through its live
+// conv + attention caches. No cross-arm comparison, so no greedy lottery; no
+// finish_reason, num_tokens, or byte-equality assertion, so nothing here varies
+// with the runner. Same oracle as (d) — see [`answer_surface`].
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real LFM2 checkpoint"]
+async fn lfm2_flat_delta_memory_probe_content() {
+    let Some(src) = resolve_source_model() else {
+        return;
+    };
+
+    let flat_dir = match clone_model_dir(&src, "lfm2-flat-memprobe-cont", false) {
+        Ok(p) => p,
+        Err(e) => panic!("failed to clone model dir for flat path: {e}"),
+    };
+    let flat_model = Lfm2Model::load_from_dir(&flat_dir.to_string_lossy())
+        .await
+        .expect("failed to load flat-path LFM2 model");
+
+    let r1 = flat_model
+        .chat_session_start(
+            vec![user_message(
+                "Here are values to remember: amber = 7 and cobalt = 11. What is amber?",
+            )],
+            Some(memory_probe_chat_config()),
+        )
+        .await
+        .expect("flat turn 1 chat_session_start failed");
+    eprintln!(
+        "[flat-mem-probe] turn1: finish={} text={:?}",
+        r1.finish_reason, r1.text,
+    );
+
+    let r2 = flat_model
+        .chat_session_continue(
+            "Add amber and cobalt together. What is the sum?".to_string(),
+            None,
+            None,
+            Some(memory_probe_chat_config()),
+        )
+        .await
+        .expect("flat turn 2 chat_session_continue failed");
+    eprintln!(
+        "[flat-mem-probe] turn2: cached={} text={:?}",
+        r2.cached_tokens, r2.text,
+    );
+    assert!(
+        states_number(answer_surface(&r2), "18"),
+        "flat warm-continue turn 2 lost the turn-1 context: expected the sum 18 in {:?}",
+        r2.raw_text,
+    );
+
+    let r3 = flat_model
+        .chat_session_continue(
+            "One more value: jade = 13. What is amber + cobalt + jade in total?".to_string(),
+            None,
+            None,
+            Some(memory_probe_chat_config()),
+        )
+        .await
+        .expect("flat turn 3 chat_session_continue failed");
+    eprintln!(
+        "[flat-mem-probe] turn3: cached={} text={:?}",
+        r3.cached_tokens, r3.text,
+    );
+    assert!(
+        states_number(answer_surface(&r3), "31"),
+        "flat warm-continue turn 3 lost accumulated context: expected the sum 31 in {:?}",
+        r3.raw_text,
+    );
+
+    // Reachability: a 0 here would mean the "continue" turns silently
+    // re-prefilled from scratch, in which case the answers above prove nothing
+    // about the flat caches this test exists to exercise.
+    assert!(
+        r2.cached_tokens > 0 && r3.cached_tokens > r2.cached_tokens,
+        "flat deltas did not warm-continue (cached {} -> {}); the content assertions above did \
+         not exercise the live flat conv + attention caches",
+        r2.cached_tokens,
+        r3.cached_tokens,
+    );
+
+    eprintln!(
+        "[PASS] lfm2 FLAT warm-continue memory probe: answers correct (18, 31); cached {} -> {}",
+        r2.cached_tokens, r3.cached_tokens,
     );
 }
 
