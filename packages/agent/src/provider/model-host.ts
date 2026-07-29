@@ -15,8 +15,36 @@
 
 import type { ChatSession, loadModel, SessionCapableModel } from '@mlx-node/lm';
 
+import { COLD_TIER_RESTORE_FAMILIES } from '../cold-tier.js';
 import type { DiscoveredModelLike } from '../types.js';
 import { claimNativeOwner } from './native-owner.js';
+
+/**
+ * Re-exported so the HOST consults exactly the symbol the drift guard and the
+ * `--no-persist-cache` help text consult. The definition lives in the
+ * native-free `../cold-tier.js` leaf (reachable off-package through the
+ * `@mlx-node/agent/catalog` subpath, which re-exports it)
+ * because this module value-imports `@mlx-node/lm`, which loads the native
+ * addon — the dashboard and the CLI help path must be able to read the list
+ * without that.
+ */
+export { COLD_TIER_RESTORE_FAMILIES };
+
+/** Per-load policy handed to {@link MlxModelHostOptions.resolveModelPathFn}. */
+export interface ModelLoadPolicy {
+  /**
+   * Authoritative cold-tier directive for the config overlay
+   * (`persist_paged_cache` in the cloned config.json). Present ONLY for loads
+   * of a {@link COLD_TIER_RESTORE_FAMILIES} family, carrying the resolved
+   * {@link MlxModelHostOptions.persistPagedCache} value as an EXPLICIT
+   * boolean: `true` enables the SSD cold tier, `false` authoritatively
+   * disables it — overriding any `persist_paged_cache` the checkpoint's own
+   * config.json hard-codes, so `mlx agent --no-persist-cache` truly wins.
+   * Every other family receives no policy at all, so the overlay never touches
+   * the field for them.
+   */
+  persistPagedCache: boolean;
+}
 
 export interface MlxModelHostOptions {
   /** Injectable model loader so tests can stub native loading. */
@@ -24,9 +52,10 @@ export interface MlxModelHostOptions {
   /**
    * Optional load-path policy. `mlx agent` uses this to point the loader at
    * an ephemeral config overlay with block-paged attention enabled while
-   * leaving the checkpoint directory untouched.
+   * leaving the checkpoint directory untouched. The optional per-load policy
+   * carries the qwen3 cold-tier opt-in (see {@link ModelLoadPolicy}).
    */
-  resolveModelPathFn?: (model: DiscoveredModelLike) => Promise<string>;
+  resolveModelPathFn?: (model: DiscoveredModelLike, policy?: ModelLoadPolicy) => Promise<string>;
   /**
    * Reject a loaded model unless its native paged-cache adapter is active.
    * The agent entrypoint enables this on builds where paging can actually
@@ -37,6 +66,14 @@ export interface MlxModelHostOptions {
    * flat-cache-only.
    */
   requirePagedCache?: boolean;
+  /**
+   * Enable the cold tier (persisted paged prefix blocks) by default. `mlx
+   * agent` turns this on; `mlx agent --no-persist-cache` sets it false.
+   * Applied only to loads of a {@link COLD_TIER_RESTORE_FAMILIES} family —
+   * every other family keeps per-layer state outside the paged pool, so its
+   * prefix cannot be restored soundly. Defaults true.
+   */
+  persistPagedCache?: boolean;
 }
 
 /**
@@ -73,8 +110,9 @@ export class MlxModelHost {
   private readonly byName = new Map<string, DiscoveredModelLike>();
   /** `null` ⇒ use the lazily-loaded native `loadModel` (see {@link loadNativeHost}). */
   private readonly loadModelFn: typeof loadModel | null;
-  private readonly resolveModelPathFn: (model: DiscoveredModelLike) => Promise<string>;
+  private readonly resolveModelPathFn: (model: DiscoveredModelLike, policy?: ModelLoadPolicy) => Promise<string>;
   private readonly requirePagedCache: boolean;
+  private readonly persistPagedCache: boolean;
   private resident: ResidentModel | null = null;
   private chain: Promise<unknown> = Promise.resolve();
 
@@ -83,6 +121,7 @@ export class MlxModelHost {
     this.loadModelFn = opts.loadModelFn ?? null;
     this.resolveModelPathFn = opts.resolveModelPathFn ?? (async (model) => model.path);
     this.requirePagedCache = opts.requirePagedCache ?? false;
+    this.persistPagedCache = opts.persistPagedCache ?? true;
   }
 
   get residentId(): string | null {
@@ -107,13 +146,19 @@ export class MlxModelHost {
    * use the resident session; there is deliberately no method that
    * returns a session outside the serialized section.
    *
+   * `fn` also receives a `resident` boolean: `true` when the turn reused
+   * the already-loaded model (warm — no load happened), `false` when it had
+   * to load or swap the checkpoint first. This is the same warm/cold
+   * distinction the branch below already makes; surfacing it lets a metrics
+   * consumer separate queue wait from cold-load time without another channel.
+   *
    * Swaps drop the old session + model refs BEFORE loading the new
    * checkpoint so GC + native destructors can reclaim the old weights
    * during the load. A load failure leaves no resident (next call
    * retries); a failure thrown by `fn` rejects only this call's promise
    * and keeps the resident loaded for later callers.
    */
-  runWithResident<T>(modelId: string, fn: (session: ChatSession) => Promise<T>): Promise<T> {
+  runWithResident<T>(modelId: string, fn: (session: ChatSession, resident: boolean) => Promise<T>): Promise<T> {
     const entry = this.byName.get(modelId);
     if (!entry) {
       const known = [...this.byName.keys()].join(', ');
@@ -121,16 +166,29 @@ export class MlxModelHost {
     }
     return this.runSerialized(async () => {
       let session: ChatSession;
+      // `true` when this turn reuses the loaded resident (warm), `false` when
+      // it loaded/swapped the checkpoint first (cold).
+      let resident: boolean;
       if (this.resident?.id === modelId) {
         session = this.resident.session;
+        resident = true;
       } else {
+        resident = false;
         this.resident = null;
         // Claim the process latch FIRST: `resolveModelPathFn` is the agent's
         // paged overlay, which reaches `@mlx-node/lm` lazily, and no dlopen
         // may happen before the latch has ruled out a second MLX runtime
         // (genmlx-djw6 process purity).
         const native = await loadNativeHost();
-        const resolvedPath = await this.resolveModelPathFn(entry);
+        // Only a COLD_TIER_RESTORE_FAMILIES family has a sound paged cold
+        // restore. Hand it an EXPLICIT tri-state directive so the overlay can
+        // authoritatively set the flag either way (default-on, or
+        // `--no-persist-cache` off — overriding any value in the checkpoint's
+        // config.json). Every other family gets no policy at all, so the
+        // overlay never touches the field for them.
+        const resolvedPath = COLD_TIER_RESTORE_FAMILIES.has(entry.modelType)
+          ? await this.resolveModelPathFn(entry, { persistPagedCache: this.persistPagedCache })
+          : await this.resolveModelPathFn(entry);
         const model = await (this.loadModelFn ?? native.loadModel)(resolvedPath);
         const sessionModel = model as unknown as SessionCapableModel;
         const gemmaDraftActive = entry.modelType === 'gemma4' && sessionModel.hasMtpWeights?.() === true;
@@ -151,7 +209,7 @@ export class MlxModelHost {
         session = new native.ChatSession(sessionModel);
         this.resident = { id: modelId, session, model, dirty: false };
       }
-      return await fn(session);
+      return await fn(session, resident);
     });
   }
 

@@ -8,6 +8,7 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::{DType, MxArray};
+use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
 use crate::engine::persistence::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
     prewarm_checkpoint_pages,
@@ -370,6 +371,7 @@ fn parse_config_with_load_metadata(model_path: &Path) -> Result<ParsedGemma4Conf
             .and_then(|v| v.as_u64())
             .map(|v| v as u32),
         use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
+        persist_paged_cache: raw.get("persist_paged_cache").and_then(|v| v.as_bool()),
     };
 
     Ok(ParsedGemma4Config {
@@ -2272,6 +2274,52 @@ fn apply_unified_vision_embedder_weights(
     Ok(())
 }
 
+/// Resolve the target's `use_block_paged_cache` against a resolved draft.
+///
+/// `explicit` is the value the checkpoint's `config.json` carried (`None`
+/// when the key is absent, which is the shipping case — no gemma4 checkpoint
+/// writes it). `draft_source` is `Some(label)` once a draft checkpoint has
+/// been resolved, where `label` names how it was requested, and `None` when
+/// there is no draft at all.
+///
+/// Draft speculative decoding runs only on the flat KV-cache path, so a draft
+/// forces flat. The forcing is what keeps a draft turn off the paged handler,
+/// and it is load-bearing rather than cosmetic:
+///
+/// ```text
+///   Some(false) here  ->  Gemma4Inner::new builds NO paged adapter
+///                     ->  ExecutionPlan.paged_attention = None
+///                     ->  TurnPlan::resolve keeps DecoderPlan::Speculative
+///                     ->  TurnPlan::path() = TurnPath::Speculative
+///
+///   drop it, and `use_block_paged_cache.unwrap_or(true)` builds the adapter
+///                     ->  paged ON + SpeculativePlan.supports_paged_attention:false
+///                     ->  TurnPlan::resolve downgrades to Autoregressive
+///                     ->  path() tests paged BEFORE speculative => TurnPath::Paged
+///                     ->  engine::paged_turn never reads `plan.decoder`
+/// ```
+///
+/// The draft would then load, hold its weights resident and answer
+/// `hasMtpWeights()`, while not one draft forward ever runs — a silent
+/// autoregressive decode. That is exactly the outcome the explicit-`true` arm
+/// below refuses to allow, so the two arms must stay in step.
+fn resolve_gemma4_draft_paged_cache(
+    explicit: Option<bool>,
+    draft_source: Option<&str>,
+) -> Result<Option<bool>> {
+    let Some(draft_source) = draft_source else {
+        return Ok(explicit);
+    };
+    if explicit == Some(true) {
+        return Err(Error::from_reason(format!(
+            "Gemma4 {draft_source} conflicts with use_block_paged_cache=true: draft \
+                 speculative decoding runs only on the flat KV-cache path. Remove the \
+                 draft request or set use_block_paged_cache to false in config.json."
+        )));
+    }
+    Ok(Some(false))
+}
+
 impl Gemma4Inner {
     /// Load a Gemma4Inner from a directory containing safetensors and config.json.
     ///
@@ -2321,16 +2369,10 @@ impl Gemma4Inner {
         // defaults ON (`unwrap_or(true)` in `Gemma4Inner::new`); a draft
         // request flips that default to flat, but an EXPLICIT `true` is a
         // config-level conflict the caller must resolve.
-        if resolved_draft_model_path.is_some() {
-            if config.use_block_paged_cache == Some(true) {
-                return Err(Error::from_reason(format!(
-                    "Gemma4 {draft_source} conflicts with use_block_paged_cache=true: draft \
-                         speculative decoding runs only on the flat KV-cache path. Remove the \
-                         draft request or set use_block_paged_cache to false in config.json."
-                )));
-            }
-            config.use_block_paged_cache = Some(false);
-        }
+        config.use_block_paged_cache = resolve_gemma4_draft_paged_cache(
+            config.use_block_paged_cache,
+            resolved_draft_model_path.is_some().then_some(draft_source),
+        )?;
 
         // Merge stop tokens and sampling defaults from generation_config.json
         let gen_config_path = path.join("generation_config.json");
@@ -2407,7 +2449,25 @@ impl Gemma4Inner {
         // Converted unified checkpoints keep the encoder-free vision/audio
         // tensors from GGUF mmproj in `vision.safetensors`. Plain Gemma and
         // text-only unified configs continue loading only the main checkpoint.
+        // Cold-tier persistence intent, resolved BEFORE the mmap so the
+        // shard-identity bracket can open on the pre-mmap snapshot.
+        // Precedence: explicit config > `MLX_PERSIST_PAGED_CACHE` > off.
+        let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
+        let persist_cold =
+            resolve_persist_cold("gemma4", persist_env.as_deref(), config.persist_paged_cache);
+        let shard_snapshot_before_mmap = if persist_cold {
+            snapshot_shard_identities(path)
+        } else {
+            None
+        };
+
         let mut params = load_all_safetensors(path, should_load_media_sidecar(&config))?;
+
+        let shard_snapshot_at_mmap = if persist_cold {
+            snapshot_shard_identities(path)
+        } else {
+            None
+        };
 
         // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval
         // of any mmap-backed weight (FP8 dequant in `dequant_fp8_weights`,
@@ -2580,7 +2640,7 @@ impl Gemma4Inner {
         // Materialize weights in chunked evals to avoid Metal command buffer
         // timeouts on large models. Without this, weights remain as lazy mmap
         // references and every decode step re-reads ~48GB from disk.
-        {
+        let weights_resident = {
             let mut weight_refs: Vec<&MxArray> = params.values().collect();
             // PLE shards live outside `params` (their oversized source key was
             // removed); materialize them too. Each shard is sub-cap, so the
@@ -2588,7 +2648,44 @@ impl Gemma4Inner {
             if let Some(ple) = inner.ple.as_ref() {
                 weight_refs.extend(ple.embed_tokens_per_layer.shard_arrays());
             }
-            crate::array::memory::materialize_weights(&weight_refs)?;
+            crate::array::memory::materialize_weights(&weight_refs)?
+        };
+
+        if persist_cold {
+            // Fail-closed revalidation bracketing the WHOLE
+            // load-to-materialize-to-fingerprint span, identical in shape to the
+            // qwen3 loader's: compute the content fingerprint FIRST (it reads the
+            // shards), then re-stat and require shard identity to be unchanged
+            // across [before-mmap .. at-mmap .. after the fingerprint read]. Only
+            // then attach. Any change at any checkpoint — or an unreadable shard —
+            // means the fingerprint could describe a different revision than the
+            // weights the mmap actually loaded, so leave persistence off.
+            //
+            // Both steps sit BELOW `materialize_weights` and take its
+            // `WeightsResident` witness. MLX preads shard bytes lazily through a
+            // held fd, so an identity read above that pass would leave a window in
+            // which a same-inode in-place rewrite binds persisted KV to bytes this
+            // process never ran — and nothing re-derives the identity at read time.
+            //
+            // The gemma4 context additionally carries a `ColdSidecarPolicy`, so
+            // attaching it also arms the reconcile-down restore and the
+            // auxiliary-state obligation the sliding prefill discharges.
+            if let Some(ctx) = inner.build_cold_tier_context(model_path, &weights_resident) {
+                let after_fingerprint = snapshot_shard_identities(path);
+                if shard_identities_stable(
+                    &shard_snapshot_before_mmap,
+                    &shard_snapshot_at_mmap,
+                    &after_fingerprint,
+                ) {
+                    inner.attach_cold_tier(ctx, &weights_resident);
+                } else {
+                    tracing::warn!(
+                        "cold-tier persistence disabled for {model_path}: model directory \
+                         changed during load (shard identity mismatch); KV persistence stays \
+                         off for safety"
+                    );
+                }
+            }
         }
 
         // Gemma4's forward runs entirely through primitive-op FFI that takes
@@ -3130,6 +3227,102 @@ mod tests {
             err.reason
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The whole truth table of [`resolve_gemma4_draft_paged_cache`], because
+    /// `load_from_dir` cannot reach the interesting rows: it runs
+    /// `validate_required_weights` before `Gemma4Inner::new`, so a config-only
+    /// fixture always dies on the missing safetensors long before the adapter
+    /// decision, and the two guard tests above can therefore only observe the
+    /// ABSENCE of the conflict error — which holds whether or not the flat
+    /// forcing survives.
+    ///
+    /// ```text
+    ///   explicit      draft   ->  resolved       what it pins
+    ///   None          no      ->  None           forcing is DRAFT-scoped
+    ///   Some(true)    no      ->  Some(true)     ...not a blanket override
+    ///   Some(false)   no      ->  Some(false)    passthrough
+    ///   None          yes     ->  Some(false)    THE SHIPPING ROW
+    ///   Some(false)   yes     ->  Some(false)    agreement, not conflict
+    ///   Some(true)    yes     ->  Err            the sibling arm
+    /// ```
+    ///
+    /// The `None + draft` row is the one that carries the feature: no gemma4
+    /// checkpoint writes `use_block_paged_cache`, so every real draft load
+    /// arrives with `explicit = None`. Delete the forcing and that row returns
+    /// `None`, `Gemma4Inner::new`'s `unwrap_or(true)` builds a paged adapter,
+    /// and the turn silently resolves to `TurnPath::Paged` with the draft
+    /// loaded but never stepped. It is also the only row that survives that
+    /// mutation as a distinguishable value — `Some(false) + draft` returns
+    /// `Some(false)` either way.
+    #[test]
+    fn draft_paged_cache_resolution_covers_the_whole_truth_table() {
+        for (explicit, draft_source, expected, why) in [
+            (
+                None,
+                None,
+                None,
+                "no draft: an absent key must stay absent, so a plain load keeps the \
+                 paged default",
+            ),
+            (
+                Some(true),
+                None,
+                Some(true),
+                "no draft: an explicit opt-in must survive — the forcing is scoped to \
+                 draft loads, not a blanket paged kill switch",
+            ),
+            (
+                Some(false),
+                None,
+                Some(false),
+                "no draft: an explicit opt-out passes through untouched",
+            ),
+            (
+                None,
+                Some("draft_model_path"),
+                Some(false),
+                "draft with the key absent — the shipping configuration. This MUST be \
+                 forced flat: `Gemma4Inner::new` reads `unwrap_or(true)`, so leaving it \
+                 `None` builds a paged adapter, `TurnPlan::path` prefers Paged over \
+                 Speculative, and the draft loads without ever running a forward",
+            ),
+            (
+                Some(false),
+                Some("embedded draft/ checkpoint"),
+                Some(false),
+                "draft plus an explicit opt-out agree; that is not a conflict",
+            ),
+        ] {
+            let resolved = match resolve_gemma4_draft_paged_cache(explicit, draft_source) {
+                Ok(v) => v,
+                Err(e) => panic!("({explicit:?}, {draft_source:?}) must resolve, got: {e}"),
+            };
+            assert_eq!(
+                resolved, expected,
+                "resolve_gemma4_draft_paged_cache({explicit:?}, {draft_source:?}) = \
+                 {resolved:?}, expected {expected:?} — {why}"
+            );
+        }
+
+        // The sibling arm: an EXPLICIT paged opt-in plus a draft is a config
+        // conflict the caller has to resolve, because silently dropping either
+        // one is worse than failing the load.
+        for draft_source in ["draft_model_path", "embedded draft/ checkpoint"] {
+            let err = match resolve_gemma4_draft_paged_cache(Some(true), Some(draft_source)) {
+                Ok(v) => panic!("explicit paged + {draft_source} must be rejected, got {v:?}"),
+                Err(e) => e,
+            };
+            assert_eq!(
+                err.reason,
+                format!(
+                    "Gemma4 {draft_source} conflicts with use_block_paged_cache=true: draft \
+                     speculative decoding runs only on the flat KV-cache path. Remove the \
+                     draft request or set use_block_paged_cache to false in config.json."
+                ),
+                "the conflict message is user-facing config advice; keep it verbatim"
+            );
+        }
     }
 
     // ── draft kind probe (load_draft_variant) ──────────────────────────

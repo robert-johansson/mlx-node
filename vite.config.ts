@@ -24,6 +24,7 @@ export default defineConfig({
     },
     ignorePatterns: [
       '**/dist/**',
+      'packages/dashboard/web/**',
       '**/tests/**',
       '**/generated/**',
       '**/fixtures/**',
@@ -51,6 +52,9 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
+    // Tests must never write inference telemetry to the developer's real
+    // ~/.mlx-node. metrics-trace.test.ts manages this var itself (temp dirs).
+    env: { MLX_AGENT_METRICS: '0' },
     maxConcurrency: 1,
     watch: false,
     testTimeout: 120000, // 2 minutes
@@ -65,6 +69,7 @@ export default defineConfig({
     alias: {
       '@mlx-node/core': resolve(__dirname, './packages/core/index.cjs'),
       '@mlx-node/lm': resolve(__dirname, './packages/lm/src/index.ts'),
+      '@mlx-node/agent/catalog': resolve(__dirname, './packages/agent/src/catalog.ts'),
       '@mlx-node/agent': resolve(__dirname, './packages/agent/src/index.ts'),
       '@mlx-node/privacy': resolve(__dirname, './packages/privacy/src/index.ts'),
       '@mlx-node/trl': resolve(__dirname, './packages/trl/src/index.ts'),
@@ -73,6 +78,11 @@ export default defineConfig({
       // fall through to the barrel alias below.
       '@mlx-node/server/presets': resolve(__dirname, './packages/server/src/presets.ts'),
       '@mlx-node/server': resolve(__dirname, './packages/server/src/index.ts'),
+      '@mlx-node/dashboard': resolve(__dirname, './packages/dashboard/src/index.ts'),
+      // The dashboard SPA's own `@/…` alias (packages/dashboard/ui/vite.config.ts),
+      // repeated here so a test can import a page component. Keyed with the
+      // trailing slash so it can never swallow an `@mlx-node/…` specifier.
+      '@/': `${resolve(__dirname, './packages/dashboard/ui/src')}/`,
     },
   },
 });

@@ -3,10 +3,11 @@
  * `??=` semantics, the exact extension set (both in-process local providers),
  * registry-policy lifecycle, and verbatim argv forwarding.
  */
-import { homedir } from 'node:os';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { AuthStorage, type InlineExtension, ModelRegistry } from '@earendil-works/pi-coding-agent';
+import { type InlineExtension, ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import {
@@ -29,7 +30,12 @@ const FAKE_GENMLX_MODEL = {
   piModel: {},
 } as never;
 
-const ENV_KEYS = ['PI_CODING_AGENT_DIR', 'PI_SKIP_VERSION_CHECK', 'MLX_PAGED_PREFILL_CHUNK_SIZE'] as const;
+const ENV_KEYS = [
+  'PI_CODING_AGENT_DIR',
+  'PI_SKIP_VERSION_CHECK',
+  'MLX_PAGED_PREFILL_CHUNK_SIZE',
+  'PI_OFFLINE',
+] as const;
 
 type EnvKey = (typeof ENV_KEYS)[number];
 
@@ -56,7 +62,7 @@ function makeSeam(): { main: RunAgentMain; calls: SeamCapture[] } {
 }
 
 function piImpl(main: RunAgentMain): RunAgentPi {
-  return { main, ModelRegistry };
+  return { main, ModelRuntime };
 }
 
 function pagedConfigOverrides(): AgentPagedConfigOverrides & { cleanup: ReturnType<typeof vi.fn> } {
@@ -94,9 +100,10 @@ describe('runAgent', () => {
     expect(env.PI_CODING_AGENT_DIR).toBe(join(homedir(), '.mlx-node', 'agent'));
     expect(env.PI_SKIP_VERSION_CHECK).toBe('1');
     expect(env.MLX_PAGED_PREFILL_CHUNK_SIZE).toBe('2048');
+    expect(env.PI_OFFLINE).toBe('1');
   });
 
-  it('never clobbers user-set env values', async () => {
+  it('never clobbers the ??= tunables, but always forces PI_OFFLINE=1', async () => {
     process.env.PI_CODING_AGENT_DIR = '/custom/agent-home';
     process.env.PI_SKIP_VERSION_CHECK = '0';
     process.env.MLX_PAGED_PREFILL_CHUNK_SIZE = '512';
@@ -108,6 +115,18 @@ describe('runAgent', () => {
     expect(env.PI_CODING_AGENT_DIR).toBe('/custom/agent-home');
     expect(env.PI_SKIP_VERSION_CHECK).toBe('0');
     expect(env.MLX_PAGED_PREFILL_CHUNK_SIZE).toBe('512');
+    // PI_OFFLINE was never user-set here; the offline invariant still forces it on.
+    expect(env.PI_OFFLINE).toBe('1');
+  });
+
+  it('forces PI_OFFLINE=1 even when the user tried to disable it', async () => {
+    // Hard offline invariant: no ambient PI_OFFLINE=0 may re-enable cloud network.
+    process.env.PI_OFFLINE = '0';
+
+    const { main, calls } = makeSeam();
+    await runAgent({ modelsDir: '/models', models: [], argv: [], piImpl: piImpl(main) });
+
+    expect(calls[0]!.envAtCall.PI_OFFLINE).toBe('1');
   });
 
   it('passes exactly the built-in mlx extensions, in order', async () => {
@@ -228,23 +247,35 @@ describe('runAgent', () => {
     expect(paged.cleanup).toHaveBeenCalledOnce();
   });
 
-  it('applies the registry policy while main runs and restores it afterward', async () => {
-    const authStorage = AuthStorage.inMemory({ groq: { type: 'api_key', key: 'test-groq-key' } });
-    const registry = ModelRegistry.inMemory(authStorage);
-    const groq = registry.getAll().find((model) => model.provider === 'groq');
-    expect(groq).toBeDefined();
+  it('applies the runtime policy while main runs and restores it afterward', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'mlx-run-agent-policy-'));
+    try {
+      // Isolated runtime: no models.json, an empty temp auth file. The full
+      // builtin catalog still contains cloud providers regardless of auth.
+      const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null });
+      const groq = runtime.getModels().find((model) => model.provider === 'groq');
+      expect(groq).toBeDefined();
 
-    await runAgent({
-      modelsDir: '/models',
-      models: [FAKE_MODEL],
-      argv: [],
-      piImpl: piImpl(async () => {
-        expect(registry.find('groq', groq!.id)).toBeUndefined();
-        expect(registry.getAll()).toEqual([]);
-      }),
-    });
+      await runAgent({
+        modelsDir: '/models',
+        models: [FAKE_MODEL],
+        argv: [],
+        piImpl: {
+          main: async () => {
+            // The filter installs on the runtime prototype for `main`'s lifetime,
+            // so this concrete instance's reads become mlx-only. No mlx/local is
+            // registered on it, so the filtered catalog collapses to empty.
+            expect(runtime.getModel('groq', groq!.id)).toBeUndefined();
+            expect(runtime.getModels()).toEqual([]);
+          },
+          ModelRuntime,
+        },
+      });
 
-    expect(registry.find('groq', groq!.id)).toBeDefined();
+      expect(runtime.getModel('groq', groq!.id)).toBeDefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('allowlists genmlx models too, so the second provider stays visible', async () => {

@@ -19,8 +19,10 @@ import type {
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { contextToChatMessages } from '../src/provider/convert-messages.js';
-import { makeMlxStreamSimple, type StreamSimpleHost } from '../src/provider/stream-adapter.js';
+import { makeMlxStreamSimple, type StreamSimpleHost, type TurnRecorder } from '../src/provider/stream-adapter.js';
 import type { DiscoveredModelLike } from '../src/types.js';
+
+type TurnRecord = Parameters<TurnRecorder>[0];
 
 const DISCOVERED: DiscoveredModelLike = { name: 'qwen-small', path: '/models/qwen-small', modelType: 'qwen3_5' };
 
@@ -178,12 +180,12 @@ function makeFakeHost(session: FakeChatSession, log: string[] = session.log): Fa
   const invalidatedIds: string[] = [];
   return {
     modelInfo: (modelId) => (modelId === DISCOVERED.name ? DISCOVERED : undefined),
-    runWithResident<T>(modelId: string, fn: (s: ChatSession) => Promise<T>): Promise<T> {
+    runWithResident<T>(modelId: string, fn: (s: ChatSession, resident: boolean) => Promise<T>): Promise<T> {
       const n = ++calls;
       const run = async (): Promise<T> => {
         log.push(`fn${n}-start:${modelId}`);
         try {
-          return await fn(session.asChatSession());
+          return await fn(session.asChatSession(), true);
         } finally {
           log.push(`fn${n}-end:${modelId}`);
         }
@@ -526,6 +528,184 @@ describe('makeMlxStreamSimple', () => {
     expect(finalMessage(events).stopReason).toBe('stop');
   });
 
+  it('records one turn with the request sessionId, the message traceId, and a non-negative duration', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield delta('Hi');
+        yield finalEvent({ text: 'Hi', numTokens: 3, promptTokens: 10, cachedTokens: 4, reasoningTokens: 2 });
+      },
+    ]);
+    let recorded: TurnRecord | undefined;
+    const recorder = vi.fn((rec: TurnRecord) => {
+      recorded = rec;
+    });
+
+    const events = await collect(
+      makeMlxStreamSimple(
+        makeFakeHost(session),
+        undefined,
+        undefined,
+        recorder,
+      )(MODEL, CONTEXT, {
+        sessionId: 'sess-9',
+      }),
+    );
+    const message = finalMessage(events) as AssistantMessage & { mlxTraceId?: string };
+
+    expect(recorder).toHaveBeenCalledOnce();
+    expect(recorded?.sessionId).toBe('sess-9');
+    expect(recorded?.model).toBe('qwen-small');
+    // The join key on the record matches the custom field stamped on the message.
+    expect(typeof message.mlxTraceId).toBe('string');
+    expect(recorded?.traceId).toBe(message.mlxTraceId);
+    expect(recorded?.durationMs).toBeGreaterThanOrEqual(0);
+    // The raw native final is handed through for field mapping.
+    expect(recorded?.final.finishReason).toBe('stop');
+    expect(recorded?.final.numTokens).toBe(3);
+    expect(recorded?.final.promptTokens).toBe(10);
+    expect(recorded?.final.cachedTokens).toBe(4);
+  });
+
+  it('fires onTurnStart inside the serialized closure before any session work (11a snapshot point)', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent({ text: 'ok' });
+      },
+    ]);
+    let logAtStart: string[] | undefined;
+    const onTurnStart = vi.fn(() => {
+      logAtStart = [...session.log];
+    });
+
+    await collect(
+      makeMlxStreamSimple(makeFakeHost(session), undefined, undefined, undefined, onTurnStart)(MODEL, CONTEXT),
+    );
+
+    expect(onTurnStart).toHaveBeenCalledOnce();
+    // The cold-stats snapshot must be taken BEFORE this turn's native work
+    // (prime/prefill/decode) so the recorded delta covers only this turn.
+    expect(logAtStart).toContain('fn1-start:qwen-small');
+    expect(logAtStart).not.toContain('prime');
+    expect(logAtStart).not.toContain('stream-created');
+  });
+
+  it('does not fire onTurnStart for a turn terminated while queued (no native work)', async () => {
+    const session = new FakeChatSession([]);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const host: StreamSimpleHost = {
+      modelInfo: () => DISCOVERED,
+      ...dirtyStubs(),
+      async runWithResident<T>(_modelId: string, fn: (s: ChatSession, resident: boolean) => Promise<T>): Promise<T> {
+        await gate;
+        return fn(session.asChatSession(), true);
+      },
+    };
+    const controller = new AbortController();
+    const onTurnStart = vi.fn();
+    const stream = makeMlxStreamSimple(
+      host,
+      undefined,
+      undefined,
+      undefined,
+      onTurnStart,
+    )(MODEL, CONTEXT, { signal: controller.signal });
+    controller.abort(); // abort while queued — the resident closure has not run
+
+    await collect(stream);
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The turn did no native work, so no cold baseline should have been taken.
+    expect(onTurnStart).not.toHaveBeenCalled();
+  });
+
+  it('does not record a turn when the native stream errors before a final', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield delta('half');
+        throw new Error('native decode fault');
+      },
+    ]);
+    const recorder = vi.fn();
+
+    const events = await collect(
+      makeMlxStreamSimple(makeFakeHost(session), undefined, undefined, recorder)(MODEL, CONTEXT),
+    );
+
+    expect(finalMessage(events).stopReason).toBe('error');
+    expect(recorder).not.toHaveBeenCalled();
+  });
+
+  it('does not record a turn on an in-band finishReason=error final', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield delta('par');
+        yield finalEvent({ finishReason: 'error' });
+      },
+    ]);
+    const recorder = vi.fn();
+
+    const events = await collect(
+      makeMlxStreamSimple(makeFakeHost(session), undefined, undefined, recorder)(MODEL, CONTEXT),
+    );
+
+    expect(finalMessage(events).stopReason).toBe('error');
+    expect(recorder).not.toHaveBeenCalled();
+  });
+
+  it('does not record a turn that is aborted before a final', async () => {
+    const controller = new AbortController();
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield delta('partial');
+        controller.abort();
+      },
+    ]);
+    const recorder = vi.fn();
+
+    const events = await collect(
+      makeMlxStreamSimple(
+        makeFakeHost(session),
+        undefined,
+        undefined,
+        recorder,
+      )(MODEL, CONTEXT, {
+        signal: controller.signal,
+      }),
+    );
+
+    expect(finalMessage(events).stopReason).toBe('aborted');
+    expect(recorder).not.toHaveBeenCalled();
+  });
+
+  it('still completes the Pi stream when the best-effort turn recorder throws', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent({ text: 'ok' });
+      },
+    ]);
+    const recorder = vi.fn(() => {
+      throw new Error('metrics sink failed');
+    });
+
+    const events = await collect(
+      makeMlxStreamSimple(makeFakeHost(session), undefined, undefined, recorder)(MODEL, CONTEXT),
+    );
+
+    expect(recorder).toHaveBeenCalledOnce();
+    expect(events.at(-1)?.type).toBe('done');
+    expect(finalMessage(events).stopReason).toBe('stop');
+  });
+
   it('does not prime a prior error/aborted partial assistant turn into the reset session (WB-4)', async () => {
     // Integration guard for WB-4: pi's history can carry a turn that errored (or
     // was aborted) mid-decode with PARTIAL content. contextToChatMessages must
@@ -714,10 +894,10 @@ describe('makeMlxStreamSimple', () => {
     const host: StreamSimpleHost = {
       modelInfo: () => DISCOVERED,
       ...dirtyStubs(),
-      async runWithResident<T>(_modelId: string, fn: (s: ChatSession) => Promise<T>): Promise<T> {
+      async runWithResident<T>(_modelId: string, fn: (s: ChatSession, resident: boolean) => Promise<T>): Promise<T> {
         await gate; // prior work that never yields until released
         closureRan = true;
-        return fn(session.asChatSession());
+        return fn(session.asChatSession(), true);
       },
     };
     const controller = new AbortController();
@@ -1017,6 +1197,55 @@ describe('makeMlxStreamSimple', () => {
     expect(seenRoots).toEqual(['root-0', 'root-1']);
   });
 
+  it('attributes a completed turn to the root it was SUBMITTED under, not a root that switched mid-flight (Finding 8)', async () => {
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const firstStartedPromise = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+    const releaseFirstPromise = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const session = new FakeChatSession([
+      async function* () {
+        firstStarted();
+        await releaseFirstPromise;
+        yield finalEvent({ text: 'first' });
+      },
+    ]);
+
+    let currentRootId: string | undefined = 'root-S1';
+    let currentRootFile: string | undefined = '/sessions/root-S1.jsonl';
+    const records: TurnRecord[] = [];
+    const recorder = vi.fn((rec: TurnRecord) => {
+      records.push(rec);
+    });
+    const streamSimple = makeMlxStreamSimple(
+      makeFakeHost(session),
+      undefined,
+      () => currentRootId,
+      recorder,
+      undefined,
+      () => currentRootFile,
+    );
+
+    // Submit under root S1, let it reach native work, THEN switch the live root
+    // to S2 (a /new or /resume) while the turn is still in flight.
+    const turn = collect(streamSimple(MODEL, CONTEXT, { sessionId: 'child-of-S1' }));
+    await firstStartedPromise;
+    currentRootId = 'root-S2';
+    currentRootFile = '/sessions/root-S2.jsonl';
+    releaseFirst();
+    await turn;
+
+    // The record must carry S1 (id AND file): stamping the now-live S2 would make
+    // this subagent turn vanish from S1's dashboard (its only join key is the root).
+    expect(recorder).toHaveBeenCalledOnce();
+    expect(records[0]?.rootSessionId).toBe('root-S1');
+    expect(records[0]?.rootSessionFile).toBe('/sessions/root-S1.jsonl');
+    expect(records[0]?.sessionId).toBe('child-of-S1');
+  });
+
   describe('post-error KV recovery (full reset instead of warm reuse)', () => {
     it('full-resets on the turn AFTER a native ERROR terminal', async () => {
       const session = new FakeChatSession([
@@ -1170,10 +1399,10 @@ describe('makeMlxStreamSimple', () => {
           return was;
         },
         invalidateResident: () => undefined,
-        runWithResident<T>(id: string, fn: (s: ChatSession) => Promise<T>): Promise<T> {
+        runWithResident<T>(id: string, fn: (s: ChatSession, resident: boolean) => Promise<T>): Promise<T> {
           const run = async (): Promise<T> => {
             try {
-              return await fn(session.asChatSession());
+              return await fn(session.asChatSession(), true);
             } catch (err) {
               // At fn's rejection: with the fix, dirty is already set
               // (synchronous, in the callback). Reverting leaves this false.

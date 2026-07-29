@@ -26,6 +26,11 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import type { InlineExtension } from '@earendil-works/pi-coding-agent';
+// NOTE (ledger §3): upstream statically imports `coldCacheDrain` from
+// '@mlx-node/core' and `PagedConfigOverrideManager` from '@mlx-node/lm' here.
+// Both are reached LAZILY in this fork instead — see `createPagedConfigOverrides`
+// and the drain in the `-p` cleanup path — so the agent import graph stays free
+// of static native chains (pinned by __test__/native-import-graph.test.ts).
 
 import { createPermissionGateExtension } from './extensions/permission-gate.js';
 import { createSubagentExtension } from './extensions/subagent.js';
@@ -36,7 +41,7 @@ import type { GenmlxModelInfo } from './provider/genmlx/models.js';
 import { createMlxProviderExtension } from './provider/index.js';
 import { MlxModelHost } from './provider/model-host.js';
 import {
-  type FilterableModelRegistryConstructor,
+  type FilterableModelRuntimeConstructor,
   installMlxOnlyModelRegistryFilter,
 } from './provider/model-registry-filter.js';
 import type { MlxModelInfo } from './provider/models.js';
@@ -46,12 +51,12 @@ export type RunAgentMain = (args: string[], opts: { extensionFactories: InlineEx
 
 export interface RunAgentPi {
   main: RunAgentMain;
-  ModelRegistry: FilterableModelRegistryConstructor;
+  ModelRuntime: FilterableModelRuntimeConstructor;
 }
 
 /** @internal Narrow lifecycle seam for the agent's paged config overlays. */
 export interface AgentPagedConfigOverrides {
-  resolve(modelPath: string, modelType?: string): Promise<string>;
+  resolve(modelPath: string, modelType?: string, persistPagedCache?: boolean): Promise<string>;
   cleanup(): Promise<void>;
 }
 
@@ -68,6 +73,15 @@ export interface RunAgentOptions {
   argv: string[];
   /** Native inference-log path to surface after Pi takes over the TUI. */
   traceLogFile?: string;
+  /**
+   * Enable the SSD cold tier by default (the agent's default; the CLI sets it
+   * false for `--no-persist-cache`). Forwarded to {@link MlxModelHost}, which
+   * applies this ONE value to every load whose family is in
+   * `COLD_TIER_RESTORE_FAMILIES` — not to qwen3 alone. Families off that list
+   * are handed no policy because they can never persist, not because this flag
+   * spares them. `undefined` keeps the host's on-by-default behavior.
+   */
+  persistPagedCache?: boolean;
   /** @internal Test seam; when set, the pi dynamic import is skipped entirely. */
   piImpl?: RunAgentPi;
   /** @internal Test seam for paged model-path resolution and cleanup. */
@@ -156,27 +170,42 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   // Mirrors `mlx launch claude`: chunked paged prefill keeps long-prompt
   // TTFT bounded on the default paged path.
   process.env.MLX_PAGED_PREFILL_CHUNK_SIZE ??= '2048';
+  // Hard offline invariant — NOT a user-overridable default, hence `=` not `??=`.
+  // `mlx agent` is local-only: no cloud provider may ever be contacted. pi 0.81.1's
+  // interactive and RPC startup call `ModelRuntime.refresh()`, which when PI_OFFLINE
+  // is unset fetches remote provider catalogs from pi.dev and can refresh a persisted
+  // cloud credential — a network path the mlx-only prototype filter does NOT cover
+  // (it patches the read methods, not `refresh`). Forcing PI_OFFLINE=1 here, before pi
+  // is imported below, also pins every ModelRuntime in this process to `allowNetwork`
+  // off, so no ambient/prior cloud credential can leak outbound traffic.
+  process.env.PI_OFFLINE = '1';
 
   const pagedConfigOverrides = opts.pagedConfigOverrides ?? createPagedConfigOverrides(agentGemmaDraftEnabled());
   const modelHost = new MlxModelHost(
     opts.models.map((model) => model.discovered),
     {
-      resolveModelPathFn: (model) => pagedConfigOverrides.resolve(model.path, model.modelType),
+      resolveModelPathFn: (model, policy) =>
+        pagedConfigOverrides.resolve(model.path, model.modelType, policy?.persistPagedCache),
       // Only where paging can actually be active: on a non-Metal build every
-      // model reports a flat cache, so enforcing this would reject them all.
+      // model reports a flat cache, so upstream's unconditional `true` would
+      // reject them all (ledger §3 — throws on every `mlx agent` load on CUDA).
       requirePagedCache: agentPagedCacheSupported(),
+      persistPagedCache: opts.persistPagedCache,
     },
   );
 
-  // Keep the pi import strictly behind the seam. The seam carries BOTH main
-  // and its registry class, so tests and production exercise the same policy
-  // installation/lifecycle instead of being able to bypass it accidentally.
+  // Keep the pi import strictly behind the seam. The seam carries BOTH main and
+  // the ModelRuntime class, so tests and production exercise the same policy
+  // installation/lifecycle instead of being able to bypass it accidentally. The
+  // filter patches the runtime prototype (not the extension-only ModelRegistry
+  // facade), which is where the selector / listing / resolution paths read.
   const pi: RunAgentPi = opts.piImpl ?? (await import('@earendil-works/pi-coding-agent'));
   // BOTH local providers' models must survive the policy. The registry's
   // unscoped reads back Tab, `/models`, RPC enumeration and session restore,
   // and an omitted id simply vanishes from all of them with no error — so a
   // genmlx-only inventory would look like an agent with no models at all.
-  const restoreModelRegistry = installMlxOnlyModelRegistryFilter(pi.ModelRegistry, [
+  // (upstream passes only `opts.models` here — ledger §3.)
+  const restoreModelRegistry = installMlxOnlyModelRegistryFilter(pi.ModelRuntime, [
     ...opts.models.map((model) => model.discovered.name),
     ...(opts.genmlxModels ?? []).map((model) => model.discovered.name),
   ]);
@@ -200,6 +229,20 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
       restoreModelRegistry();
     } finally {
       await pagedConfigOverrides.cleanup();
+      // `mlx agent -p` is one-shot: flush any accepted cold-tier prefix blocks
+      // to disk before the process exits, otherwise a prompt's just-persisted
+      // KV could still be queued/mid-write when we return. No-op when the tier
+      // was never opened, bounded so a stuck fsync can't hang exit, and never
+      // allowed to throw out of cleanup (best-effort durability).
+      try {
+        // Lazy (ledger §3): by this point the model host has already loaded the
+        // addon, so this resolves from module cache. A static import here would
+        // put a native chain on every `mlx agent` import path.
+        const { coldCacheDrain } = await import('@mlx-node/core');
+        coldCacheDrain(5000);
+      } catch {
+        // Best-effort: a drain failure must never mask the real exit path.
+      }
     }
   }
 }

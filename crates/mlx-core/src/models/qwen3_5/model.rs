@@ -35,11 +35,14 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
 #[cfg(test)]
-use super::gdn_checkpoint_store::compute_paged_prefix_block_hash;
 use super::gdn_checkpoint_store::{
-    GDN_PREFIX_CHECKPOINT_LIMIT, GDN_PREFIX_CHECKPOINTS_PER_OWNER, GdnCheckpointLineage,
-    compute_paged_prefix_block_hashes, find_longest_valid_gdn_checkpoint_index,
-    prune_gdn_checkpoints, replay_gdn_cache_and_commit,
+    GDN_PREFIX_CHECKPOINTS_PER_OWNER, GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER,
+    compute_paged_prefix_block_hash,
+};
+use super::gdn_checkpoint_store::{
+    GdnCheckpointLineage, GdnSidecarBoundary, compute_paged_prefix_block_hashes,
+    find_longest_valid_gdn_checkpoint_index, gdn_retention_caps, prune_gdn_checkpoints,
+    replay_gdn_cache_and_commit, select_gdn_sidecar_boundary,
 };
 use super::layer_cache::Qwen3_5LayerCache;
 use super::mtp::Qwen3_5MTPModule;
@@ -1399,6 +1402,97 @@ impl Qwen35Inner {
         Ok(())
     }
 
+    /// Build the process-global SSD cold-tier context (manager + COMPLETE
+    /// content fingerprint) for `model_path` WITHOUT attaching it, mirroring
+    /// `Qwen3Inner::build_cold_tier_context` — see its doc for how the weight
+    /// identity is established and why the caller brackets the load around it.
+    ///
+    /// The qwen3_5 difference is the [`mlx_paged_attn::ColdSidecarPolicy`]:
+    /// qwen3_5's pool covers the FULL-ATTENTION layers only, so a K/V-only
+    /// restore would resume from GDN recurrent state the pool never held. The
+    /// policy turns the restore walk into vLLM's reconcile-down — the candidate
+    /// prefix is reduced to the deepest boundary a validated GDN sidecar backs,
+    /// and a boundary nothing backs restores nothing.
+    ///
+    /// The GDN geometry (and the pool's cache dtype, which the sidecar is
+    /// written and read in) is folded into the fingerprint explicitly:
+    /// [`crate::cold_tier::ColdTierGeometry`] describes the POOL, which here
+    /// covers only the full-attention layers, so two configs differing ONLY in
+    /// GDN geometry would otherwise share a pool geometry.
+    ///
+    /// Returns `None` (fail-open) when the paged adapter is absent, the tier
+    /// cannot be opened, this checkpoint has no GDN state to persist, or a
+    /// complete content fingerprint cannot be established.
+    ///
+    /// The `weights` witness pins this call after the loader's
+    /// `materialize_weights` pass: MLX preads shard bytes lazily, so an identity
+    /// read before that pass can describe bytes the model never runs.
+    pub(crate) fn build_cold_tier_context(
+        &self,
+        model_path: &str,
+        weights: &crate::array::memory::WeightsResident,
+    ) -> Option<crate::transformer::paged_kv_cache_adapter::ColdTierContext> {
+        let adapter = self.paged_adapter.as_ref()?;
+        let manager = crate::cold_tier::global_cold_cache()?;
+        let pool = adapter.layer_kv_pool();
+        let cache_dtype = format!("{:?}", pool.cache_dtype());
+        // No GDN layers means no out-of-pool state — but it also means this is
+        // not the hybrid qwen3_5 the sidecar work validated, so stay off rather
+        // than silently behaving like a dense family.
+        let geometry = super::gdn_sidecar::geometry(&self.config, &cache_dtype)?;
+        let sidecar_policy = super::gdn_sidecar::policy(&self.config, &cache_dtype)?;
+        let mut config_json = serde_json::to_vec(&self.config).ok()?;
+        config_json.extend_from_slice(&geometry.fingerprint_component());
+        let pool_geometry = crate::cold_tier::ColdTierGeometry {
+            block_size: pool.block_size() as u64,
+            num_layers: pool.num_layers() as u64,
+            num_kv_heads: pool.config().num_kv_heads as u64,
+            head_size: pool.config().head_size as u64,
+            cache_dtype,
+        };
+        match crate::cold_tier::build_model_fingerprint(
+            "qwen3_5",
+            model_path,
+            Some(&config_json),
+            &pool_geometry,
+            weights,
+        ) {
+            Some(fingerprint) => Some(
+                crate::transformer::paged_kv_cache_adapter::ColdTierContext {
+                    manager,
+                    fingerprint,
+                    sidecar_policy: Some(sidecar_policy),
+                },
+            ),
+            None => {
+                tracing::warn!(
+                    "cold-tier persistence disabled for {model_path}: could not establish a \
+                     content fingerprint (unreadable or missing weight shard)"
+                );
+                None
+            }
+        }
+    }
+
+    /// Attach a previously-built cold-tier context to the paged adapter. A
+    /// no-op (fail-open) when the paged adapter is absent. Split from
+    /// [`Self::build_cold_tier_context`] so the caller can verify shard
+    /// identity is still stable AFTER the fingerprint read and BEFORE the cold
+    /// tier is committed.
+    ///
+    /// Takes the same `materialize_weights` witness as the build step so the
+    /// COMMIT point, not just the identity read, is compiler-pinned below
+    /// materialization.
+    pub(crate) fn attach_cold_tier(
+        &mut self,
+        ctx: crate::transformer::paged_kv_cache_adapter::ColdTierContext,
+        _weights: &crate::array::memory::WeightsResident,
+    ) {
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            adapter.set_cold_tier(ctx);
+        }
+    }
+
     pub(crate) fn paged_context_limits(&self) -> (u32, u32, u32, u32) {
         let trained = self.config.max_position_embeddings.max(0) as u32;
         let Some(adapter) = self.paged_adapter.as_ref() else {
@@ -1648,6 +1742,13 @@ impl Qwen35Inner {
     /// Unlike [`PagedBackend::finalize_paged_turn`], these cores can propagate
     /// an error directly. Never publish token history or a GDN sidecar after a
     /// failed registration: release the request and make the session cold.
+    ///
+    /// On success the GDN sidecar capture runs here, mirroring the engine hook —
+    /// these cores own every planned-MTP turn, and without this an MTP session
+    /// persists K/V blocks whose recurrent half no restore can ever reconstruct.
+    /// Unlike the engine hook there is no release to order against: these cores
+    /// only ever keep the request live, so the adapter's cold-chain frontier is
+    /// still set when the capture reads it.
     fn finalize_dense_manual_paged_turn(
         &mut self,
         image_token_positions: &[(u32, u64)],
@@ -1665,7 +1766,10 @@ impl Qwen35Inner {
                 adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0)
             });
         match finalize_result {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.capture_dense_gdn_cold_sidecar(image_token_positions);
+                Ok(())
+            }
             Err(error) => {
                 self.invalidate_dense_paged_session("manual finalization failure");
                 Err(Error::from_reason(format!(
@@ -1777,6 +1881,101 @@ impl Qwen35Inner {
         Some((prefix_len, caches))
     }
 
+    /// Install GDN recurrent state the SSD cold tier restored alongside this
+    /// turn's paged K/V prefix.
+    ///
+    /// This is the cold-tier twin of the in-memory checkpoint lookups above:
+    /// same destination (`self.caches`), different source (an on-disk
+    /// [`mlx_paged_attn::ColdSidecar`] instead of a live materialized
+    /// checkpoint). Consulted ONLY after every in-memory source missed, because
+    /// those are already materialized and cost no decode.
+    ///
+    /// `ColdTierWalk::restore_extend` guarantees the sidecar backs EXACTLY the
+    /// prefix the adapter reported, so no boundary re-derivation is needed — but
+    /// every structural precondition is re-checked here (group, layout equality
+    /// against this config's geometry, boundary == the reported prefix). A
+    /// contract slip degrades to a MISS (`Ok(false)`) that falls through to the
+    /// caller's replay, never state installed at the wrong offset.
+    ///
+    /// Taking the sidecar is unconditional so a rejected one cannot be
+    /// reconsidered later in the same turn. On success the decoded state is also
+    /// fed into the in-memory prefix store so later same-process turns hit RAM.
+    fn install_dense_gdn_cold_sidecar(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+    ) -> Result<bool> {
+        let sidecar = {
+            let Some(adapter) = self.paged_adapter.as_mut() else {
+                return Ok(false);
+            };
+            match adapter.take_restored_sidecar() {
+                Some(sidecar) => sidecar,
+                None => return Ok(false),
+            }
+        };
+        if sidecar.layout.group != mlx_paged_attn::ColdGroup::GdnState {
+            return Ok(false);
+        }
+        let boundary = sidecar.layout.boundary_tokens;
+        // The walk reconciles the prefix and the state together, so a sidecar
+        // that does not describe EXACTLY the reported prefix is a broken
+        // contract, not a deeper opportunity: refuse it.
+        if boundary == 0 || boundary != cached_prefix_len {
+            return Ok(false);
+        }
+        let cache_dtype = {
+            let Some(adapter) = self.paged_adapter.as_ref() else {
+                return Ok(false);
+            };
+            format!("{:?}", adapter.layer_kv_pool().cache_dtype())
+        };
+        let Some(geometry) = super::gdn_sidecar::geometry(&self.config, &cache_dtype) else {
+            return Ok(false);
+        };
+        // `load_sidecar` already compared the layout to the policy's template;
+        // comparing again against the geometry derived from the LOADED config
+        // makes the install independent of that earlier check.
+        if super::gdn_sidecar::layout_at(&geometry, boundary) != sidecar.layout {
+            return Ok(false);
+        }
+        let Some(caches) =
+            super::gdn_sidecar::decode_caches(&self.config, &geometry, &sidecar.tensors, boundary)?
+        else {
+            return Ok(false);
+        };
+        self.caches = Some(caches);
+        // The one observable that separates "the tier restored the recurrent
+        // half" from "the tier read it and every arm above declined". Both
+        // produce identical text, identical `num_tokens` and identical
+        // `cached_tokens`; only the second re-forwards the whole prefix.
+        crate::cold_tier::cold_sidecar_counters().record_install();
+        // Feed the in-memory store so later turns in this process hit RAM
+        // instead of decoding the sidecar again. Best-effort: a failure to
+        // clone/store never invalidates the freshly installed live caches.
+        if let Some(snapshot) = self
+            .caches
+            .as_ref()
+            .and_then(|caches| clone_dense_linear_layer_caches(&self.config, caches))
+        {
+            let checkpoint = super::paged_forward::MaterializedGdnPrefixCheckpoint {
+                prefix_len: boundary,
+                caches: snapshot,
+            };
+            self.remember_dense_gdn_materialized_prefix_checkpoint(
+                tokens,
+                block_size,
+                extra_keys_per_block,
+                cache_salt,
+                checkpoint,
+            );
+        }
+        Ok(true)
+    }
+
     fn remember_dense_gdn_materialized_prefix_checkpoint(
         &mut self,
         tokens: &[u32],
@@ -1827,28 +2026,31 @@ impl Qwen35Inner {
     }
 
     fn prune_dense_gdn_prefix_checkpoints(&mut self) {
+        // Probe the ladder predicate BEFORE the `&mut self` borrows below:
+        // `get_or_insert_with` takes one and `wants_gdn_checkpoint_ladder`
+        // needs `&self`, so an inline call in the argument list does not
+        // borrow-check.
+        let caps = gdn_retention_caps(
+            self.wants_gdn_checkpoint_ladder(),
+            self.gdn_root_cache_owner_is_explicit,
+        );
         let active_owner_id = self.active_cache_owner_id.clone();
         let root_owner_id = self
             .gdn_root_cache_owner_id
-            .get_or_insert(active_owner_id)
+            .get_or_insert_with(|| active_owner_id.clone())
             .clone();
-        let checkpoint_limit = if self.gdn_root_cache_owner_is_explicit {
-            GDN_PREFIX_CHECKPOINT_LIMIT
-        } else {
-            GDN_PREFIX_CHECKPOINTS_PER_OWNER
-        };
         prune_gdn_checkpoints(
             &mut self.gdn_prefix_checkpoints,
-            checkpoint_limit,
-            GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            caps,
             &root_owner_id,
+            &active_owner_id,
         );
     }
 
     fn publish_dense_gdn_materialized_prefix_checkpoint(
         &mut self,
         tokens: &[u32],
-        checkpoint: Option<super::paged_forward::MaterializedGdnPrefixCheckpoint>,
+        checkpoints: Vec<super::paged_forward::MaterializedGdnPrefixCheckpoint>,
     ) {
         let Some(block_size) = self
             .paged_adapter
@@ -1866,7 +2068,7 @@ impl Qwen35Inner {
             tokens,
             &extra_keys,
             0,
-            checkpoint,
+            checkpoints,
         );
     }
 
@@ -1875,12 +2077,11 @@ impl Qwen35Inner {
         tokens: &[u32],
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
-        checkpoint: Option<super::paged_forward::MaterializedGdnPrefixCheckpoint>,
+        checkpoints: Vec<super::paged_forward::MaterializedGdnPrefixCheckpoint>,
     ) {
-        let Some(checkpoint) = checkpoint else {
+        if checkpoints.is_empty() {
             return;
-        };
-        let prefix_len = checkpoint.prefix_len;
+        }
         let Some(block_size) = self
             .paged_adapter
             .as_ref()
@@ -1888,25 +2089,392 @@ impl Qwen35Inner {
         else {
             return;
         };
-        let stored = self.remember_dense_gdn_materialized_prefix_checkpoint(
-            tokens,
-            block_size,
-            extra_keys_per_block,
-            cache_salt,
-            checkpoint,
-        );
-        if tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO) {
-            tracing::info!(
-                target: "mlx_core::inference",
-                event = "gdn_prefix_checkpoint_store",
-                prefix_tokens = prefix_len,
+        // Ascending, so the deepest boundary is remembered last and is the
+        // most recent entry the lookup prefers on a tie.
+        for checkpoint in checkpoints {
+            let prefix_len = checkpoint.prefix_len;
+            let stored = self.remember_dense_gdn_materialized_prefix_checkpoint(
+                tokens,
                 block_size,
-                cache_owner_id = %self.active_cache_owner_id,
-                cache_root_owner_id = %self.gdn_root_cache_owner_id.as_deref().unwrap_or(""),
-                stored,
-                retained_checkpoints = self.gdn_prefix_checkpoints.len(),
-                "dense GDN prefix checkpoint stored"
+                extra_keys_per_block,
+                cache_salt,
+                checkpoint,
             );
+            if tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO) {
+                tracing::info!(
+                    target: "mlx_core::inference",
+                    event = "gdn_prefix_checkpoint_store",
+                    prefix_tokens = prefix_len,
+                    block_size,
+                    cache_owner_id = %self.active_cache_owner_id,
+                    cache_root_owner_id = %self.gdn_root_cache_owner_id.as_deref().unwrap_or(""),
+                    stored,
+                    retained_checkpoints = self.gdn_prefix_checkpoints.len(),
+                    "dense GDN prefix checkpoint stored"
+                );
+            }
+        }
+    }
+
+    /// Effective paged-prefill chunk size for EVERY paged prefill this model
+    /// runs — the engine's `paged_prefill` and the hand-written sync/stream
+    /// cores alike.
+    ///
+    /// The GDN cold sidecar can only persist recurrent state at a boundary the
+    /// prefill actually materialized state at, and those are exactly the
+    /// `gdn_prefill_checkpoint_boundaries` ladder rungs
+    /// (`paged_prefill_ranges` forces a break at each rung's offset).
+    /// Single-shot prefill (the default when `MLX_PAGED_PREFILL_CHUNK_SIZE` is
+    /// unset) crosses no rung, so it produces none of the in-memory checkpoints
+    /// the capture reads from.
+    ///
+    /// So when the SSD cold tier carries a GDN sidecar policy (persistence on),
+    /// return a chunk size large enough that the ONLY breaks are the ladder's.
+    /// An explicit `MLX_PAGED_PREFILL_CHUNK_SIZE` still wins.
+    ///
+    /// With no cold GDN policy and no env override this is the unchanged
+    /// single-shot default (0), which crosses no boundary at all. With no cold
+    /// GDN policy but the env var SET, chunking is on and the break set is
+    /// `prefill_checkpoint_boundaries(.., want_ladder = false)` — the single
+    /// deep `gdn_checkpoint_target`, exactly what a persist-off turn split at
+    /// before the ladder existed. Both arms read
+    /// `paged_forward::gdn_cold_sidecar_ladder_wanted` so the chunk size and the
+    /// break set cannot disagree about whether this is a persist turn.
+    ///
+    /// Splitting is algebraically transparent — every attention query still
+    /// attends over the whole cumulative range, and a break only marks where
+    /// the recurrent state is snapshotted — but it is NOT numerically
+    /// bit-identical: the chunk length is the GEMM's M, which selects a
+    /// different kernel class and accumulation order. The measured size of that
+    /// drift is documented on
+    /// `test_chunked_prefill_qwen3_5_moe_matches_single_shot_logits`, which
+    /// needs a RELAXED logit tolerance rather than bit-equality. That test
+    /// skips on `test_support::half_gemm_untrustworthy` — an 8x64 bf16 GEMM
+    /// correctness canary, NOT a GPU-generation gate, so on a host whose
+    /// half-precision GEMM is sound it runs and the tolerance is the real
+    /// claim. Either way it measures ONE logit vector at 96 tokens, which
+    /// bounds nothing about an argmax flip 30 greedy steps into a 1400-token
+    /// prompt. So turning persistence on can change the sampled tokens of an
+    /// otherwise identical request. That trade was already taken for autoregressive turns, which
+    /// have read this since the sidecar landed; the hand-written cores now take
+    /// it too rather than silently persisting K/V whose recurrent half no
+    /// restore can reconstruct.
+    ///
+    /// A caller must read this BEFORE it takes the `&mut self` borrows the
+    /// prefill needs (`&mut self.layers` + `&mut self.paged_adapter`); an inline
+    /// call in the argument list does not borrow-check.
+    fn cold_gdn_prefill_chunk_size(&self) -> i32 {
+        let env_chunk = crate::array::paged_prefill_chunk_size();
+        if env_chunk > 0 {
+            return env_chunk;
+        }
+        if self.wants_gdn_checkpoint_ladder() {
+            i32::MAX
+        } else {
+            0
+        }
+    }
+
+    /// Whether this turn's prefill should publish the whole checkpoint ladder.
+    ///
+    /// Thin wrapper over [`super::paged_forward::gdn_cold_sidecar_ladder_wanted`]
+    /// so the model layer and the prefill body probe the SAME predicate.
+    fn wants_gdn_checkpoint_ladder(&self) -> bool {
+        self.paged_adapter
+            .as_ref()
+            .is_some_and(super::paged_forward::gdn_cold_sidecar_ladder_wanted)
+    }
+
+    /// Prefill for the hand-written paged cores (sync + stream, text).
+    ///
+    /// The engine's `PagedBackend::paged_prefill` serves only AR turns; a
+    /// planned-MTP turn returns from `paged_whole_turn` before the engine runs
+    /// and prefills here instead. Both cores share this one body so the chunk
+    /// size — and with it the whole checkpoint ladder a cold sidecar is anchored
+    /// on — cannot be right in one core and wrong in the other.
+    ///
+    /// `keep_prompt_hidden_tokens` is `Some` exactly when the caller wants the
+    /// per-token prompt hidden for the MTP prompt-prefix seed; the returned
+    /// hidden is `Some` on that arm and `None` otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn run_dense_core_paged_prefill(
+        &mut self,
+        tokens: &[u32],
+        suffix: &[u32],
+        cached_prefix_len: u32,
+        gdn_prefix_already_primed: bool,
+        keep_prompt_hidden_tokens: Option<usize>,
+        layer_kinds: &[super::decoder_layer::Qwen3_5LayerKind],
+        context: &'static str,
+    ) -> Result<(
+        MxArray,
+        Option<MxArray>,
+        Vec<super::paged_forward::MaterializedGdnPrefixCheckpoint>,
+    )> {
+        let embed = self.embedding.clone();
+        let embedding_weight = embed.get_weight();
+        // Cross-turn M-RoPE delta (0 unless this text turn warm-continues an
+        // image prefill); feeds the scalar-offset RoPE for the suffix.
+        let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
+        let chunk_size = self.cold_gdn_prefill_chunk_size();
+        let caches_ref = self
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason(format!("{context}: caches not initialized")))?;
+        let adapter = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason(format!("{context}: paged_adapter dropped")))?;
+        if let Some(keep_tokens) = keep_prompt_hidden_tokens {
+            let (logits, hidden, checkpoints) =
+                super::paged_forward::run_paged_prefill_chunk_with_hidden_with_size(
+                    tokens,
+                    suffix,
+                    cached_prefix_len,
+                    gdn_prefix_already_primed,
+                    &embed,
+                    &mut self.layers,
+                    caches_ref,
+                    &self.final_norm,
+                    &self.lm_head,
+                    &embedding_weight,
+                    layer_kinds,
+                    adapter,
+                    chunk_size,
+                    Some(keep_tokens),
+                    rope_deltas,
+                )?;
+            Ok((logits, Some(hidden), checkpoints))
+        } else {
+            let (logits, checkpoints) = super::paged_forward::run_paged_prefill_chunk_with_size(
+                tokens,
+                suffix,
+                cached_prefix_len,
+                gdn_prefix_already_primed,
+                &embed,
+                &mut self.layers,
+                caches_ref,
+                &self.final_norm,
+                &self.lm_head,
+                &embedding_weight,
+                layer_kinds,
+                adapter,
+                chunk_size,
+                rope_deltas,
+            )?;
+            Ok((logits, None, checkpoints))
+        }
+    }
+
+    /// Persist this turn's GDN recurrent state to the SSD cold tier, so a later
+    /// process can resume from the restored paged K/V prefix WITHOUT replaying
+    /// GDN over it (`run_gdn_only_prefill_materialized`).
+    ///
+    /// Best-effort and infallible by construction — every failure path is a
+    /// silent skip. A missing sidecar is never a correctness problem: the
+    /// restore walk reconciles the candidate prefix down past that boundary and
+    /// the state is recomputed exactly as it is today.
+    ///
+    /// A GDN recurrent state is valid ONLY at the exact prefix length it was
+    /// produced at (vLLM `MambaSpec`), so the boundary is not chosen freely: it
+    /// is the DEEPEST already-materialized in-memory GDN checkpoint (a rung of
+    /// the `gdn_prefill_checkpoint_boundaries` ladder a prior prefill published)
+    /// whose block-aligned prefix the persisted K/V chain ALSO reaches
+    /// (`cold_captured_blocks`). A sidecar past the chain's frontier could never
+    /// be selected on restore, so writing one would only burn quota.
+    ///
+    /// At most ONE sidecar per turn (~75 MiB on the 27B); the writer queue is
+    /// bounded. Media turns are skipped in v1: their image-aware keys already
+    /// isolate them, but the GDN VLM exactness gate is not modeled here, so
+    /// refusing is the fail-closed answer.
+    ///
+    /// `image_token_positions` is the turn's OWN media map, passed in rather
+    /// than read off `self`: the VLM cores clear
+    /// `cached_paged_image_token_positions` before their prefill and reassign it
+    /// only after finalization returns, so a `self`-read guard would see an
+    /// empty vec on exactly the media turns it exists to refuse.
+    fn capture_dense_gdn_cold_sidecar(&self, image_token_positions: &[(u32, u64)]) {
+        crate::cold_tier::cold_sidecar_counters().record_capture_reached();
+        let Some(adapter) = self.paged_adapter.as_ref() else {
+            return;
+        };
+        let Some(cold) = adapter.cold_tier() else {
+            return;
+        };
+        let Some(policy) = cold.sidecar_policy.as_ref() else {
+            return;
+        };
+        if policy.group() != mlx_paged_attn::ColdGroup::GdnState {
+            return;
+        }
+        // v1: text-only. See the doc comment.
+        if !image_token_positions.is_empty() {
+            return;
+        }
+        let cache_dtype = format!("{:?}", adapter.layer_kv_pool().cache_dtype());
+        let Some(geometry) = super::gdn_sidecar::geometry(&self.config, &cache_dtype) else {
+            return;
+        };
+        let block_size = adapter.block_size();
+        // The K/V capture walk that just ran spends its budget waiting for
+        // writer-queue slots, so it hands this sidecar a queue it may well have
+        // filled microseconds ago. A non-blocking offer here loses that race,
+        // and a dropped sidecar is strictly worse than a dropped block: the
+        // restore reconciles down to the deepest boundary a VALIDATED sidecar
+        // backs, so losing it makes the turn's entire persisted K/V chain
+        // unusable. Wait out the same budget the walk did.
+        let sidecar_wait = adapter.cold_capture_budget().max_walk;
+        if block_size == 0 {
+            return;
+        }
+        let request_tokens = adapter.request_tokens();
+        // Whole blocks of this request the persisted K/V chain actually covers.
+        let full_blocks = request_tokens.len() / block_size as usize;
+        let chain_blocks = (adapter.cold_captured_blocks() as usize).min(full_blocks);
+        if chain_blocks == 0 {
+            // A different diagnosis from the boundary miss below: the persisted
+            // chain covers no whole block of this request, so no checkpoint at
+            // any depth could have been used. This is the arm a genuinely cold
+            // process hits on its first turns, while the bounded writer queue is
+            // still ratcheting the chain forward.
+            crate::cold_tier::cold_sidecar_counters().record_chain_empty();
+            if inference_trace_enabled() {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3_5 gdn_cold_sidecar_capture_skipped reason=persisted_chain_covers_no_whole_block cold_captured_blocks={} full_blocks={} block_size={} prompt_len={}",
+                    adapter.cold_captured_blocks(),
+                    full_blocks,
+                    block_size,
+                    request_tokens.len()
+                ));
+            }
+            return;
+        }
+        let ceiling_tokens = u32::try_from((chain_blocks as u64).saturating_mul(block_size as u64))
+            .unwrap_or(u32::MAX);
+        let extra_keys_per_block =
+            engine::build_paged_extra_keys(request_tokens.len(), block_size, image_token_positions);
+
+        // Deepest same-owner in-memory GDN checkpoint whose block-hash chain
+        // matches this request and whose prefix the KV chain reaches. `cache_salt`
+        // is 0 here to match the KV-chain finalize
+        // (`finalize_turn_keep_live_per_block(.., 0)`) and the in-memory publish,
+        // so the restore walk — which chains the sidecar under the SAME salt as
+        // the KV blocks — can select it.
+        let (idx, boundary) = match select_gdn_sidecar_boundary(
+            &self.gdn_prefix_checkpoints,
+            &self.active_cache_owner_id,
+            request_tokens,
+            ceiling_tokens,
+            block_size,
+            &extra_keys_per_block,
+            0,
+            |checkpoint| dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)),
+        ) {
+            GdnSidecarBoundary::Selected { index, boundary } => (index, boundary),
+            GdnSidecarBoundary::Missed(miss) => {
+                // Nothing is written and the restore walk will later reconcile
+                // the whole candidate prefix away. Count and trace it, otherwise
+                // a session that never persists recurrent state is
+                // indistinguishable from one that needs none.
+                crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
+                if inference_trace_enabled() {
+                    let reason = match miss.deepest_retained {
+                        Some(deepest) if deepest > ceiling_tokens => {
+                            "deepest_checkpoint_past_chain_reach"
+                        }
+                        _ => "no_checkpoint_on_this_lineage_at_or_below_chain_reach",
+                    };
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3_5 gdn_cold_sidecar_capture_skipped reason={} ceiling_tokens={} chain_blocks={} cold_captured_blocks={} block_size={} prompt_len={} deepest_retained_boundary={} retained_for_owner={} retained_total={}",
+                        reason,
+                        ceiling_tokens,
+                        chain_blocks,
+                        adapter.cold_captured_blocks(),
+                        block_size,
+                        request_tokens.len(),
+                        miss.deepest_retained.unwrap_or(0),
+                        miss.retained_for_owner,
+                        miss.retained_total
+                    ));
+                }
+                return;
+            }
+        };
+        let checkpoint = &self.gdn_prefix_checkpoints[idx];
+
+        // Derive the GdnState chain key for blocks `0..boundary/block_size` — the
+        // KV chain recomputed under the `GdnState` domain tag (vLLM's
+        // `BlockHashWithGroupId`). `ColdTierWalk::deepest_backed_boundary`
+        // derives the identical chain on restore. Built BEFORE the payload so the
+        // `contains_in` dedup below can skip the whole encode (a device->host
+        // readback of tens of MiB) when the chain is already on disk.
+        let blocks = boundary as usize / block_size as usize;
+        let mut parent: Option<mlx_paged_attn::ColdCacheKey> = None;
+        for index in 0..blocks {
+            let (Some(extra_keys), Some(tokens)) = (
+                extra_keys_per_block.get(index),
+                request_tokens.get(index * block_size as usize..(index + 1) * block_size as usize),
+            ) else {
+                return;
+            };
+            parent = Some(mlx_paged_attn::ColdCacheKey::chain(
+                mlx_paged_attn::ColdGroup::GdnState,
+                cold.fingerprint,
+                parent,
+                tokens,
+                extra_keys,
+                0,
+                index,
+            ));
+        }
+        let Some(key) = parent else {
+            return;
+        };
+        // Already persisted for this exact chain: nothing to do. `contains_in` is
+        // explicitly side-effect free (no hit/miss accounting), so this arm must
+        // do its own — an unrecorded exit here reads downstream as `enqueued=0`,
+        // which is also what a collapsed checkpoint ladder produces.
+        if cold
+            .manager
+            .contains_in(&key, mlx_paged_attn::ColdGroup::GdnState)
+        {
+            crate::cold_tier::cold_sidecar_counters().record_already_persisted();
+            return;
+        }
+
+        let Ok(Some(tensors)) = super::gdn_sidecar::encode_tensors(
+            &self.config,
+            &geometry,
+            &checkpoint.caches,
+            boundary,
+        ) else {
+            return;
+        };
+        let sidecar = mlx_paged_attn::ColdSidecar {
+            key,
+            fingerprint: cold.fingerprint,
+            layout: super::gdn_sidecar::layout_at(&geometry, boundary),
+            tensors,
+        };
+        match cold
+            .manager
+            .enqueue_sidecar_before(sidecar, std::time::Instant::now() + sidecar_wait)
+        {
+            Ok(true) => crate::cold_tier::cold_sidecar_counters().record_enqueued(),
+            // The bounded writer queue stayed full for the whole capture
+            // budget. Nothing is written and nothing failed, so this turn is
+            // otherwise indistinguishable from a successful capture.
+            Ok(false) => {
+                crate::cold_tier::cold_sidecar_counters().record_queue_drop();
+                tracing::debug!(
+                    target: "mlx_core::qwen3_5::paged",
+                    "qwen3.5 GDN sidecar dropped at boundary {boundary}: cold-cache writer queue full"
+                );
+            }
+            Err(error) => tracing::debug!(
+                target: "mlx_core::qwen3_5::paged",
+                "qwen3.5 GDN sidecar enqueue failed at boundary {boundary}: {error}"
+            ),
         }
     }
 
@@ -2053,6 +2621,24 @@ impl Qwen35Inner {
                 restored_prefix_len,
                 replayed_prefix_len,
             ));
+        }
+
+        // Cold-tier GDN sidecar: on-SSD recurrent state the restore walk brought
+        // back for EXACTLY this cached prefix (reconcile-down guarantees the
+        // boundary). Consulted only after every in-memory source above missed —
+        // i.e. the common process-restart case. v1 is text-only: an image-aware
+        // prefix still goes through the exactness gates below.
+        if cached_prefix_len > 0
+            && !image_aware_prefix
+            && self.install_dense_gdn_cold_sidecar(
+                tokens,
+                cached_prefix_len,
+                block_size,
+                extra_keys_per_block,
+                cache_salt,
+            )?
+        {
+            return Ok(finish("cold_sidecar", cached_prefix_len, 0));
         }
 
         let fresh_caches = fresh_dense_layer_caches(&self.config);
@@ -3625,6 +4211,19 @@ impl Qwen35Inner {
             }
         };
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
+        // Discharge the adapter's auxiliary (GDN) prefix obligation before the
+        // turn's first `record_tokens`. See `prime_prefix_state` for the full
+        // rationale; a no-op unless a HOT K/V hit handed back a prefix the cold
+        // tier's `ColdSidecarPolicy` was not gated against.
+        let confirm_result = self
+            .paged_adapter
+            .as_mut()
+            .map(|adapter| adapter.confirm_aux_prefix_primed(cached_prefix_len))
+            .unwrap_or(Ok(()));
+        if let Err(error) = confirm_result {
+            self.invalidate_dense_paged_session("planned-MTP GDN auxiliary-prefix confirmation");
+            return Err(Error::from_reason(error));
+        }
         let preserves_image_lineage = carries_image_lineage && cached_prefix_len > 0;
         self.cached_token_history.clear();
         if !preserves_image_lineage {
@@ -3802,58 +4401,15 @@ impl Qwen35Inner {
         let mut mtp_profiler = begin_paged_mtp_profiler(eager_mtp_paged, suffix_len);
 
         // === PREFILL ===
-        let mut prompt_hidden: Option<MxArray> = None;
-        let (last_logits, gdn_checkpoint) = {
-            let embed = self.embedding.clone();
-            let embedding_weight = embed.get_weight();
-            let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("paged_turn_sync_core_inner: caches not initialized")
-            })?;
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("paged_turn_sync_core_inner: paged_adapter dropped")
-            })?;
-            // Cross-turn M-RoPE delta (0 unless this text turn warm-continues
-            // an image prefill). Feeds the scalar-offset RoPE so the suffix
-            // keys stay aligned with the compressed-position image keys.
-            let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
-            if want_prompt_hidden {
-                let (logits, ph, checkpoint) =
-                    super::paged_forward::run_paged_prefill_chunk_with_hidden_and_checkpoint(
-                        tokens,
-                        suffix,
-                        cached_prefix_len,
-                        gdn_prefix_already_primed,
-                        &embed,
-                        &mut self.layers,
-                        caches_ref,
-                        &self.final_norm,
-                        &self.lm_head,
-                        &embedding_weight,
-                        &layer_kinds,
-                        adapter,
-                        Some(mtp_prompt_history.keep_tokens),
-                        rope_deltas,
-                    )?;
-                prompt_hidden = Some(ph);
-                (logits, checkpoint)
-            } else {
-                super::paged_forward::run_paged_prefill_chunk_with_checkpoint(
-                    tokens,
-                    suffix,
-                    cached_prefix_len,
-                    gdn_prefix_already_primed,
-                    &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &embedding_weight,
-                    &layer_kinds,
-                    adapter,
-                    rope_deltas,
-                )?
-            }
-        };
+        let (last_logits, prompt_hidden, gdn_checkpoint) = self.run_dense_core_paged_prefill(
+            tokens,
+            suffix,
+            cached_prefix_len,
+            gdn_prefix_already_primed,
+            want_prompt_hidden.then_some(mtp_prompt_history.keep_tokens),
+            &layer_kinds,
+            "paged_turn_sync_core_inner",
+        )?;
         if let Some(profiler) = mtp_profiler.as_mut() {
             profiler.end_prefill();
         }
@@ -5290,6 +5846,21 @@ impl Qwen35Inner {
             }
         };
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
+        // Discharge the adapter's auxiliary (GDN) prefix obligation before the
+        // turn's first `record_tokens`. See `prime_prefix_state` for the full
+        // rationale; a no-op unless a HOT K/V hit handed back a prefix the cold
+        // tier's `ColdSidecarPolicy` was not gated against.
+        let confirm_result = self
+            .paged_adapter
+            .as_mut()
+            .map(|adapter| adapter.confirm_aux_prefix_primed(cached_prefix_len))
+            .unwrap_or(Ok(()));
+        if let Err(error) = confirm_result {
+            self.invalidate_dense_paged_session(
+                "planned-MTP stream GDN auxiliary-prefix confirmation",
+            );
+            return Err(Error::from_reason(error));
+        }
         let gdn_prefix_state = gdn_prefix_preparation.state;
         let gdn_restored_prefix_tokens = gdn_prefix_preparation.restored_prefix_tokens;
         let gdn_replayed_prefix_tokens = gdn_prefix_preparation.replayed_prefix_tokens;
@@ -5341,6 +5912,10 @@ impl Qwen35Inner {
         }
 
         if trace_enabled {
+            // The size this turn's prefill actually splits on, not the raw
+            // `MLX_PAGED_PREFILL_CHUNK_SIZE`: under a GDN cold policy the two
+            // differ, and reading 0 here while the same turn reports
+            // `gdn_checkpoint_materialized=true` points at the wrong diagnosis.
             write_inference_trace(format_args!(
                 "[MLX_TRACE] qwen3.5-dense stream_paged_start prompt_tokens={} \
                  cached_prefix_tokens={} suffix_tokens={} block_size={} \
@@ -5350,7 +5925,7 @@ impl Qwen35Inner {
                 cached_prefix_len,
                 suffix_len,
                 block_size,
-                crate::array::paged_prefill_chunk_size(),
+                self.cold_gdn_prefill_chunk_size(),
                 crate::array::paged_prefill_eval_interval(),
                 crate::array::paged_decode_cache_clear_interval(),
                 gdn_prefix_state
@@ -5653,57 +6228,15 @@ impl Qwen35Inner {
         }
 
         let mut mtp_profiler = begin_paged_mtp_profiler(eager_mtp_paged, suffix_len);
-        let mut prompt_hidden: Option<MxArray> = None;
-        let (last_logits, gdn_checkpoint) = {
-            let embed = self.embedding.clone();
-            let embedding_weight = embed.get_weight();
-            let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("paged_turn_stream_core_inner: caches not initialized")
-            })?;
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("paged_turn_stream_core_inner: paged_adapter dropped")
-            })?;
-            // Cross-turn M-RoPE delta (0 unless this text turn warm-continues
-            // an image prefill); feeds the scalar-offset RoPE for the suffix.
-            let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
-            if want_prompt_hidden {
-                let (logits, ph, checkpoint) =
-                    super::paged_forward::run_paged_prefill_chunk_with_hidden_and_checkpoint(
-                        tokens,
-                        suffix,
-                        cached_prefix_len,
-                        gdn_prefix_already_primed,
-                        &embed,
-                        &mut self.layers,
-                        caches_ref,
-                        &self.final_norm,
-                        &self.lm_head,
-                        &embedding_weight,
-                        &layer_kinds,
-                        adapter,
-                        Some(mtp_prompt_history.keep_tokens),
-                        rope_deltas,
-                    )?;
-                prompt_hidden = Some(ph);
-                (logits, checkpoint)
-            } else {
-                super::paged_forward::run_paged_prefill_chunk_with_checkpoint(
-                    tokens,
-                    suffix,
-                    cached_prefix_len,
-                    gdn_prefix_already_primed,
-                    &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &embedding_weight,
-                    &layer_kinds,
-                    adapter,
-                    rope_deltas,
-                )?
-            }
-        };
+        let (last_logits, prompt_hidden, gdn_checkpoint) = self.run_dense_core_paged_prefill(
+            tokens,
+            suffix,
+            cached_prefix_len,
+            gdn_prefix_already_primed,
+            want_prompt_hidden.then_some(mtp_prompt_history.keep_tokens),
+            &layer_kinds,
+            "paged_turn_stream_core_inner",
+        )?;
         if let Some(profiler) = mtp_profiler.as_mut() {
             profiler.end_prefill();
         }
@@ -8714,6 +9247,17 @@ impl PagedBackend for Qwen35Inner {
             continued_live_prefix,
         )?;
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
+        // GDN recurrent state now covers exactly the cached prefix (installed
+        // live, restored from a cold sidecar, or replayed just above). Discharge
+        // the adapter's auxiliary-state obligation — set when the cold tier
+        // carries a `ColdSidecarPolicy` and a HOT K/V hit handed back a prefix
+        // no sidecar was gated against — before the turn's first `record_tokens`.
+        // A no-op for a live continuation or a sidecar-backed restore.
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            adapter
+                .confirm_aux_prefix_primed(cached_prefix_len)
+                .map_err(Error::from_reason)?;
+        }
         let preserves_image_lineage = carries_image_lineage && cached_prefix_len > 0;
         // Clear the per-turn session state here (history is re-set in
         // `save_paged_history`; image key is reset because the paged path does
@@ -8768,6 +9312,7 @@ impl PagedBackend for Qwen35Inner {
         // continues an image prefill); aligns the suffix keys with the
         // compressed-position image keys.
         let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
+        let chunk_size = self.cold_gdn_prefill_chunk_size();
         let (logits, checkpoint) = {
             let caches_ref = self
                 .caches
@@ -8777,7 +9322,7 @@ impl PagedBackend for Qwen35Inner {
                 .paged_adapter
                 .as_mut()
                 .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?;
-            super::paged_forward::run_paged_prefill_chunk_with_checkpoint(
+            super::paged_forward::run_paged_prefill_chunk_with_size(
                 &prefix.full_tokens,
                 suffix_tokens,
                 prefix.effective_cached_prefix_len as u32,
@@ -8790,6 +9335,7 @@ impl PagedBackend for Qwen35Inner {
                 &embedding_weight,
                 &layer_kinds,
                 adapter,
+                chunk_size,
                 rope_deltas,
             )?
         };
@@ -8813,7 +9359,8 @@ impl PagedBackend for Qwen35Inner {
         // error must downgrade the session before the engine's unconditional
         // `save_paged_history` call can publish image-placeholder history.
         self.paged_finalize_failed = false;
-        let finalize_error = match self.paged_adapter.as_mut() {
+        let mut release_pending = false;
+        let mut finalize_error = match self.paged_adapter.as_mut() {
             Some(adapter) if reuse_cache => {
                 let total_for_finalize = adapter.request_tokens().len();
                 let block_size = adapter.block_size();
@@ -8834,15 +9381,31 @@ impl PagedBackend for Qwen35Inner {
                     block_size,
                     &self.cached_paged_image_token_positions,
                 );
-                // Always attempt the release, even when registration fails.
-                let register_error = adapter
+                // The release is attempted below (even when registration fails),
+                // but only AFTER the GDN sidecar capture — releasing resets the
+                // adapter's cold-chain frontier to 0.
+                release_pending = true;
+                adapter
                     .register_full_blocks_for_reuse_per_block(&finalize_extra_keys, 0)
-                    .err();
-                let release_error = adapter.release_request().err();
-                register_error.or(release_error)
+                    .err()
             }
             None => Some("paged_adapter is None during dense finalization".to_owned()),
         };
+        // Persist the out-of-pool GDN recurrent state for the SAME chain the
+        // adapter just captured (its `cold_captured_blocks` is now set), so a
+        // later process can resume from the restored K/V prefix instead of
+        // replaying GDN over it. Runs BEFORE the release below, which resets the
+        // captured-chain frontier to 0. Skipped when the finalize failed: the
+        // K/V chain the sidecar would anchor on was not published, so nothing
+        // could ever select it.
+        if finalize_error.is_none() {
+            self.capture_dense_gdn_cold_sidecar(&self.cached_paged_image_token_positions);
+        }
+        // Always attempt the release for the non-reuse path, even when
+        // registration failed (mirrors the prior `register_error.or(release)`).
+        if release_pending && let Some(adapter) = self.paged_adapter.as_mut() {
+            finalize_error = finalize_error.or(adapter.release_request().err());
+        }
         if let Some(error) = finalize_error {
             self.downgrade_failed_paged_finalize(&error);
         }
@@ -13348,6 +13911,7 @@ mod paged_construction_tests {
             paged_cache_memory_mb: Some(64),
             paged_block_size: Some(16),
             use_block_paged_cache: if use_block_paged { Some(true) } else { None },
+            persist_paged_cache: None,
             n_mtp_layers: 0,
         }
     }
@@ -13408,16 +13972,17 @@ mod paged_construction_tests {
     }
 
     fn paged_inner_or_skip(test_name: &str) -> Option<(Qwen35Inner, Qwen3_5Config)> {
+        // Only a device-less host licenses a skip. A `LayerKVPool::new: ...
+        // must be > 0` means the test config stopped producing a usable pool,
+        // and skipping on that is a silent green — see `metal_device_absent`.
+        let unavailable = crate::test_support::metal_device_absent;
         let cfg = tiny_paged_forward_cfg();
         match Qwen35Inner::new(cfg.clone()) {
             Ok(mut inner) => match inner.initialize_paged_adapter() {
                 Ok(()) => Some((inner, cfg)),
                 Err(err) => {
                     let msg = err.reason.to_string();
-                    if msg.contains("Metal")
-                        || msg.contains("device")
-                        || msg.contains("LayerKVPool")
-                    {
+                    if unavailable(&msg) {
                         eprintln!("skipping {test_name} (paged adapter unavailable): {msg}");
                         None
                     } else {
@@ -13427,7 +13992,7 @@ mod paged_construction_tests {
             },
             Err(err) => {
                 let msg = err.reason.to_string();
-                if msg.contains("Metal") || msg.contains("device") || msg.contains("LayerKVPool") {
+                if unavailable(&msg) {
                     eprintln!("skipping {test_name} (paged adapter unavailable): {msg}");
                     None
                 } else {
@@ -13572,7 +14137,7 @@ mod paged_construction_tests {
         chunk_size: i32,
     ) -> Result<(
         MxArray,
-        Option<super::super::paged_forward::MaterializedGdnPrefixCheckpoint>,
+        Vec<super::super::paged_forward::MaterializedGdnPrefixCheckpoint>,
     )> {
         let layer_kinds =
             decoder_layer::compute_layer_kinds(inner.config.num_layers as usize, |i| {
@@ -13597,6 +14162,53 @@ mod paged_construction_tests {
             &layer_kinds,
             adapter,
             chunk_size,
+            /* cached_rope_deltas */ 0,
+        )
+    }
+
+    /// The planned-MTP twin of [`run_dense_paged_prefill_with_size_and_checkpoint`].
+    ///
+    /// `run_dense_core_paged_prefill` forks on `keep_prompt_hidden_tokens`: an
+    /// AR turn lands in `run_paged_prefill_chunk_with_size`, a planned-MTP turn
+    /// in `run_paged_prefill_chunk_with_hidden_with_size`. Those are two
+    /// separate bodies that each decide their own checkpoint break set, so a
+    /// helper that only reaches the first cannot see the second regress.
+    fn run_dense_paged_prefill_with_hidden_and_checkpoint(
+        inner: &mut Qwen35Inner,
+        full_tokens: &[u32],
+        suffix_tokens: &[u32],
+        cached_prefix_len: u32,
+        chunk_size: i32,
+    ) -> Result<(
+        MxArray,
+        MxArray,
+        Vec<super::super::paged_forward::MaterializedGdnPrefixCheckpoint>,
+    )> {
+        let layer_kinds =
+            decoder_layer::compute_layer_kinds(inner.config.num_layers as usize, |i| {
+                inner.config.is_linear_layer(i)
+            });
+        let embed = inner.embedding.clone();
+        let embedding_weight = embed.get_weight();
+        let keep_tokens = full_tokens.len();
+        let caches = inner.caches.as_mut().expect("qwen35 caches initialized");
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+
+        super::super::paged_forward::run_paged_prefill_chunk_with_hidden_with_size(
+            full_tokens,
+            suffix_tokens,
+            cached_prefix_len,
+            false,
+            &embed,
+            &mut inner.layers,
+            caches,
+            &inner.final_norm,
+            &inner.lm_head,
+            &embedding_weight,
+            &layer_kinds,
+            adapter,
+            chunk_size,
+            Some(keep_tokens),
             /* cached_rope_deltas */ 0,
         )
     }
@@ -13871,12 +14483,192 @@ mod paged_construction_tests {
                 .any(|checkpoint| checkpoint.owner_id == "root-1")
         );
 
+        // Without an explicit root there is no separate global budget, so the
+        // owner cap is also the global cap. This model has no paged adapter and
+        // therefore no cold GDN policy, so the owner cap is the PRE-LADDER one:
+        // nothing here could ever read a ladder, and widening the store on that
+        // arm changes which checkpoint a later persistence-OFF turn lands on.
         let mut legacy = Qwen35Inner::new(tiny_cfg(false)).expect("construct legacy dense model");
-        for marker in 1..=3 {
+        assert!(
+            !legacy.wants_gdn_checkpoint_ladder(),
+            "a model with no paged adapter cannot have a cold GDN sidecar policy"
+        );
+        for marker in 1..=(GDN_PREFIX_CHECKPOINTS_PER_OWNER as u32 + 1) {
             push_checkpoint(&mut legacy, "", None, marker);
         }
         assert!(!legacy.gdn_root_cache_owner_is_explicit);
-        assert_eq!(legacy.gdn_prefix_checkpoints.len(), 2);
+        assert_eq!(
+            legacy.gdn_prefix_checkpoints.len(),
+            GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER
+        );
+    }
+
+    /// The retention cap is chosen at this call site, not inside the store, and
+    /// the two arms are reachable only from here: `wants_gdn_checkpoint_ladder`
+    /// reads the adapter's installed cold-tier policy, which no store-level test
+    /// can see.
+    ///
+    /// Push the SAME four-rung ladder both ways. With a GDN sidecar policy
+    /// installed the whole ladder must survive — that is what the ladder is for.
+    /// With the policy removed the same push must collapse to the pre-ladder
+    /// number, because a turn that publishes no ladder must retain what it
+    /// retained before the ladder existed.
+    ///
+    /// Catches: hardcoding either arm at the call site. `true` regresses every
+    /// persistence-OFF request's emitted tokens; `false` silently reverts
+    /// persist-ON to single-endpoint retention.
+    #[test]
+    fn dense_gdn_retention_follows_the_installed_cold_sidecar_policy() {
+        let Some(mut inner) = dense_inner_with_test_adapter_or_skip(
+            "dense_gdn_retention_follows_the_installed_cold_sidecar_policy",
+        ) else {
+            return;
+        };
+        let tokens: Vec<u32> = (0..64u32).collect();
+        let extra_keys = vec![Vec::new(); 4];
+
+        let push_ladder = |inner: &mut Qwen35Inner| {
+            inner.gdn_prefix_checkpoints.clear();
+            crate::engine::backend::ChatBackend::set_cache_owner_id(inner, "", None);
+            for rung in 1..=4u32 {
+                let prefix_len = rung * 16;
+                let block_hashes =
+                    compute_paged_prefix_block_hashes(&tokens, prefix_len, 16, &extra_keys, 0)
+                        .expect("block-aligned rung must hash");
+                inner
+                    .gdn_prefix_checkpoints
+                    .push_back(DenseGdnPrefixCheckpoint {
+                        owner_id: inner.active_cache_owner_id.clone(),
+                        prefix_len,
+                        block_size: 16,
+                        final_block_hash: block_hashes.last().copied().unwrap_or_default(),
+                        block_hashes,
+                        tokens: tokens[..prefix_len as usize].to_vec(),
+                        caches: Vec::new(),
+                    });
+                inner.prune_dense_gdn_prefix_checkpoints();
+            }
+            inner.gdn_prefix_checkpoints.len()
+        };
+
+        assert!(!inner.wants_gdn_checkpoint_ladder());
+        assert_eq!(
+            push_ladder(&mut inner),
+            GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER,
+            "with no cold GDN policy the store must stay at the pre-ladder cap"
+        );
+
+        let root = temp_cold_root("dense-gdn-retention-policy");
+        install_gdn_cold_tier(&mut inner, &root);
+        assert!(inner.wants_gdn_checkpoint_ladder());
+        assert_eq!(
+            push_ladder(&mut inner),
+            GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            "a cold GDN sidecar policy must keep the whole published ladder"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The retention policy lives in `gdn_checkpoint_store`, but WHICH owner it
+    /// protects is decided here, by what this call site passes. A twin that
+    /// hands `prune_gdn_checkpoints` the root where the active owner belongs
+    /// collapses a subagent's ladder to its endpoint rung while every
+    /// store-level test stays green, so drive it through the model.
+    ///
+    /// The root is seeded with a spare rung on purpose: that is the redundancy
+    /// the first arm spends, and without it there is nothing for the arm to
+    /// prefer and the mutation is invisible.
+    ///
+    /// The cold tier is installed for the same reason. Publisher deferral is a
+    /// `GdnRetentionPolicy::Ladder` behaviour and `active_owner_id` is read on
+    /// no other arm, so a turn with no GDN sidecar policy cannot express the
+    /// mutation at all — this test used to run on that arm and asserted the
+    /// ladder answer anyway, which only agreed while the policy was ungated.
+    /// The persistence-OFF push below pins the other arm's shape rather than
+    /// leaving it unmeasured.
+    #[test]
+    fn test_dense_ladder_survives_sibling_owners_through_the_model_call_site() {
+        fn push(inner: &mut Qwen35Inner, owner_id: &str, root_owner_id: &str, blocks: u32) {
+            crate::engine::backend::ChatBackend::set_cache_owner_id(
+                inner,
+                owner_id,
+                Some(root_owner_id),
+            );
+            inner
+                .gdn_prefix_checkpoints
+                .push_back(DenseGdnPrefixCheckpoint {
+                    owner_id: inner.active_cache_owner_id.clone(),
+                    prefix_len: blocks * 16,
+                    block_size: 16,
+                    final_block_hash: u64::from(blocks),
+                    block_hashes: (1..=u64::from(blocks)).collect(),
+                    tokens: (0..blocks * 16).collect(),
+                    caches: Vec::new(),
+                });
+            inner.prune_dense_gdn_prefix_checkpoints();
+        }
+
+        /// Root seeded with a spare rung, two siblings holding one each, then a
+        /// third subagent publishing a whole quartered ladder rung by rung the
+        /// way `publish_dense_gdn_materialized_prefix_checkpoint_with_keys`
+        /// does. Every slot is taken before the ladder starts.
+        fn run_fleet(inner: &mut Qwen35Inner) -> Vec<(String, u32)> {
+            inner.gdn_prefix_checkpoints.clear();
+            push(inner, "root", "root", 1);
+            push(inner, "root", "root", 64);
+            for sibling in ["child-0", "child-1"] {
+                push(inner, sibling, "root", 64);
+            }
+            for blocks in [1, 4, 16, 64] {
+                push(inner, "child-3", "root", blocks);
+            }
+            inner
+                .gdn_prefix_checkpoints
+                .iter()
+                .map(|checkpoint| (checkpoint.owner_id.clone(), checkpoint.prefix_len))
+                .collect()
+        }
+
+        let Some(mut inner) = dense_inner_with_test_adapter_or_skip(
+            "test_dense_ladder_survives_sibling_owners_through_the_model_call_site",
+        ) else {
+            return;
+        };
+
+        // Persistence OFF: no deferral, and the pre-ladder per-owner cap of 2.
+        assert!(!inner.wants_gdn_checkpoint_ladder());
+        assert_eq!(
+            run_fleet(&mut inner),
+            vec![
+                ("root".to_string(), 1024),
+                ("child-0".to_string(), 1024),
+                ("child-1".to_string(), 1024),
+                ("child-3".to_string(), 256),
+                ("child-3".to_string(), 1024),
+            ],
+            "a persistence-OFF turn takes the pre-ladder victim order, which \
+             keeps the publisher's DEEPEST rungs and defers nobody"
+        );
+
+        // Persistence ON: the publisher's shallow rung is what this turn's cold
+        // capture anchors on, so it outlives the root's spare rung.
+        let root = temp_cold_root("dense-ladder-sibling-call-site");
+        install_gdn_cold_tier(&mut inner, &root);
+        assert!(inner.wants_gdn_checkpoint_ladder());
+        assert_eq!(
+            run_fleet(&mut inner),
+            vec![
+                ("root".to_string(), 1024),
+                ("child-0".to_string(), 1024),
+                ("child-1".to_string(), 1024),
+                ("child-3".to_string(), 16),
+                ("child-3".to_string(), 1024),
+            ],
+            "the publishing subagent must keep the shallow rung this turn's \
+             capture anchors on, paid for by the root's spare rung, and no \
+             sibling may be pushed to zero"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -14467,7 +15259,10 @@ mod paged_construction_tests {
         .expect("dense paged checkpoint prefill");
         assert_finite_vocab_logits(&logits, cfg.vocab_size, "checkpoint prefill logits");
 
-        let checkpoint = checkpoint.expect("stable reusable-block GDN checkpoint");
+        let mut checkpoint = checkpoint;
+        let checkpoint = checkpoint
+            .pop()
+            .expect("stable reusable-block GDN checkpoint");
         assert_eq!(checkpoint.prefix_len, 16);
         assert!(dense_paged_linear_caches_ready(
             &inner.config,
@@ -14547,7 +15342,7 @@ mod paged_construction_tests {
         )
         .expect("single-shot A");
         assert!(
-            checkpoint_a.is_none(),
+            checkpoint_a.is_empty(),
             "chunk_size=0 must not split to capture a GDN checkpoint"
         );
         assert_finite_vocab_logits(&logits_a, cfg.vocab_size, "single-shot A");
@@ -14567,7 +15362,7 @@ mod paged_construction_tests {
         )
         .expect("single-shot B");
         assert!(
-            checkpoint_b.is_none(),
+            checkpoint_b.is_empty(),
             "chunk_size=0 must stay single-shot after adapter reset"
         );
         let a = logits_to_f32_vec(&logits_a);
@@ -14586,5 +15381,426 @@ mod paged_construction_tests {
         let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
         let _ = adapter.register_full_blocks_for_reuse(&[], 0);
         adapter.release_request().expect("release_request");
+    }
+
+    /// Dense inner carrying a real adapter over a test-sized `LayerKVPool`.
+    ///
+    /// `initialize_paged_adapter` sizes a pool for a real checkpoint and needs a
+    /// production block geometry; the lifecycle below dispatches no kernel, so a
+    /// two-layer placeholder pool is enough and runs wherever the adapter's own
+    /// lifecycle tests run.
+    fn dense_inner_with_test_adapter_or_skip(test_name: &str) -> Option<Qwen35Inner> {
+        const BLOCK_SIZE: u32 = 16;
+        const NUM_BLOCKS: u32 = 8;
+        let pool_config = mlx_paged_attn::PagedAttentionConfig {
+            block_size: BLOCK_SIZE,
+            num_kv_heads: 1,
+            head_size: 32,
+            num_layers: 2,
+            ..mlx_paged_attn::PagedAttentionConfig::default()
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new_for_test(
+            pool_config,
+            NUM_BLOCKS,
+            2,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            // Routed through `test_support::metal_device_absent` rather than
+            // matching the string inline, so `MLX_TEST_REQUIRE_METAL=1` can
+            // turn a self-skip into a failure here too. libtest counts a
+            // skipped-and-returned test as passed, and these two are the only
+            // gates that can see a hardcoded arm at the prune call site.
+            Err(err) if crate::test_support::metal_device_absent(&err) => {
+                eprintln!("skipping {test_name} (no Metal device): {err}");
+                return None;
+            }
+            Err(err) => {
+                panic!("unexpected LayerKVPool::new_for_test failure in {test_name}: {err}")
+            }
+        };
+        let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
+            NUM_BLOCKS, BLOCK_SIZE,
+        )));
+        let adapter = PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE)
+            .expect("test paged adapter must construct");
+        let mut inner = Qwen35Inner::new(tiny_cfg(true)).expect("construct tiny dense model");
+        inner.paged_adapter = Some(adapter);
+        Some(inner)
+    }
+
+    /// Attach a cold tier carrying the GDN sidecar policy — the exact shape
+    /// `build_cold_tier_context` installs when persistence is on.
+    fn install_gdn_cold_tier(inner: &mut Qwen35Inner, root: &std::path::Path) {
+        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.to_path_buf())
+            .expect("temp-dir cold cache must open");
+        let cache_dtype = {
+            let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
+            format!("{:?}", adapter.layer_kv_pool().cache_dtype())
+        };
+        let policy = crate::models::qwen3_5::gdn_sidecar::policy(&inner.config, &cache_dtype)
+            .expect("a hybrid config must yield a GDN sidecar policy");
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        adapter.set_cold_tier(
+            crate::transformer::paged_kv_cache_adapter::ColdTierContext {
+                manager: Arc::new(manager),
+                fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
+                    b"qwen3-5-dense-sidecar-test".as_slice(),
+                ]),
+                sidecar_policy: Some(policy),
+            },
+        );
+    }
+
+    fn temp_cold_root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "mlx-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    fn record_whole_paged_request(inner: &mut Qwen35Inner, prompt: &[u32]) {
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        adapter.reset_for_new_request(0).expect("reset request");
+        adapter
+            .allocate_suffix_blocks(prompt.len() as u32)
+            .expect("allocate suffix blocks");
+        adapter.record_tokens(prompt).expect("record tokens");
+    }
+
+    /// The hand-written cores finalize through `finalize_dense_manual_paged_turn`
+    /// — every planned-MTP turn ends there and never reaches the engine hook. It
+    /// must run the GDN sidecar capture, otherwise an MTP session persists K/V
+    /// blocks whose recurrent half no restore can reconstruct.
+    ///
+    /// Catches: deleting `capture_dense_gdn_cold_sidecar` from the `Ok` arm of
+    /// `finalize_dense_manual_paged_turn` — both deltas drop to zero.
+    #[test]
+    fn dense_manual_paged_finalize_reaches_the_gdn_sidecar_capture() {
+        let Some(mut inner) = dense_inner_with_test_adapter_or_skip(
+            "dense_manual_paged_finalize_reaches_the_gdn_sidecar_capture",
+        ) else {
+            return;
+        };
+        let root = temp_cold_root("dense-manual-finalize-capture");
+        install_gdn_cold_tier(&mut inner, &root);
+        let prompt: Vec<u32> = (0u32..32).collect();
+        record_whole_paged_request(&mut inner, &prompt);
+
+        let _serialized = crate::cold_tier::sidecar_counter_test_lock();
+        let before = crate::cold_tier::cold_sidecar_telemetry();
+        inner
+            .finalize_dense_manual_paged_turn(&[])
+            .expect("manual paged finalization must succeed");
+        let after = crate::cold_tier::cold_sidecar_telemetry();
+
+        assert_eq!(
+            after.capture_reached,
+            before.capture_reached + 1,
+            "the manual finalize must enter the GDN sidecar capture exactly once"
+        );
+        // The chain really carried both blocks off the GPU. Asserted here
+        // because everything below depends on it and nothing below can see it:
+        // a pool whose buffers are too small makes `read_block_all_layers`
+        // return `Err`, the chain capture stops at its first block, and the
+        // boundary assertion after this one becomes unreachable rather than
+        // false. Without this line that failure reads as "the capture did not
+        // reach its boundary selection", three layers from the real cause.
+        assert_eq!(
+            inner
+                .paged_adapter
+                .as_ref()
+                .expect("paged_adapter")
+                .cold_captured_blocks(),
+            2,
+            "both whole blocks must have been captured off the pool"
+        );
+        // The finalize published two whole blocks to the cold chain, so the
+        // capture ran all the way to the boundary selection and found no
+        // in-memory checkpoint to anchor on. Reaching THAT arm proves it got
+        // past the policy and media guards rather than bailing at its first line.
+        assert_eq!(
+            after.boundary_skips,
+            before.boundary_skips + 1,
+            "the capture must reach its boundary selection under a GdnState policy"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The v1 text-only guard reads the turn's OWN media map. The VLM cores clear
+    /// `cached_paged_image_token_positions` before prefill and reassign it only
+    /// after finalization returns, so a `self`-read guard sees an empty vec on
+    /// exactly the media turns it exists to refuse.
+    ///
+    /// Catches: reverting the guard to `self.cached_paged_image_token_positions`
+    /// — that field is empty here, so the capture would run on past it and bump
+    /// `chain_empty`.
+    #[test]
+    fn dense_gdn_sidecar_capture_refuses_the_turns_own_media_map() {
+        let Some(mut inner) = dense_inner_with_test_adapter_or_skip(
+            "dense_gdn_sidecar_capture_refuses_the_turns_own_media_map",
+        ) else {
+            return;
+        };
+        let root = temp_cold_root("dense-manual-finalize-media");
+        install_gdn_cold_tier(&mut inner, &root);
+        let prompt: Vec<u32> = (0u32..32).collect();
+        record_whole_paged_request(&mut inner, &prompt);
+        assert!(
+            inner.cached_paged_image_token_positions.is_empty(),
+            "the model-level media map is empty mid-turn; only the argument carries the truth"
+        );
+
+        let _serialized = crate::cold_tier::sidecar_counter_test_lock();
+        let before = crate::cold_tier::cold_sidecar_telemetry();
+        inner
+            .finalize_dense_manual_paged_turn(&[(4, 99)])
+            .expect("manual paged finalization must succeed");
+        let after = crate::cold_tier::cold_sidecar_telemetry();
+
+        assert_eq!(
+            after.capture_reached,
+            before.capture_reached + 1,
+            "a media turn still enters the capture"
+        );
+        assert_eq!(
+            after.boundary_skips, before.boundary_skips,
+            "a media turn must be refused before the capture inspects the cold chain"
+        );
+        assert_eq!(
+            after.chain_empty, before.chain_empty,
+            "a media turn must be refused before the capture inspects the cold chain"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The chunk size every paged prefill reads. Single-shot materializes no GDN
+    /// checkpoint, so a sidecar has nothing to anchor on; an installed GdnState
+    /// policy has to turn the ladder's rungs into real splits.
+    ///
+    /// Catches: dropping the policy probe from `cold_gdn_prefill_chunk_size`
+    /// (returns 0 with a policy installed) — the defect that leaves a persist-cold
+    /// turn publishing no rung at all.
+    #[test]
+    fn dense_cold_gdn_prefill_chunk_size_follows_the_installed_sidecar_policy() {
+        let Some(mut inner) = dense_inner_with_test_adapter_or_skip(
+            "dense_cold_gdn_prefill_chunk_size_follows_the_installed_sidecar_policy",
+        ) else {
+            return;
+        };
+        assert_eq!(
+            inner.cold_gdn_prefill_chunk_size(),
+            0,
+            "without a cold GDN policy the prefill stays single-shot"
+        );
+
+        let root = temp_cold_root("dense-chunk-size-policy");
+        install_gdn_cold_tier(&mut inner, &root);
+        assert!(
+            inner.cold_gdn_prefill_chunk_size() > 0,
+            "an installed GdnState policy must make the prefill split at the ladder"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Both hand-written cores prefill through `run_dense_core_paged_prefill`, so
+    /// this drives that shared body directly: with a GdnState policy installed it
+    /// must publish checkpoint ladder rungs, and with no cold tier it must stay
+    /// single-shot.
+    ///
+    /// Catches: passing a literal `0` or `crate::array::paged_prefill_chunk_size()`
+    /// instead of `self.cold_gdn_prefill_chunk_size()` inside
+    /// `run_dense_core_paged_prefill` — the cold arm then returns no rungs, which
+    /// is exactly the MTP-turn defect.
+    ///
+    /// The last two arms use an EXPLICIT positive chunk size, which is the only
+    /// way to reach the break-set decision with no policy installed — the shape
+    /// a persist-off `mlx agent` turn has, since `run-agent.ts` seeds
+    /// `MLX_PAGED_PREFILL_CHUNK_SIZE=2048` before any persistence decision. They
+    /// catch hardcoding `gdn_cold_sidecar_ladder_wanted`'s result at the prefill
+    /// body in either direction, which the arms above cannot: at 64 tokens the
+    /// ladder is already a single rung, so both arms agree there.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy() {
+        let Some((mut inner, _cfg)) = paged_inner_or_skip(
+            "dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy",
+        ) else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+        let layer_kinds =
+            decoder_layer::compute_layer_kinds(inner.config.num_layers as usize, |i| {
+                inner.config.is_linear_layer(i)
+            });
+        let prompt: Vec<u32> = (0u32..64).map(|i| (i * 5 + 7) % 257).collect();
+
+        reset_paged_request(&mut inner, &prompt);
+        let (_, hidden, cold_checkpoints) = inner
+            .run_dense_core_paged_prefill(
+                &prompt,
+                &prompt,
+                0,
+                false,
+                None,
+                &layer_kinds,
+                "cold-policy prefill",
+            )
+            .expect("prefill with no cold tier");
+        assert!(hidden.is_none());
+        assert!(
+            cold_checkpoints.is_empty(),
+            "with no cold GDN policy the cores must stay single-shot"
+        );
+
+        // A prompt long enough that the two break sets DIFFER: ladder
+        // [48, 192] against the single pre-ladder boundary [192]. Run BEFORE
+        // the cold tier is installed — the adapter has no way to drop one.
+        let long_prompt: Vec<u32> = (0u32..200).map(|i| (i * 5 + 7) % 257).collect();
+        reset_paged_request(&mut inner, &long_prompt);
+        let (_, no_policy_rungs) = run_dense_paged_prefill_with_size_and_checkpoint(
+            &mut inner,
+            &long_prompt,
+            &long_prompt,
+            0,
+            2048,
+        )
+        .expect("explicit-chunk prefill with no cold tier");
+        assert_eq!(
+            no_policy_rungs
+                .iter()
+                .map(|c| c.prefix_len)
+                .collect::<Vec<_>>(),
+            vec![192],
+            "with no cold GDN policy an explicit chunk size must take the single pre-ladder \
+             boundary, not the ladder — the extra breaks change the prefill GEMM's M and so the \
+             sampled tokens of a persistence-off request"
+        );
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("paged_adapter")
+            .release_request()
+            .expect("release_request");
+
+        // The SAME claim on the planned-MTP body. `run_dense_core_paged_prefill`
+        // forks on `keep_prompt_hidden_tokens` into two separate prefill
+        // functions that each pick their own break set, and every arm above
+        // takes the AR fork only. Measured: hardcoding `want_ladder = true` at
+        // the MTP call site alone (`run_paged_prefill_chunk_with_hidden_with_size`)
+        // left this whole gate and its MoE twin GREEN before this arm existed.
+        // `ChatSession::mergeConfig` auto-defaults `enableMtp` to true on any
+        // checkpoint carrying an MTP head, so on those checkpoints the MTP fork
+        // is the one an `mlx agent` turn actually takes.
+        reset_paged_request(&mut inner, &long_prompt);
+        let (_, _, no_policy_mtp_rungs) = run_dense_paged_prefill_with_hidden_and_checkpoint(
+            &mut inner,
+            &long_prompt,
+            &long_prompt,
+            0,
+            2048,
+        )
+        .expect("explicit-chunk MTP prefill with no cold tier");
+        assert_eq!(
+            no_policy_mtp_rungs
+                .iter()
+                .map(|c| c.prefix_len)
+                .collect::<Vec<_>>(),
+            vec![192],
+            "the planned-MTP prefill body must take the same single pre-ladder boundary with no \
+             cold GDN policy as the AR body does"
+        );
+        // Release WITHOUT registering: publishing this prompt's blocks would
+        // give the next arm's shared 64-token prefix a cache hit, and every arm
+        // here has to start cold.
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("paged_adapter")
+            .release_request()
+            .expect("release_request");
+
+        let root = temp_cold_root("dense-core-ladder");
+        install_gdn_cold_tier(&mut inner, &root);
+        reset_paged_request(&mut inner, &prompt);
+        let (_, _, ladder) = inner
+            .run_dense_core_paged_prefill(
+                &prompt,
+                &prompt,
+                0,
+                false,
+                None,
+                &layer_kinds,
+                "cold-policy prefill",
+            )
+            .expect("prefill under a cold GDN policy");
+        assert!(
+            !ladder.is_empty(),
+            "a persist-cold turn must materialize the GDN checkpoint ladder the sidecar anchors on"
+        );
+        for checkpoint in &ladder {
+            assert!(
+                checkpoint.prefix_len > 0 && (checkpoint.prefix_len as usize) < prompt.len(),
+                "a rung must sit strictly inside the prompt, got {}",
+                checkpoint.prefix_len
+            );
+        }
+
+        // Same long prompt, same explicit chunk size, policy now installed:
+        // every rung of the ladder is a real break.
+        reset_paged_request(&mut inner, &long_prompt);
+        let (_, cold_rungs) = run_dense_paged_prefill_with_size_and_checkpoint(
+            &mut inner,
+            &long_prompt,
+            &long_prompt,
+            0,
+            2048,
+        )
+        .expect("explicit-chunk prefill under a cold GDN policy");
+        assert_eq!(
+            cold_rungs.iter().map(|c| c.prefix_len).collect::<Vec<_>>(),
+            vec![48, 192],
+            "an explicit chunk size under a GDN cold policy still publishes the whole ladder"
+        );
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("paged_adapter")
+            .release_request()
+            .expect("release_request");
+
+        // And the MTP fork under the policy: the ladder is what the sidecar
+        // anchors on, so an MTP turn that publishes only the deep rung is the
+        // silent-zero-reuse defect `29be89e0` set out to fix, on the fork it
+        // did not cover.
+        reset_paged_request(&mut inner, &long_prompt);
+        let (_, _, cold_mtp_rungs) = run_dense_paged_prefill_with_hidden_and_checkpoint(
+            &mut inner,
+            &long_prompt,
+            &long_prompt,
+            0,
+            2048,
+        )
+        .expect("explicit-chunk MTP prefill under a cold GDN policy");
+        assert_eq!(
+            cold_mtp_rungs
+                .iter()
+                .map(|c| c.prefix_len)
+                .collect::<Vec<_>>(),
+            vec![48, 192],
+            "the planned-MTP prefill body must publish the whole ladder under a cold GDN policy"
+        );
+
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+        adapter.release_request().expect("release_request");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

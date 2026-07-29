@@ -654,15 +654,20 @@ impl BlockAllocator {
         let block_size_us = block_size as usize;
         let num_full_blocks = token_ids.len() / block_size_us;
 
+        // Precompute the per-block chained hashes with the shared walk so the
+        // lookup and the cold-tier restore path (Task A4) hash the identical
+        // chain. `chain_hashes[n]` equals the hash this loop computed inline
+        // before the refactor; `chain_hashes[n - 1]` is block `n`'s parent.
+        let hashes = chain_hashes(token_ids, block_size, extra_keys, cache_salt);
+
         let mut blocks: Vec<Arc<PhysicalBlock>> = Vec::with_capacity(num_full_blocks);
-        let mut previous_block_hash: u64 = 0;
 
         for n in 0..num_full_blocks {
             let start = n * block_size_us;
             let end = start + block_size_us;
             let block_tokens = &token_ids[start..end];
-            let parent_hash = if n == 0 { 0 } else { previous_block_hash };
-            let block_hash = hash_block(block_tokens, parent_hash, extra_keys, cache_salt, n);
+            let parent_hash = if n == 0 { 0 } else { hashes[n - 1] };
+            let block_hash = hashes[n];
 
             if self.prefix_identity_mismatches(
                 block_hash,
@@ -678,7 +683,6 @@ impl BlockAllocator {
             match self.lookup_prefix(block_hash) {
                 Some(block) => {
                     blocks.push(block);
-                    previous_block_hash = block_hash;
                 }
                 None => break,
             }
@@ -727,21 +731,26 @@ impl BlockAllocator {
         let block_size_us = block_size as usize;
         let num_full_blocks = token_ids.len() / block_size_us;
 
+        // Same shared-walk contract as `find_longest_cache_hit`: one source of
+        // truth for the chained per-block hashes so the hot lookup and the
+        // cold-tier restore path can never drift. The walk stops early when
+        // `extra_keys_per_block` runs short, which reproduces the old inline
+        // `break` (caller didn't supply keys for this block → treat as a miss
+        // to keep cache identity unambiguous; vLLM aborts here too).
+        let hashes =
+            chain_hashes_per_block(token_ids, block_size, extra_keys_per_block, cache_salt);
+
         let mut blocks: Vec<Arc<PhysicalBlock>> = Vec::with_capacity(num_full_blocks);
-        let mut previous_block_hash: u64 = 0;
 
         for n in 0..num_full_blocks {
-            let Some(per_block) = extra_keys_per_block.get(n) else {
-                // Caller didn't supply keys for this block — treat as a
-                // miss to keep cache identity unambiguous. (vLLM aborts
-                // here too.)
+            let (Some(per_block), Some(&block_hash)) = (extra_keys_per_block.get(n), hashes.get(n))
+            else {
                 break;
             };
             let start = n * block_size_us;
             let end = start + block_size_us;
             let block_tokens = &token_ids[start..end];
-            let parent_hash = if n == 0 { 0 } else { previous_block_hash };
-            let block_hash = hash_block(block_tokens, parent_hash, per_block, cache_salt, n);
+            let parent_hash = if n == 0 { 0 } else { hashes[n - 1] };
 
             if self.prefix_identity_mismatches(
                 block_hash,
@@ -757,7 +766,6 @@ impl BlockAllocator {
             match self.lookup_prefix(block_hash) {
                 Some(block) => {
                     blocks.push(block);
-                    previous_block_hash = block_hash;
                 }
                 None => break,
             }
@@ -1146,6 +1154,89 @@ fn hash_block(
     }
     cache_salt.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Chained per-block hot hashes for the leading full blocks of `token_ids`.
+///
+/// This is the single source for the per-block chain-hash walk shared by the
+/// hot lookup ([`BlockAllocator::find_longest_cache_hit`]) and the cold-tier
+/// restore path: block 0's parent hash seeds at `0`, every later block chains
+/// off its predecessor's hash, and `cache_salt` is mixed into block 0 only
+/// (via [`hash_block`]) — identical math to `find_longest_cache_hit` and
+/// `cache_full_blocks`. Entry `n` is the hash the allocator looks up /
+/// registers for full block `n`, so `chain_hashes(...)[n]` is the `hot_hash`
+/// and `chain_hashes(...)[n - 1]` the `parent_hot_hash` a restore must supply.
+///
+/// Returns one hash per full block (`token_ids.len() / block_size`); an empty
+/// vec when `block_size == 0` or fewer than one full block is present. Only
+/// the leading `num_full_blocks * block_size` tokens participate; trailing
+/// partial-block tokens are ignored.
+pub fn chain_hashes(
+    token_ids: &[u32],
+    block_size: u32,
+    extra_keys: &[u64],
+    cache_salt: u64,
+) -> Vec<u64> {
+    if block_size == 0 {
+        return Vec::new();
+    }
+    let block_size_us = block_size as usize;
+    let num_full_blocks = token_ids.len() / block_size_us;
+    let mut hashes = Vec::with_capacity(num_full_blocks);
+    let mut previous_block_hash: u64 = 0;
+    for n in 0..num_full_blocks {
+        let start = n * block_size_us;
+        let end = start + block_size_us;
+        let block_tokens = &token_ids[start..end];
+        let parent_hash = if n == 0 { 0 } else { previous_block_hash };
+        let block_hash = hash_block(block_tokens, parent_hash, extra_keys, cache_salt, n);
+        hashes.push(block_hash);
+        previous_block_hash = block_hash;
+    }
+    hashes
+}
+
+/// Per-block-`extra_keys` variant of [`chain_hashes`].
+///
+/// Block `n` is hashed with `extra_keys_per_block[n]`; everything else matches
+/// [`chain_hashes`] exactly (parent seeded at `0`, later blocks chain off their
+/// predecessor, `cache_salt` mixed into block 0 only via [`hash_block`]).
+///
+/// The walk STOPS at the first block index without per-block keys, so the
+/// returned vec has `min(token_ids.len() / block_size, extra_keys_per_block.len())`
+/// entries. Callers must treat a short result as "no cache identity beyond this
+/// point" — that is exactly what [`BlockAllocator::find_longest_cache_hit_per_block`]
+/// does (break → miss), and what the cold-tier restore walk must do as well.
+///
+/// With an all-empty per-block vec of full length, the result is bit-equal to
+/// `chain_hashes(token_ids, block_size, &[], cache_salt)`.
+pub fn chain_hashes_per_block(
+    token_ids: &[u32],
+    block_size: u32,
+    extra_keys_per_block: &[Vec<u64>],
+    cache_salt: u64,
+) -> Vec<u64> {
+    if block_size == 0 {
+        return Vec::new();
+    }
+    let block_size_us = block_size as usize;
+    let num_full_blocks = (token_ids.len() / block_size_us).min(extra_keys_per_block.len());
+    let mut hashes = Vec::with_capacity(num_full_blocks);
+    let mut previous_block_hash: u64 = 0;
+    for (n, per_block) in extra_keys_per_block
+        .iter()
+        .enumerate()
+        .take(num_full_blocks)
+    {
+        let start = n * block_size_us;
+        let end = start + block_size_us;
+        let block_tokens = &token_ids[start..end];
+        let parent_hash = if n == 0 { 0 } else { previous_block_hash };
+        let block_hash = hash_block(block_tokens, parent_hash, per_block, cache_salt, n);
+        hashes.push(block_hash);
+        previous_block_hash = block_hash;
+    }
+    hashes
 }
 
 #[cfg(test)]
@@ -1566,6 +1657,114 @@ mod tests {
         let (hits, n) = allocator.find_longest_cache_hit(&tokens, 4, &[], 0xAAAA_AAAA_AAAA_AAAA);
         assert_eq!(hits.len(), 2, "matching cache_salt must hit fully");
         assert_eq!(n, 8);
+    }
+
+    /// `chain_hashes` must reproduce the inline per-block walk that
+    /// `find_longest_cache_hit` / `cache_full_blocks` use (the refactor is
+    /// equivalence-preserving), and a chain registered via the allocator
+    /// must be reachable at exactly `chain_hashes[n]` — so the cold-tier
+    /// restore path can trust the helper to yield the hot identity the
+    /// allocator publishes under.
+    #[test]
+    fn chain_hashes_matches_inline_walk_and_lookup() {
+        let tokens: Vec<u32> = (0..12).collect();
+        let extra_keys = [0x1234u64, 0x5678u64];
+        let salt = 0xDEAD_BEEFu64;
+
+        // Byte-for-byte equality with the inline hash_block chain, both with
+        // and without a salt (first-block-only composition).
+        for &cache_salt in &[0u64, salt] {
+            let expected: Vec<u64> = {
+                let mut out = Vec::new();
+                let mut parent = 0u64;
+                for n in 0..3 {
+                    let block = &tokens[n * 4..(n + 1) * 4];
+                    let parent_hash = if n == 0 { 0 } else { parent };
+                    let h = hash_block(block, parent_hash, &extra_keys, cache_salt, n);
+                    out.push(h);
+                    parent = h;
+                }
+                out
+            };
+            assert_eq!(chain_hashes(&tokens, 4, &extra_keys, cache_salt), expected);
+        }
+
+        // A chain registered through the public API is reachable at exactly
+        // the helper's hashes.
+        let mut allocator = BlockAllocator::new(8, 4);
+        let b0 = allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
+        let b2 = allocator.allocate().unwrap();
+        allocator
+            .cache_full_blocks(&tokens, &[b0, b1, b2], 4, &extra_keys, salt)
+            .unwrap();
+        let hashes = chain_hashes(&tokens, 4, &extra_keys, salt);
+        assert_eq!(hashes.len(), 3);
+        for h in &hashes {
+            assert!(
+                allocator.lookup_prefix(*h).is_some(),
+                "registered block must be reachable at its chain_hashes entry"
+            );
+        }
+
+        // Trailing partial-block tokens are ignored.
+        let mut longer = tokens.clone();
+        longer.push(99);
+        assert_eq!(
+            chain_hashes(&longer, 4, &extra_keys, salt),
+            hashes,
+            "partial trailing block must not affect the chain"
+        );
+        // Degenerate block_size → empty.
+        assert!(chain_hashes(&tokens, 0, &extra_keys, salt).is_empty());
+    }
+
+    /// `chain_hashes_per_block` must be the exact per-block generalization of
+    /// `chain_hashes`: identical output when every block carries the same keys,
+    /// and a SHORT result (not a panic, not a padded chain) when the per-block
+    /// vec runs out — that short result is what makes the cold restore walk
+    /// bail as a miss instead of inventing an identity.
+    #[test]
+    fn chain_hashes_per_block_generalizes_the_uniform_walk() {
+        let tokens: Vec<u32> = (0..12).collect();
+        let salt = 0xDEAD_BEEFu64;
+
+        for &cache_salt in &[0u64, salt] {
+            // All-empty per-block keys == uniform empty keys.
+            let empty_per_block = vec![Vec::<u64>::new(); 3];
+            assert_eq!(
+                chain_hashes_per_block(&tokens, 4, &empty_per_block, cache_salt),
+                chain_hashes(&tokens, 4, &[], cache_salt),
+                "all-empty per-block keys must reproduce the uniform empty-key chain"
+            );
+
+            // Same non-empty keys on every block == uniform keys.
+            let uniform = [0x1234u64, 0x5678u64];
+            let repeated = vec![uniform.to_vec(); 3];
+            assert_eq!(
+                chain_hashes_per_block(&tokens, 4, &repeated, cache_salt),
+                chain_hashes(&tokens, 4, &uniform, cache_salt),
+                "repeating one key vec must reproduce the uniform chain"
+            );
+
+            // Differing keys on block 1 must diverge from block 1 onward while
+            // block 0 stays identical (chained hashing).
+            let mut varied = repeated.clone();
+            varied[1] = vec![0xAAAAu64];
+            let base = chain_hashes_per_block(&tokens, 4, &repeated, cache_salt);
+            let alt = chain_hashes_per_block(&tokens, 4, &varied, cache_salt);
+            assert_eq!(base[0], alt[0]);
+            assert_ne!(base[1], alt[1]);
+            assert_ne!(base[2], alt[2]);
+        }
+
+        // Short per-block vec truncates the walk instead of panicking.
+        let short = vec![Vec::<u64>::new(); 2];
+        assert_eq!(chain_hashes_per_block(&tokens, 4, &short, salt).len(), 2);
+        assert!(chain_hashes_per_block(&tokens, 4, &[], salt).is_empty());
+        // Degenerate block_size → empty.
+        let full = vec![Vec::<u64>::new(); 3];
+        assert!(chain_hashes_per_block(&tokens, 0, &full, salt).is_empty());
     }
 
     /// Direct-hash assertion that `cache_salt` is NOT mixed into the hash of

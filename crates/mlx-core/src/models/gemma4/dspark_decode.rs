@@ -1096,6 +1096,38 @@ impl Gemma4Inner {
     /// final one; the save's keep-all history then equals the physical
     /// cache offsets). No sample / push / emit; like the AR steppers, this
     /// deliberately does NOT fire a sliding decode-boundary checkpoint.
+    ///
+    /// Nor does anything else on the draft path, and that is structural rather
+    /// than an omission. `maybe_remember_gemma4_sliding_decode_boundary_checkpoint`
+    /// exists to feed `capture_gemma4_sliding_cold_sidecar`, which needs a
+    /// `PagedKVCacheAdapter` — and a draft turn provably has none:
+    /// `persistence::resolve_gemma4_draft_paged_cache` forces
+    /// `use_block_paged_cache = Some(false)` the moment a draft is resolved (an
+    /// explicit `true` is a hard load error), so `Gemma4Inner::new` builds no
+    /// adapter, `build_cold_tier_context` returns `None` at its first line for
+    /// want of one, and neither this file nor `assistant_decode.rs` touches
+    /// `paged_adapter` at all. Publishing here would be dead code, not a fix.
+    ///
+    /// So the answer to "should draft/MTP turns publish sliding checkpoints?"
+    /// is no, and not because it would be wrong — because there is no paged
+    /// state on a draft turn for a rung to describe. Writing the crossed-
+    /// boundary machinery now would be machinery for a path that does not
+    /// exist. It becomes reachable only if `engine::paged_turn` grows a
+    /// speculative branch, and at that point it is required, not optional: a
+    /// variable accept count steps the cursor from below a rung to above it
+    /// without landing on it, so `rung == prefix_len` silently never fires.
+    /// The predicate has to be "a boundary lies in `(previous, current]`" —
+    /// the `gemma4_sliding_checkpoint_boundaries_crossed` shape the prefill
+    /// chunk walk already uses — and the snapshot has to be sliced back to
+    /// that boundary rather than taken at the cursor. Note also that on a
+    /// persistence-OFF turn publishing changes the retained set and therefore
+    /// the emitted tokens, so it must stay behind the same transparency gate
+    /// as the AR publisher.
+    ///
+    /// Pinned by `persistence::tests::{dspark,embedded}_draft_conflicts_with_explicit_paged_cache`
+    /// and `draft_paged_cache_resolution_covers_the_whole_truth_table` on the
+    /// load path; by `model::tests::gemma4_draft_decode_paths_never_touch_the_paged_adapter`
+    /// and `gemma4_paged_plus_draft_silently_drops_the_draft` on the plan path.
     fn dspark_materialize_final(&mut self, token_id: u32, stream: Stream) -> Result<()> {
         let caches = self
             .caches

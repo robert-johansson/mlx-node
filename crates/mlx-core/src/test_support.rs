@@ -1,11 +1,46 @@
 //! Test-only helpers for detecting host-level numeric-environment issues
-//! that make certain assertions meaningless.
+//! that make certain assertions meaningless, plus the tolerance arithmetic
+//! that keeps half-precision parity assertions honest.
 
 use std::sync::OnceLock;
 
 use mlx_sys as sys;
 
 use crate::array::{DType, MxArray};
+
+/// Largest absolute value in `values`; `0.0` for an empty slice. This is the
+/// scale to anchor [`bf16_scaled_tolerance`] on.
+pub(crate) fn max_abs(values: &[f32]) -> f32 {
+    values.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+}
+
+/// Element-wise budget for comparing two bf16 tensors that two different
+/// execution paths computed from the same inputs.
+///
+/// bf16 keeps 8 significand bits, so neighbouring bf16 values are a relative
+/// `2^-8`..`2^-7` apart. Two paths that reduce the same dot products in a
+/// different order land on different sides of a rounding boundary whenever
+/// the exact result happens to sit near one — which, for operands drawn from
+/// an unseeded PRNG, is a per-process coin flip. A fixed absolute tolerance
+/// smaller than that grid spacing is therefore not a tolerance at all: it
+/// asserts bit-equality and fails on the draws that lose the flip.
+///
+/// The budget is anchored to `scale` — the largest magnitude in the
+/// **reference** tensor — and NOT to the element being compared. The absolute
+/// error of a dot product is set by its partial sums, so an element that is
+/// small only because its terms cancelled carries the same absolute error as
+/// the largest element; a per-element relative bound would demand far more of
+/// the cancelled elements than the arithmetic can deliver. Anchoring on the
+/// reference (rather than on either side) also stops a blown-up value on the
+/// candidate side from inflating its own budget.
+///
+/// `ulps / 128.0` is `ulps * 2^-7`, i.e. `ulps` bf16 grid steps at `scale`.
+/// `floor` keeps the budget usable when every value sits near zero. Mirrors
+/// the `5e-3.max(max_abs * (3.0 / 128.0))` rule already used by the
+/// `banded_attention` bf16 parity test.
+pub(crate) fn bf16_scaled_tolerance(scale: f32, ulps: f32, floor: f32) -> f32 {
+    floor.max(scale.abs() * ulps / 128.0)
+}
 
 /// Returns `true` when this host's half-precision GEMM produces results
 /// that deviate from an f32 host reference by more than `0.1` on a small
@@ -295,4 +330,121 @@ pub(crate) fn sorted_gather_mm_untrustworthy() -> bool {
             Err(_) => false,
         }
     })
+}
+
+/// True when `msg` says this host has no usable Metal device, so a paged test
+/// that needs one may print `skipping` and return instead of failing.
+///
+/// Matched against the message from `Qwen35Inner::new` /
+/// `Qwen35MoeInner::new` / `initialize_paged_adapter`, which wrap whatever
+/// `LayerKVPool` returned.
+///
+/// It matches the two device-absence strings and nothing else — deliberately
+/// NOT the substring `LayerKVPool`, which also appears in
+/// `LayerKVPool::new: num_blocks must be > 0` and
+/// `LayerKVPool::new: config.num_layers must be > 0`. Those two mean the test
+/// config no longer produces a usable pool, i.e. the test lost its coverage.
+/// A self-skip on them is invisible: libtest counts a skipped-and-returned
+/// test as passed, and the CI leg that owns these tests asserts a pass COUNT,
+/// so a config drift would read green with nothing exercised.
+///
+/// `MLX_TEST_REQUIRE_METAL=1` removes the licence entirely. A leg that runs on a
+/// Metal runner sets it, so a Metal init failure there takes the caller's
+/// `panic!` arm and the leg goes RED instead of reporting a full pass count with
+/// nothing exercised. Scraping the log for the `skipping` line cannot do that
+/// job: libtest writes `test <name> ... ` and flushes BEFORE running the body,
+/// so under `--nocapture` the skip line lands mid-line and never at column 0.
+pub(crate) fn metal_device_absent(msg: &str) -> bool {
+    metal_device_absent_when(metal_required(), msg)
+}
+
+/// Whether this run forbids a Metal self-skip. Read once — a test that flipped
+/// the var mid-run would otherwise race every other test thread.
+///
+/// Public within the crate for skip arms that do not go through
+/// [`metal_device_absent`] because they have no error message to match against.
+pub(crate) fn metal_required() -> bool {
+    static REQUIRED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUIRED.get_or_init(|| {
+        std::env::var("MLX_TEST_REQUIRE_METAL")
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// The decision itself, with the environment lifted out.
+///
+/// Split from [`metal_device_absent`] so the require-Metal contract is testable
+/// as a pure function — asserting it through the env var would need
+/// `set_var`, which is `unsafe` and racy against every other test thread.
+pub(crate) fn metal_device_absent_when(require_metal: bool, msg: &str) -> bool {
+    if require_metal {
+        return false;
+    }
+    msg.contains("Metal GPU not available") || msg.contains("No Metal device found")
+}
+
+#[cfg(test)]
+mod skip_predicate_tests {
+    use super::metal_device_absent_when;
+
+    /// `MLX_TEST_REQUIRE_METAL=1` must remove the skip licence for the device-
+    /// absence strings too, not just for config failures.
+    ///
+    /// Catches, verified by mutation: reverting the wrapper to an unconditional
+    /// `msg.contains(...)`, i.e. deleting the `require_metal` term. The sibling
+    /// below survives that mutation, which is why this case exists separately.
+    ///
+    /// It is the whole reason the env var exists: on a Metal runner a device
+    /// init failure has to fail the leg, and the log-scraping guard that used to
+    /// carry that job structurally could not — see `metal_device_absent`.
+    #[test]
+    fn require_metal_forbids_a_skip() {
+        for absent in [
+            "Metal GPU not available",
+            "No Metal device found",
+            "paged init failed: Metal GPU not available",
+        ] {
+            assert!(
+                !metal_device_absent_when(true, absent),
+                "with MLX_TEST_REQUIRE_METAL=1 even a device-less host must fail loudly: {absent}"
+            );
+            assert!(
+                metal_device_absent_when(false, absent),
+                "without it the licence is unchanged: {absent}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_device_absence_licenses_a_paged_test_to_skip() {
+        for absent in [
+            "Metal GPU not available",
+            "No Metal device found",
+            "paged init failed: Metal GPU not available",
+        ] {
+            // The pure form, not `metal_device_absent`: this arm asserts that
+            // device absence licenses a skip, which is only true while
+            // MLX_TEST_REQUIRE_METAL is unset. Reading the env here would make
+            // the test assert the ambient environment rather than the
+            // predicate, and it fails on any run that sets the var — which the
+            // `cargo test` CI leg now does for every test in the crate.
+            assert!(
+                metal_device_absent_when(false, absent),
+                "a genuinely device-less host must still be able to skip: {absent}"
+            );
+        }
+        for real_failure in [
+            "LayerKVPool::new: num_blocks must be > 0",
+            "LayerKVPool::new: config.num_layers must be > 0",
+            "LayerKVPool allocation failed",
+            "block_size must be > 0",
+        ] {
+            assert!(
+                !metal_device_absent_when(false, real_failure),
+                "a config/caller failure must fail the test, not silently skip it: \
+                 {real_failure}"
+            );
+        }
+    }
 }

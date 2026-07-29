@@ -173,18 +173,163 @@ pub(crate) fn gdn_checkpoint_target(
     (target > cached_prefix_len).then_some(target)
 }
 
+/// Spacing between checkpoint boundaries. Each rung is a quarter of the one
+/// above it, so whatever prefix the persisted K/V chain has reached, the
+/// deepest usable rung is within a factor of four of it.
+const GDN_CHECKPOINT_LADDER_RATIO: u32 = 4;
+
+/// Boundaries one prefill snapshots at.
+///
+/// A GDN checkpoint is a full recurrent state, and a prefill snapshots every
+/// boundary it crosses before publishing any of them, so a whole ladder is
+/// resident at once ON TOP OF everything `GDN_PREFIX_CHECKPOINT_LIMIT` already
+/// retains. Both halves of that are measured, not estimated:
+///
+/// - One checkpoint on the dense 27B (48 GDN layers, bf16; `[1,3,10240]` conv
+///   plus `[1,48,128,128]` recurrent per layer) is 78,446,592 B of tensor and
+///   78,643,202 B resident, 75.00 MiB — see
+///   `gdn_sidecar::tests::one_gdn_checkpoint_of_the_27b_costs_a_known_number_of_bytes`
+///   and the `#[ignore]`d allocator measurement beside it.
+/// - The peak is the store bound PLUS the whole undrained ladder, 5 + 4 = 9
+///   checkpoints — see
+///   `gdn_checkpoint_store::tests::publishing_a_ladder_peaks_at_the_store_bound_plus_the_whole_ladder`.
+///
+/// So the worst case is 675 MiB, against 450 MiB for the single-rung behaviour
+/// this replaces: four rungs cost ~225 MiB of transient headroom and span a 64x
+/// range of prefix lengths. Publishing each rung as it is produced instead of
+/// accumulating the ladder would cap the peak at 6 checkpoints, but the forward
+/// pass holds the caches borrowed and cannot reach the store.
+///
+/// This does not rescue turn 1 of a long prompt. The persisted chain reaches
+/// only a handful of blocks after one turn (~128 tokens at block_size 16),
+/// while a 32K prompt's shallowest rung is 32768 / 64 = 512 tokens — still
+/// above it, so turn 1 writes no sidecar. What the ladder changes is turn 2
+/// onward: a single endpoint rung needs the chain to reach the prompt's own
+/// end, which takes tens of turns, whereas the ladder needs it to reach only
+/// a quarter of the deepest rung.
+pub(crate) const GDN_CHECKPOINT_LADDER_RUNGS: u32 = 4;
+
+/// Prefix boundaries this prefill materializes a GDN checkpoint at, ascending.
+///
+/// The deepest rung is [`gdn_checkpoint_target`] — the boundary a warm turn
+/// restores from, unchanged. The shallower rungs exist because the SSD cold
+/// tier's block chain advances only a few blocks per turn (its writer queue is
+/// bounded and the capture walk stops at the first block it refuses), so for
+/// many turns the chain reaches nowhere near the prompt's own end. A sidecar
+/// may only be anchored where the chain already reaches; without a rung down
+/// there, nothing is written and the next process reuses zero blocks.
+///
+/// Every entry is a real block-aligned boundary the forward pass stops at, so
+/// each becomes a genuine recurrent snapshot taken at exactly that prefix
+/// length — never truncated or interpolated from a deeper one, which a running
+/// summary of all preceding tokens does not admit.
+pub(crate) fn gdn_prefill_checkpoint_boundaries(
+    full_tokens_len: usize,
+    cached_prefix_len: u32,
+    block_size: u32,
+) -> Vec<u32> {
+    let Some(deepest) = gdn_checkpoint_target(full_tokens_len, cached_prefix_len, block_size)
+    else {
+        return Vec::new();
+    };
+    let mut boundaries = Vec::with_capacity(GDN_CHECKPOINT_LADDER_RUNGS as usize);
+    let mut rung = deepest;
+    for _ in 0..GDN_CHECKPOINT_LADDER_RUNGS {
+        boundaries.push(rung);
+        // Block-align downwards so the rung is a boundary the paged allocator
+        // can chain-hash, and stop once the ladder would repeat or run out.
+        let next = rung / GDN_CHECKPOINT_LADDER_RATIO / block_size * block_size;
+        if next == 0 || next <= cached_prefix_len || next >= rung {
+            break;
+        }
+        rung = next;
+    }
+    boundaries.reverse();
+    boundaries
+}
+
+/// Whether this adapter's cold tier will actually consume a checkpoint ladder.
+///
+/// The ladder's shallow rungs exist for ONE consumer: a GDN sidecar anchored
+/// where the SSD block chain already reaches. With no such policy installed
+/// nothing can ever read them, so paying for them is pure cost — extra forced
+/// chunk breaks (each one a different GEMM `M`, so a different kernel class and
+/// accumulation order), extra `synchronize_and_clear_cache` barriers, and extra
+/// full GDN snapshots held resident.
+///
+/// This is the single source of truth for "persistence is on for the recurrent
+/// half": both `cold_gdn_prefill_chunk_size` (dense and MoE) and the boundary
+/// selection below read it, so the chunk size and the break set cannot disagree
+/// about whether this turn is a persist turn.
+pub(crate) fn gdn_cold_sidecar_ladder_wanted(adapter: &PagedKVCacheAdapter) -> bool {
+    adapter
+        .cold_tier()
+        .and_then(|cold| cold.sidecar_policy.as_ref())
+        .is_some_and(|policy| policy.group() == mlx_paged_attn::ColdGroup::GdnState)
+}
+
+/// Boundaries a prefill forces a chunk break at, ascending.
+///
+/// `want_ladder` is [`gdn_cold_sidecar_ladder_wanted`] for the turn's adapter:
+///
+/// ```text
+///   want_ladder = true   -> gdn_prefill_checkpoint_boundaries   (up to 4 rungs)
+///   want_ladder = false  -> gdn_checkpoint_target               (0 or 1 rung)
+/// ```
+///
+/// The `false` arm is not an optimization, it is a compatibility contract. A
+/// prefill split at N points is algebraically transparent but NOT numerically
+/// bit-identical, so a turn with no cold tier must take exactly the break set it
+/// took before the ladder existed — a single deep boundary — or the sampled
+/// tokens of a persistence-off request can change. That matters because
+/// `MLX_PAGED_PREFILL_CHUNK_SIZE` is not exotic: `packages/agent/src/run-agent.ts`
+/// and `packages/cli/src/commands/launch-claude/index.ts` both default it to
+/// 2048 unconditionally, so `mlx agent --no-persist-cache` reaches a positive
+/// chunk size with no policy installed. Keeping the deep boundary on that arm
+/// also preserves the warm in-process continuation, which
+/// `find_dense_gdn_prefix_checkpoint` serves from exactly that rung.
+pub(crate) fn prefill_checkpoint_boundaries(
+    full_tokens_len: usize,
+    cached_prefix_len: u32,
+    block_size: u32,
+    want_ladder: bool,
+) -> Vec<u32> {
+    if want_ladder {
+        gdn_prefill_checkpoint_boundaries(full_tokens_len, cached_prefix_len, block_size)
+    } else {
+        gdn_checkpoint_target(full_tokens_len, cached_prefix_len, block_size)
+            .into_iter()
+            .collect()
+    }
+}
+
+/// Rebase absolute checkpoint boundaries onto the uncached suffix the prefill
+/// actually forwards. Boundaries at or below the cached prefix are dropped —
+/// this prefill never crosses them, so it cannot snapshot there.
+pub(crate) fn checkpoint_suffix_offsets(boundaries: &[u32], cached_prefix_len: u32) -> Vec<usize> {
+    boundaries
+        .iter()
+        .filter_map(|boundary| boundary.checked_sub(cached_prefix_len))
+        .filter(|offset| *offset > 0)
+        .map(|offset| offset as usize)
+        .collect()
+}
+
+/// Split the suffix into forward-pass chunks, forcing a break at every
+/// checkpoint offset so each boundary is a chunk edge the caller can snapshot
+/// at. `checkpoint_suffix_offsets` must be ascending.
 pub(crate) fn paged_prefill_ranges(
     suffix_len: usize,
     chunk_size: usize,
-    checkpoint_suffix_offset: Option<usize>,
+    checkpoint_suffix_offsets: &[usize],
 ) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0usize;
     while start < suffix_len {
         let mut end = start.saturating_add(chunk_size).min(suffix_len);
-        if let Some(checkpoint) = checkpoint_suffix_offset
-            && checkpoint > start
-            && checkpoint < end
+        if let Some(&checkpoint) = checkpoint_suffix_offsets
+            .iter()
+            .find(|&&offset| offset > start && offset < end)
         {
             end = checkpoint;
         }
@@ -271,56 +416,27 @@ pub(crate) fn run_gdn_only_prefill_materialized(
     Ok(())
 }
 
-/// Run a paged prefill over the suffix tokens. Returns the last
-/// position's logits squeezed to `[vocab]`.
+/// Run a paged prefill over the suffix tokens. Returns the last position's
+/// logits squeezed to `[vocab]` plus every GDN recurrent checkpoint the split
+/// materialized.
 ///
 /// `cached_prefix_len` is how many tokens the paged adapter has
 /// already cached for this request (0 on a fresh prefill). The full
 /// prompt is `tokens` (used for the GDN pass-1 prefill of the prefix);
 /// the suffix `&tokens[cached_prefix_len..]` is what gets recorded
 /// into the paged adapter and fed through the full forward pass.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_paged_prefill_chunk_with_checkpoint(
-    full_tokens: &[u32],
-    suffix_tokens: &[u32],
-    cached_prefix_len: u32,
-    gdn_prefix_already_primed: bool,
-    embed: &Embedding,
-    layers: &mut [DecoderLayer],
-    caches: &mut [Qwen3_5LayerCache],
-    final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
-    layer_kinds: &[Qwen3_5LayerKind],
-    paged_adapter: &mut PagedKVCacheAdapter,
-    cached_rope_deltas: i32,
-) -> Result<(MxArray, Option<MaterializedGdnPrefixCheckpoint>)> {
-    let chunk_size = crate::array::paged_prefill_chunk_size();
-    run_paged_prefill_chunk_with_size(
-        full_tokens,
-        suffix_tokens,
-        cached_prefix_len,
-        gdn_prefix_already_primed,
-        embed,
-        layers,
-        caches,
-        final_norm,
-        lm_head,
-        embedding_weight,
-        layer_kinds,
-        paged_adapter,
-        chunk_size,
-        cached_rope_deltas,
-    )
-}
-
-/// Chunk-size-parameterized worker for `run_paged_prefill_chunk`.
 ///
-/// `chunk_size <= 0` keeps the single-shot path. Positive chunk sizes split
-/// only the uncached suffix. Each chunk writes its K/V into the paged adapter,
-/// attends over the cumulative cached range, then clears MLX's transient graph
-/// before the next chunk. This matches the Qwen3/Qwen3.5 MoE driver shape and
-/// keeps dense Qwen from building one giant prefill graph for 30k+ suffixes.
+/// `chunk_size <= 0` keeps the single-shot path, which crosses no boundary and
+/// so returns an empty checkpoint vec. Positive chunk sizes split only the
+/// uncached suffix. Each chunk writes its K/V into the paged adapter, attends
+/// over the cumulative cached range, then clears MLX's transient graph before
+/// the next chunk. This matches the Qwen3/Qwen3.5 MoE driver shape and keeps
+/// dense Qwen from building one giant prefill graph for 30k+ suffixes.
+///
+/// The size is the caller's to choose — nothing here reads
+/// `MLX_PAGED_PREFILL_CHUNK_SIZE`. Every production caller passes
+/// `Qwen35Inner::cold_gdn_prefill_chunk_size()`, so a persist-cold turn splits
+/// at the checkpoint ladder's rungs and every other turn stays single-shot.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_paged_prefill_chunk_with_size(
     full_tokens: &[u32],
@@ -337,7 +453,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
     cached_rope_deltas: i32,
-) -> Result<(MxArray, Option<MaterializedGdnPrefixCheckpoint>)> {
+) -> Result<(MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
             "run_paged_prefill_chunk called with empty suffix",
@@ -364,16 +480,17 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             paged_adapter,
             cached_rope_deltas,
         )
-        .map(|logits| (logits, None));
+        .map(|logits| (logits, Vec::new()));
     }
 
-    let checkpoint_target = gdn_checkpoint_target(
+    let checkpoint_boundaries = prefill_checkpoint_boundaries(
         full_tokens.len(),
         cached_prefix_len,
         paged_adapter.block_size(),
+        gdn_cold_sidecar_ladder_wanted(paged_adapter),
     );
 
-    if checkpoint_target.is_none() && suffix_tokens.len() <= chunk_size as usize {
+    if checkpoint_boundaries.is_empty() && suffix_tokens.len() <= chunk_size as usize {
         return run_paged_prefill_single_shot(
             full_tokens,
             suffix_tokens,
@@ -389,21 +506,15 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             paged_adapter,
             cached_rope_deltas,
         )
-        .map(|logits| (logits, None));
+        .map(|logits| (logits, Vec::new()));
     }
 
     let trace_enabled = inference_trace_enabled();
     let inference_info_enabled =
         tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
     let chunk_size_usize = chunk_size as usize;
-    let checkpoint_suffix_offset = checkpoint_target
-        .and_then(|target| target.checked_sub(cached_prefix_len))
-        .map(|offset| offset as usize);
-    let chunk_ranges = paged_prefill_ranges(
-        suffix_tokens.len(),
-        chunk_size_usize,
-        checkpoint_suffix_offset,
-    );
+    let suffix_offsets = checkpoint_suffix_offsets(&checkpoint_boundaries, cached_prefix_len);
+    let chunk_ranges = paged_prefill_ranges(suffix_tokens.len(), chunk_size_usize, &suffix_offsets);
 
     // Pass 1: GDN-only prefill over the cached prefix. This runs once before
     // suffix chunking; GDN recurrent state then advances in-place across chunks.
@@ -439,10 +550,16 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             );
         }
     }
+    // The recurrent half of the cached prefix is now in hand (either it already
+    // was, or the pass above just replayed it from token ids). Clear the
+    // adapter's auxiliary-state obligation before the first `record_tokens`.
+    paged_adapter
+        .confirm_aux_prefix_primed(cached_prefix_len)
+        .map_err(Error::from_reason)?;
 
     let total_chunks = chunk_ranges.len();
     let mut last_logits: Option<MxArray> = None;
-    let mut checkpoint = None;
+    let mut checkpoints = Vec::new();
     let mut chunk_start_position = cached_prefix_len;
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
@@ -469,7 +586,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         )?;
 
         let context_after = chunk_start_position + chunk.len() as u32;
-        let capture_checkpoint = checkpoint_target == Some(context_after);
+        let capture_checkpoint = checkpoint_boundaries.contains(&context_after);
 
         if is_last_chunk {
             last_logits = Some(project_last_token_logits(
@@ -481,12 +598,12 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             )?);
             if capture_checkpoint {
                 materialize_linear_layer_caches(caches)?;
-                checkpoint = snapshot_materialized_linear_layer_caches(caches).map(|caches| {
-                    MaterializedGdnPrefixCheckpoint {
+                if let Some(caches) = snapshot_materialized_linear_layer_caches(caches) {
+                    checkpoints.push(MaterializedGdnPrefixCheckpoint {
                         prefix_len: context_after,
                         caches,
-                    }
-                });
+                    });
+                }
             }
             if let Some(start) = chunk_trace_start {
                 let chunk_elapsed_ms = elapsed_ms(start);
@@ -529,12 +646,12 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             hidden_states.eval();
             if capture_checkpoint {
                 materialize_linear_layer_caches(caches)?;
-                checkpoint = snapshot_materialized_linear_layer_caches(caches).map(|caches| {
-                    MaterializedGdnPrefixCheckpoint {
+                if let Some(caches) = snapshot_materialized_linear_layer_caches(caches) {
+                    checkpoints.push(MaterializedGdnPrefixCheckpoint {
                         prefix_len: context_after,
                         caches,
-                    }
-                });
+                    });
+                }
             }
             crate::array::synchronize_and_clear_cache();
             if let Some(start) = chunk_trace_start {
@@ -596,7 +713,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             "chunked prefill produced no last chunk (unreachable for non-empty suffix)",
         )
     })?;
-    Ok((logits, checkpoint))
+    Ok((logits, checkpoints))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -618,10 +735,14 @@ fn run_paged_prefill_single_shot(
     let inference_info_enabled =
         tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
     let single_shot_start = inference_info_enabled.then(Instant::now);
-    paged_adapter
-        .record_tokens(suffix_tokens)
-        .map_err(Error::from_reason)?;
 
+    // The GDN pre-pass runs BEFORE `record_tokens` so the auxiliary-state
+    // acknowledgement below precedes the first token recorded against the
+    // cached prefix (the chunked driver already has this order). The swap is
+    // observationally inert: `run_gdn_only_prefill` takes no paged adapter and
+    // so cannot touch the block table, pool or cursor, while `record_tokens` is
+    // host-side bookkeeping plus block allocation and never reads the GDN
+    // caches. Neither one's result depends on the other.
     if cached_prefix_len > 0 && !gdn_prefix_already_primed {
         let gdn_info_start = inference_info_enabled.then(Instant::now);
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
@@ -641,6 +762,13 @@ fn run_paged_prefill_single_shot(
             );
         }
     }
+    paged_adapter
+        .confirm_aux_prefix_primed(cached_prefix_len)
+        .map_err(Error::from_reason)?;
+
+    paged_adapter
+        .record_tokens(suffix_tokens)
+        .map_err(Error::from_reason)?;
 
     let hidden_states = run_paged_prefill_one_chunk(
         suffix_tokens,
@@ -711,7 +839,7 @@ pub(crate) fn run_paged_vlm_prefill(
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
-) -> Result<(MxArray, Option<MaterializedGdnPrefixCheckpoint>)> {
+) -> Result<(MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if expanded_tokens.is_empty() {
         return Err(Error::from_reason(
             "run_paged_vlm_prefill called with empty prompt",
@@ -749,6 +877,12 @@ pub(crate) fn run_paged_vlm_prefill(
             "run_paged_vlm_prefill received a K/V prefix without an exact GDN sidecar; caller must restart cold",
         ));
     }
+    // Past the guard the recurrent half is exact by construction (an image
+    // prefix is never replayed from token ids — the caller restarts cold
+    // instead), so the adapter's obligation is discharged here.
+    paged_adapter
+        .confirm_aux_prefix_primed(cached_prefix_len)
+        .map_err(Error::from_reason)?;
 
     let suffix_tokens = &expanded_tokens[cached_prefix_len_us..];
     let configured_chunk_size = crate::array::paged_prefill_chunk_size();
@@ -760,16 +894,17 @@ pub(crate) fn run_paged_vlm_prefill(
     // Image-aware KV reuse also needs an exact recurrent sidecar. Even when
     // generic text prefill chunking is disabled, split once at the reusable
     // block boundary so a later non-live image-prefix hit remains exact.
-    let checkpoint_target =
-        gdn_checkpoint_target(prompt_len, cached_prefix_len, paged_adapter.block_size());
-    let checkpoint_suffix_offset = checkpoint_target
-        .and_then(|target| target.checked_sub(cached_prefix_len))
-        .map(|offset| offset as usize);
-    let chunk_ranges =
-        paged_prefill_ranges(suffix_tokens.len(), chunk_size, checkpoint_suffix_offset);
+    // A media turn never writes a cold sidecar, so it keeps the single deepest
+    // boundary rather than a ladder: the extra rungs would only cost memory.
+    let checkpoint_boundaries: Vec<u32> =
+        gdn_checkpoint_target(prompt_len, cached_prefix_len, paged_adapter.block_size())
+            .into_iter()
+            .collect();
+    let suffix_offsets = checkpoint_suffix_offsets(&checkpoint_boundaries, cached_prefix_len);
+    let chunk_ranges = paged_prefill_ranges(suffix_tokens.len(), chunk_size, &suffix_offsets);
     let total_chunks = chunk_ranges.len();
     let mut last_logits = None;
-    let mut checkpoint = None;
+    let mut checkpoints = Vec::new();
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
         let absolute_start = cached_prefix_len_us + range.start;
@@ -802,7 +937,7 @@ pub(crate) fn run_paged_vlm_prefill(
         )?;
 
         let context_after = absolute_end as u32;
-        let capture_checkpoint = checkpoint_target == Some(context_after);
+        let capture_checkpoint = checkpoint_boundaries.contains(&context_after);
         let is_last_chunk = chunk_idx + 1 == total_chunks;
         if is_last_chunk {
             last_logits = Some(project_last_token_logits(
@@ -817,12 +952,12 @@ pub(crate) fn run_paged_vlm_prefill(
         }
         if capture_checkpoint {
             materialize_linear_layer_caches(caches)?;
-            checkpoint = snapshot_materialized_linear_layer_caches(caches).map(|caches| {
-                MaterializedGdnPrefixCheckpoint {
+            if let Some(caches) = snapshot_materialized_linear_layer_caches(caches) {
+                checkpoints.push(MaterializedGdnPrefixCheckpoint {
                     prefix_len: context_after,
                     caches,
-                }
-            });
+                });
+            }
         }
         if !is_last_chunk {
             crate::array::synchronize_and_clear_cache();
@@ -831,7 +966,7 @@ pub(crate) fn run_paged_vlm_prefill(
 
     let logits = last_logits
         .ok_or_else(|| Error::from_reason("run_paged_vlm_prefill produced no final chunk"))?;
-    Ok((logits, checkpoint))
+    Ok((logits, checkpoints))
 }
 
 /// Paged prefill variant that ALSO returns the post-`final_norm` hidden
@@ -849,45 +984,14 @@ pub(crate) fn run_paged_vlm_prefill(
 /// the same `want_prompt_hidden` predicate). On a cache-reuse turn the
 /// prefill only processes the suffix, so the captured hidden would not
 /// cover the full prompt and the prompt-prefix seed cannot use it.
+///
+/// `chunk_size` carries the same contract as the non-hidden worker: `<= 0` is
+/// legacy single-shot (no checkpoints), and the value comes from the caller,
+/// never from `MLX_PAGED_PREFILL_CHUNK_SIZE` read here. An MTP turn is the only
+/// consumer, and it is a persist-cold turn like any other — reading the raw env
+/// default here is what kept MTP turns from publishing any ladder rung at all.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_paged_prefill_chunk_with_hidden_and_checkpoint(
-    full_tokens: &[u32],
-    suffix_tokens: &[u32],
-    cached_prefix_len: u32,
-    gdn_prefix_already_primed: bool,
-    embed: &Embedding,
-    layers: &mut [DecoderLayer],
-    caches: &mut [Qwen3_5LayerCache],
-    final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
-    layer_kinds: &[Qwen3_5LayerKind],
-    paged_adapter: &mut PagedKVCacheAdapter,
-    keep_last_hidden: Option<usize>,
-    cached_rope_deltas: i32,
-) -> Result<(MxArray, MxArray, Option<MaterializedGdnPrefixCheckpoint>)> {
-    let chunk_size = crate::array::paged_prefill_chunk_size();
-    run_paged_prefill_chunk_with_hidden_with_size(
-        full_tokens,
-        suffix_tokens,
-        cached_prefix_len,
-        gdn_prefix_already_primed,
-        embed,
-        layers,
-        caches,
-        final_norm,
-        lm_head,
-        embedding_weight,
-        layer_kinds,
-        paged_adapter,
-        chunk_size,
-        keep_last_hidden,
-        cached_rope_deltas,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_paged_prefill_chunk_with_hidden_with_size(
+pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
     full_tokens: &[u32],
     suffix_tokens: &[u32],
     cached_prefix_len: u32,
@@ -903,7 +1007,7 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
     chunk_size: i32,
     keep_last_hidden: Option<usize>,
     cached_rope_deltas: i32,
-) -> Result<(MxArray, MxArray, Option<MaterializedGdnPrefixCheckpoint>)> {
+) -> Result<(MxArray, MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
             "run_paged_prefill_chunk_with_hidden called with empty suffix",
@@ -929,16 +1033,17 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
             keep_last_hidden,
             cached_rope_deltas,
         )
-        .map(|(logits, hidden)| (logits, hidden, None));
+        .map(|(logits, hidden)| (logits, hidden, Vec::new()));
     }
 
-    let checkpoint_target = gdn_checkpoint_target(
+    let checkpoint_boundaries = prefill_checkpoint_boundaries(
         full_tokens.len(),
         cached_prefix_len,
         paged_adapter.block_size(),
+        gdn_cold_sidecar_ladder_wanted(paged_adapter),
     );
 
-    if checkpoint_target.is_none() && suffix_tokens.len() <= chunk_size as usize {
+    if checkpoint_boundaries.is_empty() && suffix_tokens.len() <= chunk_size as usize {
         return run_paged_prefill_single_shot_with_hidden(
             full_tokens,
             suffix_tokens,
@@ -955,21 +1060,15 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
             keep_last_hidden,
             cached_rope_deltas,
         )
-        .map(|(logits, hidden)| (logits, hidden, None));
+        .map(|(logits, hidden)| (logits, hidden, Vec::new()));
     }
 
     let inference_info_enabled =
         tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
     let prefill_trace_start = inference_info_enabled.then(Instant::now);
     let chunk_size_usize = chunk_size as usize;
-    let checkpoint_suffix_offset = checkpoint_target
-        .and_then(|target| target.checked_sub(cached_prefix_len))
-        .map(|offset| offset as usize);
-    let chunk_ranges = paged_prefill_ranges(
-        suffix_tokens.len(),
-        chunk_size_usize,
-        checkpoint_suffix_offset,
-    );
+    let suffix_offsets = checkpoint_suffix_offsets(&checkpoint_boundaries, cached_prefix_len);
+    let chunk_ranges = paged_prefill_ranges(suffix_tokens.len(), chunk_size_usize, &suffix_offsets);
 
     if cached_prefix_len > 0 && !gdn_prefix_already_primed {
         let gdn_trace_start = inference_info_enabled.then(Instant::now);
@@ -990,10 +1089,15 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
             );
         }
     }
+    // See the non-MTP chunked driver: discharge the auxiliary-state obligation
+    // before the first `record_tokens` of the turn.
+    paged_adapter
+        .confirm_aux_prefix_primed(cached_prefix_len)
+        .map_err(Error::from_reason)?;
 
     let total_chunks = chunk_ranges.len();
     let mut last_logits: Option<MxArray> = None;
-    let mut checkpoint = None;
+    let mut checkpoints = Vec::new();
     let mut hidden_chunks: Vec<MxArray> = Vec::with_capacity(total_chunks);
     let total_suffix_len = suffix_tokens.len();
     let keep_start = keep_last_hidden
@@ -1033,7 +1137,7 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
             None
         };
         let context_after = chunk_start_position + chunk.len() as u32;
-        let capture_checkpoint = checkpoint_target == Some(context_after);
+        let capture_checkpoint = checkpoint_boundaries.contains(&context_after);
 
         if is_last_chunk {
             // Reuse the already-normed last chunk to project last-token
@@ -1076,12 +1180,12 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
         }
         if capture_checkpoint {
             materialize_linear_layer_caches(caches)?;
-            checkpoint = snapshot_materialized_linear_layer_caches(caches).map(|caches| {
-                MaterializedGdnPrefixCheckpoint {
+            if let Some(caches) = snapshot_materialized_linear_layer_caches(caches) {
+                checkpoints.push(MaterializedGdnPrefixCheckpoint {
                     prefix_len: context_after,
                     caches,
-                }
-            });
+                });
+            }
         }
         if !is_last_chunk {
             crate::array::synchronize_and_clear_cache();
@@ -1128,17 +1232,18 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
         )
     })?;
 
-    let prompt_hidden = if hidden_chunks.len() == 1 {
-        hidden_chunks.into_iter().next().ok_or_else(|| {
-            Error::from_reason("run_paged_prefill_chunk_with_hidden: empty hidden chunks")
-        })?
-    } else {
-        let mut acc = hidden_chunks[0].clone();
-        for chunk in &hidden_chunks[1..] {
-            acc = MxArray::concatenate(&acc, chunk, 1)?;
-        }
-        acc
-    };
+    let mut retained = hidden_chunks.into_iter();
+    let mut prompt_hidden = retained.next().ok_or_else(|| {
+        Error::from_reason("run_paged_prefill_chunk_with_hidden: empty hidden chunks")
+    })?;
+    for chunk in retained {
+        prompt_hidden = MxArray::concatenate(&prompt_hidden, &chunk, 1)?;
+    }
+    // Same contract the single-shot sibling ends on: the caller runs
+    // `synchronize_and_clear_cache()` before `begin_mtp_decode` consumes this
+    // as its prompt-prefix seed, so the concat must not be left lazy across
+    // that sweep.
+    prompt_hidden.eval();
 
     if let Some(start) = prefill_trace_start {
         tracing::info!(
@@ -1153,7 +1258,7 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
         );
     }
 
-    Ok((last_logits, prompt_hidden, checkpoint))
+    Ok((last_logits, prompt_hidden, checkpoints))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1173,14 +1278,19 @@ fn run_paged_prefill_single_shot_with_hidden(
     keep_last_hidden: Option<usize>,
     cached_rope_deltas: i32,
 ) -> Result<(MxArray, MxArray)> {
-    paged_adapter
-        .record_tokens(suffix_tokens)
-        .map_err(Error::from_reason)?;
-
+    // GDN pre-pass before `record_tokens`; see `run_paged_prefill_single_shot`
+    // for why the two are order-independent.
     if cached_prefix_len > 0 && !gdn_prefix_already_primed {
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
         run_gdn_only_prefill(prefix, embed, layers, caches)?;
     }
+    paged_adapter
+        .confirm_aux_prefix_primed(cached_prefix_len)
+        .map_err(Error::from_reason)?;
+
+    paged_adapter
+        .record_tokens(suffix_tokens)
+        .map_err(Error::from_reason)?;
 
     let hidden_states = run_paged_prefill_one_chunk(
         suffix_tokens,
@@ -1633,7 +1743,121 @@ pub(crate) fn run_paged_verify_step(
 
 #[cfg(test)]
 mod gdn_checkpoint_tests {
-    use super::{gdn_checkpoint_target, paged_prefill_ranges};
+    use super::{
+        gdn_checkpoint_target, gdn_prefill_checkpoint_boundaries, paged_prefill_ranges,
+        prefill_checkpoint_boundaries,
+    };
+
+    /// A turn with no GDN cold policy must take the break set it took before the
+    /// ladder existed: the single deep `gdn_checkpoint_target`, never the rungs.
+    ///
+    /// This is a numerical-output contract, not a tidiness one. Chunk length is
+    /// the prefill GEMM's `M`, so a different break set selects a different
+    /// kernel class and accumulation order and can flip an argmax. And a
+    /// persist-off turn DOES reach a positive chunk size without anyone typing
+    /// an env var: `packages/agent/src/run-agent.ts` and
+    /// `packages/cli/src/commands/launch-claude/index.ts` both default
+    /// `MLX_PAGED_PREFILL_CHUNK_SIZE` to 2048 unconditionally, before any
+    /// persistence decision, and `mlx agent --no-persist-cache` forces paged on
+    /// with no flat fallback.
+    ///
+    /// Catches, verified by mutation: calling `gdn_prefill_checkpoint_boundaries`
+    /// unconditionally at the three prefill bodies, i.e. dropping the
+    /// `want_ladder` arm. The `false` rows then return four rungs and the range
+    /// row becomes `[0..16, 16..80, 80..336, 336..1392, 1392..1400]`.
+    ///
+    /// 1400 is load-bearing. At the 64-token prompt the model-layer ladder gates
+    /// use, the ladder is already a single rung, so that length cannot tell the
+    /// two arms apart.
+    #[test]
+    fn no_cold_policy_keeps_the_single_deep_boundary_the_ladder_replaced() {
+        assert_eq!(
+            prefill_checkpoint_boundaries(1400, 0, 16, false),
+            vec![1392],
+            "with no GDN cold policy the break set is the pre-ladder single boundary"
+        );
+        assert_eq!(
+            prefill_checkpoint_boundaries(1400, 0, 16, true),
+            vec![16, 80, 336, 1392],
+            "with a GDN cold policy every rung is a real break the sidecar can anchor on"
+        );
+        assert_eq!(
+            paged_prefill_ranges(1400, 2048, &[1392]),
+            vec![0..1392, 1392..1400],
+            "two chunks, M = 1392 then 8 — what a persist-off turn forwarded before the ladder"
+        );
+
+        // The two arms agree exactly where the ladder degenerates, so a fixture
+        // that only ever exercises a short prompt proves nothing about either.
+        for (len, cached) in [(200usize, 0u32), (64, 0), (4096, 1008)] {
+            assert_eq!(
+                prefill_checkpoint_boundaries(len, cached, 16, false),
+                gdn_checkpoint_target(len, cached, 16)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "the false arm IS gdn_checkpoint_target at {len}/{cached}"
+            );
+        }
+        assert_eq!(
+            prefill_checkpoint_boundaries(4096, 1008, 16, true),
+            prefill_checkpoint_boundaries(4096, 1008, 16, false),
+            "a deep cached prefix collapses the ladder to one rung, so both arms agree"
+        );
+
+        // And where they differ, they differ in the direction that matters: the
+        // ladder is a strict superset ending at the same deepest rung.
+        let ladder = prefill_checkpoint_boundaries(1400, 0, 16, true);
+        let plain = prefill_checkpoint_boundaries(1400, 0, 16, false);
+        assert_eq!(ladder.last(), plain.last());
+        assert!(ladder.len() > plain.len());
+    }
+
+    /// Pin the ladder's exact rung VALUES, not just its shape.
+    ///
+    /// Everything else that touches the ladder checks a property: `len() == 4`,
+    /// `rung * 4 > chain_reach`, "some rung is under the reach". Every one of
+    /// those survives `GDN_CHECKPOINT_LADDER_RATIO 4 -> 2`, because 4 = 2^2
+    /// makes the halved ladder a SUPERSET of the quartered one at the deep end
+    /// (4080 and 1008 appear in both), and a halved ladder still has four
+    /// rungs. So did the multi-minute cold-tier parity gate, which only asks
+    /// that the restore anchor on *a* rung: with a chain reaching ~24 blocks
+    /// both spacings put the deepest usable rung in the same place.
+    ///
+    /// Exact values are the cheapest thing that does not survive it. Held
+    /// against the same literals in
+    /// `cold_tier_parity_harness::harness_tests`, whose restated copy of this
+    /// recurrence is otherwise free to drift away from this one silently.
+    ///
+    /// | mutation   | ladder at 4096 tokens, block 16 |
+    /// |------------|---------------------------------|
+    /// | ratio 4 ✓  | `[48, 240, 1008, 4080]`         |
+    /// | ratio 2    | `[496, 1008, 2032, 4080]`       |
+    /// | ratio 3    | `[144, 448, 1360, 4080]`        |
+    /// | ratio 8    | `[48, 496, 4080]`               |
+    /// | rungs 1    | `[4080]`                        |
+    #[test]
+    fn ladder_rungs_are_quarters_of_the_one_above() {
+        assert_eq!(
+            gdn_prefill_checkpoint_boundaries(4096, 0, 16),
+            vec![48, 240, 1008, 4080]
+        );
+        assert_eq!(
+            gdn_prefill_checkpoint_boundaries(1400, 0, 16),
+            vec![16, 80, 336, 1392]
+        );
+        // A cached prefix truncates the ladder from the BOTTOM: same deepest
+        // rung, same values, the shallow ones this prefill cannot cross are
+        // dropped. That is what makes the harness's `cached = 0` copy a
+        // superset of every warm turn's ladder.
+        assert_eq!(
+            gdn_prefill_checkpoint_boundaries(4096, 240, 16),
+            vec![1008, 4080]
+        );
+        assert_eq!(
+            gdn_prefill_checkpoint_boundaries(4096, 1008, 16),
+            vec![4080]
+        );
+    }
 
     fn assert_contiguous_cover(ranges: &[std::ops::Range<usize>], suffix_len: usize) {
         let mut cursor = 0;
@@ -1671,31 +1895,54 @@ mod gdn_checkpoint_tests {
     #[test]
     fn prefill_ranges_split_at_checkpoint_inside_chunk() {
         let non_aligned_target = gdn_checkpoint_target(37, 0, 16);
-        let ranges = paged_prefill_ranges(37, 2048, non_aligned_target.map(|v| v as usize));
+        let ranges = paged_prefill_ranges(
+            37,
+            2048,
+            &non_aligned_target
+                .map(|v| v as usize)
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(ranges, vec![0..32, 32..37]);
         assert_contiguous_cover(&ranges, 37);
 
         let aligned_target = gdn_checkpoint_target(32, 0, 16);
-        let ranges = paged_prefill_ranges(32, 2048, aligned_target.map(|v| v as usize));
+        let ranges = paged_prefill_ranges(
+            32,
+            2048,
+            &aligned_target
+                .map(|v| v as usize)
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(ranges, vec![0..16, 16..32]);
         assert_contiguous_cover(&ranges, 32);
 
         // Cached prefix 16, full prompt 37: checkpoint 32 is suffix offset 16.
-        let ranges = paged_prefill_ranges(21, 2048, Some(16));
+        let ranges = paged_prefill_ranges(21, 2048, &[16]);
         assert_eq!(ranges, vec![0..16, 16..21]);
         assert_contiguous_cover(&ranges, 21);
     }
 
+    /// A ladder puts several boundaries inside one chunk. Every rung must end
+    /// up a chunk edge, otherwise the snapshot for it is never taken.
+    #[test]
+    fn prefill_ranges_split_at_every_ladder_rung() {
+        let ranges = paged_prefill_ranges(4080, 8192, &[64, 256, 1024, 4080]);
+        assert_eq!(ranges, vec![0..64, 64..256, 256..1024, 1024..4080]);
+        assert_contiguous_cover(&ranges, 4080);
+    }
+
     #[test]
     fn prefill_ranges_keep_existing_chunk_boundary() {
-        let ranges = paged_prefill_ranges(2053, 2048, Some(2048));
+        let ranges = paged_prefill_ranges(2053, 2048, &[2048]);
         assert_eq!(ranges, vec![0..2048, 2048..2053]);
         assert_contiguous_cover(&ranges, 2053);
     }
 
     #[test]
     fn prefill_ranges_cover_suffix_without_checkpoint() {
-        let ranges = paged_prefill_ranges(5000, 2048, None);
+        let ranges = paged_prefill_ranges(5000, 2048, &[]);
         assert_eq!(ranges, vec![0..2048, 2048..4096, 4096..5000]);
         assert_contiguous_cover(&ranges, 5000);
     }

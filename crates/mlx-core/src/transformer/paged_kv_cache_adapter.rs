@@ -75,7 +75,7 @@
 //! flat path. See `finalize_turn_keep_live` for full discussion.
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use mlx_paged_attn::metal::KvScaleManager;
@@ -638,6 +638,729 @@ pub struct PagedPrefillMemorySnapshot {
     pub paged_pool_allocated_bytes: Option<u64>,
 }
 
+/// SSD cold-tier handle for persisting full paged KV blocks across process
+/// restarts. `fingerprint` binds every persisted block to one model + cache
+/// layout identity; any drift (weights, config, pool geometry, dtype) must
+/// produce a different fingerprint so stale blocks can never validate.
+pub struct ColdTierContext {
+    pub manager: std::sync::Arc<mlx_paged_attn::ColdCacheManager>,
+    pub fingerprint: mlx_paged_attn::ColdCacheFingerprint,
+    /// The auxiliary (non-KV) state this family REQUIRES at any boundary it
+    /// resumes from, or `None` when the paged pool already holds every piece
+    /// of per-token state the forward pass carries between turns.
+    ///
+    /// `None` is the dense-`qwen3` control: the restore walk behaves exactly
+    /// as it did before sidecars existed. `Some(policy)` turns the walk into
+    /// vLLM's reconcile-down — the candidate prefix is reduced to the deepest
+    /// boundary a VALIDATED sidecar backs, and a boundary no sidecar backs
+    /// restores nothing rather than handing back attention state whose
+    /// recurrent half never existed.
+    pub sidecar_policy: Option<mlx_paged_attn::ColdSidecarPolicy>,
+}
+
+/// The adapter fields the cold-tier restore and capture walks need, borrowed
+/// as one bundle.
+///
+/// Both walks are shared verbatim between the uniform-`extra_keys` entry points
+/// (`find_cached_prefix*` / `register_full_blocks_for_reuse`) and the per-block
+/// ones (`find_cached_prefix_per_block*` /
+/// `register_full_blocks_for_reuse_per_block`); the ONLY difference is how a
+/// block index maps to its `extra_keys`, which callers supply as a closure. The
+/// uniform side returns the same slice for every index, the per-block side
+/// indexes its per-block vec.
+///
+/// This is a borrowed bundle rather than `&self` methods on the adapter because
+/// the lookup path holds a `&mut` borrow of `self.block_table` across the
+/// restore call; taking `&self` there would conflict, while borrowing the four
+/// disjoint fields below does not.
+struct ColdTierWalk<'a> {
+    cold: &'a ColdTierContext,
+    pool: &'a Arc<LayerKVPool>,
+    allocator: &'a Arc<Mutex<BlockAllocator>>,
+    block_size: u32,
+}
+
+/// Outcome of one cold-tier restore walk.
+///
+/// INVARIANT, and the whole point of this type: when `sidecar` is `Some`, it is
+/// the validated auxiliary state for EXACTLY the boundary the returned `blocks`
+/// end at (hot prefix + `blocks`). The two can never describe different
+/// boundaries — every path that shortens `blocks` also re-derives (or drops)
+/// the sidecar.
+///
+/// `sidecar` is always `None` for a family with no [`ColdSidecarPolicy`].
+struct ColdRestore {
+    blocks: Vec<Arc<PhysicalBlock>>,
+    sidecar: Option<mlx_paged_attn::ColdSidecar>,
+}
+
+impl ColdRestore {
+    /// Restore nothing: the hot hit stands unextended and no state is handed
+    /// back. Every fail-closed exit returns this.
+    fn miss() -> Self {
+        Self {
+            blocks: Vec::new(),
+            sidecar: None,
+        }
+    }
+}
+
+impl ColdTierWalk<'_> {
+    /// SSD cold-tier restore on a hot-cache prefix miss: for each full block
+    /// the in-memory lookup did NOT cover, recompute the persisted chain (the
+    /// capture contract below — parent-linked per block, `cache_salt` mixed
+    /// into block 0 only) and transactionally restore it into a fresh physical
+    /// slot before falling back to prefill. Returns the restored blocks, in
+    /// order, to append to the hot hit.
+    ///
+    /// Fail-open everywhere: the first block that misses on disk, fails
+    /// validation, or cannot be uploaded stops the extension and leaves the hot
+    /// hit untouched. The hot identity each restored block is published under
+    /// comes from `hot_hashes`, so a subsequent lookup on this same allocator
+    /// serves it directly.
+    ///
+    /// `hot_hashes` is invoked at most once, with the full-block count, and
+    /// must return the hot chain hashes for exactly those blocks. A SHORT
+    /// return CAPS the walk: it means the caller could not establish a cache
+    /// identity past that point — for the per-block path, that the per-block
+    /// `extra_keys` vec ran out — and restoring under a guessed identity would
+    /// publish blocks a later lookup could serve for the wrong keys. This is
+    /// the same rule the hot allocator applies when `extra_keys_per_block` runs
+    /// short (`find_longest_cache_hit_per_block` breaks at the first block
+    /// without keys, keeping the blocks before it).
+    ///
+    /// ## Reconcile-down (families with a [`ColdSidecarPolicy`])
+    ///
+    /// Paged KV is only half the state of a hybrid family: GDN recurrent state
+    /// (`qwen3_5`) and sliding-window `RotatingKVCache` state (`gemma4`) live
+    /// OUTSIDE the pool, so a restored KV prefix whose auxiliary state is
+    /// missing describes a model state that never existed. vLLM's rule for the
+    /// same hazard is that each cache group may only REDUCE the candidate
+    /// length (`vllm/v1/core/sched/scheduler.py`,
+    /// `vllm/v1/core/kv_cache_coordinator.py`): "No external tokens back the
+    /// deeper local hit, so its resume boundary would have no valid Mamba
+    /// state. Reconcile to the boundary every group agrees on."
+    ///
+    /// So when a policy is present the walk runs in phases:
+    ///
+    ///  1. probe how far the persisted KV chain reaches (index only, no I/O);
+    ///  2. descend from that ceiling to the deepest boundary a VALIDATED
+    ///     sidecar backs — nothing backed means restore NOTHING, never a
+    ///     "close enough" prefix;
+    ///  3. restore exactly that many blocks;
+    ///  4. if step 3 came up short (a block failed to decode, upload, or
+    ///     publish), reconcile down AGAIN over what actually landed and free
+    ///     the tail, so the returned sidecar always backs exactly the returned
+    ///     prefix.
+    ///
+    /// The floor of every reconcile is the hot hit: this walk can only extend
+    /// it, so it never claims to have reduced a prefix the in-memory cache
+    /// already served.
+    ///
+    /// That leaves one thing this gate deliberately does NOT cover: a HOT hit
+    /// is not gated here. A block that a backed restore published (or that
+    /// phase 4 released — `free` decrefs it to a cache-only entry, it is not
+    /// erased) stays in the allocator's prefix cache and a later lookup in the
+    /// same process can serve it as a hot hit with no sidecar attached. The KV
+    /// is valid; what is missing is the auxiliary half. So a hybrid family must
+    /// still establish its own state for a hot prefix, or restart the turn cold
+    /// via [`PagedKVCacheAdapter::restart_prepared_turn_cold_per_block`]. This
+    /// walk changes only what the SSD tier is allowed to hand back; the hot
+    /// half is covered by the `aux_prefix_unbacked` latch, which turns that
+    /// obligation into a checked one (see its field doc).
+    ///
+    /// With `sidecar_policy: None` every phase above is skipped and the body is
+    /// the pre-sidecar walk verbatim.
+    fn restore_extend<'k>(
+        &self,
+        lookup_tokens: &[u32],
+        hot_cached_tokens: usize,
+        cache_salt: u64,
+        extra_keys_for: impl Fn(usize) -> Option<&'k [u64]>,
+        hot_hashes: impl FnOnce(usize) -> Vec<u64>,
+    ) -> ColdRestore {
+        let bs = self.block_size as usize;
+        // `checked_div` folds the degenerate `block_size == 0` case into a
+        // no-op: both counts become 0, so the extension loop never runs.
+        let mut full_blocks = lookup_tokens.len().checked_div(bs).unwrap_or(0);
+        // Blocks the hot hit already covers. This is the walk's floor — it can
+        // extend the hot hit but never shorten it.
+        let base = hot_cached_tokens
+            .min(lookup_tokens.len())
+            .checked_div(bs)
+            .unwrap_or(0);
+        let mut idx = base;
+        let mut restored: Vec<Arc<PhysicalBlock>> = Vec::new();
+        if idx >= full_blocks {
+            return ColdRestore::miss();
+        }
+
+        let hot = hot_hashes(full_blocks);
+        full_blocks = full_blocks.min(hot.len());
+        if idx >= full_blocks {
+            return ColdRestore::miss();
+        }
+
+        // Rebuild the cold keys of the already-covered leading blocks so the
+        // first restore chains off the correct parent key.
+        let mut parent_key: Option<mlx_paged_attn::ColdCacheKey> = None;
+        for i in 0..idx {
+            let Some(extra_keys) = extra_keys_for(i) else {
+                self.record_decline(
+                    "parent_chain_unavailable",
+                    base,
+                    full_blocks,
+                    full_blocks,
+                    bs,
+                    lookup_tokens.len(),
+                );
+                return ColdRestore::miss();
+            };
+            parent_key = Some(mlx_paged_attn::ColdCacheKey::chain(
+                mlx_paged_attn::ColdGroup::Kv,
+                self.cold.fingerprint,
+                parent_key,
+                &lookup_tokens[i * bs..(i + 1) * bs],
+                extra_keys,
+                cache_salt,
+                i,
+            ));
+        }
+
+        // Phases 1-2: reduce the candidate to a boundary the family's auxiliary
+        // state actually backs, BEFORE any Metal blit or hot-cache publish, so
+        // an unbacked prefix is never materialized in the first place.
+        let mut limit = full_blocks;
+        let mut sidecar = None;
+        if let Some(policy) = self.cold.sidecar_policy.as_ref() {
+            let ceiling = self.kv_chain_upper_bound(
+                lookup_tokens,
+                cache_salt,
+                &extra_keys_for,
+                base,
+                full_blocks,
+                parent_key,
+            );
+            let Some((backed, state)) = self.deepest_backed_boundary(
+                policy,
+                lookup_tokens,
+                cache_salt,
+                &extra_keys_for,
+                base,
+                ceiling,
+            ) else {
+                // The silent zero this whole counter exists for. Both probes
+                // this verdict rests on (`contains` / `contains_in`) are
+                // side-effect free by contract, `load_sidecar` and
+                // `restore_block` are never reached, and the walk returns
+                // above its own trace line — so a refused restore moved no
+                // counter and printed nothing, and the tier reported `0/0`
+                // exactly like a turn that never opened it.
+                self.record_decline(
+                    "no_backed_boundary",
+                    base,
+                    ceiling,
+                    full_blocks,
+                    bs,
+                    lookup_tokens.len(),
+                );
+                return ColdRestore::miss();
+            };
+            limit = backed;
+            sidecar = Some(state);
+        }
+
+        // The restore loop has no budget and deliberately gets none: capping it
+        // would cap REUSE, which is the whole feature. It is timed instead,
+        // because the per-block restore cost is what decides whether reuse pays
+        // at all — a block restored slower than the prefill that would have
+        // recomputed it is a loss no coverage can fix.
+        let restore_started = Instant::now();
+        while idx < limit {
+            let Some(extra_keys) = extra_keys_for(idx) else {
+                break;
+            };
+            let toks = &lookup_tokens[idx * bs..(idx + 1) * bs];
+            let key = mlx_paged_attn::ColdCacheKey::chain(
+                mlx_paged_attn::ColdGroup::Kv,
+                self.cold.fingerprint,
+                parent_key,
+                toks,
+                extra_keys,
+                cache_salt,
+                idx,
+            );
+            let identity = mlx_paged_attn::RestorePrefixIdentity {
+                hot_hash: hot[idx],
+                tokens: toks.to_vec(),
+                parent_hot_hash: if idx == 0 { 0 } else { hot[idx - 1] },
+                extra_keys: extra_keys.to_vec(),
+                cache_salt,
+                block_index: idx,
+            };
+            match self.cold.manager.restore_block(
+                self.pool,
+                self.allocator,
+                key,
+                self.cold.fingerprint,
+                &identity,
+            ) {
+                Some(block) => {
+                    restored.push(block);
+                    parent_key = Some(key);
+                    idx += 1;
+                }
+                None => break,
+            }
+        }
+        if inference_trace_enabled() {
+            let elapsed_ms = restore_started.elapsed().as_secs_f64() * 1000.0;
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] paged cold_restore_walk blocks={} base={} limit={} elapsed_ms={:.3} per_block_ms={:.3}",
+                restored.len(),
+                base,
+                limit,
+                elapsed_ms,
+                if restored.is_empty() {
+                    0.0
+                } else {
+                    elapsed_ms / restored.len() as f64
+                },
+            ));
+        }
+
+        // Phase 4: the restore stopped short of the boundary the sidecar backs
+        // (a block failed to decode, allocate, upload, or publish). The state
+        // in hand is for a prefix we do not have, so reconcile down again over
+        // the blocks that actually landed and release the tail. Fail-closed:
+        // when nothing shorter is backed either, the whole extension is
+        // dropped rather than returned without state.
+        if let Some(policy) = self.cold.sidecar_policy.as_ref()
+            && idx < limit
+        {
+            let keep = match self.deepest_backed_boundary(
+                policy,
+                lookup_tokens,
+                cache_salt,
+                &extra_keys_for,
+                base,
+                idx,
+            ) {
+                Some((backed, state)) => {
+                    sidecar = Some(state);
+                    backed
+                }
+                None => {
+                    sidecar = None;
+                    base
+                }
+            };
+            // `keep >= base` by construction (`deepest_backed_boundary` only
+            // returns counts above its floor), so this can never exceed what
+            // was restored; the clamp keeps a future contract slip a no-op
+            // instead of an underflow panic.
+            let drop_count = (base + restored.len())
+                .saturating_sub(keep)
+                .min(restored.len());
+            if drop_count > 0 {
+                let tail = restored.split_off(restored.len() - drop_count);
+                let mut guard = self
+                    .allocator
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for block in tail {
+                    guard.free(block);
+                }
+                // Everything this walk restored was handed back to the
+                // allocator, so it extends the hot hit by nothing. Unlike the
+                // refusals above this one has already paid for real `hits` and
+                // `bytes_restored`, which is what makes it the more misleading
+                // of the two: the tier reports blocks restored on a turn that
+                // reuses none of them.
+                if restored.is_empty() {
+                    self.record_decline(
+                        "restore_short_of_boundary",
+                        base,
+                        keep,
+                        limit,
+                        bs,
+                        lookup_tokens.len(),
+                    );
+                }
+            }
+        }
+
+        ColdRestore {
+            blocks: restored,
+            sidecar,
+        }
+    }
+
+    /// Count one restore this walk refused to serve, and trace why.
+    ///
+    /// The counter (`ColdCacheStats::restore_declines`) is what makes a refusal
+    /// exist at all for anything downstream: `hits` and `misses` count per-block
+    /// lookups, a refusal happens instead of those lookups, so before this a
+    /// refused restore was reported as `0 hits / 0 misses` — the same row a
+    /// turn that never touched the tier produces, which reads as "nothing ran"
+    /// rather than "reuse was refused".
+    ///
+    /// The block geometry goes to the trace instead of to counters on purpose.
+    /// A ceiling is a per-walk position, and summing positions across turns
+    /// produces a number with no meaning; what the diagnosis needs is the
+    /// single line where `ceiling` and `full_blocks` sit next to each other —
+    /// a capture that anchors one block past the restore's reach shows up here
+    /// as `ceiling` one short of the boundary it would need, on the turn it
+    /// happened.
+    ///
+    /// `ceiling_tokens` is that comparison already made. It is the DEEPEST
+    /// boundary this walk could name at all — every candidate
+    /// `deepest_backed_boundary` probed was at or below it — and it is directly
+    /// comparable with the `boundary_tokens=` a family's capture trace prints.
+    /// A capture line one block above a decline line's `ceiling_tokens`, for the
+    /// same prompt, IS the aligned-prompt gap: the lookup is capped at
+    /// `prompt_len - 1` (`lookup_tokens`), so a boundary at `prompt_len` has no
+    /// name on this side.
+    fn record_decline(
+        &self,
+        reason: &str,
+        base: usize,
+        ceiling: usize,
+        full_blocks: usize,
+        block_size: usize,
+        lookup_tokens: usize,
+    ) {
+        self.cold.manager.record_restore_decline();
+        if inference_trace_enabled() {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] paged cold_restore_declined reason={} base={} ceiling={} full_blocks={} block_size={} ceiling_tokens={} lookup_tokens={}",
+                reason,
+                base,
+                ceiling,
+                full_blocks,
+                block_size,
+                ceiling.saturating_mul(block_size),
+                lookup_tokens,
+            ));
+        }
+    }
+
+    /// How far the persisted KV chain reaches past the hot hit, as a block
+    /// count, using the in-memory index only — no file I/O, no decode, and no
+    /// hit/miss accounting (`contains` is explicitly side-effect free).
+    ///
+    /// This is the ceiling the sidecar descent starts from. Without it a
+    /// sidecar recorded at a deep boundary would be selected even when the KV
+    /// blocks under it were evicted, and the walk would blit and publish blocks
+    /// it must then free again. The index can be optimistic (an externally
+    /// deleted file leaves a stale entry), which only means the restore loop
+    /// stops short and phase 4 reconciles — never that an unbacked prefix is
+    /// returned.
+    ///
+    /// `parent_key` must be the KV chain key of block `base - 1` (`None` when
+    /// `base == 0`), i.e. exactly what the leading-block rebuild produced.
+    fn kv_chain_upper_bound<'k>(
+        &self,
+        lookup_tokens: &[u32],
+        cache_salt: u64,
+        extra_keys_for: &impl Fn(usize) -> Option<&'k [u64]>,
+        base: usize,
+        full_blocks: usize,
+        mut parent_key: Option<mlx_paged_attn::ColdCacheKey>,
+    ) -> usize {
+        let bs = self.block_size as usize;
+        let mut end = base;
+        for i in base..full_blocks {
+            let (Some(extra_keys), Some(toks)) =
+                (extra_keys_for(i), lookup_tokens.get(i * bs..(i + 1) * bs))
+            else {
+                break;
+            };
+            let key = mlx_paged_attn::ColdCacheKey::chain(
+                mlx_paged_attn::ColdGroup::Kv,
+                self.cold.fingerprint,
+                parent_key,
+                toks,
+                extra_keys,
+                cache_salt,
+                i,
+            );
+            if !self.cold.manager.contains(&key) {
+                break;
+            }
+            parent_key = Some(key);
+            end = i + 1;
+        }
+        end
+    }
+
+    /// The reconcile-down step: the DEEPEST block count in `(floor, ceiling]`
+    /// whose auxiliary state is on disk and validates against `policy`, with
+    /// that state. `None` means no boundary in range is backed, which callers
+    /// must treat as "restore nothing" — never as "restore anyway".
+    ///
+    /// The sidecar chain is the KV chain recomputed under the sidecar group's
+    /// own domain tag: identical per-block arguments (tokens, `extra_keys`,
+    /// `cache_salt`, block index), different group. That is vLLM's
+    /// `BlockHashWithGroupId` (`vllm/v1/core/kv_cache_utils.py`) — the group is
+    /// part of the key — so a sidecar key can never collide with, or be
+    /// decoded as, a KV block key. Gaps are fine: a boundary that was never
+    /// captured still lets deeper boundaries derive, because the chain is pure
+    /// computation over the prompt, not a walk over what exists on disk.
+    ///
+    /// Each candidate is index-probed before it is loaded, so boundaries that
+    /// were simply never captured cost no I/O and register no miss; a probe
+    /// that says present and then fails to load is a real miss (and, if the
+    /// bytes were readable, a corruption) counted by
+    /// [`mlx_paged_attn::ColdCacheManager::load_sidecar`].
+    fn deepest_backed_boundary<'k>(
+        &self,
+        policy: &mlx_paged_attn::ColdSidecarPolicy,
+        lookup_tokens: &[u32],
+        cache_salt: u64,
+        extra_keys_for: &impl Fn(usize) -> Option<&'k [u64]>,
+        floor: usize,
+        ceiling: usize,
+    ) -> Option<(usize, mlx_paged_attn::ColdSidecar)> {
+        let bs = self.block_size as usize;
+        if bs == 0 || ceiling <= floor {
+            return None;
+        }
+        let mut keys: Vec<mlx_paged_attn::ColdCacheKey> = Vec::with_capacity(ceiling);
+        let mut parent: Option<mlx_paged_attn::ColdCacheKey> = None;
+        for i in 0..ceiling {
+            let (Some(extra_keys), Some(toks)) =
+                (extra_keys_for(i), lookup_tokens.get(i * bs..(i + 1) * bs))
+            else {
+                // No cache identity for block `i`, so the chain — and every
+                // boundary past it — cannot be derived at all.
+                break;
+            };
+            let key = mlx_paged_attn::ColdCacheKey::chain(
+                policy.group(),
+                self.cold.fingerprint,
+                parent,
+                toks,
+                extra_keys,
+                cache_salt,
+                i,
+            );
+            keys.push(key);
+            parent = Some(key);
+        }
+
+        for count in (floor + 1..=keys.len()).rev() {
+            let key = keys[count - 1];
+            if !self.cold.manager.contains_in(&key, policy.group()) {
+                continue;
+            }
+            // A boundary past `u32::MAX` tokens cannot be expressed in the
+            // layout, so it cannot match; shallower candidates still can.
+            let Ok(boundary) = u32::try_from(count.saturating_mul(bs)) else {
+                continue;
+            };
+            if let Some(state) = self.cold.manager.load_sidecar(
+                key,
+                self.cold.fingerprint,
+                &policy.expected_at(boundary),
+            ) {
+                return Some((count, state));
+            }
+        }
+        None
+    }
+
+    /// SSD cold-tier capture, fail-open: a persistence error only means the
+    /// next process recomputes this prefix. Keys follow the hot chain-hash
+    /// contract — parent-linked per block, `cache_salt` mixed into block 0 only
+    /// — so [`Self::restore_extend`] recomputes the identical chain.
+    /// `contains` dedups re-publishes of a chain already on disk without
+    /// touching Metal.
+    ///
+    /// Reports how many leading blocks the persisted chain now covers — every
+    /// block that was already on disk or was accepted by the writer queue, up
+    /// to the first one that was not. A family capturing an auxiliary sidecar
+    /// alongside the chain must not anchor it deeper than this: a sidecar past
+    /// the chain's break can never be selected on restore
+    /// ([`Self::kv_chain_upper_bound`] caps the descent at the chain's reach),
+    /// so writing it would only burn quota.
+    ///
+    /// # What bounds this walk
+    ///
+    /// `budget`, and only `budget`. Until this took a budget the walk was
+    /// bounded by the writer queue refusing a block, which made the per-turn
+    /// capture depth an emergent property of the filesystem rather than a
+    /// policy — `(Q + 1) / (1 - Tc/Tw)` blocks, measured at ~12 on this
+    /// machine — so an 8 K-token prompt needed ~40 turns to persist and the
+    /// restored prefix measured a few percent of the prompt. Waiting a bounded
+    /// time for a queue slot (`capture_and_enqueue_before`) instead of giving
+    /// up on one decouples the depth from `Tw` entirely.
+    ///
+    /// # Why it still breaks rather than skipping
+    ///
+    /// A block that did not land ends the walk, and every deeper block is left
+    /// for a later turn. Skipping it instead would buy nothing on the turn that
+    /// hits it: [`Self::kv_chain_upper_bound`] and [`Self::restore_extend`]
+    /// both stop at the first key that is absent, so the chain's REACH is the
+    /// index of the first hole under either policy. It would only pay from the
+    /// turn after — at the price of a full Metal blit per skipped block, all of
+    /// them on the inference thread, all of them discarded. Under a budget
+    /// there is no cheap refusal left to skip anyway: `Ok(false)` now means the
+    /// deadline expired, which is exactly when the walk should stop.
+    fn capture_chain<'k>(
+        &self,
+        request_tokens: &[u32],
+        blocks_slice: &[Arc<PhysicalBlock>],
+        cache_salt: u64,
+        budget: ColdCaptureBudget,
+        extra_keys_for: impl Fn(usize) -> Option<&'k [u64]>,
+    ) -> ColdCaptureOutcome {
+        let started = Instant::now();
+        let deadline = started + budget.max_walk;
+        let mut outcome = ColdCaptureOutcome::default();
+        let bs = self.block_size as usize;
+        if bs == 0 {
+            return outcome;
+        }
+        let mut parent: Option<mlx_paged_attn::ColdCacheKey> = None;
+        for (i, block) in blocks_slice.iter().enumerate() {
+            // Both lookups are infallible under the callers' own
+            // preconditions; `get` keeps a contract slip a graceful stop
+            // instead of a panic.
+            let (Some(extra_keys), Some(toks)) =
+                (extra_keys_for(i), request_tokens.get(i * bs..(i + 1) * bs))
+            else {
+                break;
+            };
+            let key = mlx_paged_attn::ColdCacheKey::chain(
+                mlx_paged_attn::ColdGroup::Kv,
+                self.cold.fingerprint,
+                parent,
+                toks,
+                extra_keys,
+                cache_salt,
+                i,
+            );
+            if !self.cold.manager.contains(&key) {
+                // Budget checks guard the CAPTURE, not the free `contains`
+                // skip above: re-walking a chain already on disk costs an
+                // in-memory index probe per block and must not consume a
+                // turn's capture depth, or a long persisted prefix would stop
+                // the walk before it reached the first block that needs
+                // writing.
+                if outcome.enqueued >= budget.max_blocks {
+                    outcome.stop = ColdCaptureStop::Budget;
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    outcome.stop = ColdCaptureStop::Deadline;
+                    break;
+                }
+                match self.cold.manager.capture_and_enqueue_before(
+                    self.pool,
+                    block,
+                    key,
+                    self.cold.fingerprint,
+                    toks,
+                    deadline,
+                ) {
+                    Ok(true) => outcome.enqueued += 1,
+                    // The queue stayed full for the rest of the budget: the
+                    // storage device, not the walk, is the bottleneck.
+                    Ok(false) => {
+                        outcome.stop = ColdCaptureStop::Deadline;
+                        break;
+                    }
+                    // A failed blit leaves nothing to chain off. Descendants
+                    // must not be persisted under a missing parent — that is a
+                    // chain hole, and a hole is unrestorable past its index.
+                    Err(_) => {
+                        outcome.stop = ColdCaptureStop::Error;
+                        break;
+                    }
+                }
+            }
+            parent = Some(key);
+            outcome.blocks = i + 1;
+        }
+        outcome.elapsed = started.elapsed();
+        outcome
+    }
+}
+
+/// How much of the prompt one turn's cold-tier capture walk may persist.
+///
+/// Two independent bounds because they answer different failure modes.
+/// `max_blocks` bounds the STEADY state: how fast the persisted chain is
+/// allowed to ratchet up a long prompt, which is a trade of turn tail against
+/// how many turns it takes before a restore covers anything worth having.
+/// `max_walk` bounds the TAIL: it is what stops a stalled storage device, or a
+/// filesystem so fast that the queue never pushes back, from turning a 64 K
+/// first turn into a second of dead time after the last token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColdCaptureBudget {
+    pub max_blocks: usize,
+    pub max_walk: Duration,
+}
+
+impl Default for ColdCaptureBudget {
+    /// The process-wide budget, from `MLX_COLD_CAPTURE_BLOCKS_PER_TURN` /
+    /// `MLX_COLD_CAPTURE_BUDGET_MS`.
+    fn default() -> Self {
+        let (max_blocks, max_walk) = crate::cold_tier::cold_capture_budget();
+        Self {
+            max_blocks,
+            max_walk,
+        }
+    }
+}
+
+/// Why [`ColdTierWalk::capture_chain`] stopped.
+///
+/// `End` and `Budget` are the healthy states — the walk ran out of prompt, or
+/// spent its depth. `Deadline` means the writer could not keep up within
+/// `max_walk`, so this turn ratcheted less than it was allowed to; `Error`
+/// means a Metal blit failed. Both of the latter are visible per turn in the
+/// `cold_capture_walk` trace line, and `Deadline` additionally warns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColdCaptureStop {
+    /// Walked every full block of the request.
+    #[default]
+    End,
+    /// Spent `max_blocks`.
+    Budget,
+    /// Ran out of `max_walk` waiting on the writer queue.
+    Deadline,
+    /// A capture failed; the chain must stay contiguous, so the walk stopped.
+    Error,
+}
+
+impl ColdCaptureStop {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::End => "end",
+            Self::Budget => "budget",
+            Self::Deadline => "deadline",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Outcome of one [`ColdTierWalk::capture_chain`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ColdCaptureOutcome {
+    /// Leading blocks the persisted chain covers after this walk. Includes
+    /// blocks that were already on disk, so it is the number a sidecar may
+    /// anchor under — NOT the number this turn wrote.
+    pub blocks: usize,
+    /// Blocks this walk actually handed to the writer queue. What the budget
+    /// counts, and what separates "the chain advanced" from "the chain was
+    /// already there".
+    pub enqueued: usize,
+    pub elapsed: Duration,
+    pub stop: ColdCaptureStop,
+}
+
 /// Per-model session-friendly KV cache adapter.
 ///
 /// Holds shared `BlockAllocator` (`Arc<Mutex<...>>`) so multiple in-flight
@@ -675,6 +1398,93 @@ pub struct PagedKVCacheAdapter {
     /// the shared allocator). Both violate the documented at-most-once
     /// lifecycle.
     prefix_lookup_done: bool,
+
+    /// Optional SSD cold tier for persisting full blocks across process
+    /// restarts. `None` (the default) keeps persistence fully off. Lives
+    /// for the adapter's whole lifetime — cross-request prefix reuse spans
+    /// requests, so per-request resets must not clear it.
+    cold_tier: Option<ColdTierContext>,
+
+    /// One-shot cold-restore suppressor armed by an EXPLICIT command reset
+    /// (`release_request_and_purge_prefix_cache`). The command reset's
+    /// contract is a fully cold state, but purging only the hot prefix cache
+    /// leaves the just-cleared prefix restorable from the SSD cold tier, so
+    /// the immediate reset-then-rerun would take the suffix-prefill path
+    /// (different bf16 reduction order) instead of a cold full prefill. When
+    /// set, the NEXT `find_cached_prefix_inner` skips the cold-restore branch
+    /// and clears this flag; later same-prompt turns restore normally. Not
+    /// armed by the per-turn `release_request` path.
+    suppress_cold_restore_once: bool,
+
+    /// Auxiliary state the last prefix lookup restored, for the caller to
+    /// install before it resumes from the cached prefix. Always `None` unless
+    /// the cold tier carries a [`ColdSidecarPolicy`], and — when `Some` — it is
+    /// the validated state for EXACTLY `cached_token_count` tokens, because the
+    /// restore walk reconciles the two together. Cleared at the start of every
+    /// request so a stale turn's state can never be installed on a later one.
+    restored_sidecar: Option<mlx_paged_attn::ColdSidecar>,
+
+    /// Latch: the last prefix lookup handed this request a cached K/V prefix
+    /// whose AUXILIARY (out-of-pool) half the adapter cannot vouch for.
+    ///
+    /// ## Why a latch and not a walk-side gate
+    ///
+    /// [`ColdTierWalk::restore_extend`] reconciles the SSD tier down to a
+    /// sidecar-backed boundary, but it runs only on what the HOT prefix cache
+    /// did NOT already cover — `find_longest_cache_hit*` is consulted first and
+    /// its result is the walk's floor. So a pure hot hit takes the walk's
+    /// `idx >= full_blocks` exit and no sidecar is ever produced. And the hot
+    /// cache is guaranteed to contain such blocks: `restore_block` publishes
+    /// every restored block through `BlockAllocator::publish_restored_prefix`
+    /// (leaving it at refcount 2), phase 4's `free` on the reconciled-away tail
+    /// only decrefs it to 1 so the cache-only entry SURVIVES, and ordinary
+    /// end-of-turn `finalize_turn_keep_live*` /
+    /// `register_full_blocks_for_reuse*` republishes the same blocks anyway.
+    /// The very boundary the reconcile-down gate refused is therefore servable
+    /// as a hot hit on the next lookup, with no state attached.
+    ///
+    /// Making a hot hit impossible would mean disabling the in-process prefix
+    /// cache for every hybrid family — a large, permanent perf loss for a
+    /// hazard the family can handle itself (GDN / sliding replay from token
+    /// ids). So the gate is instead an explicit per-turn obligation: when the
+    /// adapter cannot vouch for the auxiliary half, the family MUST call
+    /// [`PagedKVCacheAdapter::confirm_aux_prefix_primed`] before it records a
+    /// single token against that prefix. This field is that obligation, made
+    /// machine-checked instead of conventional.
+    ///
+    /// SET by `find_cached_prefix{,_per_block}_inner`, and only when the cold
+    /// tier carries a [`ColdSidecarPolicy`]. With `sidecar_policy: None` (dense
+    /// `qwen3`, and every adapter with no cold tier at all) it is never set, so
+    /// those families are bit-for-bit unaffected: every enforcement point below
+    /// short-circuits on `false`.
+    ///
+    /// CLEARED by `reset_for_new_request`, `release_request`, `continue_turn`
+    /// (a live continuation never dropped the auxiliary half in the first
+    /// place) and by a successful `confirm_aux_prefix_primed`.
+    ///
+    /// ENFORCED (`Err` while latched) by `record_tokens`,
+    /// `finalize_turn_keep_live{,_per_block}` and
+    /// `register_full_blocks_for_reuse{,_per_block}` — i.e. before any new K/V
+    /// is written on top of the prefix, and before the resulting blocks are
+    /// published for anyone else to reuse.
+    aux_prefix_unbacked: bool,
+
+    /// How many leading K/V blocks of the CURRENT request the cold tier's
+    /// persisted chain covers after this turn's capture — the return of
+    /// [`ColdTierWalk::capture_chain`], or 0 while no capture has run.
+    ///
+    /// A hybrid family captures its auxiliary sidecar right after finalize,
+    /// and the sidecar is only ever selectable at a boundary the KV chain also
+    /// reaches ([`ColdTierWalk::kv_chain_upper_bound`] is the descent's
+    /// ceiling). Publishing this lets the family cap its sidecar boundary at
+    /// the chain's real reach instead of writing a payload that can never be
+    /// chosen. Cleared by `reset_for_new_request` / `release_request`.
+    cold_capture: ColdCaptureOutcome,
+
+    /// Per-turn budget handed to [`ColdTierWalk::capture_chain`]. Process-wide
+    /// by default ([`ColdCaptureBudget::default`] reads the environment once);
+    /// per-adapter so a test can drive a specific depth without a global.
+    cold_capture_budget: ColdCaptureBudget,
 
     /// Optional FP8 K/V scale manager. When `Some`, the adapter
     /// reads per-layer K/V scales from the manager and threads them into
@@ -884,6 +1694,12 @@ impl PagedKVCacheAdapter {
             request_tokens: Vec::new(),
             already_registered: false,
             prefix_lookup_done: false,
+            cold_tier: None,
+            suppress_cold_restore_once: false,
+            restored_sidecar: None,
+            aux_prefix_unbacked: false,
+            cold_capture: ColdCaptureOutcome::default(),
+            cold_capture_budget: ColdCaptureBudget::default(),
             #[cfg(target_os = "macos")]
             scale_manager: None,
             #[cfg(target_os = "macos")]
@@ -903,6 +1719,186 @@ impl PagedKVCacheAdapter {
         })
     }
 
+    /// Wire the SSD cold tier into this adapter. Capture/restore paths key
+    /// every persisted block off `ctx.fingerprint`.
+    pub fn set_cold_tier(&mut self, ctx: ColdTierContext) {
+        self.cold_tier = Some(ctx);
+    }
+
+    /// The cold-tier context this adapter persists through, if any. Exposed so
+    /// a hybrid family can write its own auxiliary sidecar under the SAME
+    /// manager and fingerprint the K/V chain uses — a sidecar keyed off a
+    /// different identity could never be selected.
+    pub fn cold_tier(&self) -> Option<&ColdTierContext> {
+        self.cold_tier.as_ref()
+    }
+
+    /// Take the auxiliary state the last prefix lookup restored, if any.
+    ///
+    /// `Some` only for a family whose [`ColdTierContext::sidecar_policy`] is
+    /// set, and then it is the validated state for exactly the prefix
+    /// `find_cached_prefix*` reported — the restore walk reduces the KV prefix
+    /// and the state together, so the caller can install this without
+    /// re-checking the boundary. Taking it leaves `None` behind, so a caller
+    /// that installs state once cannot accidentally install it twice.
+    pub fn take_restored_sidecar(&mut self) -> Option<mlx_paged_attn::ColdSidecar> {
+        self.restored_sidecar.take()
+    }
+
+    /// How many leading K/V blocks of this request the persisted cold chain
+    /// covers after the last capture. See the `cold_capture` field doc; `0`
+    /// when nothing was captured (no tier, no finalize yet, or the chain broke
+    /// on its very first block).
+    pub fn cold_captured_blocks(&self) -> u32 {
+        self.cold_capture.blocks.try_into().unwrap_or(u32::MAX)
+    }
+
+    /// Full outcome of the last capture walk: reach, how much of it this turn
+    /// wrote, how long it took, and why it stopped.
+    pub fn cold_capture(&self) -> ColdCaptureOutcome {
+        self.cold_capture
+    }
+
+    /// The per-turn capture budget this adapter walks under.
+    pub fn cold_capture_budget(&self) -> ColdCaptureBudget {
+        self.cold_capture_budget
+    }
+
+    /// Override the per-turn capture budget. Tests drive a specific depth
+    /// through this rather than through the process-wide environment read.
+    pub fn set_cold_capture_budget(&mut self, budget: ColdCaptureBudget) {
+        self.cold_capture_budget = budget;
+    }
+
+    /// Publish one capture walk's outcome.
+    ///
+    /// The trace line carries the whole ratchet: `enqueued` is what this turn
+    /// added, `blocks` is where the chain now reaches, and `stop` says which
+    /// bound ended it. A `deadline` stop additionally warns, because unlike the
+    /// other three it is not a policy decision — it means the storage device
+    /// could not absorb the turn's budget, so the chain ratcheted slower than
+    /// configured and the next restore covers less than it should.
+    fn trace_cold_capture_walk(
+        entry: &str,
+        outcome: ColdCaptureOutcome,
+        budget: ColdCaptureBudget,
+    ) {
+        if inference_trace_enabled() {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] paged cold_capture_walk entry={} blocks={} enqueued={} stop={} elapsed_ms={:.3} budget_blocks={} budget_ms={}",
+                entry,
+                outcome.blocks,
+                outcome.enqueued,
+                outcome.stop.as_str(),
+                outcome.elapsed.as_secs_f64() * 1000.0,
+                budget.max_blocks,
+                budget.max_walk.as_millis(),
+            ));
+        }
+        if outcome.stop == ColdCaptureStop::Deadline {
+            tracing::warn!(
+                target: "mlx_core::paged::cold",
+                "cold-tier capture walk hit its {} ms deadline after {} of {} budgeted blocks; \
+                 the persisted prefix will ratchet slower than configured",
+                budget.max_walk.as_millis(),
+                outcome.enqueued,
+                budget.max_blocks,
+            );
+        }
+    }
+
+    /// Whether the prefix this request is resuming from has an auxiliary
+    /// (out-of-pool) half the adapter cannot vouch for. See
+    /// [`Self::confirm_aux_prefix_primed`] and the `aux_prefix_unbacked` field
+    /// doc. Always `false` for a family with no [`ColdSidecarPolicy`].
+    pub fn aux_prefix_unbacked(&self) -> bool {
+        self.aux_prefix_unbacked
+    }
+
+    /// Decide whether the prefix just handed back leaves an unmet auxiliary
+    /// obligation.
+    ///
+    /// `false` — the only possible answer without a [`ColdSidecarPolicy`] —
+    /// means either the family keeps ALL of its cross-token state inside the
+    /// paged pool, or the restore walk handed back state that backs exactly the
+    /// prefix it returned.
+    fn aux_prefix_state_missing(&self) -> bool {
+        let Some(cold) = self.cold_tier.as_ref() else {
+            return false;
+        };
+        if cold.sidecar_policy.is_none() {
+            return false;
+        }
+        if self.cached_token_count == 0 {
+            return false;
+        }
+        match self.restored_sidecar.as_ref() {
+            // `restore_extend` reconciles the prefix and the state together, so
+            // this normally holds; re-checking keeps a future contract slip
+            // fail-closed instead of silently resuming on the wrong boundary.
+            Some(sidecar) => sidecar.layout.boundary_tokens != self.cached_token_count,
+            None => true,
+        }
+    }
+
+    /// The family acknowledges that it has established the auxiliary
+    /// (out-of-pool) state for exactly `primed_tokens` of cached prefix — GDN
+    /// recurrent state for `qwen3_5*`, sliding-window `RotatingKVCache` state
+    /// for `gemma4` — and clears the obligation the prefix lookup latched.
+    ///
+    /// Call this at the ONE point per family where the auxiliary half is
+    /// provably in hand: immediately after the "already primed, or replay the
+    /// prefix now" decision, and BEFORE the first `record_tokens` of the turn.
+    ///
+    /// No-op unless the obligation is actually outstanding, so a family with no
+    /// [`ColdSidecarPolicy`] (dense `qwen3` today) is unaffected, and so is a
+    /// live continuation — `continue_turn` never dropped the auxiliary half and
+    /// leaves `cached_token_count` describing the PREVIOUS lookup, which the
+    /// caller's live prefix length is not required to match.
+    ///
+    /// When the obligation IS outstanding, `primed_tokens` must equal the
+    /// prefix the adapter reported (`cached_token_count`). A mismatch means the
+    /// family primed a different boundary than the one it is about to resume
+    /// from, which is exactly the corruption this gate exists to prevent, so it
+    /// returns `Err` and leaves the latch set.
+    pub fn confirm_aux_prefix_primed(&mut self, primed_tokens: u32) -> Result<(), String> {
+        if !self.aux_prefix_unbacked {
+            return Ok(());
+        }
+        if primed_tokens != self.cached_token_count {
+            return Err(format!(
+                "confirm_aux_prefix_primed: family primed {primed_tokens} tokens of auxiliary \
+                 state but the request resumes from a {} token cached prefix. The out-of-pool \
+                 state must cover exactly the reused prefix.",
+                self.cached_token_count
+            ));
+        }
+        self.aux_prefix_unbacked = false;
+        Ok(())
+    }
+
+    /// Fail closed on any operation that would build on — or publish — a
+    /// cached prefix whose auxiliary half nobody has established.
+    fn ensure_aux_prefix_primed(&self, op: &str) -> Result<(), String> {
+        if !self.aux_prefix_unbacked {
+            return Ok(());
+        }
+        Err(format!(
+            "{op}: this request resumed from a {} token cached K/V prefix whose out-of-pool \
+             state (GDN recurrent / sliding-window) was not restored with it, and the model \
+             never called confirm_aux_prefix_primed. Continuing would attend over K/V that no \
+             recurrent state matches. Prime the prefix (or restart the turn cold) first.",
+            self.cached_token_count
+        ))
+    }
+
+    /// Shared per-layer K/V pool. Exposed so callers can fold the pool's
+    /// cache layout (block size, layers, heads, head size, dtype) into the
+    /// cold-tier fingerprint.
+    pub fn layer_kv_pool(&self) -> &Arc<LayerKVPool> {
+        &self.layer_kv_pool
+    }
+
     /// Begin a new request. Releases any prior request's blocks first.
     /// `seq_id` is a logical request identifier (caller's choice; not
     /// interpreted by the adapter beyond passing it to `SequenceBlockTable`).
@@ -915,6 +1911,14 @@ impl PagedKVCacheAdapter {
         self.block_table = Some(SequenceBlockTable::new(seq_id, self.block_size));
         self.cached_token_count = 0;
         self.request_tokens.clear();
+        // Auxiliary state belongs to the prefix the previous lookup restored,
+        // never to the next request.
+        self.restored_sidecar = None;
+        // No prefix is being resumed yet, so there is no auxiliary obligation.
+        self.aux_prefix_unbacked = false;
+        // The previous turn's capture depth describes the previous turn's
+        // tokens; a family must never anchor this turn's sidecar on it.
+        self.cold_capture = ColdCaptureOutcome::default();
         #[cfg(target_os = "macos")]
         {
             self.prefill_attention_inputs_cache = None;
@@ -1337,6 +2341,10 @@ impl PagedKVCacheAdapter {
                  Call reset_for_new_request() to start a new request."
                 .to_string());
         }
+        // Consume the command-reset one-shot on every processed lookup
+        // (including the forced-miss `skip_lookup` path below), so exactly the
+        // immediately-following request is suppressed.
+        let suppress_cold_restore = std::mem::take(&mut self.suppress_cold_restore_once);
         let block_table = self
             .block_table
             .as_mut()
@@ -1369,13 +2377,47 @@ impl PagedKVCacheAdapter {
             .unwrap_or(prompt_tokens.len());
         let lookup_tokens = &prompt_tokens[..lookup_len];
 
-        let (blocks, cached_tokens) = {
+        let (mut blocks, mut cached_tokens) = {
             let mut guard = self
                 .allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
             guard.find_longest_cache_hit(lookup_tokens, self.block_size, extra_keys, cache_salt)
         };
+
+        // Extend the hot hit with SSD-persisted blocks (see
+        // [`ColdTierWalk::restore_extend`]).
+        //
+        // Skipped for one lookup after a command reset (`suppress_cold_restore`)
+        // so the just-purged prefix is re-prefilled cold rather than restored.
+        if !suppress_cold_restore && let Some(cold) = self.cold_tier.as_ref() {
+            let block_size = self.block_size;
+            let walk = ColdTierWalk {
+                cold,
+                pool: &self.layer_kv_pool,
+                allocator: &self.allocator,
+                block_size,
+            };
+            let restored = walk.restore_extend(
+                lookup_tokens,
+                cached_tokens,
+                cache_salt,
+                |_| Some(extra_keys),
+                |full_blocks| {
+                    mlx_paged_attn::chain_hashes(
+                        &lookup_tokens[..full_blocks * block_size as usize],
+                        block_size,
+                        extra_keys,
+                        cache_salt,
+                    )
+                },
+            );
+            cached_tokens += restored.blocks.len() * block_size as usize;
+            blocks.extend(restored.blocks);
+            // Backs exactly `cached_tokens` — the walk reduced the prefix and
+            // the state together.
+            self.restored_sidecar = restored.sidecar;
+        }
 
         for block in &blocks {
             block_table.add_block(Arc::clone(block));
@@ -1397,6 +2439,10 @@ impl PagedKVCacheAdapter {
         block_table.set_num_tokens(self.request_tokens.len() as u32);
 
         self.prefix_lookup_done = true;
+        // The prefix above may include blocks the HOT cache served, which the
+        // cold walk's reconcile-down never sees. Latch the outstanding
+        // auxiliary-state obligation; see the `aux_prefix_unbacked` field doc.
+        self.aux_prefix_unbacked = self.aux_prefix_state_missing();
         Ok(CachedPrefix {
             blocks,
             cached_token_count,
@@ -1501,6 +2547,12 @@ impl PagedKVCacheAdapter {
                     .to_string(),
             );
         }
+        // Consume the command-reset one-shot on every processed lookup
+        // (including the forced-miss `skip_lookup` path below), exactly as the
+        // uniform entry point does. Leaving it armed here would let a
+        // suppression armed by `release_request_and_purge_prefix_cache` survive
+        // a per-block lookup and later land on an unrelated uniform lookup.
+        let suppress_cold_restore = std::mem::take(&mut self.suppress_cold_restore_once);
         let block_table = self.block_table.as_mut().ok_or_else(|| {
             "find_cached_prefix_per_block called before reset_for_new_request".to_string()
         })?;
@@ -1528,7 +2580,7 @@ impl PagedKVCacheAdapter {
             .unwrap_or(prompt_tokens.len());
         let lookup_tokens = &prompt_tokens[..lookup_len];
 
-        let (blocks, cached_tokens) = {
+        let (mut blocks, mut cached_tokens) = {
             let mut guard = self
                 .allocator
                 .lock()
@@ -1540,6 +2592,42 @@ impl PagedKVCacheAdapter {
                 cache_salt,
             )
         };
+
+        // Extend the hot hit with SSD-persisted blocks (see
+        // [`ColdTierWalk::restore_extend`]). The chain hashes come from the
+        // PER-BLOCK walk so a restored block is published under exactly the
+        // identity `find_longest_cache_hit_per_block` will look it up by;
+        // `chain_hashes_per_block` truncates when `extra_keys_per_block` runs
+        // short, which caps the restore at the covered blocks — the same
+        // break-at-the-first-block-without-keys rule the hot walk applies.
+        if !suppress_cold_restore && let Some(cold) = self.cold_tier.as_ref() {
+            let block_size = self.block_size;
+            let walk = ColdTierWalk {
+                cold,
+                pool: &self.layer_kv_pool,
+                allocator: &self.allocator,
+                block_size,
+            };
+            let restored = walk.restore_extend(
+                lookup_tokens,
+                cached_tokens,
+                cache_salt,
+                |i| extra_keys_per_block.get(i).map(Vec::as_slice),
+                |full_blocks| {
+                    mlx_paged_attn::chain_hashes_per_block(
+                        &lookup_tokens[..full_blocks * block_size as usize],
+                        block_size,
+                        extra_keys_per_block,
+                        cache_salt,
+                    )
+                },
+            );
+            cached_tokens += restored.blocks.len() * block_size as usize;
+            blocks.extend(restored.blocks);
+            // Backs exactly `cached_tokens` — the walk reduced the prefix and
+            // the state together.
+            self.restored_sidecar = restored.sidecar;
+        }
 
         for block in &blocks {
             block_table.add_block(Arc::clone(block));
@@ -1555,6 +2643,9 @@ impl PagedKVCacheAdapter {
         block_table.set_num_tokens(self.request_tokens.len() as u32);
 
         self.prefix_lookup_done = true;
+        // Same obligation as the uniform entry point — and this is the path
+        // `qwen3_5` / `qwen3_5_moe` / `gemma4` use exclusively.
+        self.aux_prefix_unbacked = self.aux_prefix_state_missing();
         Ok(CachedPrefix {
             blocks,
             cached_token_count,
@@ -1722,6 +2813,9 @@ impl PagedKVCacheAdapter {
         if self.block_table.is_none() {
             return Err("record_tokens called before reset_for_new_request".to_string());
         }
+        // Nothing may be written on top of a cached prefix whose out-of-pool
+        // half is unaccounted for.
+        self.ensure_aux_prefix_primed("record_tokens")?;
         // Compute the new total BEFORE mutating state so we can grow the
         // block table first and leave caller-visible state unchanged on
         // allocator exhaustion.
@@ -3767,6 +4861,10 @@ impl PagedKVCacheAdapter {
         extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<u32, String> {
+        // Never publish blocks computed on top of a prefix whose out-of-pool
+        // half nobody established — that would hand the same unsound resume
+        // point to every later request.
+        self.ensure_aux_prefix_primed("register_full_blocks_for_reuse")?;
         // Idempotent: subsequent calls within the same request are no-ops.
         if self.already_registered {
             return Ok(0);
@@ -3835,6 +4933,33 @@ impl PagedKVCacheAdapter {
             )
             .map_err(|e| format!("cache_full_blocks failed: {e}"))?;
 
+        // Release the shared allocator before the cold-tier capture below:
+        // `capture_and_enqueue` blits every layer's block bytes off Metal,
+        // and holding the lock across that would serialize other requests.
+        // The blocks stay pinned by this request's own references until
+        // `release_request`, so dropping the lock cannot race an eviction.
+        drop(guard);
+
+        // Persist the same chain to the SSD cold tier (see
+        // [`ColdTierWalk::capture_chain`]).
+        if let Some(cold) = self.cold_tier.as_ref() {
+            let outcome = ColdTierWalk {
+                cold,
+                pool: &self.layer_kv_pool,
+                allocator: &self.allocator,
+                block_size: self.block_size,
+            }
+            .capture_chain(
+                &self.request_tokens,
+                blocks_slice,
+                cache_salt,
+                self.cold_capture_budget,
+                |_| Some(extra_keys),
+            );
+            Self::trace_cold_capture_walk("uniform", outcome, self.cold_capture_budget);
+            self.cold_capture = outcome;
+        }
+
         // Mark registered ONLY on the success path so an Err leaves
         // already_registered == false (callers may retry / move on, and a
         // future correct call should still be able to do the work). A
@@ -3881,6 +5006,30 @@ impl PagedKVCacheAdapter {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Result<u32, String> {
+        self.ensure_aux_prefix_primed("register_full_blocks_for_reuse_per_block")?;
+        // A family that captures an auxiliary sidecar derives that sidecar's
+        // chain with a salt of ZERO (see `capture_dense_gdn_cold_sidecar` /
+        // `capture_gemma4_sliding_cold_sidecar`), while the restore walk chains
+        // under whatever salt the LOOKUP carried. Both are zero today, so they
+        // agree. Should a salt ever be introduced (tenant isolation is the
+        // obvious reason) the K/V chain would move and the sidecar chain would
+        // not, so `deepest_backed_boundary` would find nothing — every hybrid
+        // restore silently and permanently pinned at zero, indistinguishable
+        // from a cold cache. Fail loudly at the seam instead: the fix is to
+        // thread the salt into sidecar capture, not to quietly lose the tier.
+        if cache_salt != 0
+            && self
+                .cold_tier
+                .as_ref()
+                .is_some_and(|cold| cold.sidecar_policy.is_some())
+        {
+            return Err(format!(
+                "register_full_blocks_for_reuse_per_block: cache_salt={cache_salt} with an \
+                 auxiliary sidecar policy installed, but sidecar capture derives its chain \
+                 with salt 0 — the two chains would disagree and every restore would miss. \
+                 Thread the salt through sidecar capture before using a non-zero salt."
+            ));
+        }
         if self.already_registered {
             return Ok(0);
         }
@@ -3945,6 +5094,35 @@ impl PagedKVCacheAdapter {
             )
             .map_err(|e| format!("cache_full_blocks_per_block failed: {e}"))?;
 
+        // Release the shared allocator before the cold-tier capture below:
+        // `capture_and_enqueue` blits every layer's block bytes off Metal, and
+        // holding the lock across that would serialize other requests. The
+        // blocks stay pinned by this request's own references until
+        // `release_request`, so dropping the lock cannot race an eviction.
+        drop(guard);
+
+        // Persist the same chain to the SSD cold tier (see
+        // [`ColdTierWalk::capture_chain`]). The `extra_keys_per_block.len()`
+        // check above already guarantees a per-block entry for every block
+        // handed to the walk.
+        if let Some(cold) = self.cold_tier.as_ref() {
+            let outcome = ColdTierWalk {
+                cold,
+                pool: &self.layer_kv_pool,
+                allocator: &self.allocator,
+                block_size: self.block_size,
+            }
+            .capture_chain(
+                &self.request_tokens,
+                blocks_slice,
+                cache_salt,
+                self.cold_capture_budget,
+                |i| extra_keys_per_block.get(i).map(Vec::as_slice),
+            );
+            Self::trace_cold_capture_walk("per_block", outcome, self.cold_capture_budget);
+            self.cold_capture = outcome;
+        }
+
         self.already_registered = true;
         Ok(registered as u32)
     }
@@ -3980,6 +5158,10 @@ impl PagedKVCacheAdapter {
 
         self.cached_token_count = 0;
         self.request_tokens.clear();
+        self.restored_sidecar = None;
+        // The request that carried the obligation is gone.
+        self.aux_prefix_unbacked = false;
+        self.cold_capture = ColdCaptureOutcome::default();
         #[cfg(target_os = "macos")]
         {
             self.prefill_attention_inputs_cache = None;
@@ -4026,6 +5208,11 @@ impl PagedKVCacheAdapter {
             .lock()
             .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
         guard.purge_prefix_cache();
+        drop(guard);
+        // Purging the hot prefix cache does not touch the SSD cold tier, so
+        // arm a one-shot suppressor: the next lookup must NOT restore the
+        // just-cleared prefix from disk (see `suppress_cold_restore_once`).
+        self.suppress_cold_restore_once = true;
         Ok(released)
     }
 
@@ -4090,6 +5277,7 @@ impl PagedKVCacheAdapter {
         extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<u32, String> {
+        self.ensure_aux_prefix_primed("finalize_turn_keep_live")?;
         // Idempotent like `register_full_blocks_for_reuse`: subsequent
         // calls within the same turn return Ok(0) without side effects.
         // This intentionally mirrors the registration-half's idempotency
@@ -4137,6 +5325,7 @@ impl PagedKVCacheAdapter {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Result<u32, String> {
+        self.ensure_aux_prefix_primed("finalize_turn_keep_live_per_block")?;
         if self.already_registered {
             #[cfg(target_os = "macos")]
             self.clear_attention_inputs_caches();
@@ -4275,6 +5464,22 @@ impl PagedKVCacheAdapter {
         // future caller that mixes patterns isn't tripped by stale state.
         self.already_registered = false;
         self.prefix_lookup_done = true; // already implicitly "done" — no fresh lookup is allowed
+        // A live continuation never dropped the auxiliary (out-of-pool) half:
+        // the model's own caches carried it across the turn boundary, exactly
+        // as the partial trailing block carried the K/V. Nothing to prime.
+        self.aux_prefix_unbacked = false;
+        // By the same argument the restore walk's sidecar is spent: a live
+        // continuation needs no install, so anything still here belongs to the
+        // turn that just ended. A family whose install runs AFTER its in-memory
+        // sources (gemma4 checks live / last_history / checkpoint first) can
+        // leave one untaken, and gemma4's install accepts a strictly shallower
+        // `boundary <= cached_prefix_len` — so without this clear, a stale
+        // boundary from the previous turn is installable on the next one. That
+        // is currently harmless only because `starts_with` above makes the old
+        // boundary a genuine token prefix and the caller replays the delta;
+        // honour the field's own "cleared at the start of every request"
+        // contract rather than leaning on two unrelated invariants.
+        self.restored_sidecar = None;
         #[cfg(target_os = "macos")]
         {
             self.clear_attention_inputs_caches();
@@ -5273,6 +6478,1727 @@ mod tests {
         block_size: u32,
     ) -> Option<PagedKVCacheAdapter> {
         Some(maybe_make_adapter(allocator, block_size)?.expect("adapter ctor must succeed"))
+    }
+
+    #[test]
+    fn cold_tier_defaults_none_and_holds_context_across_resets() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            return;
+        };
+        assert!(
+            adapter.cold_tier().is_none(),
+            "cold tier must be off unless explicitly wired"
+        );
+
+        let root =
+            std::env::temp_dir().join(format!("mlx-adapter-cold-tier-{}", std::process::id()));
+        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+            .expect("temp-dir cold cache must open");
+        let fingerprint =
+            mlx_paged_attn::ColdCacheFingerprint::from_components([b"qwen3-test".as_slice()]);
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::new(manager),
+            fingerprint,
+            sidecar_policy: None,
+        });
+
+        let ctx = adapter.cold_tier().expect("context must be stored");
+        assert_eq!(ctx.fingerprint, fingerprint);
+
+        // Cross-request prefix reuse spans requests, so the context must
+        // survive the per-request reset.
+        adapter.reset_for_new_request(1).unwrap();
+        assert!(adapter.cold_tier().is_some());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A command reset (`release_request_and_purge_prefix_cache`) must arm a
+    /// ONE-SHOT cold-restore suppressor so the immediate reset-then-rerun
+    /// re-prefills the whole prompt cold instead of restoring the just-purged
+    /// prefix from the SSD tier. The per-turn `release_request` must NOT arm
+    /// it, and exactly the next lookup consumes it.
+    #[test]
+    fn cold_tier_command_reset_suppresses_next_restore_once() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            return;
+        };
+
+        let root =
+            std::env::temp_dir().join(format!("mlx-adapter-cold-suppress-{}", std::process::id()));
+        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+            .expect("temp-dir cold cache must open");
+        let fingerprint =
+            mlx_paged_attn::ColdCacheFingerprint::from_components([b"qwen3-suppress".as_slice()]);
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::new(manager),
+            fingerprint,
+            sidecar_policy: None,
+        });
+
+        // Per-turn release must NOT arm the suppressor.
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.release_request().unwrap();
+        assert!(
+            !adapter.suppress_cold_restore_once,
+            "per-turn release must not arm cold-restore suppression"
+        );
+
+        // A command reset arms it.
+        adapter.release_request_and_purge_prefix_cache().unwrap();
+        assert!(
+            adapter.suppress_cold_restore_once,
+            "command reset must arm the one-shot cold-restore suppressor"
+        );
+
+        // Starting the next request must NOT consume the arming — it has to
+        // survive into that request's prefix lookup.
+        adapter.reset_for_new_request(2).unwrap();
+        assert!(
+            adapter.suppress_cold_restore_once,
+            "reset_for_new_request must preserve the armed suppressor until the lookup"
+        );
+
+        // The lookup consumes the flag and skips the cold-restore branch.
+        adapter
+            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], 0, false)
+            .unwrap();
+        assert!(
+            !adapter.suppress_cold_restore_once,
+            "the immediately-following lookup must consume the one-shot suppressor"
+        );
+
+        // A subsequent same-prompt turn restores normally: the flag stays clear.
+        adapter.reset_for_new_request(3).unwrap();
+        adapter
+            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], 0, false)
+            .unwrap();
+        assert!(
+            !adapter.suppress_cold_restore_once,
+            "later turns must not re-arm suppression"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Publishing full blocks for cross-request reuse must also capture
+    /// them into the SSD cold tier when one is wired, under the chained
+    /// key contract shared with the hot cache (parent-linked, salt mixed
+    /// into block 0 only). Re-registering the same chain must dedup via
+    /// the manager's index probe instead of re-enqueueing identical bytes.
+    #[test]
+    fn register_full_blocks_captures_to_cold_tier_once() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping register_full_blocks_captures_to_cold_tier_once: Metal unavailable"
+            );
+            return;
+        };
+
+        let root =
+            std::env::temp_dir().join(format!("mlx-adapter-cold-capture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let manager = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                .expect("temp-dir cold cache must open"),
+        );
+        let fingerprint =
+            mlx_paged_attn::ColdCacheFingerprint::from_components([b"qwen3-test".as_slice()]);
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager),
+            fingerprint,
+            sidecar_policy: None,
+        });
+
+        let tokens: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        let registered = adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
+        assert_eq!(registered, 2, "two full blocks of size 4 = 8 tokens");
+
+        let key0 = mlx_paged_attn::ColdCacheKey::chain(
+            mlx_paged_attn::ColdGroup::Kv,
+            fingerprint,
+            None,
+            &tokens[..4],
+            &[],
+            0,
+            0,
+        );
+        let key1 = mlx_paged_attn::ColdCacheKey::chain(
+            mlx_paged_attn::ColdGroup::Kv,
+            fingerprint,
+            Some(key0),
+            &tokens[4..],
+            &[],
+            0,
+            1,
+        );
+        let paths = [
+            root.join(format!("{}.safetensors", key0.to_hex())),
+            root.join(format!("{}.safetensors", key1.to_hex())),
+        ];
+
+        // The manager's writer thread persists asynchronously; poll for
+        // both committed files instead of asserting immediately.
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while paths.iter().any(|p| !p.exists()) {
+            assert!(
+                Instant::now() < deadline,
+                "cold-tier files not committed within 2s: {paths:?}; stats: {:?}",
+                manager.stats()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(manager.contains(&key0), "index must publish block 0");
+        assert!(manager.contains(&key1), "index must publish block 1");
+        assert_eq!(manager.stats().enqueued, 2);
+
+        // A follow-up request re-registering the identical chain must not
+        // re-capture: the pre-enqueue `contains` probe sees both keys.
+        adapter.release_request().unwrap();
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
+        assert_eq!(
+            manager.stats().enqueued,
+            2,
+            "identical chain must dedup via contains, not re-enqueue"
+        );
+        let persisted = std::fs::read_dir(&root)
+            .expect("cold root must be listable")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
+            .count();
+        assert_eq!(persisted, 2, "exactly one file per full block");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The PER-BLOCK registration entry point must capture to the SSD cold
+    /// tier exactly like the uniform one — the multimodal families
+    /// (qwen3_5 / qwen3_5_moe / gemma4) only ever call this variant, so a
+    /// missing hook here silently disables persistence for them.
+    ///
+    /// Also pins the BIT-EQUALITY contract: per-block capture with all-empty
+    /// per-block keys produces byte-identical cold keys to uniform capture with
+    /// an empty slice. The dedup assertion is the strong form of that — a
+    /// re-register through the OTHER entry point, against the SAME manager,
+    /// must find both keys already present and enqueue nothing.
+    #[test]
+    fn register_full_blocks_per_block_captures_to_cold_tier_once() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping register_full_blocks_per_block_captures_to_cold_tier_once: Metal unavailable"
+            );
+            return;
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "mlx-adapter-cold-capture-per-block-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let manager = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                .expect("temp-dir cold cache must open"),
+        );
+        let fingerprint =
+            mlx_paged_attn::ColdCacheFingerprint::from_components([b"qwen3-per-block".as_slice()]);
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager),
+            fingerprint,
+            sidecar_policy: None,
+        });
+
+        let tokens: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        let per_block: Vec<Vec<u64>> = vec![Vec::new(), Vec::new()];
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        let registered = adapter
+            .register_full_blocks_for_reuse_per_block(&per_block, 0)
+            .unwrap();
+        assert_eq!(registered, 2, "two full blocks of size 4 = 8 tokens");
+
+        // Keys computed with the UNIFORM empty-slice contract: the per-block
+        // path must land on exactly these.
+        let key0 = mlx_paged_attn::ColdCacheKey::chain(
+            mlx_paged_attn::ColdGroup::Kv,
+            fingerprint,
+            None,
+            &tokens[..4],
+            &[],
+            0,
+            0,
+        );
+        let key1 = mlx_paged_attn::ColdCacheKey::chain(
+            mlx_paged_attn::ColdGroup::Kv,
+            fingerprint,
+            Some(key0),
+            &tokens[4..],
+            &[],
+            0,
+            1,
+        );
+        let paths = [
+            root.join(format!("{}.safetensors", key0.to_hex())),
+            root.join(format!("{}.safetensors", key1.to_hex())),
+        ];
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while paths.iter().any(|p| !p.exists()) {
+            assert!(
+                Instant::now() < deadline,
+                "per-block cold-tier files not committed within 2s: {paths:?}; stats: {:?}",
+                manager.stats()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(manager.contains(&key0), "index must publish block 0");
+        assert!(manager.contains(&key1), "index must publish block 1");
+        assert_eq!(manager.stats().enqueued, 2);
+
+        // Re-register the identical chain through the per-block path: dedup.
+        adapter.release_request().unwrap();
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        adapter
+            .register_full_blocks_for_reuse_per_block(&per_block, 0)
+            .unwrap();
+        assert_eq!(
+            manager.stats().enqueued,
+            2,
+            "identical per-block chain must dedup via contains, not re-enqueue"
+        );
+
+        // Cross-path bit-equality: the UNIFORM entry point, same manager, same
+        // tokens, empty uniform keys. If the two key derivations diverged at
+        // all this would enqueue two more objects.
+        adapter.release_request().unwrap();
+        adapter.reset_for_new_request(2).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
+        assert_eq!(
+            manager.stats().enqueued,
+            2,
+            "uniform capture with an empty slice must produce byte-identical keys \
+             to per-block capture with all-empty per-block keys"
+        );
+        let persisted = std::fs::read_dir(&root)
+            .expect("cold root must be listable")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
+            .count();
+        assert_eq!(
+            persisted, 2,
+            "exactly one file per full block across both entry points"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Wire a fresh adapter to a cold tier whose writer queue is DELIBERATELY
+    /// far shallower than the capture budget under test, so the only way to
+    /// spend the budget is to wait for slots.
+    ///
+    /// Returns `None` when Metal is unavailable (the caller skips).
+    fn cold_capture_fixture(
+        tag: &str,
+        blocks: u32,
+        block_size: u32,
+        queue_depth: usize,
+    ) -> Option<(
+        PagedKVCacheAdapter,
+        Arc<mlx_paged_attn::ColdCacheManager>,
+        std::path::PathBuf,
+    )> {
+        let allocator = new_allocator(blocks, block_size);
+        let mut adapter = maybe_adapter(Arc::clone(&allocator), block_size)?;
+        let root = std::env::temp_dir().join(format!(
+            "mlx-adapter-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let manager = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_at(root.clone(), 8 << 30, 0, queue_depth)
+                .expect("temp-dir cold cache must open"),
+        );
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager),
+            fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
+                tag.as_bytes(),
+                b"capture-budget".as_slice(),
+            ]),
+            sidecar_policy: None,
+        });
+        Some((adapter, manager, root))
+    }
+
+    /// Fill the writer queue and PROVE it is full, by offering ballast blocks
+    /// until one is refused.
+    ///
+    /// The ballast is deliberately huge (`mib` megabytes per object) so the
+    /// commit the writer is parked in outlasts, by orders of magnitude, the one
+    /// host blit between this function returning and the capture walk's first
+    /// admission attempt. Without that margin the writer frees a slot in the
+    /// gap and a non-waiting walk sails through, which is exactly how the first
+    /// version of this fixture passed under the mutation it exists to catch.
+    ///
+    /// Returns how long the last, refused offer took — a non-blocking `enqueue`
+    /// must not have waited, and the caller asserts that as a second check that
+    /// the saturation is real rather than a fast writer being missed.
+    fn saturate_cold_queue(
+        manager: &mlx_paged_attn::ColdCacheManager,
+        fingerprint: mlx_paged_attn::ColdCacheFingerprint,
+        mib: usize,
+    ) -> std::time::Duration {
+        let bytes = mib * 1024 * 1024;
+        for i in 0..64u32 {
+            let tokens = vec![i; 4];
+            let ballast = mlx_paged_attn::ColdCacheBlock {
+                key: mlx_paged_attn::ColdCacheKey::chain(
+                    mlx_paged_attn::ColdGroup::Kv,
+                    fingerprint,
+                    None,
+                    &tokens,
+                    &[],
+                    u64::from(i) + 1,
+                    0,
+                ),
+                fingerprint,
+                tokens,
+                layout: mlx_paged_attn::ColdCacheLayout {
+                    block_size: 4,
+                    num_layers: 1,
+                    num_kv_heads: 1,
+                    head_size: 1,
+                    cache_dtype: "BFloat16".to_string(),
+                    key_bytes_per_layer: bytes,
+                    value_bytes_per_layer: bytes,
+                },
+                layers: vec![mlx_paged_attn::ColdLayerBlock {
+                    keys: vec![0u8; bytes],
+                    values: vec![0u8; bytes],
+                }],
+            };
+            let started = Instant::now();
+            if !manager.enqueue(ballast).expect("writer must be alive") {
+                return started.elapsed();
+            }
+        }
+        panic!("the bounded writer queue never refused a ballast block");
+    }
+
+    /// The per-turn capture depth must be the BUDGET, not the writer queue's
+    /// depth.
+    ///
+    /// This is the whole bug. The walk used to stop at the first block the
+    /// bounded queue refused, so a turn persisted `(Q + 1) / (1 - Tc/Tw)`
+    /// blocks — an emergent number, ~12 in the field — and an 8 K-token prompt
+    /// needed ~40 turns before a restore covered anything. Waiting a bounded
+    /// time for a slot decouples the two.
+    ///
+    /// Vacuity is the real hazard here and the ballast is the answer to it. A
+    /// shallow queue alone does NOT saturate: on this machine the tiny test
+    /// blocks commit faster than they blit, so the queue stays empty, both
+    /// admission policies behave identically, and the test passes under its own
+    /// mutation. The walk therefore starts against a queue that has been
+    /// PROVEN full, so its very first block can only land by waiting.
+    #[test]
+    fn capture_walk_persists_the_whole_budget_not_just_the_queue_depth() {
+        const BLOCKS: u32 = 64;
+        const BS: u32 = 4;
+        let Some((mut adapter, manager, root)) =
+            cold_capture_fixture("cold-budget-depth", BLOCKS, BS, 1)
+        else {
+            eprintln!(
+                "skipping capture_walk_persists_the_whole_budget_not_just_the_queue_depth: Metal unavailable"
+            );
+            return;
+        };
+        adapter.set_cold_capture_budget(ColdCaptureBudget {
+            max_blocks: BLOCKS as usize,
+            max_walk: std::time::Duration::from_secs(60),
+        });
+        let fingerprint = adapter
+            .cold_tier()
+            .expect("fixture wires a cold tier")
+            .fingerprint;
+        let refusal = saturate_cold_queue(&manager, fingerprint, 96);
+        assert!(
+            refusal < std::time::Duration::from_millis(50),
+            "the refused ballast proves saturation only if `enqueue` did not wait for it \
+             ({refusal:?})"
+        );
+        let drops_before = manager.stats().queue_drops;
+
+        let tokens: Vec<u32> = (0..BLOCKS * BS).collect();
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(tokens.len() as u32).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
+
+        let outcome = adapter.cold_capture();
+        assert_eq!(
+            outcome.blocks, BLOCKS as usize,
+            "the chain must reach the whole budget, not the queue depth ({outcome:?})"
+        );
+        assert_eq!(
+            outcome.enqueued, BLOCKS as usize,
+            "every block of the budget must have been handed to the writer ({outcome:?})"
+        );
+        assert_eq!(
+            outcome.stop,
+            ColdCaptureStop::End,
+            "the walk ran out of prompt before it ran out of budget ({outcome:?})"
+        );
+        assert_eq!(
+            manager.stats().queue_drops - drops_before,
+            0,
+            "waiting for a slot must replace dropping, not supplement it"
+        );
+
+        assert!(
+            manager.drain(std::time::Duration::from_secs(60)),
+            "every accepted block must commit"
+        );
+        let persisted = std::fs::read_dir(&root)
+            .expect("cold root must be listable")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".safetensors")
+            })
+            .count();
+        assert!(
+            persisted >= BLOCKS as usize,
+            "one committed object per budgeted block, plus the ballast (got {persisted})"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The budget must also STOP the walk, and must count only blocks this
+    /// turn actually wrote — so a turn resumes the ratchet where the last one
+    /// left off instead of re-spending its depth on the chain already on disk.
+    ///
+    /// Turn 1 covers exactly the budget; turn 2 walks the same 16 blocks for
+    /// free through the `contains` probe and then spends its own 16 on the
+    /// next stretch, reaching 32.
+    #[test]
+    fn capture_walk_stops_at_the_block_budget_and_resumes_next_turn() {
+        const BLOCKS: u32 = 64;
+        const BS: u32 = 4;
+        const BUDGET: usize = 16;
+        let Some((mut adapter, manager, root)) =
+            cold_capture_fixture("cold-budget-stop", BLOCKS, BS, 1)
+        else {
+            eprintln!(
+                "skipping capture_walk_stops_at_the_block_budget_and_resumes_next_turn: Metal unavailable"
+            );
+            return;
+        };
+        adapter.set_cold_capture_budget(ColdCaptureBudget {
+            max_blocks: BUDGET,
+            max_walk: std::time::Duration::from_secs(60),
+        });
+
+        let tokens: Vec<u32> = (0..BLOCKS * BS).collect();
+        let turn = |adapter: &mut PagedKVCacheAdapter, id: u32| -> ColdCaptureOutcome {
+            adapter.reset_for_new_request(id).unwrap();
+            adapter.allocate_suffix_blocks(tokens.len() as u32).unwrap();
+            adapter.record_tokens(&tokens).unwrap();
+            adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
+            let outcome = adapter.cold_capture();
+            adapter.release_request().unwrap();
+            outcome
+        };
+
+        let first = turn(&mut adapter, 0);
+        assert_eq!(
+            (first.blocks, first.enqueued, first.stop),
+            (BUDGET, BUDGET, ColdCaptureStop::Budget),
+            "turn 1 must spend exactly its budget and stop there ({first:?})"
+        );
+
+        // The writer must have committed turn 1's chain, or turn 2's `contains`
+        // probes miss and it re-captures the same blocks instead of advancing.
+        assert!(
+            manager.drain(std::time::Duration::from_secs(30)),
+            "turn 1's chain must commit before turn 2 probes for it"
+        );
+
+        let second = turn(&mut adapter, 1);
+        assert_eq!(
+            (second.blocks, second.enqueued, second.stop),
+            (BUDGET * 2, BUDGET, ColdCaptureStop::Budget),
+            "turn 2 must skip turn 1's chain for free and spend its own budget on \
+             the next stretch ({second:?})"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A per-block lookup must consume the one-shot cold-restore suppressor
+    /// armed by `release_request_and_purge_prefix_cache`, exactly as the
+    /// uniform lookup does. Without this, a suppression armed by a command
+    /// reset survives the per-block lookup it was meant for and later lands on
+    /// an unrelated uniform lookup, silently disabling that lookup's restore.
+    #[test]
+    fn cold_tier_per_block_lookup_consumes_suppression_once() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            return;
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "mlx-adapter-cold-suppress-per-block-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+            .expect("temp-dir cold cache must open");
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::new(manager),
+            fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
+                b"qwen3-suppress-per-block".as_slice(),
+            ]),
+            sidecar_policy: None,
+        });
+
+        let per_block: Vec<Vec<u64>> = vec![Vec::new(), Vec::new()];
+
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.release_request_and_purge_prefix_cache().unwrap();
+        assert!(
+            adapter.suppress_cold_restore_once,
+            "command reset must arm the one-shot cold-restore suppressor"
+        );
+
+        adapter.reset_for_new_request(2).unwrap();
+        assert!(
+            adapter.suppress_cold_restore_once,
+            "reset_for_new_request must preserve the armed suppressor until the lookup"
+        );
+        adapter
+            .find_cached_prefix_per_block(&[1, 2, 3, 4, 5, 6, 7, 8], &per_block, 0, false)
+            .unwrap();
+        assert!(
+            !adapter.suppress_cold_restore_once,
+            "the per-block lookup must consume the one-shot suppressor instead of \
+             leaking it onto a later uniform lookup"
+        );
+
+        // The forced-miss `skip_lookup` path consumes it too — same contract
+        // as the uniform entry point.
+        adapter.release_request().unwrap();
+        adapter.release_request_and_purge_prefix_cache().unwrap();
+        assert!(adapter.suppress_cold_restore_once);
+        adapter.reset_for_new_request(3).unwrap();
+        adapter
+            .find_cached_prefix_per_block(&[1, 2, 3, 4, 5, 6, 7, 8], &per_block, 0, true)
+            .unwrap();
+        assert!(
+            !adapter.suppress_cold_restore_once,
+            "skip_lookup must still consume the one-shot suppressor"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Full restart round-trip through the public adapter API: an adapter
+    /// captures a two-block prefix to the SSD cold tier, then a FRESH
+    /// allocator + pool + adapter (a new process, same fingerprint) resolves
+    /// the identical prompt through `find_cached_prefix` alone. The restore
+    /// hook must rebuild the whole prefix — `cached_token_count` covers every
+    /// full block — and each restored physical block must be byte-identical
+    /// to what the first adapter captured, on every layer. This exercises the
+    /// A3 capture hook and the A4 restore loop end-to-end with real KV bytes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn find_cached_prefix_restores_persisted_prefix_on_fresh_adapter() {
+        use mlx_paged_attn::metal::MetalDtype;
+
+        let make_config = || PagedAttentionConfig {
+            block_size: 8,
+            gpu_memory_mb: 256,
+            head_size: 64,
+            num_kv_heads: 1,
+            num_layers: 2,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(1),
+        };
+        // Real pools (not `new_for_test`) so KV bytes actually round-trip.
+        let pool_src = match LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16) {
+            Ok(pool) => Arc::new(pool),
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!(
+                    "skipping find_cached_prefix_restores_persisted_prefix_on_fresh_adapter: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let num_layers = pool_src.num_layers();
+        let bytes_per_side = 64 * 8 * 2usize;
+        // Distinct per (layer, block position, side) so a mixed-up block or
+        // layer cannot pass by coincidence.
+        let pattern = |layer: usize, pos: usize| -> (Vec<u8>, Vec<u8>) {
+            let keys = (0..bytes_per_side)
+                .map(|i| ((i + layer * 31 + pos * 97) % 251) as u8)
+                .collect();
+            let values = (0..bytes_per_side)
+                .map(|i| ((i * 2 + layer * 17 + pos * 53) % 251) as u8)
+                .collect();
+            (keys, values)
+        };
+
+        let tokens: [u32; 16] = [
+            11, 12, 13, 14, 15, 16, 17, 18, 21, 22, 23, 24, 25, 26, 27, 28,
+        ];
+        let fingerprint =
+            mlx_paged_attn::ColdCacheFingerprint::from_components([b"qwen3-restore".as_slice()]);
+        let root = std::env::temp_dir().join(format!(
+            "mlx-adapter-cold-restore-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // --- Capture side: adapter1 persists the prefix. ---
+        let alloc_src = new_allocator(8, 8);
+        let mut adapter_src = PagedKVCacheAdapter::new(alloc_src, Arc::clone(&pool_src), 8)
+            .expect("capture adapter ctor");
+        let manager_src = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                .expect("temp-dir cold cache must open"),
+        );
+        adapter_src.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager_src),
+            fingerprint,
+            sidecar_policy: None,
+        });
+
+        adapter_src.reset_for_new_request(0).unwrap();
+        adapter_src.allocate_suffix_blocks(16).unwrap();
+        adapter_src.record_tokens(&tokens).unwrap();
+        let source_ids: Vec<u32> = adapter_src
+            .block_table()
+            .unwrap()
+            .blocks()
+            .iter()
+            .map(|b| b.block_id)
+            .collect();
+        assert_eq!(source_ids.len(), 2, "two full blocks of size 8 = 16 tokens");
+        for (pos, &block_id) in source_ids.iter().enumerate() {
+            for layer in 0..num_layers {
+                let (keys, values) = pattern(layer, pos);
+                pool_src
+                    .write_blocks_from_host(layer as u32, &[block_id], &keys, &values)
+                    .unwrap();
+            }
+        }
+        let registered = adapter_src.register_full_blocks_for_reuse(&[], 0).unwrap();
+        assert_eq!(registered, 2);
+
+        let key0 = mlx_paged_attn::ColdCacheKey::chain(
+            mlx_paged_attn::ColdGroup::Kv,
+            fingerprint,
+            None,
+            &tokens[..8],
+            &[],
+            0,
+            0,
+        );
+        let key1 = mlx_paged_attn::ColdCacheKey::chain(
+            mlx_paged_attn::ColdGroup::Kv,
+            fingerprint,
+            Some(key0),
+            &tokens[8..],
+            &[],
+            0,
+            1,
+        );
+        let paths = [
+            root.join(format!("{}.safetensors", key0.to_hex())),
+            root.join(format!("{}.safetensors", key1.to_hex())),
+        ];
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while paths.iter().any(|p| !p.exists()) {
+            assert!(
+                Instant::now() < deadline,
+                "cold-tier files not committed within 5s: {paths:?}; stats: {:?}",
+                manager_src.stats()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // --- Restart: fresh allocator + pool + adapter, same fingerprint. ---
+        drop(adapter_src);
+        drop(manager_src);
+        let pool_dst = Arc::new(LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16).unwrap());
+        let alloc_dst = new_allocator(8, 8);
+        let mut adapter_dst = PagedKVCacheAdapter::new(alloc_dst, Arc::clone(&pool_dst), 8)
+            .expect("restore adapter ctor");
+        let manager_dst = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                .expect("reopen cold cache"),
+        );
+        adapter_dst.set_cold_tier(ColdTierContext {
+            manager: manager_dst,
+            fingerprint,
+            sidecar_policy: None,
+        });
+
+        adapter_dst.reset_for_new_request(0).unwrap();
+        let prefix = adapter_dst
+            .find_cached_prefix(&tokens, &[], 0, false)
+            .unwrap();
+        assert_eq!(
+            prefix.cached_token_count, 16,
+            "the whole two-block prefix must be restored from the cold tier"
+        );
+        assert_eq!(prefix.blocks.len(), 2);
+
+        for (pos, block) in prefix.blocks.iter().enumerate() {
+            for layer in 0..num_layers {
+                let (rk, rv) = pool_dst
+                    .read_blocks_to_host(layer as u32, &[block.block_id])
+                    .unwrap();
+                let (ek, ev) = pattern(layer, pos);
+                assert_eq!(
+                    rk, ek,
+                    "restored keys mismatch (block {pos}, layer {layer})"
+                );
+                assert_eq!(
+                    rv, ev,
+                    "restored values mismatch (block {pos}, layer {layer})"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The PER-BLOCK restart round-trip. Same shape as
+    /// `find_cached_prefix_restores_persisted_prefix_on_fresh_adapter` but
+    /// driven entirely through the per-block entry points — the only ones
+    /// qwen3_5 / qwen3_5_moe / gemma4 ever call — and with NON-EMPTY per-block
+    /// keys so the test actually proves the keys are threaded into the cold
+    /// chain rather than silently dropped.
+    ///
+    /// Three fresh "restarts" against the same on-disk chain assert:
+    ///   1. matching per-block keys → the whole prefix restores, byte-identical;
+    ///   2. different per-block keys → total miss (no cross-image reuse);
+    ///   3. a per-block vec shorter than the full-block count → the walk caps
+    ///      at the covered blocks, exactly like the hot allocator.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn find_cached_prefix_per_block_restores_persisted_prefix_on_fresh_adapter() {
+        use mlx_paged_attn::metal::MetalDtype;
+
+        let make_config = || PagedAttentionConfig {
+            block_size: 8,
+            gpu_memory_mb: 256,
+            head_size: 64,
+            num_kv_heads: 1,
+            num_layers: 2,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(1),
+        };
+        let pool_src = match LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16) {
+            Ok(pool) => Arc::new(pool),
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!(
+                    "skipping find_cached_prefix_per_block_restores_persisted_prefix_on_fresh_adapter: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let num_layers = pool_src.num_layers();
+        let bytes_per_side = 64 * 8 * 2usize;
+        let pattern = |layer: usize, pos: usize| -> (Vec<u8>, Vec<u8>) {
+            let keys = (0..bytes_per_side)
+                .map(|i| ((i + layer * 41 + pos * 89) % 251) as u8)
+                .collect();
+            let values = (0..bytes_per_side)
+                .map(|i| ((i * 3 + layer * 23 + pos * 61) % 251) as u8)
+                .collect();
+            (keys, values)
+        };
+
+        let tokens: [u32; 16] = [
+            31, 32, 33, 34, 35, 36, 37, 38, 41, 42, 43, 44, 45, 46, 47, 48,
+        ];
+        // Distinct per-block keys: this is the multimodal case the per-block
+        // API exists for.
+        let per_block: Vec<Vec<u64>> = vec![vec![0xA1A1_A1A1], vec![0xB2B2_B2B2]];
+        let fingerprint = mlx_paged_attn::ColdCacheFingerprint::from_components([
+            b"qwen3-restore-per-block".as_slice(),
+        ]);
+        let root = std::env::temp_dir().join(format!(
+            "mlx-adapter-cold-restore-per-block-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // --- Capture side. ---
+        let alloc_src = new_allocator(8, 8);
+        let mut adapter_src = PagedKVCacheAdapter::new(alloc_src, Arc::clone(&pool_src), 8)
+            .expect("capture adapter ctor");
+        let manager_src = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                .expect("temp-dir cold cache must open"),
+        );
+        adapter_src.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager_src),
+            fingerprint,
+            sidecar_policy: None,
+        });
+
+        adapter_src.reset_for_new_request(0).unwrap();
+        adapter_src.allocate_suffix_blocks(16).unwrap();
+        adapter_src.record_tokens(&tokens).unwrap();
+        let source_ids: Vec<u32> = adapter_src
+            .block_table()
+            .unwrap()
+            .blocks()
+            .iter()
+            .map(|b| b.block_id)
+            .collect();
+        assert_eq!(source_ids.len(), 2, "two full blocks of size 8 = 16 tokens");
+        for (pos, &block_id) in source_ids.iter().enumerate() {
+            for layer in 0..num_layers {
+                let (keys, values) = pattern(layer, pos);
+                pool_src
+                    .write_blocks_from_host(layer as u32, &[block_id], &keys, &values)
+                    .unwrap();
+            }
+        }
+        let registered = adapter_src
+            .register_full_blocks_for_reuse_per_block(&per_block, 0)
+            .unwrap();
+        assert_eq!(registered, 2);
+
+        let key0 = mlx_paged_attn::ColdCacheKey::chain(
+            mlx_paged_attn::ColdGroup::Kv,
+            fingerprint,
+            None,
+            &tokens[..8],
+            &per_block[0],
+            0,
+            0,
+        );
+        let key1 = mlx_paged_attn::ColdCacheKey::chain(
+            mlx_paged_attn::ColdGroup::Kv,
+            fingerprint,
+            Some(key0),
+            &tokens[8..],
+            &per_block[1],
+            0,
+            1,
+        );
+        let paths = [
+            root.join(format!("{}.safetensors", key0.to_hex())),
+            root.join(format!("{}.safetensors", key1.to_hex())),
+        ];
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while paths.iter().any(|p| !p.exists()) {
+            assert!(
+                Instant::now() < deadline,
+                "per-block cold-tier files not committed within 5s: {paths:?}; stats: {:?}",
+                manager_src.stats()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(adapter_src);
+        drop(manager_src);
+
+        // Builds a fresh allocator + pool + adapter over the same cold root —
+        // one simulated process restart.
+        let fresh = |keys: &[Vec<u64>]| -> (Arc<LayerKVPool>, CachedPrefix) {
+            let pool = Arc::new(LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16).unwrap());
+            let mut adapter = PagedKVCacheAdapter::new(new_allocator(8, 8), Arc::clone(&pool), 8)
+                .expect("restore adapter ctor");
+            adapter.set_cold_tier(ColdTierContext {
+                manager: Arc::new(
+                    mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                        .expect("reopen cold cache"),
+                ),
+                fingerprint,
+                sidecar_policy: None,
+            });
+            adapter.reset_for_new_request(0).unwrap();
+            let prefix = adapter
+                .find_cached_prefix_per_block(&tokens, keys, 0, false)
+                .unwrap();
+            (pool, prefix)
+        };
+
+        // 1. Matching keys → full restore, byte-identical on every layer.
+        let (pool_dst, prefix) = fresh(&per_block);
+        assert_eq!(
+            prefix.cached_token_count, 16,
+            "the whole two-block prefix must be restored through the per-block path"
+        );
+        assert_eq!(prefix.blocks.len(), 2);
+        for (pos, block) in prefix.blocks.iter().enumerate() {
+            for layer in 0..num_layers {
+                let (rk, rv) = pool_dst
+                    .read_blocks_to_host(layer as u32, &[block.block_id])
+                    .unwrap();
+                let (ek, ev) = pattern(layer, pos);
+                assert_eq!(
+                    rk, ek,
+                    "restored keys mismatch (block {pos}, layer {layer})"
+                );
+                assert_eq!(
+                    rv, ev,
+                    "restored values mismatch (block {pos}, layer {layer})"
+                );
+            }
+        }
+
+        // 2. Different per-block keys must NOT reuse the persisted chain.
+        let other: Vec<Vec<u64>> = vec![vec![0xDEAD_DEAD], vec![0xBEEF_BEEF]];
+        let (_pool, miss) = fresh(&other);
+        assert_eq!(
+            miss.cached_token_count, 0,
+            "per-block keys must be part of the cold key: different keys must miss"
+        );
+
+        // 3. A short per-block vec caps the walk at the covered blocks —
+        //    the same break-at-first-missing-keys rule the hot allocator uses.
+        let short: Vec<Vec<u64>> = vec![per_block[0].clone()];
+        let (_pool, capped) = fresh(&short);
+        assert_eq!(
+            capped.cached_token_count, 8,
+            "a per-block vec shorter than the full-block count must cap the restore \
+             at the blocks it covers, never guess an identity for the rest"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Geometry of the auxiliary state the reconcile-down test persists.
+    /// Deliberately tiny — what is under test is the boundary arithmetic and
+    /// the gate, not the payload.
+    #[cfg(target_os = "macos")]
+    fn reconcile_sidecar_layout(boundary_tokens: u32) -> mlx_paged_attn::ColdSidecarLayout {
+        mlx_paged_attn::ColdSidecarLayout {
+            group: mlx_paged_attn::ColdGroup::GdnState,
+            boundary_tokens,
+            num_layers: 2,
+            tensors_per_layer: 2,
+            dtype: "BFloat16".to_string(),
+            dims: vec![4, 8],
+            bytes_per_tensor: 6,
+        }
+    }
+
+    /// THE fail-closed gate. A family whose per-token state is not entirely
+    /// inside the paged pool may only resume from a boundary whose auxiliary
+    /// state is on disk AND validates; vLLM's rule is that each cache group may
+    /// only REDUCE the candidate length
+    /// (`vllm/v1/core/sched/scheduler.py`, `vllm/v1/core/kv_cache_coordinator.py`):
+    /// "No external tokens back the deeper local hit, so its resume boundary
+    /// would have no valid Mamba state. Reconcile to the boundary every group
+    /// agrees on."
+    ///
+    /// Eight full blocks are persisted once, then read back three ways:
+    ///
+    ///   1. CONTROL — `sidecar_policy: None` (dense `qwen3` today) restores all
+    ///      eight, byte-identical, under golden cold keys. This path must not
+    ///      move at all.
+    ///   2. A policy whose state is NOWHERE on disk restores ZERO blocks even
+    ///      though all eight KV blocks are present and indexed — and does so
+    ///      before a single block is blitted or published (`hits == 0`).
+    ///   3. A policy whose state backs only the 32-token boundary truncates the
+    ///      eight-block chain to exactly four blocks and hands that state back.
+    ///
+    /// Both restore entry points are exercised for 2 and 3: the uniform one and
+    /// the per-block one that `qwen3_5` / `qwen3_5_moe` / `gemma4` use
+    /// exclusively.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cold_restore_reconciles_down_to_a_sidecar_backed_boundary() {
+        use mlx_paged_attn::metal::MetalDtype;
+
+        let make_config = || PagedAttentionConfig {
+            block_size: 8,
+            gpu_memory_mb: 256,
+            head_size: 64,
+            num_kv_heads: 1,
+            num_layers: 2,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(1),
+        };
+        let pool_src = match LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16) {
+            Ok(pool) => Arc::new(pool),
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!(
+                    "skipping cold_restore_reconciles_down_to_a_sidecar_backed_boundary: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let num_layers = pool_src.num_layers();
+        let bytes_per_side = 64 * 8 * 2usize;
+        let pattern = |layer: usize, pos: usize| -> (Vec<u8>, Vec<u8>) {
+            let keys = (0..bytes_per_side)
+                .map(|i| ((i + layer * 13 + pos * 71) % 251) as u8)
+                .collect();
+            let values = (0..bytes_per_side)
+                .map(|i| ((i * 5 + layer * 29 + pos * 43) % 251) as u8)
+                .collect();
+            (keys, values)
+        };
+
+        // Eight full blocks of eight tokens.
+        let tokens: Vec<u32> = (0..64u32).map(|i| 700 + i * 3).collect();
+        let fingerprint = mlx_paged_attn::ColdCacheFingerprint::from_components([
+            b"qwen3-reconcile-down".as_slice(),
+        ]);
+        let root = std::env::temp_dir().join(format!(
+            "mlx-adapter-cold-reconcile-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // The chain the walk recomputes, in any group.
+        let chain_keys = |group: mlx_paged_attn::ColdGroup| -> Vec<mlx_paged_attn::ColdCacheKey> {
+            let mut parent = None;
+            (0..8)
+                .map(|i| {
+                    let key = mlx_paged_attn::ColdCacheKey::chain(
+                        group,
+                        fingerprint,
+                        parent,
+                        &tokens[i * 8..(i + 1) * 8],
+                        &[],
+                        0,
+                        i,
+                    );
+                    parent = Some(key);
+                    key
+                })
+                .collect()
+        };
+
+        // --- Capture side: persist all eight blocks. ---
+        let mut adapter_src =
+            PagedKVCacheAdapter::new(new_allocator(8, 8), Arc::clone(&pool_src), 8)
+                .expect("capture adapter ctor");
+        let manager_src = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                .expect("temp-dir cold cache must open"),
+        );
+        adapter_src.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager_src),
+            fingerprint,
+            sidecar_policy: None,
+        });
+        adapter_src.reset_for_new_request(0).unwrap();
+        adapter_src.allocate_suffix_blocks(64).unwrap();
+        adapter_src.record_tokens(&tokens).unwrap();
+        let source_ids: Vec<u32> = adapter_src
+            .block_table()
+            .unwrap()
+            .blocks()
+            .iter()
+            .map(|b| b.block_id)
+            .collect();
+        assert_eq!(
+            source_ids.len(),
+            8,
+            "eight full blocks of size 8 = 64 tokens"
+        );
+        for (pos, &block_id) in source_ids.iter().enumerate() {
+            for layer in 0..num_layers {
+                let (keys, values) = pattern(layer, pos);
+                pool_src
+                    .write_blocks_from_host(layer as u32, &[block_id], &keys, &values)
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            adapter_src.register_full_blocks_for_reuse(&[], 0).unwrap(),
+            8
+        );
+        assert!(
+            manager_src.drain(std::time::Duration::from_secs(10)),
+            "every captured block must be durable before the restore side opens"
+        );
+
+        let kv_keys = chain_keys(mlx_paged_attn::ColdGroup::Kv);
+        for (i, key) in kv_keys.iter().enumerate() {
+            assert!(manager_src.contains(key), "block {i} must be indexed");
+        }
+        // Golden: the KV chain derivation is frozen. A change here means every
+        // cache on disk anywhere silently stopped matching.
+        assert_eq!(
+            kv_keys[0].to_hex(),
+            "9c0f9450e1009988c9d57755602a22748e3dac5db7e699ace16d771485ef31e2",
+            "golden cold key for block 0"
+        );
+        assert_eq!(
+            kv_keys[7].to_hex(),
+            "328dd15556c4bfb1769c44531356803bfdad94bf2b0d121ce8ebf9aabc809802",
+            "golden cold key for block 7"
+        );
+        drop(adapter_src);
+        drop(manager_src);
+
+        // One simulated process restart: fresh pool, allocator, adapter and
+        // manager over the same cold root.
+        let fresh = |policy: Option<mlx_paged_attn::ColdSidecarPolicy>, per_block: bool| {
+            let pool = Arc::new(LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16).unwrap());
+            let manager = Arc::new(
+                mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                    .expect("reopen cold cache"),
+            );
+            let mut adapter = PagedKVCacheAdapter::new(new_allocator(8, 8), Arc::clone(&pool), 8)
+                .expect("restore adapter ctor");
+            adapter.set_cold_tier(ColdTierContext {
+                manager: Arc::clone(&manager),
+                fingerprint,
+                sidecar_policy: policy,
+            });
+            adapter.reset_for_new_request(0).unwrap();
+            let prefix = if per_block {
+                let per_block_keys: Vec<Vec<u64>> = vec![Vec::new(); 8];
+                adapter
+                    .find_cached_prefix_per_block(&tokens, &per_block_keys, 0, false)
+                    .unwrap()
+            } else {
+                adapter.find_cached_prefix(&tokens, &[], 0, false).unwrap()
+            };
+            (pool, manager, adapter, prefix)
+        };
+
+        // 1. CONTROL: no policy, so the walk is the pre-sidecar walk verbatim.
+        {
+            let (pool_dst, manager, mut adapter, prefix) = fresh(None, false);
+            assert_eq!(
+                prefix.cached_token_count, 64,
+                "a family with no auxiliary state must restore the whole chain"
+            );
+            assert_eq!(prefix.blocks.len(), 8);
+            for (pos, block) in prefix.blocks.iter().enumerate() {
+                for layer in 0..num_layers {
+                    let (rk, rv) = pool_dst
+                        .read_blocks_to_host(layer as u32, &[block.block_id])
+                        .unwrap();
+                    let (ek, ev) = pattern(layer, pos);
+                    assert_eq!(
+                        rk, ek,
+                        "restored keys mismatch (block {pos}, layer {layer})"
+                    );
+                    assert_eq!(
+                        rv, ev,
+                        "restored values mismatch (block {pos}, layer {layer})"
+                    );
+                }
+            }
+            let stats = manager.stats();
+            assert_eq!(stats.hits, 8);
+            // The control must not move the new counter either. A decline
+            // recorded on a walk that served every block would be non-zero on
+            // every healthy dense turn, which is how a diagnostic counter
+            // becomes noise nobody reads.
+            assert_eq!(
+                stats.restore_declines, 0,
+                "a walk that restored the whole chain declined nothing"
+            );
+            assert!(
+                adapter.take_restored_sidecar().is_none(),
+                "a family with no policy must never be handed auxiliary state"
+            );
+        }
+
+        // The policy is a geometry TEMPLATE: the boundary passed here is
+        // dropped, and each candidate boundary is stamped in during the walk.
+        let policy = mlx_paged_attn::ColdSidecarPolicy::new(reconcile_sidecar_layout(32))
+            .expect("policy geometry must validate");
+
+        // 2. A required state that is nowhere on disk restores NOTHING, through
+        //    either entry point, without touching a single KV block.
+        for per_block in [true, false] {
+            let (_pool, manager, mut adapter, prefix) = fresh(Some(policy.clone()), per_block);
+            assert_eq!(
+                prefix.cached_token_count, 0,
+                "eight KV blocks are on disk, but no boundary is backed \
+                 (per_block={per_block}): the prefix must be recomputed, not guessed"
+            );
+            assert!(prefix.blocks.is_empty());
+            assert!(adapter.take_restored_sidecar().is_none());
+            let stats = manager.stats();
+            assert_eq!(
+                stats.hits, 0,
+                "the gate must fire BEFORE any block is blitted or published \
+                 (per_block={per_block})"
+            );
+            // THE silent zero. `hits` and `misses` are both 0 here — the walk
+            // reached its verdict from index probes that are side-effect free
+            // by contract — so without `restore_declines` this refusal is
+            // reported as an empty row, identical to a turn that never
+            // consulted the tier. Asserted together, because the pair is the
+            // observation: a refusal that costs no lookup and still shows up.
+            assert_eq!(
+                stats.misses, 0,
+                "no block was looked up, so nothing may be counted as a miss \
+                 (per_block={per_block})"
+            );
+            assert_eq!(
+                stats.restore_declines, 1,
+                "a restore refused over an on-disk chain must be counted, or \
+                 `0 hits / 0 misses` reads as 'nothing ran' (per_block={per_block})"
+            );
+        }
+
+        // Persist auxiliary state for the 32-token boundary only — block index
+        // 3 of the chain, keyed in the sidecar's own group.
+        let sidecar_keys = chain_keys(mlx_paged_attn::ColdGroup::GdnState);
+        let layout = reconcile_sidecar_layout(32);
+        let tensor_count = layout.tensor_count().unwrap();
+        let state = mlx_paged_attn::ColdSidecar {
+            key: sidecar_keys[3],
+            fingerprint,
+            layout,
+            tensors: (0..tensor_count)
+                .map(|i| (0..6u8).map(|b| i as u8 * 16 + b).collect())
+                .collect(),
+        };
+        {
+            let writer = mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                .expect("reopen cold cache to write state");
+            assert!(writer.enqueue_sidecar(state.clone()).unwrap());
+            assert!(writer.drain(std::time::Duration::from_secs(10)));
+        }
+
+        // 3. Reconcile DOWN: the KV chain reaches 64 tokens, the state reaches
+        //    32, so the reused prefix is 32.
+        for per_block in [true, false] {
+            let (pool_dst, manager, mut adapter, prefix) = fresh(Some(policy.clone()), per_block);
+            assert_eq!(
+                prefix.cached_token_count, 32,
+                "the prefix must reconcile down to the deepest backed boundary \
+                 (per_block={per_block})"
+            );
+            assert_eq!(
+                prefix.blocks.len(),
+                4,
+                "the returned block list must match the reconciled boundary"
+            );
+            for (pos, block) in prefix.blocks.iter().enumerate() {
+                for layer in 0..num_layers {
+                    let (rk, rv) = pool_dst
+                        .read_blocks_to_host(layer as u32, &[block.block_id])
+                        .unwrap();
+                    let (ek, ev) = pattern(layer, pos);
+                    assert_eq!(
+                        rk, ek,
+                        "restored keys mismatch (block {pos}, layer {layer})"
+                    );
+                    assert_eq!(
+                        rv, ev,
+                        "restored values mismatch (block {pos}, layer {layer})"
+                    );
+                }
+            }
+            let restored = adapter
+                .take_restored_sidecar()
+                .expect("the state backing the reconciled boundary must be handed back");
+            assert_eq!(restored, state, "the exact persisted state, byte for byte");
+            assert_eq!(
+                restored.layout.boundary_tokens, prefix.cached_token_count,
+                "the state's boundary must equal the reused prefix exactly"
+            );
+            let stats = manager.stats();
+            assert_eq!(
+                stats.hits, 4,
+                "only the backed blocks may be blitted and published \
+                 (per_block={per_block})"
+            );
+            // The negative control the decline counter needs: reconciling DOWN
+            // to a shorter backed boundary is reuse working as designed, not a
+            // refusal. A counter that also fired here would be non-zero on
+            // every healthy hybrid turn and worth nothing.
+            assert_eq!(
+                stats.restore_declines, 0,
+                "a restore that served a reconciled prefix is not a decline \
+                 (per_block={per_block})"
+            );
+            assert!(
+                adapter.take_restored_sidecar().is_none(),
+                "taking the state must leave none behind"
+            );
+        }
+
+        // 4. A restore that comes up SHORT of the backed boundary must not keep
+        //    the part it got: corrupt block 2 so the chain stops at 16 tokens
+        //    while the only state on disk is for 32. Nothing shorter is backed,
+        //    so the whole extension is released rather than returned with state
+        //    that describes a prefix we do not have.
+        std::fs::write(
+            root.join(format!("{}.safetensors", kv_keys[2].to_hex())),
+            b"not a safetensors object",
+        )
+        .expect("corrupting a persisted block must succeed");
+        {
+            let (_pool, manager, mut adapter, prefix) = fresh(Some(policy.clone()), true);
+            assert_eq!(
+                prefix.cached_token_count, 0,
+                "a restore that cannot reach the backed boundary must reuse nothing"
+            );
+            assert!(prefix.blocks.is_empty());
+            assert!(
+                adapter.take_restored_sidecar().is_none(),
+                "state for a boundary the restore never reached must be dropped"
+            );
+            let stats = manager.stats();
+            assert_eq!(
+                stats.corruptions, 1,
+                "the malformed block must be counted, not panicked on"
+            );
+            assert_eq!(
+                stats.hits, 2,
+                "the two blocks before the corrupt one were published, then released"
+            );
+            // The most misleading shape of all, and the reason the counter is
+            // recorded in phase 4 too: this turn has `hits 2` and non-zero
+            // `bytes_restored`, so the tier looks like it reused a prefix —
+            // while `cached_token_count` is 0 and every restored block was
+            // handed straight back to the allocator.
+            assert_eq!(
+                stats.restore_declines, 1,
+                "a restore whose whole extension was released reused nothing \
+                 and must be counted as a decline"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Sidecar capture hardcodes salt 0 while the restore walk chains under the
+    /// lookup's salt. They agree only because every caller passes 0, so a
+    /// non-zero salt would move the K/V chain, leave the sidecar chain behind,
+    /// and pin every hybrid restore at zero for good. That must be an error at
+    /// the seam, not a silently dead tier — while a family with no sidecar
+    /// policy keeps salting freely, since it has no second chain to desync.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_nonzero_salt_is_refused_while_a_sidecar_policy_is_installed() {
+        let tokens: Vec<u32> = (0..32u32).map(|i| 7_100 + i).collect();
+        let root = std::env::temp_dir().join(format!(
+            "mlx-adapter-salt-guard-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let fingerprint =
+            mlx_paged_attn::ColdCacheFingerprint::from_components([b"salt-guard".as_slice()]);
+        let allocator = new_allocator(16, 8);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 8) else {
+            return;
+        };
+        let manager = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                .expect("temp-dir cold cache must open"),
+        );
+        let per_block: Vec<Vec<u64>> = vec![Vec::new(); 4];
+
+        // No policy: a salt is none of the cold tier's business.
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager),
+            fingerprint,
+            sidecar_policy: None,
+        });
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(32).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        assert!(
+            adapter
+                .register_full_blocks_for_reuse_per_block(&per_block, 42)
+                .is_ok(),
+            "a family with no auxiliary chain may salt however it likes"
+        );
+        adapter.release_request().unwrap();
+
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager),
+            fingerprint,
+            sidecar_policy: Some(
+                mlx_paged_attn::ColdSidecarPolicy::new(reconcile_sidecar_layout(32))
+                    .expect("policy geometry must validate"),
+            ),
+        });
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.allocate_suffix_blocks(32).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        let err = adapter
+            .register_full_blocks_for_reuse_per_block(&per_block, 42)
+            .expect_err("a non-zero salt desyncs the sidecar chain and must be refused");
+        assert!(
+            err.contains("cache_salt"),
+            "the error must name the offending knob, got: {err}"
+        );
+        // Salt 0 is the contract capture actually honours, so it still works.
+        assert!(
+            adapter
+                .register_full_blocks_for_reuse_per_block(&per_block, 0)
+                .is_ok(),
+            "the supported salt must remain usable after the refusal"
+        );
+        adapter.release_request().unwrap();
+        drop(adapter);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE hot-hit half of the fail-closed gate, and the prerequisite for
+    /// allowlisting any hybrid family.
+    ///
+    /// `ColdTierWalk::restore_extend` reconciles the SSD tier down to a
+    /// sidecar-backed boundary, but it only ever runs on what the in-process
+    /// prefix cache did NOT already serve — `find_longest_cache_hit*` runs
+    /// first and its result is the walk's floor. Blocks whose auxiliary state
+    /// was never persisted therefore stay servable as a pure HOT hit: an
+    /// ordinary end-of-turn `register_full_blocks_for_reuse` publishes them,
+    /// and phase 4's `free` on a reconciled-away tail only decrefs a restored
+    /// block to a surviving cache-only entry. So the boundary the reconcile
+    /// refused comes straight back through the hot path with no state attached.
+    ///
+    /// This pins both halves of the fix:
+    ///   * a hot hit for a family WITH a `ColdSidecarPolicy` is refused — for
+    ///     recording, for registering and for finalizing — until the family
+    ///     confirms it holds the out-of-pool state for exactly that prefix, and
+    ///     a confirmation for a DIFFERENT boundary is refused too;
+    ///   * the `sidecar_policy: None` control (dense `qwen3`) is untouched: it
+    ///     is never latched and the confirmation is inert at any value.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hot_prefix_hit_is_refused_until_the_family_confirms_its_auxiliary_state() {
+        let tokens: Vec<u32> = (0..32u32).map(|i| 4_000 + i).collect();
+        let root = std::env::temp_dir().join(format!(
+            "mlx-adapter-hot-hit-gate-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let fingerprint =
+            mlx_paged_attn::ColdCacheFingerprint::from_components([b"hot-hit-gate".as_slice()]);
+
+        // One shared allocator holds the hot prefix cache, so the later
+        // requests see the first request's registered blocks.
+        let allocator = new_allocator(16, 8);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 8) else {
+            return;
+        };
+
+        // Turn 1 publishes four full blocks into the HOT prefix cache with no
+        // cold tier attached, so nothing about the auxiliary half exists
+        // anywhere — exactly what a never-captured (or reconciled-away)
+        // boundary leaves behind.
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(32).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        assert_eq!(adapter.register_full_blocks_for_reuse(&[], 0).unwrap(), 4);
+        adapter.release_request().unwrap();
+
+        let manager = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                .expect("temp-dir cold cache must open"),
+        );
+        let policy = mlx_paged_attn::ColdSidecarPolicy::new(reconcile_sidecar_layout(32))
+            .expect("policy geometry must validate");
+
+        // --- CONTROL: `sidecar_policy: None`. Must not move at all. ---
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager),
+            fingerprint,
+            sidecar_policy: None,
+        });
+        adapter.reset_for_new_request(1).unwrap();
+        let control = adapter.find_cached_prefix(&tokens, &[], 0, false).unwrap();
+        assert_eq!(control.cached_token_count, 32, "the hot hit must stand");
+        assert!(
+            !adapter.aux_prefix_unbacked(),
+            "a family whose every piece of state is inside the paged pool must never be latched"
+        );
+        adapter.allocate_suffix_blocks(33).unwrap();
+        adapter
+            .record_tokens(&[9_001])
+            .expect("policy-None families build on a hot hit exactly as before");
+        // The acknowledgement is inert for them, at any value.
+        adapter.confirm_aux_prefix_primed(7).unwrap();
+        adapter.release_request().unwrap();
+
+        // --- GATED: same allocator, same hot hit, but the family's state
+        //     lives outside the pool. ---
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager),
+            fingerprint,
+            sidecar_policy: Some(policy),
+        });
+        adapter.reset_for_new_request(2).unwrap();
+        let gated = adapter.find_cached_prefix(&tokens, &[], 0, false).unwrap();
+        assert_eq!(
+            gated.cached_token_count, 32,
+            "the K/V half is genuinely cached; the gate is about the other half"
+        );
+        assert!(
+            adapter.aux_prefix_unbacked(),
+            "a hot hit with no state behind it must latch the obligation"
+        );
+        assert_eq!(
+            manager.stats().hits,
+            0,
+            "a full hot hit never reaches the SSD tier, which is precisely why \
+             the reconcile-down gate cannot see it"
+        );
+        adapter.allocate_suffix_blocks(33).unwrap();
+
+        // Every way of building on — or republishing — the prefix is refused.
+        for err in [
+            adapter.record_tokens(&[9_002]).unwrap_err(),
+            adapter.register_full_blocks_for_reuse(&[], 0).unwrap_err(),
+            adapter.finalize_turn_keep_live(&[], 0).unwrap_err(),
+        ] {
+            assert!(
+                err.contains("confirm_aux_prefix_primed"),
+                "the refusal must name the obligation, got: {err}"
+            );
+        }
+        assert_eq!(
+            adapter.current_token_count(),
+            32,
+            "a refused record_tokens must not advance the cursor"
+        );
+
+        // A confirmation for the WRONG boundary is refused and leaves the latch
+        // set — priming 16 tokens of state under a 32-token resume point is the
+        // corruption this gate exists to stop.
+        let mismatch = adapter.confirm_aux_prefix_primed(16).unwrap_err();
+        assert!(
+            mismatch.contains("16") && mismatch.contains("32"),
+            "the mismatch must report both boundaries, got: {mismatch}"
+        );
+        assert!(adapter.aux_prefix_unbacked());
+        assert!(adapter.record_tokens(&[9_003]).is_err());
+
+        // The family primes the out-of-pool half for exactly the reused prefix;
+        // the turn proceeds normally from there.
+        adapter.confirm_aux_prefix_primed(32).unwrap();
+        assert!(!adapter.aux_prefix_unbacked());
+        adapter.record_tokens(&[9_004]).unwrap();
+        adapter.finalize_turn_keep_live(&[], 0).unwrap();
+        adapter.release_request().unwrap();
+
+        // A turn that reuses NO prefix has nothing to prime, policy or not.
+        let other: Vec<u32> = (0..32u32).map(|i| 8_800 + i).collect();
+        adapter.reset_for_new_request(3).unwrap();
+        let fresh = adapter.find_cached_prefix(&other, &[], 0, false).unwrap();
+        assert_eq!(fresh.cached_token_count, 0);
+        assert!(
+            !adapter.aux_prefix_unbacked(),
+            "no reused prefix means no obligation"
+        );
+        adapter.allocate_suffix_blocks(32).unwrap();
+        adapter.record_tokens(&other).unwrap();
+        adapter.release_request().unwrap();
+
+        drop(adapter);
+        drop(manager);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The per-block entry point — the one `qwen3_5` / `qwen3_5_moe` /
+    /// `gemma4` use exclusively — must latch the same obligation, and
+    /// `release_request` / `reset_for_new_request` must clear it so a refused
+    /// turn does not poison the adapter.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn per_block_hot_prefix_hit_latches_and_the_latch_is_request_scoped() {
+        let tokens: Vec<u32> = (0..32u32).map(|i| 5_500 + i).collect();
+        let per_block: Vec<Vec<u64>> = vec![Vec::new(); 4];
+        let root = std::env::temp_dir().join(format!(
+            "mlx-adapter-hot-hit-gate-pb-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let fingerprint =
+            mlx_paged_attn::ColdCacheFingerprint::from_components([b"hot-hit-gate-pb".as_slice()]);
+
+        let Some(mut adapter) = maybe_adapter(new_allocator(16, 8), 8) else {
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(32).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        assert_eq!(
+            adapter
+                .register_full_blocks_for_reuse_per_block(&per_block, 0)
+                .unwrap(),
+            4
+        );
+        adapter.release_request().unwrap();
+
+        let manager = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                .expect("temp-dir cold cache must open"),
+        );
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager),
+            fingerprint,
+            sidecar_policy: Some(
+                mlx_paged_attn::ColdSidecarPolicy::new(reconcile_sidecar_layout(32))
+                    .expect("policy geometry must validate"),
+            ),
+        });
+
+        adapter.reset_for_new_request(1).unwrap();
+        let gated = adapter
+            .find_cached_prefix_per_block(&tokens, &per_block, 0, false)
+            .unwrap();
+        assert_eq!(gated.cached_token_count, 32);
+        assert!(
+            adapter.aux_prefix_unbacked(),
+            "the per-block lookup must latch exactly like the uniform one"
+        );
+        let err = adapter
+            .register_full_blocks_for_reuse_per_block(&per_block, 0)
+            .unwrap_err();
+        assert!(err.contains("confirm_aux_prefix_primed"), "got: {err}");
+        let err = adapter
+            .finalize_turn_keep_live_per_block(&per_block, 0)
+            .unwrap_err();
+        assert!(err.contains("confirm_aux_prefix_primed"), "got: {err}");
+
+        // Abandoning the turn drops the obligation with the request.
+        adapter.release_request().unwrap();
+        assert!(!adapter.aux_prefix_unbacked());
+        adapter.reset_for_new_request(2).unwrap();
+        assert!(!adapter.aux_prefix_unbacked());
+
+        drop(adapter);
+        drop(manager);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(target_os = "macos")]

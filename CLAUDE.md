@@ -21,25 +21,8 @@ There are already some wild used inference implementations for your reference:
 - [docs/ffi-cpp.md](docs/ffi-cpp.md) — C++ FFI bridge, compiled Qwen3.5 forward paths, Metal shaders
 - [docs/perf.md](docs/perf.md) — Profiling, env-var inventory, GPU arch detection, quantization
 - [docs/cli.md](docs/cli.md) — `mlx download`, `mlx convert`, `mlx launch claude`
-
-## Top-level structure
-
-```
-crates/                           Rust workspace (5 crates)
-├── mlx-sys/                      C++ FFI bridge → MLX
-├── mlx-core/                     All NAPI exports
-├── mlx-paged-attn/               Paged attention + Metal kernels
-├── mlx-db/                       SQLite training persistence
-└── mlx-tui/                      mlx-train Ratatui binary
-
-packages/                         npm workspaces (@mlx-node/*)
-├── core/                         Native addon + .d.cts
-├── lm/                           Inference, ChatSession, streaming
-├── trl/                          GRPO / SFT trainers
-├── vlm/                          Vision + document pipelines
-├── server/                       /v1/responses, /v1/messages, SessionRegistry
-└── cli/                          mlx binary
-```
+- [docs/convert-quantize.md](docs/convert-quantize.md) — Convert/quantize internals: on-disk formats, recipe decision engine, GGUF import, provenance, gotchas
+- [docs/dashboard.md](docs/dashboard.md) — `mlx dashboard`: local web UI for models/sessions/metrics/cache, `persistPagedCache`, data sources
 
 ## Build, test, lint
 
@@ -69,48 +52,6 @@ oxnode <file.ts>                                 # run a TS file (NOT tsx)
 
 `yarn build:native` is the canonical native build — running `cargo build` directly does **not** produce the `.node` addon.
 
-## Imports
-
-```typescript
-// Inference + chat sessions
-import {
-  Qwen3Model,
-  Qwen35Model,
-  Qwen35MoeModel,
-  Gemma4Model,
-  Lfm2Model,
-  loadModel,
-  loadSession,
-  ChatSession,
-  QWEN3_CONFIGS,
-  QWEN35_CONFIGS,
-  LFM2_CONFIGS,
-  enableProfiling,
-  disableProfiling,
-} from '@mlx-node/lm';
-
-// Training
-import { GRPOTrainer, GRPOTrainerConfig, SFTTrainer, SFTTrainerConfig } from '@mlx-node/trl';
-
-// Vision + document processing
-import {
-  VLModel,
-  QianfanOCRModel,
-  StructureV3Pipeline,
-  DocLayoutModel,
-  TextDetModel,
-  TextRecModel,
-  DocOrientationModel,
-  DocUnwarpModel,
-} from '@mlx-node/vlm';
-
-// Streaming chat via ChatSession
-const session = await loadSession('./model-path');
-for await (const event of session.sendStream('Hello!')) {
-  if (!event.done) process.stdout.write(event.text);
-}
-```
-
 ## Known limitations
 
 - Primary platform: macOS / Apple Silicon (Metal) — full inference + training + VLM
@@ -125,58 +66,7 @@ This project is using Vite+, a unified toolchain built on top of Vite, Rolldown,
 
 ## Vite+ Workflow
 
-`vp` is a global binary that handles the full development lifecycle. Run `vp help` to print a list of commands and `vp <command> --help` for information about a specific command.
-
-### Start
-
-- create - Create a new project from a template
-- migrate - Migrate an existing project to Vite+
-- config - Configure hooks and agent integration
-- staged - Run linters on staged files
-- install (`i`) - Install dependencies
-- env - Manage Node.js versions
-
-### Develop
-
-- dev - Run the development server
-- check - Run format, lint, and TypeScript type checks
-- lint - Lint code
-- fmt - Format code
-- test - Run tests
-
-### Execute
-
-- run - Run monorepo tasks
-- exec - Execute a command from local `node_modules/.bin`
-- dlx - Execute a package binary without installing it as a dependency
-- cache - Manage the task cache
-
-### Build
-
-- build - Build for production
-- pack - Build libraries
-- preview - Preview production build
-
-### Manage Dependencies
-
-Vite+ automatically detects and wraps the underlying package manager such as pnpm, npm, or Yarn through the `packageManager` field in `package.json` or package manager-specific lockfiles.
-
-- add - Add packages to dependencies
-- remove (`rm`, `un`, `uninstall`) - Remove packages from dependencies
-- update (`up`) - Update packages to latest versions
-- dedupe - Deduplicate dependencies
-- outdated - Check for outdated packages
-- list (`ls`) - List installed packages
-- why (`explain`) - Show why a package is installed
-- info (`view`, `show`) - View package information from the registry
-- link (`ln`) / unlink - Manage local package links
-- pm - Forward a command to the package manager
-
-### Maintain
-
-- upgrade - Update `vp` itself to the latest version
-
-These commands map to their corresponding tools. For example, `vp dev --port 3000` runs Vite's dev server and works the same as Vite. `vp test` runs JavaScript tests through the bundled Vitest. The version of all tools can be checked using `vp --version`. This is useful when researching documentation, features, and bugs.
+`vp` is a global binary that handles the full development lifecycle. Run `vp help` for the command list and `vp <command> --help` for a specific command. It wraps the underlying package manager (pnpm/npm/Yarn, detected from `packageManager` / lockfiles), so `vp add`/`remove`/`update`/`install` replace direct package-manager use, and `vp dev`/`build`/`test`/`lint`/`fmt`/`check` map to Vite/Vitest/Oxlint/Oxfmt.
 
 ## Common Pitfalls
 

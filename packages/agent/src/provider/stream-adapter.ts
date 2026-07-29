@@ -47,7 +47,7 @@ import type {
   SimpleStreamOptions,
 } from '@earendil-works/pi-ai';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
-import type { PerformanceMetrics } from '@mlx-node/lm';
+import type { ChatSession, ChatStreamFinal, PerformanceMetrics } from '@mlx-node/lm';
 
 import type { DiscoveredModelLike, StreamableSession } from '../types.js';
 import { buildChatConfig, resolveReasoningMode, type ResolvedReasoningMode } from './chat-config.js';
@@ -64,8 +64,12 @@ import { resetPreservingNativeCacheForWarmReuse } from './warm-reuse.js';
 export interface StreamSimpleHost {
   /** Discovery record for `modelId` (source of the `ModelType` → launch preset). */
   modelInfo(modelId: string): DiscoveredModelLike | undefined;
-  /** Atomic resident selection + serialized inference closure (see `MlxModelHost`). */
-  runWithResident<T>(modelId: string, fn: (session: StreamableSession) => Promise<T>): Promise<T>;
+  /**
+   * Atomic resident selection + serialized inference closure (see `MlxModelHost`).
+   * `fn` receives a `resident` boolean: `true` when the model was already warm
+   * (reused), `false` when this turn had to load/swap it.
+   */
+  runWithResident<T>(modelId: string, fn: (session: ChatSession, resident: boolean) => Promise<T>): Promise<T>;
   /** Flag the resident as post-error so the next turn does a full reset (see `MlxModelHost`). */
   markResidentDirty(modelId: string): void;
   /** Read-and-clear the resident's post-error flag; `true` ⇒ full-reset this turn. */
@@ -76,6 +80,36 @@ export interface StreamSimpleHost {
 
 export type PerformanceRecorder = (message: AssistantMessage, performance: PerformanceMetrics) => void;
 export type RootCacheOwnerResolver = () => string | undefined;
+/** Resolves the root session's JSONL path for the metrics-trace root correlation. */
+export type RootSessionFileResolver = () => string | undefined;
+
+/**
+ * Durable per-turn telemetry hook. Fires exactly once, only on a SUCCESSFUL
+ * native final (never on abort / error / load failure), from the one seam
+ * that sees the raw `ChatStreamFinal` alongside the per-request
+ * `options.sessionId` and the turn's minted `traceId`. Best-effort: the
+ * adapter guards the call so a throwing recorder can never break inference.
+ */
+export type TurnRecorder = (rec: {
+  traceId: string;
+  sessionId?: string;
+  /** Root session id/file snapshotted when this turn was submitted (see below). */
+  rootSessionId?: string;
+  rootSessionFile?: string;
+  model: string;
+  final: ChatStreamFinal;
+  /** Whole-turn wall-clock (ms): queue wait + resident selection + prefill + decode. */
+  durationMs: number;
+  /**
+   * Queue + cold-load wait (ms) BEFORE native work began this turn: the gap
+   * between turn submission and the serialized `runWithResident` callback
+   * firing (behind earlier inference and/or a model load/swap). Subtract from
+   * `durationMs` to recover execution-only time.
+   */
+  queueMs: number;
+  /** `true` when the model was already warm/resident, `false` on a cold load/swap this turn. */
+  resident: boolean;
+}) => void;
 
 /** Property read that must not throw (poisoned getters on a hostile `Model`). */
 function safeString(read: () => string, fallback: string): string {
@@ -164,6 +198,9 @@ export function makeMlxStreamSimple(
   host: StreamSimpleHost,
   onPerformance?: PerformanceRecorder,
   resolveRootCacheOwner?: RootCacheOwnerResolver,
+  onTurnRecord?: TurnRecorder,
+  onTurnStart?: () => void,
+  resolveRootSessionFile?: RootSessionFileResolver,
 ): (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream {
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
@@ -178,6 +215,7 @@ export function makeMlxStreamSimple(
     let emitter: TurnEmitter | undefined;
     let signal: AbortSignal | undefined;
     let rootCacheOwnerId: string | undefined;
+    let rootSessionFile: string | undefined;
     let resolvedReasoning: ResolvedReasoningMode;
     let detachAbort: (() => void) | undefined;
 
@@ -247,8 +285,11 @@ export function makeMlxStreamSimple(
       signal = options?.signal;
       // Snapshot the top-level owner before this request can queue behind
       // another inference. A later /new or /resume must not relabel an older
-      // request that was already submitted under the previous root.
+      // request that was already submitted under the previous root. The metrics
+      // root id reuses this same session_start value; only the JSONL path is a
+      // separate snapshot, taken here so it can never drift from the id.
       rootCacheOwnerId = resolveRootCacheOwner?.();
+      rootSessionFile = resolveRootSessionFile?.();
       // Snapshot once: the native config and the replay provenance must describe
       // the same resolved template mode. Presence alone is wrong for Pi's
       // minimal/low levels, both of which resolve to disabled thinking.
@@ -278,11 +319,34 @@ export function makeMlxStreamSimple(
 
     void (async () => {
       let sawNativeFinal = false;
-      await host.runWithResident(model.id, async (session) => {
+      // Bracket the whole serialized turn (queue wait + resident selection +
+      // prefill + decode) so a MetricsTrace record can report wall-clock
+      // duration. Read at the terminal only on the success path below.
+      const turnStartedAt = Date.now();
+      await host.runWithResident(model.id, async (session, resident) => {
+        // Callback entry: the queue wait + any cold model load/swap have now
+        // resolved, but no native work (prime/prefill/decode) has started. This
+        // is the seam that separates queue+load latency from execution time —
+        // `durationMs` (read at the terminal) still brackets the whole turn.
+        const execStartedAt = Date.now();
+        const queueMs = Math.max(0, execStartedAt - turnStartedAt);
         // Terminated while queued behind earlier inference/loading (or
         // between stages below): the terminal already went out — skip ALL
         // session work (no warm-reset, no prime, no stream).
         if (terminated) return;
+        // Serialized-turn start: fire before any native work so a metrics
+        // consumer can snapshot process-wide cold-tier counters here and diff
+        // them at the success terminal. Because turns are serialized, a prior
+        // turn that aborted/errored has already fully drained by now, so its
+        // activity is baked into this snapshot and never attributed to this
+        // turn's delta. Best-effort — a throwing hook must not break inference.
+        if (onTurnStart) {
+          try {
+            onTurnStart();
+          } catch {
+            // Telemetry snapshot is best-effort; never break inference.
+          }
+        }
         publishEffectiveContextWindow(model, session);
         const supportsImages = publishImageCapability(model, session);
         const discovered = host.modelInfo(model.id);
@@ -358,6 +422,32 @@ export function makeMlxStreamSimple(
                   detachAbort = undefined;
                   try {
                     turn.onFinal(event);
+                    // Durable per-turn telemetry: only a successful final gets
+                    // here. Guarded independently of onFinal so a throwing
+                    // recorder cannot derail the (already-emitted) terminal.
+                    if (onTurnRecord) {
+                      try {
+                        onTurnRecord({
+                          traceId: turn.traceId,
+                          sessionId: options?.sessionId,
+                          // Root correlation is the SUBMIT-time snapshot, not the
+                          // live root, so a /new or /resume that landed while this
+                          // turn ran can't reattribute it (id == cacheOwner root).
+                          rootSessionId: rootCacheOwnerId,
+                          rootSessionFile,
+                          model: model.id,
+                          final: event,
+                          durationMs: Math.max(0, Date.now() - turnStartedAt),
+                          // Queue+load wait captured at callback entry, and the
+                          // warm/cold distinction from `runWithResident` — so the
+                          // record can attribute wait vs execution latency.
+                          queueMs,
+                          resident,
+                        });
+                      } catch {
+                        // Telemetry is best-effort; never break inference.
+                      }
+                    }
                   } catch (err) {
                     pushFailsafeTerminal('error', coerceErrorMessage(err));
                   }

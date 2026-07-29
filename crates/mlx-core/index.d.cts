@@ -2573,6 +2573,164 @@ export interface CleanupStats {
 }
 
 /**
+ * Flush every accepted cold-tier block to disk, blocking until the
+ * background writer has fsync+renamed each write enqueued before this call,
+ * or `timeout_ms` elapses. Returns `true` when the drain completed — or when
+ * the tier was never opened (nothing to flush) — and `false` on timeout.
+ *
+ * Called from the agent's one-shot (`mlx agent -p`) shutdown so a prompt's
+ * just-persisted prefix blocks reach the drive before the process exits,
+ * rather than being abandoned in the write queue.
+ *
+ * The payload flush is `fsync(2)`, not `F_FULLFSYNC`: a drained block
+ * survives process death and kernel panic, but a sudden power loss can leave
+ * it torn. Torn objects fail the payload checksum on the next read and are
+ * pruned as a miss, so the cost is a recomputed prefix, never wrong state.
+ */
+export declare function coldCacheDrain(timeoutMs: number): boolean;
+
+/**
+ * Return a snapshot of the process-wide cold tier. Read-only: never opens
+ * the tier itself, so it reports `enabled: false` until inference first
+ * initializes the tier.
+ */
+export declare function coldCacheStats(): ColdCacheStats;
+
+/**
+ * The native cold-restore allowlist, exposed so a test can assert it agrees
+ * exactly with the TypeScript `COLD_TIER_RESTORE_FAMILIES` set.
+ */
+export declare function coldRestoreFamilies(): Array<string>;
+
+/**
+ * Return the process-wide sidecar counters. Unlike [`cold_cache_stats`] this
+ * never consults the tier at all, so it is valid before any inference has run
+ * and reports honestly even when the tier failed to open.
+ *
+ * The plain-Rust [`cold_sidecar_telemetry`] stays as it is: the parity harness
+ * and the in-crate tests destructure `ColdSidecarTelemetry`, and a napi
+ * `#[napi(object)]` return type cannot serve both.
+ */
+export declare function coldSidecarStats(): ColdSidecarStats;
+
+/**
+ * Snapshot of the process-wide SSD cold tier for paged prefix blocks.
+ * Counters are cumulative since the tier was opened; all numeric values
+ * are returned as `f64` to avoid BigInt round-trips in JS.
+ */
+export interface ColdCacheStats {
+  /**
+   * `false` until the tier is first opened by inference, or when opening
+   * failed (fail-open: inference then runs without persistence).
+   */
+  enabled: boolean;
+  /** Cache root directory (empty while disabled). */
+  root: string;
+  /** Disk quota in bytes. */
+  quotaBytes: number;
+  /** Blocks restored from disk after validation. */
+  hits: number;
+  /** Lookups that found no usable block (includes corrupt entries). */
+  misses: number;
+  /**
+   * Objects accepted onto the background write queue — K/V blocks and
+   * family state sidecars alike, since both take a slot in the same queue.
+   * `coldSidecarEnqueued` counts a subset of this; never sum them.
+   */
+  enqueued: number;
+  /**
+   * Writes REFUSED at admission because the bounded queue was full. Same
+   * object scope as `enqueued`. Disjoint from `writeErrors`, which counts
+   * accepted writes that then failed to land — never sum the two into one
+   * "lost writes" number.
+   */
+  queueDrops: number;
+  /**
+   * Bytes that LANDED, credited after the payload sync, the commit rename
+   * and the directory fsync all succeeded. Not an enqueue-time estimate:
+   * a failed write credits nothing here and one `writeErrors` instead.
+   */
+  bytesWritten: number;
+  /** Total bytes read back on validated hits. */
+  bytesRestored: number;
+  /** Entries evicted to respect the quota / free-space reserve. */
+  evictions: number;
+  /** Entries that failed checksum/identity validation and were removed. */
+  corruptions: number;
+  /**
+   * Writes the queue accepted that never reached disk — a read-only, full
+   * or unmounted cache root, a failed rename, a failed fsync. The writer is
+   * fail-open and reports the error to nobody, so without this a cache that
+   * stores nothing at all still looks perfectly healthy.
+   */
+  writeErrors: number;
+  /**
+   * Restores refused before any block was looked up. Neither a hit nor a
+   * miss — so a refused restore reads as `0/0`, exactly like a turn that
+   * never consulted the tier.
+   */
+  restoreDeclines: number;
+}
+
+/**
+ * Snapshot of [`ColdSidecarTelemetry`] for JS. Counters are cumulative since
+ * process start; all values are `f64` to avoid BigInt round-trips.
+ *
+ * Separate from [`ColdCacheStatsJs`] because this one isolates SIDECARS — the
+ * recurrent and sliding-window state that lives outside the pool — while that
+ * one is scoped to the write queue as a whole. Both structs carry an
+ * `enqueued` and a `queue_drops`, and they are NOT disjoint: a sidecar
+ * admission bumps both, so these are a subset of those and summing them
+ * double-counts. The JS side keeps them apart by prefix (`coldEnqueued` vs
+ * `coldSidecarEnqueued`); read the sidecar pair when you need "did the family
+ * state persist?", the block pair when you need "is the writer keeping up?".
+ */
+export interface ColdSidecarStats {
+  /**
+   * Turns that reached a family's sidecar capture at all. Every other
+   * counter here is a sub-count of this one, so `captureReached == 0`
+   * separates "the finalize path never calls the capture" from "the capture
+   * ran and declined".
+   */
+  captureReached: number;
+  /**
+   * Turns whose persisted K/V chain covered no whole block, so there was no
+   * prefix to anchor recurrent state under.
+   */
+  chainEmpty: number;
+  /**
+   * Turns whose chain covered blocks but where no retained checkpoint sat at
+   * or below its reach.
+   */
+  boundarySkips: number;
+  /**
+   * Turns that selected a boundary already on disk — nothing written, and
+   * nothing needed to be. The steady state of a repeated prompt, and the
+   * only thing that tells a healthy run from a collapsed ladder.
+   */
+  alreadyPersisted: number;
+  /** Sidecars handed to the bounded writer queue. */
+  enqueued: number;
+  /** Sidecars the bounded writer queue refused because it was full. */
+  queueDrops: number;
+  /**
+   * Restored sidecars a family actually INSTALLED as its live per-turn
+   * state. The one read-side counter, and the only signal that separates
+   * "restored and used" from "restored and silently re-derived by a full
+   * O(prefix) replay" — every other counter, and text parity itself, is
+   * satisfied by the replay.
+   */
+  installed: number;
+  /**
+   * Restores a family THREW AWAY after the walk served them, restarting the
+   * turn cold. Unlike `ColdCacheStats.restoreDeclines` this one comes AFTER
+   * real `coldHits` and `coldBytesRestored`, so the turn looks like it
+   * reused a prefix right up to the point where it recomputed all of it.
+   */
+  restoreSuppressed: number;
+}
+
+/**
  * Structured completion information aligned with ChatResult.
  * Contains pre-parsed tool calls, thinking, and clean text.
  */
@@ -2874,6 +3032,26 @@ export interface FunctionParameters {
 }
 
 /**
+ * How many GDN prefix checkpoints the native store holds across all owners
+ * ([`GDN_PREFIX_CHECKPOINT_LIMIT`]), exposed for the same reason
+ * [`cold_restore_families`] is: it is one half of a cross-language invariant
+ * and nothing else carries it over the boundary.
+ *
+ * The other half is `MAX_CONCURRENCY` in
+ * `packages/agent/src/extensions/subagent.ts`. The store's demand is
+ * `MAX_CONCURRENCY + 1` — one owner per concurrent child loop plus the root
+ * session — and the cliff sits exactly one owner past the cap, where every
+ * owner holds a single entry and the store is still over it, so each publish
+ * takes somebody's last checkpoint. `retention_sim` measures that as 0 blind
+ * turns at five owners and 28 of 40 at six.
+ *
+ * No Rust gate can see a TypeScript-only edit, so raising the fleet alone
+ * would land in that regime with every Rust gate still green.
+ * `packages/agent/__test__/gdn-checkpoint-capacity.test.ts` is what stops it.
+ */
+export declare function gdnPrefixCheckpointLimit(): number;
+
+/**
  * Gemma 4 model configuration (dense variant).
  *
  * Supports E2B (2.3B), E4B (4.5B), and 31B dense models.
@@ -3006,6 +3184,15 @@ export interface Gemma4Config {
    * real Gemma-4-E2B weights.
    */
   useBlockPagedCache?: boolean | undefined;
+  /**
+   * Persist full paged KV blocks — and gemma4's out-of-pool sliding-window
+   * state, as a cold-tier sidecar — to the SSD cold tier so warm prefixes
+   * survive process restarts. Off unless explicitly enabled.
+   *
+   * An EXPLICIT value here is authoritative and beats the ambient
+   * `MLX_PERSIST_PAGED_CACHE` default (`cold_tier::resolve_persist_cold`).
+   */
+  persistPagedCache?: boolean | undefined;
 }
 
 /** Optional load-time settings for [`Gemma4Model::load`]. */
@@ -4049,6 +4236,13 @@ export interface Qwen35Config {
    */
   useBlockPagedCache?: boolean | undefined;
   /**
+   * Persist the out-of-pool GDN recurrent state (and the paged KV blocks it
+   * gates) to the SSD cold tier so warm prefixes survive process restarts.
+   * Off unless explicitly enabled. See `crate::models::qwen3_5::gdn_sidecar`
+   * and `crate::cold_tier::resolve_persist_cold`.
+   */
+  persistPagedCache?: boolean | undefined;
+  /**
    * Number of MTP (Multi-Token Prediction) head layers shipped with the
    * checkpoint. Populated from `mtp_num_hidden_layers` /
    * `num_nextn_predict_layers` in `config.json`. `0` means the
@@ -4144,6 +4338,14 @@ export interface Qwen35MoeConfig {
    */
   useBlockPagedCache?: boolean | undefined;
   /**
+   * Persist the out-of-pool GDN recurrent state (and the paged KV blocks it
+   * gates) to the SSD cold tier so warm prefixes survive process restarts.
+   * Off unless explicitly enabled. Shares the dense qwen3_5 GDN sidecar codec
+   * (`crate::models::qwen3_5::gdn_sidecar`) via `to_dense_config`; the
+   * precedence rules live in `crate::cold_tier::resolve_persist_cold`.
+   */
+  persistPagedCache?: boolean | undefined;
+  /**
    * Number of MTP (Multi-Token Prediction) head layers shipped with
    * the checkpoint. Populated from `mtp_num_hidden_layers` /
    * `num_nextn_predict_layers` in `config.json`. `0` means the
@@ -4210,6 +4412,11 @@ export interface Qwen3Config {
    * Default: true.
    */
   useBlockPagedCache?: boolean | undefined;
+  /**
+   * Persist full paged KV blocks to the SSD cold tier so warm prefixes
+   * survive process restarts. Off unless explicitly enabled.
+   */
+  persistPagedCache?: boolean | undefined;
 }
 
 /** Qwen3 language model configuration */

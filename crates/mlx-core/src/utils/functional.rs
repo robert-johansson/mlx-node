@@ -1820,6 +1820,7 @@ mod forward_pass_equivalence_tests {
             // codepath (Metal pool + per-layer dispatch), so we MUST stay
             // on the flat path to keep the assertion meaningful.
             use_block_paged_cache: Some(false),
+            persist_paged_cache: None,
         }
     }
 
@@ -1991,6 +1992,18 @@ mod chunked_lm_head_tests {
     use super::*;
     use crate::nn::efficient_selective_log_softmax;
 
+    /// Pin MLX's global RNG so the random hidden states / weights / targets
+    /// each test draws below are the same on every run.
+    ///
+    /// MLX seeds its default PRNG key once from wall-clock milliseconds and
+    /// never resets it, so an unseeded test draws different inputs in every
+    /// process. These are chunked-vs-full parity comparisons at a fixed
+    /// `atol + rtol * |y|` bound, so leaving the draw free makes whether the
+    /// bound is met a property of the process rather than of the code.
+    fn pin_mlx_rng() {
+        unsafe { mlx_sys::mlx_seed(0xF0E9_3D02u64) };
+    }
+
     /// Helper to check if two arrays are close within tolerance
     fn arrays_close(a: &[f32], b: &[f32], atol: f32, rtol: f32) -> bool {
         if a.len() != b.len() {
@@ -2025,6 +2038,7 @@ mod chunked_lm_head_tests {
 
     #[test]
     fn test_chunked_matches_full_small() {
+        pin_mlx_rng();
         // Small test case for debugging
         let batch = 4;
         let seq = 8;
@@ -2064,6 +2078,7 @@ mod chunked_lm_head_tests {
 
     #[test]
     fn test_chunked_matches_full_various_chunk_sizes() {
+        pin_mlx_rng();
         let batch = 8;
         let seq = 4;
         let hidden = 16;
@@ -2108,6 +2123,7 @@ mod chunked_lm_head_tests {
 
     #[test]
     fn test_chunked_with_non_tied_embeddings() {
+        pin_mlx_rng();
         let batch = 6;
         let seq = 4;
         let hidden = 16;
@@ -2145,6 +2161,7 @@ mod chunked_lm_head_tests {
 
     #[test]
     fn test_chunked_batch_smaller_than_chunk_size() {
+        pin_mlx_rng();
         // When batch_size <= chunk_size, should skip chunking
         let batch = 2;
         let seq = 4;
@@ -2176,6 +2193,7 @@ mod chunked_lm_head_tests {
 
     #[test]
     fn test_chunked_output_shape() {
+        pin_mlx_rng();
         let batch = 8;
         let seq = 16;
         let hidden = 32;
@@ -2197,6 +2215,7 @@ mod chunked_lm_head_tests {
 
     #[test]
     fn test_chunked_numerical_stability() {
+        pin_mlx_rng();
         // Test with extreme values to ensure numerical stability
         let batch = 4;
         let seq = 4;
@@ -2227,6 +2246,19 @@ mod chunked_lm_head_tests {
 mod chunked_forward_tests {
     use super::*;
     use crate::models::qwen3::{Qwen3Config, Qwen3Inner};
+
+    /// Construct the tiny test model with a pinned MLX RNG seed, so the
+    /// chunked-vs-full comparisons below run on the same weights every time.
+    ///
+    /// Same reason as `forward_pass_equivalence_tests::seeded_inner`:
+    /// `Qwen3Inner::new` draws from MLX's global RNG, whose key is seeded once
+    /// from wall-clock milliseconds and never reset, so an unseeded run builds
+    /// different weights in every process and the margin left by the
+    /// `atol + rtol * |y|` bound drifts with the draw.
+    fn seeded_inner(config: Qwen3Config) -> Qwen3Inner {
+        unsafe { mlx_sys::mlx_seed(0xF0E9_3D01u64) };
+        Qwen3Inner::new(config).unwrap()
+    }
 
     /// Helper to check if two arrays are close within tolerance
     fn arrays_close(a: &[f32], b: &[f32], atol: f32, rtol: f32) -> bool {
@@ -2266,6 +2298,7 @@ mod chunked_forward_tests {
             // equality against the full flat forward. The block-paged
             // adapter is a different codepath, so stay on the flat path.
             use_block_paged_cache: Some(false),
+            persist_paged_cache: None,
         }
     }
 
@@ -2273,7 +2306,7 @@ mod chunked_forward_tests {
     fn test_chunked_forward_matches_full() {
         // Chunked forward should produce identical results to full forward
         let config = tiny_config();
-        let inner = Qwen3Inner::new(config.clone()).unwrap();
+        let inner = seeded_inner(config.clone());
         let params = inner.get_parameters_sync().unwrap();
 
         // Create input with batch_size > chunk_size to trigger chunking
@@ -2319,7 +2352,7 @@ mod chunked_forward_tests {
     #[test]
     fn test_chunked_forward_various_chunk_sizes() {
         let config = tiny_config();
-        let inner = Qwen3Inner::new(config.clone()).unwrap();
+        let inner = seeded_inner(config.clone());
         let params = inner.get_parameters_sync().unwrap();
 
         let batch = 12;
@@ -2357,7 +2390,7 @@ mod chunked_forward_tests {
     fn test_chunked_forward_small_batch_skips_chunking() {
         // When batch_size <= chunk_size, should skip chunking (identical path)
         let config = tiny_config();
-        let inner = Qwen3Inner::new(config.clone()).unwrap();
+        let inner = seeded_inner(config.clone());
         let params = inner.get_parameters_sync().unwrap();
 
         let batch = 2;
@@ -2386,7 +2419,7 @@ mod chunked_forward_tests {
     #[test]
     fn test_chunked_forward_output_shape() {
         let config = tiny_config();
-        let inner = Qwen3Inner::new(config.clone()).unwrap();
+        let inner = seeded_inner(config.clone());
         let params = inner.get_parameters_sync().unwrap();
 
         let batch = 8;
@@ -2413,7 +2446,7 @@ mod chunked_forward_tests {
         let mut config = tiny_config();
         config.tie_word_embeddings = true;
 
-        let inner = Qwen3Inner::new(config.clone()).unwrap();
+        let inner = seeded_inner(config.clone());
         let params = inner.get_parameters_sync().unwrap();
 
         let batch = 6;

@@ -14,6 +14,11 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::MxArray;
+// The cold-tier load guard (shard-identity bracket + persistence precedence)
+// is shared with every other family that attaches a `ColdTierContext`.
+#[cfg(test)]
+use crate::cold_tier::parse_bool_env;
+use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
 use crate::engine::persistence::prewarm_checkpoint_pages;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::load_safetensors_lazy;
@@ -424,6 +429,9 @@ fn parse_config(raw_config: &Value) -> Result<Qwen3Config> {
         use_block_paged_cache: raw_config["use_block_paged_cache"]
             .as_bool()
             .or_else(|| raw_config["useBlockPagedCache"].as_bool()),
+        persist_paged_cache: raw_config["persist_paged_cache"]
+            .as_bool()
+            .or_else(|| raw_config["persistPagedCache"].as_bool()),
     })
 }
 
@@ -533,8 +541,45 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                         config.num_kv_heads,
                     );
 
-                    // Load weights
+                    // Snapshot each shard's on-disk identity BEFORE the mmap.
+                    // The mmap below (`load_safetensors_mapped`) maps+closes
+                    // internally, so Rust never holds the fd; this snapshot pins
+                    // the file the mmap is ABOUT to map, closing the window in
+                    // which a swap straddling the mmap syscall would leave OLD
+                    // bytes mapped under a NEW inode. Paired with the
+                    // after-fingerprint snapshot below it brackets the ENTIRE
+                    // load-to-fingerprint span. Only needed when persistence is
+                    // on. Precedence: explicit per-model config decision >
+                    // MLX_PERSIST_PAGED_CACHE env default > off (Phase-A library
+                    // contract; an explicit CLI `--no-persist-cache` writes the
+                    // config `false` and must beat an ambient env override).
+                    let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
+                    let persist_cold = resolve_persist_cold(
+                        "qwen3",
+                        persist_env.as_deref(),
+                        config.persist_paged_cache,
+                    );
+                    let shard_snapshot_before_mmap = if persist_cold {
+                        snapshot_shard_identities(path)
+                    } else {
+                        None
+                    };
+
+                    // Load weights (mmap)
                     let mapped_params = load_safetensors_mapped(path)?;
+
+                    // Second snapshot, against the same inodes the mmap pinned.
+                    // Re-checked (with the before-mmap snapshot and a third
+                    // snapshot taken after the fingerprint read) just before
+                    // enabling the cold tier so a mid-load model-directory swap
+                    // (a separate process reinstalling a different same-shaped
+                    // revision) can never bind the OLD weights to the NEW
+                    // revision's fingerprint.
+                    let shard_snapshot_at_mmap = if persist_cold {
+                        snapshot_shard_identities(path)
+                    } else {
+                        None
+                    };
 
                     // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU
                     // eval of any mmap-backed weight (the per-layer `set_weight`
@@ -654,9 +699,48 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                     }
 
                     // Materialize all mmap-backed weight arrays
-                    {
+                    let weights_resident = {
                         let arrays: Vec<&MxArray> = mapped_params.values().collect();
-                        crate::array::memory::materialize_weights(&arrays)?;
+                        crate::array::memory::materialize_weights(&arrays)?
+                    };
+
+                    if persist_cold {
+                        // Fail-closed revalidation bracketing the WHOLE
+                        // load-to-materialize-to-fingerprint span. Compute the
+                        // content fingerprint FIRST (this reads the shards from
+                        // disk), then re-stat and require shard identity to be
+                        // unchanged across [before-mmap .. at-mmap .. after the
+                        // fingerprint read]. Only then attach the cold tier: any
+                        // change at any checkpoint — or an unreadable shard —
+                        // means the fingerprint could describe a different
+                        // revision than the weights the mmap actually loaded, so
+                        // leave persistence off.
+                        //
+                        // Both steps sit BELOW `materialize_weights` and take its
+                        // `WeightsResident` witness. MLX preads shard bytes
+                        // lazily through a held fd, so an identity read above
+                        // that pass would leave a window in which a same-inode
+                        // in-place rewrite binds persisted KV to bytes this
+                        // process never ran — and nothing re-derives the identity
+                        // at read time.
+                        if let Some(ctx) =
+                            inner.build_cold_tier_context(&model_path, &weights_resident)
+                        {
+                            let after_fingerprint = snapshot_shard_identities(path);
+                            if shard_identities_stable(
+                                &shard_snapshot_before_mmap,
+                                &shard_snapshot_at_mmap,
+                                &after_fingerprint,
+                            ) {
+                                inner.attach_cold_tier(ctx, &weights_resident);
+                            } else {
+                                tracing::warn!(
+                                    "cold-tier persistence disabled for {model_path}: model \
+                                     directory changed during load (shard identity mismatch); \
+                                     KV persistence stays off for safety"
+                                );
+                            }
+                        }
                     }
 
                     // Deterministic weight-byte total for the cache-limit
@@ -813,5 +897,253 @@ mod tests {
 
         let empty_block = json!({ "model_type": "qwen3", "quantization": {} });
         assert!(reject_quantized_checkpoint(&empty_block, "/tmp/model").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod cold_tier_shard_identity_tests {
+    use super::*;
+
+    fn unique_tmp(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "mlx-qwen3-shard-id-{}-{tag}-{n}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn missing_dir_fails_safe_to_none() {
+        let dir =
+            std::env::temp_dir().join(format!("mlx-qwen3-shard-id-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            snapshot_shard_identities(&dir).is_none(),
+            "an unreadable directory must fail safe (None → cold tier stays off)"
+        );
+    }
+
+    #[test]
+    fn stable_when_unchanged() {
+        let dir = unique_tmp("stable");
+        fs::write(dir.join("model.safetensors"), b"weights-v1").unwrap();
+        let a = snapshot_shard_identities(&dir).expect("snapshot A");
+        let b = snapshot_shard_identities(&dir).expect("snapshot B");
+        assert!(a.contains_key("model.safetensors"));
+        assert!(a == b, "two snapshots of an unchanged shard must be equal");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_reinstall_swap() {
+        let dir = unique_tmp("reinstall");
+        let shard = dir.join("model.safetensors");
+        fs::write(&shard, b"weights-v1").unwrap();
+        let before = snapshot_shard_identities(&dir).expect("before");
+
+        // Simulate a reinstall: remove + recreate with different content, so
+        // both the inode (unix) and the byte length change even if the OS
+        // reuses the inode.
+        fs::remove_file(&shard).unwrap();
+        fs::write(&shard, b"weights-v2-different-length").unwrap();
+        let after = snapshot_shard_identities(&dir).expect("after");
+
+        assert!(
+            before != after,
+            "a mid-load shard swap must be detected as changed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_added_shard() {
+        let dir = unique_tmp("added");
+        fs::write(dir.join("model-00001-of-00002.safetensors"), b"a").unwrap();
+        let before = snapshot_shard_identities(&dir).expect("before");
+        fs::write(dir.join("model-00002-of-00002.safetensors"), b"b").unwrap();
+        let after = snapshot_shard_identities(&dir).expect("after");
+        assert!(
+            before != after,
+            "a shard appearing during load must be detected as changed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ignores_non_shard_files() {
+        let dir = unique_tmp("ignore");
+        fs::write(dir.join("model.safetensors"), b"w").unwrap();
+        fs::write(dir.join("config.json"), b"{}").unwrap();
+        fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
+        let snap = snapshot_shard_identities(&dir).expect("snap");
+        assert_eq!(snap.len(), 1, "only .safetensors shards are tracked");
+        assert!(snap.contains_key("model.safetensors"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bracket_stable_across_all_three_snapshots() {
+        let dir = unique_tmp("bracket-stable");
+        fs::write(dir.join("model.safetensors"), b"weights-v1").unwrap();
+        let before = snapshot_shard_identities(&dir);
+        let at_mmap = snapshot_shard_identities(&dir);
+        let after_fp = snapshot_shard_identities(&dir);
+        assert!(
+            shard_identities_stable(&before, &at_mmap, &after_fp),
+            "unchanged shards across the whole bracket must stay eligible for cold tier"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bracket_swap_straddling_mmap_disables() {
+        // Window 1: a swap between the before-mmap snapshot and the mmap makes
+        // `at_mmap` differ from `before`, even though `at_mmap == after_fp`.
+        let dir = unique_tmp("bracket-window1");
+        let shard = dir.join("model.safetensors");
+        fs::write(&shard, b"weights-v1").unwrap();
+        let before = snapshot_shard_identities(&dir);
+        fs::remove_file(&shard).unwrap();
+        fs::write(&shard, b"weights-v2-different-length").unwrap();
+        let at_mmap = snapshot_shard_identities(&dir);
+        let after_fp = snapshot_shard_identities(&dir);
+        assert!(
+            at_mmap == after_fp,
+            "identity is stable after the straddling swap"
+        );
+        assert!(
+            !shard_identities_stable(&before, &at_mmap, &after_fp),
+            "a swap straddling the mmap must disable cold persistence"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bracket_swap_during_fingerprint_read_disables() {
+        // Window 2: `before == at_mmap`, but a swap during the fingerprint read
+        // makes the after-fingerprint snapshot differ → cold disabled.
+        let dir = unique_tmp("bracket-window2");
+        let shard = dir.join("model.safetensors");
+        fs::write(&shard, b"weights-v1").unwrap();
+        let before = snapshot_shard_identities(&dir);
+        let at_mmap = snapshot_shard_identities(&dir);
+        assert!(before == at_mmap, "no change before the fingerprint read");
+        fs::remove_file(&shard).unwrap();
+        fs::write(&shard, b"weights-v2-different-length").unwrap();
+        let after_fp = snapshot_shard_identities(&dir);
+        assert!(
+            !shard_identities_stable(&before, &at_mmap, &after_fp),
+            "a swap during the fingerprint read must disable cold persistence"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bracket_unreadable_at_any_checkpoint_disables() {
+        let dir = unique_tmp("bracket-none");
+        fs::write(dir.join("model.safetensors"), b"w").unwrap();
+        let snap = snapshot_shard_identities(&dir);
+        assert!(snap.is_some());
+        assert!(
+            !shard_identities_stable(&None, &snap, &snap),
+            "an unreadable before-mmap snapshot must fail safe"
+        );
+        assert!(
+            !shard_identities_stable(&snap, &None, &snap),
+            "an unreadable at-mmap snapshot must fail safe"
+        );
+        assert!(
+            !shard_identities_stable(&snap, &snap, &None),
+            "an unreadable after-fingerprint snapshot must fail safe"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod persist_cold_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_config_wins_over_env() {
+        // An explicit per-model config decision is authoritative in both
+        // directions and beats the env: a per-invocation CLI
+        // `--no-persist-cache` (config `false`) stays disabled even under an
+        // ambient `MLX_PERSIST_PAGED_CACHE=1`, and a config `true` stays
+        // enabled even under env `0`.
+        assert!(
+            !resolve_persist_cold("qwen3", Some("1"), Some(false)),
+            "explicit config disable must win over env=1"
+        );
+        assert!(
+            resolve_persist_cold("qwen3", Some("0"), Some(true)),
+            "explicit config enable must win over env=0"
+        );
+        assert!(resolve_persist_cold("qwen3", Some("off"), Some(true)));
+        // The env only supplies the default when the config is unset.
+        assert!(
+            resolve_persist_cold("qwen3", Some("1"), None),
+            "env fills the default when config is unset"
+        );
+        assert!(resolve_persist_cold("qwen3", Some("true"), None));
+        assert!(!resolve_persist_cold("qwen3", Some("0"), None));
+    }
+
+    #[test]
+    fn allowlist_gate_beats_every_persist_signal() {
+        // The family allowlist is enforced inside `resolve_persist_cold`, so a
+        // family that is off the list can never engage the cold tier however
+        // loudly persistence is requested — not via an explicit config `true`,
+        // not via `MLX_PERSIST_PAGED_CACHE=1`. This is what keeps a loader's
+        // cold bracket dormant until its family is admitted, so an unproven
+        // path (e.g. qwen3_5_moe before its parity gate passes) cannot be
+        // exercised by a direct library caller that bypasses the agent.
+        for family in ["lfm2", "lfm2_moe", "harrier", "not-a-family"] {
+            assert!(
+                !resolve_persist_cold(family, Some("1"), Some(true)),
+                "{family} is off the allowlist and must never persist a cold tier"
+            );
+        }
+        // A family on the list still honours the config/env precedence above.
+        assert!(resolve_persist_cold("qwen3", Some("0"), Some(true)));
+        assert!(resolve_persist_cold("gemma4", Some("1"), None));
+        assert!(resolve_persist_cold("qwen3_5", None, Some(true)));
+        assert!(resolve_persist_cold("qwen3_5_moe", Some("1"), None));
+    }
+
+    #[test]
+    fn env_parsing_is_lenient_and_case_insensitive() {
+        for on in ["1", "true", "TRUE", "on", "On", "yes", "  yes  "] {
+            assert_eq!(parse_bool_env(on), Some(true), "{on:?} must parse as true");
+        }
+        for off in ["0", "false", "FALSE", "off", "Off", "no", "  no  "] {
+            assert_eq!(
+                parse_bool_env(off),
+                Some(false),
+                "{off:?} must parse as false"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_or_unset_env_falls_through_to_config() {
+        // An unrecognized value is ignored (falls through), and no env leaves
+        // the config alias authoritative.
+        assert_eq!(parse_bool_env("maybe"), None);
+        assert!(resolve_persist_cold("qwen3", Some("maybe"), Some(true)));
+        assert!(!resolve_persist_cold("qwen3", Some("garbage"), Some(false)));
+        assert!(!resolve_persist_cold("qwen3", Some("garbage"), None));
+        assert!(resolve_persist_cold("qwen3", None, Some(true)));
+        assert!(!resolve_persist_cold("qwen3", None, Some(false)));
+    }
+
+    #[test]
+    fn default_is_off_at_library_level() {
+        // No env, no config alias → persistence off by default.
+        assert!(!resolve_persist_cold("qwen3", None, None));
     }
 }

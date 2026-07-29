@@ -17,6 +17,9 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { MlxModelInfo } from '@mlx-node/agent';
+// Native-free subpath: the help path must print without loading the addon, and
+// the family list must have exactly ONE definition (the drift guard's).
+import { coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
 
 export interface AgentArgScan {
   /** Value of `--models-dir` (the flag pair is removed from `passthrough`). */
@@ -29,6 +32,14 @@ export interface AgentArgScan {
   traceDir?: string;
   /** `--trace-dir` was present without a value — usage error. */
   traceDirMissingValue: boolean;
+  /**
+   * Whether to persist the SSD paged cold tier (on by default; the mlx-owned
+   * `--no-persist-cache` flag turns it off). A SINGLE process-wide boolean
+   * applied to every family in `COLD_TIER_RESTORE_FAMILIES` — not to qwen3
+   * alone. Lifted out of the argv like the other mlx flags — never forwarded
+   * to pi.
+   */
+  persistPagedCache: boolean;
   /**
    * `-h`/`--help` seen and this is NOT a pi pass-through invocation
    * (`install`/`remove`/`uninstall`/`list`/`config` print their own
@@ -127,6 +138,7 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   let trace = false;
   let traceDir: string | undefined;
   let traceDirMissingValue = false;
+  let persistPagedCache = true;
   let helpSeen = false;
   let piOneShot = false;
 
@@ -179,6 +191,10 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       trace = true;
       continue;
     }
+    if (arg === '--no-persist-cache') {
+      persistPagedCache = false;
+      continue;
+    }
     if (arg === '--trace-dir') {
       trace = true;
       const next = argv[i + 1];
@@ -223,6 +239,7 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     trace,
     traceDir,
     traceDirMissingValue,
+    persistPagedCache,
     help: helpSeen && !PI_PASSTHROUGH_COMMANDS.has(passthrough[0] ?? ''),
     update: passthrough[0] === 'update',
     piOneShot,
@@ -583,9 +600,15 @@ export function chooseDefaultModel(
   };
 }
 
-/** mlx-side help; pi's full flag list is appended by forwarding `--help`. */
-function printAgentPreamble(): void {
-  console.log(`
+/**
+ * mlx-side help text; pi's full flag list is appended by forwarding `--help`.
+ * Exported so a test can assert the `--no-persist-cache` copy matches the
+ * allowlist it actually applies to — the old wording named qwen3 alone and
+ * promised "other families unaffected", which running it on qwen3_5_moe
+ * disproved.
+ */
+export function agentPreambleText(): string {
+  return `
 mlx agent — local coding agent (pi) running fully offline on MLX
 
 Usage:
@@ -598,6 +621,10 @@ mlx options (handled before pi sees the args):
   --trace                   Enable bounded native inference diagnostics.
   --trace-dir <dir>         Write inference.log in this directory (implies
                             --trace; dash-leading paths need --trace-dir=<dir>).
+  --no-persist-cache        Disable the on-by-default SSD cold tier for persisted
+                            paged prefix blocks. One switch for ALL restore-eligible
+                            families (${coldTierRestoreFamilyList().join(', ')});
+                            every other family never persists, flag or not.
 
 First run: when no local model exists, an interactive wizard offers a curated
 download. Agent config home: ~/.mlx-node/agent (override: PI_CODING_AGENT_DIR).
@@ -623,7 +650,12 @@ Notes:
   manager instead. 'install'/'remove'/'list' manage pi extensions, themes and
   skills under the agent config home; 'config' edits which are enabled.
 
-pi options:`);
+pi options:`;
+}
+
+/** @internal Print {@link agentPreambleText} ahead of pi's own flag list. */
+function printAgentPreamble(): void {
+  console.log(agentPreambleText());
 }
 
 /**
@@ -771,5 +803,12 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     console.error(notice);
   }
 
-  await runAgent({ modelsDir, models, genmlxModels, argv: agentArgv, traceLogFile });
+  await runAgent({
+    modelsDir,
+    models,
+    genmlxModels,
+    argv: agentArgv,
+    traceLogFile,
+    persistPagedCache: scan.persistPagedCache,
+  });
 }
