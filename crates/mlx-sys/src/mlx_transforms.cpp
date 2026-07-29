@@ -225,7 +225,7 @@ static bool collect_capture_tape(
       continue;
     }
     if (a.has_primitive() &&
-        a.primitive().stream().device != mlx::core::Device::gpu) {
+        a.primitive().stream().device.type != mlx::core::Device::gpu) {
       return false;
     }
     for (auto& s : a.siblings()) {
