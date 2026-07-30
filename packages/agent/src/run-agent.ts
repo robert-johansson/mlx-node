@@ -32,6 +32,7 @@ import type { InlineExtension } from '@earendil-works/pi-coding-agent';
 // and the drain in the `-p` cleanup path — so the agent import graph stays free
 // of static native chains (pinned by __test__/native-import-graph.test.ts).
 
+import { createLocalImageInputExtension } from './extensions/local-image-input.js';
 import { createPermissionGateExtension } from './extensions/permission-gate.js';
 import { createSubagentExtension } from './extensions/subagent.js';
 import { createTerminalTitleExtension } from './extensions/terminal-title.js';
@@ -218,6 +219,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
       extensionFactories: [
         createMlxProviderExtension(opts.models, modelHost),
         createGenmlxProviderExtension(opts.genmlxModels ?? []),
+        createLocalImageInputExtension(),
         createPermissionGateExtension(),
         ...(subagentsEnabled ? [createSubagentExtension()] : []),
         ...(opts.traceLogFile !== undefined ? [createTraceNoticeExtension(opts.traceLogFile)] : []),

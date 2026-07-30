@@ -78,6 +78,11 @@ export interface DownloadCompletion {
   revision: string;
   /** Repo-relative paths of every file published into the final dir. */
   files: string[];
+  /**
+   * Whether the marker describes a full-model run. Missing means `full` for
+   * compatibility with markers written before selection scope was recorded.
+   */
+  scope?: 'full' | 'partial';
   /** ISO timestamp of the atomic publish. */
   completedAt: string;
 }
@@ -102,8 +107,8 @@ export function isWeightFile(path: string): boolean {
  * installed, hiding the retry.
  */
 export function isModelInstalled(modelDir: string): boolean {
-  const marker = asObject(readMarkerFile(modelDir));
-  if (marker === undefined || !Array.isArray(marker.files)) return false;
+  const marker = readCompletion(modelDir);
+  if (marker === undefined || marker.scope === 'partial') return false;
   const files = marker.files;
   // A loadable checkpoint needs a config AND a weight; a marker missing either
   // describes a hollow/one-sided publish that must NOT read as installed.
@@ -117,8 +122,9 @@ export function isModelInstalled(modelDir: string): boolean {
  * Whether `modelDir` holds a loadable checkpoint ON DISK — a `config.json` plus at
  * least one weight file — regardless of the dashboard completion marker. Unlike
  * {@link isModelInstalled} (downloader-OWNED, marker-gated) this also recognizes a
- * checkpoint installed by the `mlx download` CLI or the agent wizard, neither of
- * which writes the marker. Callers use it to show such a model as PRESENT without
+ * checkpoint installed by the agent wizard or an older `mlx download` CLI, which
+ * did not write the marker (the current CLI writes the shared marker, making its
+ * dirs downloader-owned). Callers use it to show such a model as PRESENT without
  * offering a dashboard install, which would refuse to overwrite the unowned
  * directory (`DownloadManager.refuseIfUnownedFinal`) and fail deterministically.
  *
@@ -211,11 +217,18 @@ export function readCompletion(finalDir: string): DownloadCompletion | undefined
     typeof marker.revision !== 'string' ||
     typeof marker.completedAt !== 'string' ||
     !Array.isArray(marker.files) ||
-    !marker.files.every((file) => typeof file === 'string')
+    !marker.files.every((file) => typeof file === 'string') ||
+    (marker.scope !== undefined && marker.scope !== 'full' && marker.scope !== 'partial')
   ) {
     return undefined;
   }
-  return { repo: marker.repo, revision: marker.revision, files: marker.files, completedAt: marker.completedAt };
+  return {
+    repo: marker.repo,
+    revision: marker.revision,
+    files: marker.files,
+    scope: marker.scope as DownloadCompletion['scope'],
+    completedAt: marker.completedAt,
+  };
 }
 
 /**
@@ -251,7 +264,9 @@ export function isPathOccupied(path: string): boolean {
  * ownership does NOT require every listed file to still be present (a partial,
  * mid-upgrade owned dir is still ours). The downloader uses this to decide
  * whether it may overwrite a final dir: a dir WITHOUT our marker was placed by a
- * human or by `mlx download` and must never be destroyed.
+ * human or by an older `mlx download` CLI and must never be destroyed. The
+ * current CLI writes the shared marker, so its installs count as
+ * downloader-owned here.
  *
  * NO-FOLLOW: a symlink (or any non-directory) at this path was never written by us
  * as a managed model dir, so the check `lstat`-gates on a REAL directory BEFORE

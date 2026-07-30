@@ -144,8 +144,15 @@ describe('runAgent', () => {
     });
     // The genmlx provider registers unconditionally and strictly next to the
     // v1 one — with no genmlx models pi simply treats it as unavailable
-    // (genmlx-djw6 rider 2: v1 stays the baseline arm).
-    expect(names).toEqual(['mlx-provider', 'genmlx-provider', 'mlx-permission-gate', 'mlx-terminal-title']);
+    // (genmlx-djw6 rider 2: v1 stays the baseline arm). Upstream's
+    // mlx-local-image-input also registers unconditionally, right after.
+    expect(names).toEqual([
+      'mlx-provider',
+      'genmlx-provider',
+      'mlx-local-image-input',
+      'mlx-permission-gate',
+      'mlx-terminal-title',
+    ]);
   });
 
   it('adds subagents only for a real parent model session', async () => {
@@ -155,6 +162,7 @@ describe('runAgent', () => {
     expect(extensionNames(calls[0]!.extensionFactories)).toEqual([
       'mlx-provider',
       'genmlx-provider',
+      'mlx-local-image-input',
       'mlx-permission-gate',
       'mlx-subagent',
       'mlx-terminal-title',
@@ -174,9 +182,11 @@ describe('runAgent', () => {
     // Subagents resolve `mlx/<id>` against the parent's MlxModelHost, so they
     // are a v1-provider feature; a genmlx-only session gets the provider pair
     // and the gate, nothing that would dead-end on an mlx model id.
+    // (mlx-local-image-input still registers unconditionally.)
     expect(extensionNames(calls[0]!.extensionFactories)).toEqual([
       'mlx-provider',
       'genmlx-provider',
+      'mlx-local-image-input',
       'mlx-permission-gate',
       'mlx-terminal-title',
     ]);
@@ -195,6 +205,7 @@ describe('runAgent', () => {
     expect(extensionNames(calls[0]!.extensionFactories)).toEqual([
       'mlx-provider',
       'genmlx-provider',
+      'mlx-local-image-input',
       'mlx-permission-gate',
       'mlx-subagent',
       'mlx-trace-notice',
