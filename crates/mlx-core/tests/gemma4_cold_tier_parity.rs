@@ -490,11 +490,13 @@ mod tests {
             text: "ok".to_string(),
             tool_calls: Vec::new(),
             thinking: None,
+            thinking_enabled: true,
             num_tokens: 8,
             prompt_tokens: 350,
             reasoning_tokens: 0,
             finish_reason: "stop".to_string(),
             raw_text: "ok".to_string(),
+            public_raw_text: None,
             cached_tokens,
             performance: None,
         }

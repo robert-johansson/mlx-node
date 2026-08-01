@@ -18,17 +18,30 @@
  * the reused prefix and skip the corresponding re-prefill.
  *
  * Fields accessed: `inFlight`, `history`, `lastImagesKey`, `lastAudioKey`, `turnCount`,
- * `unresolvedOkToolCallCount`, `needsFullReplay`. These are TypeScript `private` fields on
- * `ChatSession` (compile-time only) — at runtime they are ordinary
- * properties. The cast through {@link ChatSessionWarmReuseInternals}
- * gives this helper a typed view of the instance without relaxing the
- * class's `private` declarations. The field names MUST stay in sync
- * with `packages/lm/src/chat-session.ts`; a mismatch would silently
- * skip the intended state wipe — the drift test in
+ * `unresolvedOkToolCallCount`, `needsFullReplay`, `defaultConfig`, `activeTools`.
+ * These are TypeScript `private` fields on `ChatSession` (compile-time
+ * only) — at runtime they are ordinary properties. The cast through
+ * {@link ChatSessionWarmReuseInternals} gives this helper a typed view
+ * of the instance without relaxing the class's `private` declarations.
+ * The field names MUST stay in sync with
+ * `packages/lm/src/chat-session.ts`; a mismatch would silently skip
+ * the intended state wipe — the drift test in
  * `packages/agent/__test__/warm-reuse.test.ts` checks every name in
  * {@link WARM_REUSE_TOUCHED_FIELDS} against a real `ChatSession`
  * instance.
  */
+
+// FORK DIVERGENCE (CONFLICT-LEDGER §3) — do NOT re-narrow this helper back to
+// upstream's concrete `ChatSession<M extends SessionCapableModel>`. This fork
+// serves a second local provider, `genmlx` (genmlx-djw6), whose `GenmlxSession`
+// is not a `ChatSession`; the helper is retyped over the minimal structural
+// {@link StreamableSession} surface (`ChatSession` satisfies it as-is, so there
+// is zero behaviour change on the `mlx` path). `ChatConfig` IS upstream's new
+// import in this drop — it types the `defaultConfig`/`activeTools` fields the
+// internals view gained — and is carried through; `ChatSession` and
+// `SessionCapableModel` are intentionally not imported because nothing in this
+// module names them any more.
+import type { ChatConfig } from '@mlx-node/lm';
 
 import type { StreamableSession } from '../types.js';
 
@@ -47,6 +60,8 @@ interface ChatSessionWarmReuseInternals {
   turnCount: number;
   unresolvedOkToolCallCount: number | null;
   needsFullReplay: boolean;
+  defaultConfig?: ChatConfig;
+  activeTools: ChatConfig['tools'];
 }
 
 /**
@@ -63,6 +78,8 @@ const WARM_REUSE_TOUCHED_FIELD_SET: Record<keyof ChatSessionWarmReuseInternals, 
   turnCount: true,
   unresolvedOkToolCallCount: true,
   needsFullReplay: true,
+  defaultConfig: true,
+  activeTools: true,
 };
 
 /**
@@ -111,4 +128,8 @@ export async function resetPreservingNativeCacheForWarmReuse(session: Streamable
   internals.turnCount = 0;
   internals.unresolvedOkToolCallCount = null;
   internals.needsFullReplay = false;
+  // Tools are conversation state. A provider replay can switch to an
+  // unrelated history, so restore constructor defaults exactly like
+  // ChatSession.reset() instead of leaking the prior committed overlay.
+  internals.activeTools = internals.defaultConfig?.tools;
 }

@@ -1,6 +1,8 @@
 //! Prefix-cache verification and post-turn cache-state persistence,
 //! plus the multimodal (image) cache-key helpers.
 
+use std::borrow::Cow;
+
 use sha2::{Digest, Sha256};
 
 use crate::transformer::paged_kv_cache_adapter::PagedTurnPlan;
@@ -163,6 +165,42 @@ fn combine_image_hashes(digests: &[ImageCacheDigest]) -> u64 {
 /// Compute a combined cache key from raw image bytes.
 pub(crate) fn compute_image_cache_key(all_images: &[Vec<u8>]) -> u64 {
     compute_image_cache_keys(all_images).0
+}
+
+/// Collapse expanded media-placeholder runs recorded by a cache sidecar back
+/// to one logical marker per run.
+///
+/// Only positions named by `media_token_positions` are collapsed. Repeated
+/// occurrences of the same special token outside those positions (for
+/// example, model-generated output) remain byte-for-byte unchanged.
+pub(crate) fn collapse_cached_media_placeholder_runs<'a>(
+    tokens: &'a [u32],
+    media_token_id: u32,
+    media_token_positions: &[(u32, u64)],
+) -> Cow<'a, [u32]> {
+    if media_token_positions.is_empty() {
+        return Cow::Borrowed(tokens);
+    }
+
+    let positions = media_token_positions
+        .iter()
+        .map(|(position, _)| *position as usize)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut collapsed = Vec::with_capacity(tokens.len());
+    let mut inside_marked_run = false;
+    for (index, &token) in tokens.iter().enumerate() {
+        let marked_placeholder = token == media_token_id && positions.contains(&index);
+        if marked_placeholder {
+            if !inside_marked_run {
+                collapsed.push(token);
+            }
+            inside_marked_run = true;
+        } else {
+            collapsed.push(token);
+            inside_marked_run = false;
+        }
+    }
+    Cow::Owned(collapsed)
 }
 
 /// Associate every expanded image-placeholder token with its source digest.
@@ -360,10 +398,10 @@ pub(crate) fn save_cache_state_direct<C>(
     }
 }
 
-/// Commit session state after a text-only delta continuation.
+/// Commit session state after a model-specific text-only suffix continuation.
 ///
-/// The delta path (`chat_tokens_delta_sync` / `chat_stream_tokens_delta_sync`)
-/// appends a text delta on top of the live KV caches without touching the
+/// A specialized model path may append a text suffix on top of live KV caches
+/// without touching the
 /// image attention state baked in by the preceding prefill. The "current
 /// turn is text-only" signal (`has_images == false`) MUST NOT be conflated
 /// with "the session has no image context" — the KV caches still encode
@@ -499,9 +537,9 @@ pub(crate) fn verify_cache_prefix_direct(
 mod image_cache_identity_tests {
     use super::{
         IMAGE_BLOCK_EXTRA_KEYS_FORMAT_V1, IMAGE_KV_PREPROCESSING_SEMANTICS_V1, ImageCacheDigest,
-        build_paged_extra_keys, combine_image_hashes, compute_image_cache_key,
-        compute_image_cache_keys, map_expanded_image_token_positions, resolve_vlm_paged_prefix,
-        vlm_prefix_requires_cold_restart,
+        build_paged_extra_keys, collapse_cached_media_placeholder_runs, combine_image_hashes,
+        compute_image_cache_key, compute_image_cache_keys, map_expanded_image_token_positions,
+        resolve_vlm_paged_prefix, vlm_prefix_requires_cold_restart,
     };
     use crate::transformer::paged_kv_cache_adapter::{PagedTurnPlan, PagedTurnPlanReason};
     use mlx_paged_attn::{ColdCacheFingerprint, ColdCacheKey, ColdGroup};
@@ -591,6 +629,36 @@ mod image_cache_identity_tests {
                 0x6a, 0x53, 0xbd, 0x09,
             ],
             "the versioned SHA-256 derivation is part of the durable cache ABI",
+        );
+    }
+
+    #[test]
+    fn comparison_collapse_touches_only_recorded_media_runs() {
+        let tokens = vec![
+            10,
+            IMAGE_TOKEN_ID,
+            IMAGE_TOKEN_ID,
+            IMAGE_TOKEN_ID,
+            20,
+            IMAGE_TOKEN_ID,
+            IMAGE_TOKEN_ID,
+        ];
+        let positions = vec![(1, 0xA), (1, 0xB), (2, 0xA), (2, 0xB), (3, 0xA), (3, 0xB)];
+
+        assert_eq!(
+            collapse_cached_media_placeholder_runs(&tokens, IMAGE_TOKEN_ID, &positions),
+            vec![10, IMAGE_TOKEN_ID, 20, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID],
+            "the expanded cache span collapses, while unrecorded generated markers remain intact"
+        );
+        let untouched = collapse_cached_media_placeholder_runs(&tokens, IMAGE_TOKEN_ID, &[]);
+        assert!(
+            matches!(untouched, std::borrow::Cow::Borrowed(_)),
+            "no sidecar must keep the comparison path allocation-free"
+        );
+        assert_eq!(
+            untouched.as_ref(),
+            tokens,
+            "no sidecar means identity cannot safely rewrite any token"
         );
     }
 
@@ -795,13 +863,11 @@ mod image_cache_identity_tests {
 #[cfg(test)]
 mod save_cache_state_after_delta_tests {
     //! Guards the sticky-`cached_image_key` invariant on the text-only
-    //! delta path. Calling `save_cache_state_direct(has_images: false,
-    //! ...)` after a delta continuation would clear `cached_image_key`
+    //! specialized suffix path. Calling `save_cache_state_direct(has_images:
+    //! false, ...)` after such a continuation would clear `cached_image_key`
     //! even though the live KV cache still encodes the prior prefill's
     //! image attention state — contradicting the TS `ChatSession` routing
-    //! contract (warm cache across text-only follow-ups) and making the
-    //! delta path fail with a cryptic "chat_tokens_delta_sync is
-    //! text-only; session currently holds image state" on the next turn.
+    //! contract (warm cache across text-only follow-ups).
     //! [`save_cache_state_after_delta`] preserves the key instead.
     use super::{save_cache_state_after_delta, save_cache_state_direct};
 

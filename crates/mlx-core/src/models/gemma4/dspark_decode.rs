@@ -904,6 +904,12 @@ impl Gemma4Inner {
                 reasoning_tokens,
             },
         )?;
+        // `thinking_enabled` is replay provenance for the model-provided
+        // template, not Gemma4's decode-time ThinkingSetup (which is disabled
+        // by policy). Set it before both the terminal stream chunk and sync
+        // return, matching the generic and paged engines.
+        result.thinking_enabled =
+            crate::engine::params::resolve_enable_thinking(args.config).unwrap_or(true);
         // cached_tokens mirrors the session core's overwrite: fresh turns
         // report the matched prefix, delta turns the prior history length.
         result.cached_tokens = if is_delta {
@@ -1823,14 +1829,15 @@ pub(crate) mod tests {
 
         // Turn 2: depth 1 → verify blocks of <= 2 rows fit the window; the
         // turn must run cold end-to-end and land fully consistent.
-        let res = run_tiny_draft_turn(
-            &mut inner,
-            &tokenizer,
-            &tokens,
-            &tiny_turn_config(Some(1), 3),
-        )
-        .expect("the next turn after fail-closed must succeed via the cold path");
+        let mut recovery_config = tiny_turn_config(Some(1), 3);
+        recovery_config.reasoning_effort = Some("high".to_string());
+        let res = run_tiny_draft_turn(&mut inner, &tokenizer, &tokens, &recovery_config)
+            .expect("the next turn after fail-closed must succeed via the cold path");
         assert_eq!(res.finish_reason, "length");
+        assert!(
+            res.thinking_enabled,
+            "sync DSpark result must report effective template thinking provenance"
+        );
         assert_eq!(
             res.cached_tokens, 0,
             "nothing may be warm-reused after fail-closed"
@@ -2067,6 +2074,19 @@ pub(crate) mod tests {
                 audio: None,
             }
         }
+        fn assistant(result: &crate::engine::types::ChatResult) -> crate::tokenizer::ChatMessage {
+            crate::tokenizer::ChatMessage {
+                role: "assistant".to_string(),
+                content: result.text.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+                is_error: None,
+                reasoning_content: result.thinking.clone(),
+                thinking_enabled: Some(result.thinking_enabled),
+                images: None,
+                audio: None,
+            }
+        }
         fn assert_offsets_match_history(inner: &Gemma4Inner, label: &str) {
             let h = inner.cached_token_history.len() as i32;
             let mask = dspark_shared_slot_mask(&inner.config);
@@ -2095,9 +2115,7 @@ pub(crate) mod tests {
         assert_offsets_match_history(&inner, "ar_turn1");
         let ar2 = crate::engine::session::session_continue(
             &mut inner,
-            FOLLOW_UP.to_string(),
-            None,
-            None,
+            vec![user(PROMPT), assistant(&ar1), user(FOLLOW_UP)],
             cfg(false),
         )
         .expect("AR turn 2 failed");
@@ -2129,9 +2147,7 @@ pub(crate) mod tests {
 
         let sp2 = crate::engine::session::session_continue(
             &mut inner,
-            FOLLOW_UP.to_string(),
-            None,
-            None,
+            vec![user(PROMPT), assistant(&sp1), user(FOLLOW_UP)],
             cfg(true),
         )
         .expect("DSpark turn 2 failed");

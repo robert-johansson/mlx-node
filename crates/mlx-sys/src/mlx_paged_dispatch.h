@@ -59,6 +59,15 @@ enum class KvDtype : uint8_t {
   Fp8 = 2,
 };
 
+/// Per-dispatch compute-route hint. This changes only which kernel reads the
+/// authoritative paged K/V pool; it never changes cache layout or ownership.
+enum class PagedAttentionRouteHint : uint8_t {
+  Auto = 0,
+  // Legacy ABI name for the canonical grouped D512 production route.
+  ForceD512Staged = 1,
+  ForceGeneric = 2,
+};
+
 /// Dispatch the `reshape_and_cache` kernel onto the MLX command
 /// encoder. Writes `num_tokens` of `(new_k, new_v)` into the per-layer
 /// block-paged K/V pools at the slot ids supplied by `slot_mapping`.
@@ -135,7 +144,8 @@ void dispatch_paged_attention_auto(
     float scale,
     float softcap,
     int sliding_window,
-    KvDtype kv_dtype);
+    KvDtype kv_dtype,
+    PagedAttentionRouteHint route_hint);
 
 /// Ragged-Q dispatcher. Writes `[total_queries, num_q_heads,
 /// head_size]` attention output to `out`. `cu_seqlens_q` carries the

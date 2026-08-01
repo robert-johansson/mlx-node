@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-use mlx_core::engine::types::ChatConfig;
+use mlx_core::engine::types::{ChatConfig, ChatResult};
 use mlx_core::models::lfm2::model::Lfm2Model;
 use mlx_core::tokenizer::ChatMessage;
 
@@ -63,6 +63,20 @@ fn user_message(content: &str) -> ChatMessage {
         is_error: None,
         reasoning_content: None,
         thinking_enabled: None,
+        images: None,
+        audio: None,
+    }
+}
+
+fn assistant_message(result: &ChatResult) -> ChatMessage {
+    ChatMessage {
+        role: "assistant".to_string(),
+        content: result.raw_text.clone(),
+        tool_calls: None,
+        tool_call_id: None,
+        is_error: None,
+        reasoning_content: None,
+        thinking_enabled: Some(result.thinking_enabled),
         images: None,
         audio: None,
     }
@@ -124,14 +138,21 @@ async fn lfm2_moe_session_keeps_ttft_flat_across_turns() {
         "One more, different?",
     ];
     let mut snapshots: Vec<TurnSnapshot> = vec![turn1.clone()];
+    let mut transcript = vec![("Say hi in one short word.".to_string(), r1)];
 
     for (idx, next_user) in user_followups.iter().enumerate() {
         let turn_idx = idx + 2;
         let cfg = chat_config_default(64);
+        let mut messages = Vec::with_capacity(transcript.len() * 2 + 1);
+        for (prior_user, prior_result) in &transcript {
+            messages.push(user_message(prior_user));
+            messages.push(assistant_message(prior_result));
+        }
+        messages.push(user_message(next_user));
         let result = model
-            .chat_session_continue((*next_user).to_string(), None, None, Some(cfg))
+            .chat_session_continue(messages, Some(cfg))
             .await
-            .expect("delta chat failed");
+            .expect("full-history chat continuation failed");
         let ttft = result
             .performance
             .as_ref()
@@ -150,6 +171,7 @@ async fn lfm2_moe_session_keeps_ttft_flat_across_turns() {
             "unexpected finish_reason: {}",
             result.finish_reason
         );
+        transcript.push(((*next_user).to_string(), result));
     }
 
     // --- Structural assertions ---

@@ -181,7 +181,7 @@ jobs:
           APP_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          yarn workspace @mlx-node/desktop package --sign --app-version "$APP_VERSION"
+          yarn oxnode packages/desktop/scripts/package.ts --sign --app-version "$APP_VERSION"
           RESULT=packages/desktop/out/package-result.json
           [ -f "$RESULT" ] || { echo "::error::packaging produced no $RESULT"; exit 1; }
           APP="$(node -p "require('./$RESULT').appPath")"

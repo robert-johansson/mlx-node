@@ -5,7 +5,6 @@
  */
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::iter;
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
@@ -1087,13 +1086,7 @@ impl Qwen3Inner {
             .ok_or_else(|| napi::Error::from_reason("Tokenizer not available."))?
             .clone();
 
-        let formatted = messages
-            .iter()
-            .map(|msg| format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content))
-            .chain(iter::once("<|im_start|>assistant\n".to_string()))
-            .collect::<String>();
-
-        let token_ids = tokenizer.encode_sync(&formatted, Some(false))?;
+        let token_ids = tokenizer.apply_chat_template_sync(&messages, Some(true), None, None)?;
         let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
 
         // Use generate_for_training_sync on the NAPI model (which uses Arc<RwLock<>>)
@@ -1439,19 +1432,6 @@ impl Qwen3Inner {
         let num_prompts = prompts.len();
         let group_size_usize = group_size as usize;
 
-        // Tokenize all prompts
-        let mut prompt_token_arrays = Vec::with_capacity(num_prompts);
-        for messages in &prompts {
-            let formatted = messages
-                .iter()
-                .map(|msg| format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content))
-                .chain(iter::once("<|im_start|>assistant\n".to_string()))
-                .collect::<String>();
-            let token_ids = tokenizer.encode_sync(&formatted, Some(false))?;
-            let prompt_tokens = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
-            prompt_token_arrays.push(prompt_tokens);
-        }
-
         // Pre-build lightweight message copies (ChatMessage has Uint8Array which can't Clone)
         let lightweight_prompts: Vec<Vec<ChatMessage>> = prompts
             .iter()
@@ -1478,13 +1458,14 @@ impl Qwen3Inner {
         let mut all_finish_reasons = Vec::with_capacity(num_prompts);
         let mut all_token_counts = Vec::with_capacity(num_prompts);
 
-        for (prompt_idx, _prompt_tokens) in prompt_token_arrays.iter().enumerate() {
+        for lightweight_prompt in &lightweight_prompts {
             let mut prompt_finish_reasons = Vec::with_capacity(group_size_usize);
             let mut prompt_token_counts = Vec::with_capacity(group_size_usize);
 
             for _group_idx in 0..group_size {
-                // Reconstruct lightweight messages for each call (generate_sync only uses role+content)
-                let msgs = lightweight_prompts[prompt_idx]
+                // Reconstruct lightweight text-only messages for each call.
+                // `generate_sync` renders the model-provided chat template.
+                let msgs = lightweight_prompt
                     .iter()
                     .map(|m| ChatMessage {
                         role: m.role.clone(),
@@ -4050,7 +4031,15 @@ impl Qwen3Model {
         })?;
 
         // Delegate to tokenizer which handles both simple ChatML and Jinja2 with tools
-        tokenizer.apply_chat_template(env, messages, add_generation_prompt, tools, enable_thinking)
+        tokenizer.apply_chat_template(
+            env,
+            messages,
+            add_generation_prompt,
+            tools,
+            enable_thinking,
+            None,
+            None,
+        )
     }
 
     // ------------------------------------------------------------------
@@ -4102,8 +4091,8 @@ crate::models::chat_napi::chat_napi_surface! {
     thread: direct,
     image_guard: text_only,
     ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
-    ts_stream_continue: "userMessage: string, images: Uint8Array[] | null | undefined, audio: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
-    ts_stream_continue_tool: "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined",
+    ts_stream_continue: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue_tool: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
 }
 
 #[cfg(test)]

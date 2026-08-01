@@ -11,6 +11,7 @@
 //! expose `.call(napi::Result<ChatStreamChunk>, ThreadsafeFunctionCallMode)`,
 //! and the trait collapses that to a single `send`.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -27,6 +28,7 @@ use crate::engine::params::{
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaInputs, TurnPlan};
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::models::qwen3_5::mtp_decode::{MtpCommitAnchor, MtpVerifyOutput};
+use crate::nn::Embedding;
 use crate::profiling::PerformanceMetrics;
 use crate::sampling::SamplingConfig;
 use crate::stream::Stream;
@@ -291,10 +293,13 @@ impl DefaultStreamEmitter {
                 finish_reason: None,
                 tool_calls: None,
                 thinking: None,
+                thinking_enabled: None,
                 num_tokens: None,
                 prompt_tokens: None,
                 reasoning_tokens: None,
                 raw_text: None,
+                public_raw_text: None,
+                text_authoritative: None,
                 cached_tokens: None,
                 performance: None,
                 is_reasoning: Some(is_reasoning),
@@ -337,10 +342,13 @@ impl StreamEmitter for DefaultStreamEmitter {
             finish_reason: Some(result.finish_reason.clone()),
             tool_calls: Some(result.tool_calls.clone()),
             thinking: result.thinking.clone(),
+            thinking_enabled: Some(result.thinking_enabled),
             num_tokens: Some(result.num_tokens),
             prompt_tokens: Some(result.prompt_tokens),
             reasoning_tokens: Some(result.reasoning_tokens),
             raw_text: Some(result.raw_text.clone()),
+            public_raw_text: result.public_raw_text.clone(),
+            text_authoritative: Some(true),
             cached_tokens: Some(result.cached_tokens),
             performance: result.performance.clone(),
             is_reasoning: None,
@@ -356,8 +364,9 @@ impl StreamEmitter for DefaultStreamEmitter {
 /// `skip_special_tokens` flag (Gemma4 decodes with
 /// `decode_sync(generated_tokens, false)` so its `output_parser` sees
 /// the channel/tool-call DSL markers, then runs
-/// `parse_gemma4_output` + `promote_channel_only_output` instead of the
-/// Hermes `<tool_call>`/`<think>` parse).
+/// `parse_gemma4_output_with_open_channel` +
+/// `promote_channel_only_output` instead of the Hermes
+/// `<tool_call>`/`<think>` parse).
 pub(crate) struct FinalizeArgs<'a> {
     pub tokenizer: &'a Qwen3Tokenizer,
     pub generated_tokens: &'a [u32],
@@ -604,14 +613,12 @@ pub(crate) struct WholeTurnArgs<'a> {
 ///
 /// # Implementer checklist (new family)
 ///
-/// REQUIRED — no default body; a new family MUST implement all 13
+/// REQUIRED — no default body; a new family MUST implement all 11
 /// methods + the `Decode` associated type:
 ///   * `tokenizer` — cloned handle or "not loaded" error
 ///   * `family_name` — stable tag for profiler/errors (e.g. `"lfm2"`)
 ///   * `session_eos_id` — session stop-token id
 ///   * `thinking_setup` — resolve thinking-mode state from config
-///   * `render_continue_delta` — ChatML user continue-delta
-///   * `render_tool_delta` — tool-result delta
 ///   * `cached_token_history` — committed session history slice
 ///   * `reset_caches` — clear caches + session state (by `ResetScope`)
 ///   * `verify_cache_prefix` — all-or-nothing reusable-prefix length
@@ -630,7 +637,7 @@ pub(crate) struct WholeTurnArgs<'a> {
 ///   - decode/stop: `extra_eos_ids`, `eos_before_emit`,
 ///     `wired_limit_bytes`
 ///   - streaming: `stream_skip_special_tokens`, `stream_emitter`,
-///     `stream_delta_prompt_tokens`, `text_delta_media_guard`
+///     `stream_delta_prompt_tokens`
 ///   - profiling/perf: `profiler_label`, `augment_performance`
 ///   - specialized executors selected by the resolved plan:
 ///     `run_paged_turn`, `run_speculative_turn`, `run_multimodal_turn`
@@ -657,9 +664,8 @@ pub(crate) trait ChatBackend {
     fn set_cache_owner_id(&mut self, _owner_id: &str, _root_owner_id: Option<&str>) {}
 
     /// Session stop-token id. == the `<|im_end|>` resolution in
-    /// `chat_session_start_sync` / `chat_tokens_delta_sync`
-    /// (`tokenizer.im_end_id().ok_or(..)`) for the ChatML families;
-    /// Gemma4 resolves `<end_of_turn>` instead.
+    /// the session entries (`tokenizer.im_end_id().ok_or(..)`) for the
+    /// ChatML families; Gemma4 resolves `<end_of_turn>` instead.
     ///
     /// Documented accepted drift: this hook cannot know the entry point,
     /// so the streaming-start twins lose the per-entry wording
@@ -732,13 +738,10 @@ pub(crate) trait ChatBackend {
     /// Render + tokenize the fresh-turn prompt from the request
     /// messages.
     ///
-    /// Default = the jinja chat-template path every ChatML family uses
+    /// Default = the checkpoint-provided Jinja chat-template path
     /// (`apply_chat_template_sync` with `add_generation_prompt = true`,
-    /// the request tools, and `resolve_enable_thinking`). Gemma4's
-    /// override adds its manual `<|turn>` wire-format fallback for
-    /// template-less checkpoints plus the
-    /// `enable_thinking=true`-without-template error; template-bearing
-    /// checkpoints take the same default path.
+    /// the request tools, and `resolve_enable_thinking`). Missing templates
+    /// fail closed; model wire formats are never reconstructed in Rust.
     fn render_prompt(
         &self,
         tok: &Qwen3Tokenizer,
@@ -751,71 +754,6 @@ pub(crate) trait ChatBackend {
             config.tools.as_deref(),
             resolve_enable_thinking(config),
         )
-    }
-
-    /// Render + tokenize the ChatML continue-delta for a session user
-    /// turn: sanitize via `Qwen3Tokenizer::sanitize_messages_public`,
-    /// render via
-    /// [`crate::engine::params::build_chatml_continue_delta_text`], then
-    /// `encode_sync` (LFM2 forces the no-`<think>` prefix variant;
-    /// Gemma4 renders its own turn format).
-    ///
-    /// The `config` parameter resolves the delta's `<think>\n` prefix
-    /// from `resolve_enable_thinking(&config)`. lfm2 ignores it (its
-    /// template never injects the prefix).
-    ///
-    /// Default body is the ChatML pipeline: sanitize the synthetic user
-    /// turn, render via
-    /// [`crate::engine::params::build_chatml_continue_delta_text`] with
-    /// the template-resolved thinking prefix, then `encode_sync` without
-    /// auto-prepending BOS. Families whose wire delta differs (gemma4
-    /// turn-format; lfm2's hardcoded no-`<think>` prefix) override.
-    fn render_continue_delta(
-        &self,
-        tok: &Qwen3Tokenizer,
-        user_message: &str,
-        config: &ChatConfig,
-    ) -> Result<Vec<u32>> {
-        let synthetic = crate::engine::params::build_synthetic_user_message(user_message);
-        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
-        let sanitized_user = &sanitized[0].content;
-        let enable_thinking = resolve_enable_thinking(config);
-        let delta_text = crate::engine::params::build_chatml_continue_delta_text(
-            sanitized_user,
-            enable_thinking,
-        );
-        tok.encode_sync(&delta_text, Some(false))
-    }
-
-    /// Render + tokenize the tool-result delta. ==
-    /// [`crate::engine::params::build_chatml_tool_delta_text`] +
-    /// `encode_sync` in `chat_session_continue_tool_sync` (LFM2 builds
-    /// its plain `<|im_start|>tool` block inline instead).
-    ///
-    /// The `config` parameter is used for the same
-    /// `resolve_enable_thinking` reason as
-    /// [`ChatBackend::render_continue_delta`].
-    ///
-    /// Default body is the ChatML tool-delta pipeline:
-    /// [`crate::engine::params::build_chatml_tool_delta_text`] +
-    /// `encode_sync`. lfm2 overrides with its plain (no-`<tool_response>`)
-    /// delta; gemma4 with its turn-format delta.
-    fn render_tool_delta(
-        &self,
-        tok: &Qwen3Tokenizer,
-        tool_call_id: &str,
-        content: &str,
-        is_error: Option<bool>,
-        config: &ChatConfig,
-    ) -> Result<Vec<u32>> {
-        let enable_thinking = resolve_enable_thinking(config);
-        let delta_text = crate::engine::params::build_chatml_tool_delta_text(
-            tool_call_id,
-            content,
-            enable_thinking,
-            is_error,
-        );
-        tok.encode_sync(&delta_text, Some(false))
     }
 
     /// The session's committed token history.
@@ -958,12 +896,12 @@ pub(crate) trait ChatBackend {
     /// `tools::parse_tool_calls`). A family override owns the WHOLE
     /// pipeline including the raw-text decode's skip-special flag — see
     /// [`FinalizeArgs`] for the Gemma4 mapping (raw decode_sync(..,
-    /// false) → `output_parser::parse_gemma4_output` +
+    /// false) → `output_parser::parse_gemma4_output_with_open_channel` +
     /// `promote_channel_only_output`).
     ///
-    /// The session core overwrites `result.cached_tokens` AFTER this
-    /// hook returns (fresh-hit / delta prior-len accounting), so
-    /// overrides need not (and must not) fill it.
+    /// The session core overwrites `result.cached_tokens` AFTER this hook
+    /// returns with the full-history prefix hit, so overrides need not
+    /// (and must not) fill it.
     fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
         finalize_chat_result(
             args.tokenizer,
@@ -1031,41 +969,6 @@ pub(crate) trait ChatBackend {
     /// for the full mapping).
     fn stream_emitter(&self) -> Box<dyn StreamEmitter> {
         Box::new(DefaultStreamEmitter)
-    }
-
-    /// Text-delta-on-image-session guard policy. `Some(message)`
-    /// rejects the delta turn with that error; `None` lets it proceed.
-    ///
-    /// `entry_fn` is the entry point's wire name:
-    /// `"chat_tokens_delta_sync"` on the sync twin,
-    /// `"chat_stream_tokens_delta"` on the streaming twin.
-    ///
-    /// Default is a per-kind defensive guard: reject when the live session
-    /// holds any media kind the target does not actually have available.
-    /// Media-capable families that accept text deltas (qwen3.5's
-    /// sticky-image-key contract) keep the default.
-    ///
-    /// Gemma4's override REJECTS despite declaring image capability
-    /// whenever `cached_image_key.is_some()`, with the typed prefix the
-    /// TS `ChatSession` restart routing matches on:
-    /// `format!("{IMAGE_CHANGE_RESTART_PREFIX}{entry_fn} is text-only;
-    /// session currently holds image state")`.
-    fn text_delta_media_guard(&self, entry_fn: &'static str) -> Option<String> {
-        let session_media = self.session_media();
-        let unsupported = session_media.difference(self.execution_plan().media.available);
-        if !unsupported.is_empty() {
-            let media_state = match (unsupported.images, unsupported.audio) {
-                (true, true) => "image/audio",
-                (true, false) => "image",
-                (false, true) => "audio",
-                (false, false) => unreachable!("guarded by !unsupported.is_empty()"),
-            };
-            Some(format!(
-                "{entry_fn} is text-only; session currently holds {media_state} state"
-            ))
-        } else {
-            None
-        }
     }
 
     /// Byte budget for the turn's `WiredLimitContext`, or `None` for NO
@@ -1164,32 +1067,47 @@ pub(crate) trait ChatBackend {
         full_len as u32
     }
 
-    /// Whether a live session exists for the delta-continuation guard
-    /// ("requires an initialized session (call chatSessionStart
-    /// first)").
+    /// Whether a live session exists for the role-aware continuation guard
+    /// ("requires an initialized session (call chatSessionStart first)").
     ///
     /// The families check different state: lfm2 tests
     /// `!cached_token_history.is_empty()` (the default here); qwen3.5
-    /// tests `self.caches.is_some()`. Gemma4's override folds BOTH of its
-    /// delta guards (empty history AND `caches.is_none()`) into one
-    /// check; the engine then emits a single guard message naming
-    /// `chatSessionStart` — the minor message drift vs gemma4's two
-    /// distinct messages (one of which names `chatStreamSessionStart`) is
-    /// an accepted change.
+    /// tests `self.caches.is_some()`. Gemma4's override requires both
+    /// non-empty history and initialized caches.
     fn has_live_session(&self) -> bool {
         !self.cached_token_history().is_empty()
     }
 
     /// Media kinds currently represented by the live session's cache state.
     ///
-    /// Feeds the default [`ChatBackend::text_delta_media_guard`] policy
-    /// and the request planner's `context_media` fact on delta turns. Returning
-    /// the specific kinds instead of a boolean prevents speculation from
-    /// mistaking an empty current-turn input for a text-only live context.
-    /// Families that need a different delta policy override the guard hook
-    /// itself. Default covers families that never track media state.
+    /// Family-specific prefix verification and specialized cache save paths
+    /// use this to keep media-derived state aligned with token history.
+    /// Default covers families that never track media state.
     fn session_media(&self) -> MediaCapabilities {
         MediaCapabilities::NONE
+    }
+
+    /// Whether the supplied historical media payloads are the exact media
+    /// represented by the live session cache.
+    ///
+    /// The session core calls this only after the non-empty media kinds match
+    /// [`Self::session_media`]. Backends must opt in by comparing a cached
+    /// payload key or digest; the fail-closed default forces a cold replay
+    /// whenever identity cannot be proven.
+    fn session_media_matches_payloads(&self, _images: &[Vec<u8>], _audio: &[Vec<u8>]) -> bool {
+        false
+    }
+
+    /// Convert a live cached-history token stream to the logical form emitted
+    /// by the checkpoint chat template for comparison only.
+    ///
+    /// VLM backends expand one logical image marker into many placeholder
+    /// tokens before prefill. Their live history therefore needs to collapse
+    /// those recorded media positions before it can be compared with a fresh
+    /// template render. The returned tokens never replace the real cache
+    /// history; they are used only by the continuation verifier.
+    fn template_history_comparison_tokens<'a>(&self, tokens: &'a [u32]) -> Cow<'a, [u32]> {
+        Cow::Borrowed(tokens)
     }
 
     // ---- specialized whole-turn executors ----
@@ -1593,7 +1511,7 @@ pub(crate) trait MtpStepper {
     /// steps. Borrowed for the lifetime of the call (the engine passes it
     /// straight back into [`Self::verify_step`] /
     /// [`Self::restore_and_replay_main`] / [`Self::commit_mtp`]).
-    fn embedding_weight(&self) -> &MxArray;
+    fn embedding(&self) -> &Embedding;
 
     /// `true` when [`Self::commit_mtp`] runs the real committed-history
     /// commit. The engine ANDs it with `cycle_seed_was_chained` to pick
@@ -1605,6 +1523,16 @@ pub(crate) trait MtpStepper {
     /// steppers with no committed-history support return `false`.
     /// == `MtpOps::committed_history_active`.
     fn committed_history_active(&self) -> bool;
+
+    /// Whether this turn may reuse the previous verify hidden to skip the
+    /// next main-model Step A forward.
+    ///
+    /// Most steppers can use the global chained-cycle policy directly.
+    /// Families whose chained path depends on a turn-local prompt seed can
+    /// return `false` when that seed is unavailable.
+    fn chained_cycles_supported(&self) -> bool {
+        true
+    }
 
     /// Optional profiler relabel for the MTP path (e.g.
     /// `"chat_compiled"`); `None` keeps the default family label. Read
@@ -1621,7 +1549,7 @@ pub(crate) trait MtpStepper {
     fn forward_with_hidden(
         &mut self,
         ids: &MxArray,
-        emb: &MxArray,
+        embedding: &Embedding,
     ) -> Result<(MxArray, MxArray, bool)>;
 
     /// One MTP draft step returning `(h_next [1,1,hidden], draft_logits
@@ -1634,7 +1562,7 @@ pub(crate) trait MtpStepper {
     fn verify_step(
         &mut self,
         ids: &MxArray,
-        emb: &MxArray,
+        embedding: &Embedding,
         depth: usize,
     ) -> Result<MtpVerifyOutput>;
 
@@ -1646,7 +1574,7 @@ pub(crate) trait MtpStepper {
     fn verify_step_argmax_only(
         &mut self,
         _ids: &MxArray,
-        _emb: &MxArray,
+        _embedding: &Embedding,
         _depth: usize,
     ) -> Option<Result<MtpVerifyOutput>> {
         None
@@ -1658,7 +1586,7 @@ pub(crate) trait MtpStepper {
     fn verify_step_sparse(
         &mut self,
         _ids: &MxArray,
-        _emb: &MxArray,
+        _embedding: &Embedding,
         _depth: usize,
         _cfg: &SamplingConfig,
     ) -> Option<Result<MtpVerifyOutput>> {
@@ -1683,7 +1611,7 @@ pub(crate) trait MtpStepper {
     /// accepted draft so the main linear state catches up. `accepted` is
     /// the accepted-draft prefix (NOT the residual). ==
     /// `MtpOps::restore_and_replay_main` (the `RR` closure).
-    fn restore_and_replay_main(&mut self, accepted: &[u32], emb: &MxArray) -> Result<()>;
+    fn restore_and_replay_main(&mut self, accepted: &[u32], embedding: &Embedding) -> Result<()>;
 
     /// Committed-history commit. Appends `K+2` exact committed K/V slots
     /// to the persistent MTP cache. The `anchor` selects the commit
@@ -1700,7 +1628,7 @@ pub(crate) trait MtpStepper {
         verify_hiddens: &MxArray,
         committed_ids: &[u32],
         k_accepted: usize,
-        emb: &MxArray,
+        embedding: &Embedding,
     ) -> Result<()>;
 
     /// Re-anchor the MTP draft caches/offset to the main path's current

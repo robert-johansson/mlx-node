@@ -11,12 +11,12 @@
  * Design notes:
  *
  *   - The session tracks its own `ChatMessage[]` history on the
- *     TypeScript side. In the common text-continue case the history
- *     is only appended to and never read back — each `send()` on
- *     turn >= 1 issues a cheap `chatSessionContinue` delta against
- *     the live KV cache. The history is kept purely so the
- *     image-change mid-session path can call `chatSessionStart` with
- *     the full rebuilt history for a clean re-prefill.
+ *     TypeScript side and passes the complete structured transcript
+ *     on every turn. Native code renders that transcript with the
+ *     checkpoint-provided chat template, verifies the completed history
+ *     against the committed cache, and appends the template-authored suffix
+ *     to the exact cached token IDs. Incompatible or edited history cold
+ *     replays the complete render.
  *
  *   - An image hash (`lastImagesKey`) tracks the images bound to the
  *     current cache. A `send()` call whose image set has changed
@@ -24,7 +24,9 @@
  *     restart: `resetCaches()` → push the new user message (with
  *     images) to history → `chatSessionStart(history)`.
  *
- *   - Text-only `send()` on turn >= 1 takes the cheap delta path.
+ *   - Text-only `send()` on turn >= 1 still gets incremental prefill
+ *     on a token-prefix hit. Prompt structure is never reconstructed
+ *     from Rust string literals.
  *
  *   - `sendToolResult` always dispatches `chatSessionContinueTool`,
  *     since tool turns never change image state. The session enforces
@@ -48,9 +50,7 @@
  *         `sendToolResult*()` throw. The only valid recovery is
  *         `reset()` or `primeHistory()` + `startFromHistory*()` with
  *         a fully-resolved conversation — there is no "advance past
- *         the broken turn" path. This mirrors the native ChatML delta
- *         format which would otherwise silently corrupt multi-call
- *         conversations.
+ *         the broken turn" path.
  *
  *   - `sawFinal` gates `turnCount` advance on the streaming path, so
  *     the session refuses to advance when the stream throws
@@ -90,21 +90,17 @@ import type { ChatConfig, ChatMessage, ChatResult, ToolCall, ToolCallResult, Too
 import type { ChatStreamEvent } from './stream.js';
 
 /**
- * Typed prefix the native delta path uses to reject a text-only
- * continuation while the session still holds image/audio KV state
- * (gemma4 raises this after a media turn). The native session refuses
- * to advance the cheap delta on top of media KV, so the session layer
- * recognizes this exact prefix and transparently replays the whole
- * conversation through the cold start path instead of surfacing the
- * raw error to the caller.
+ * Typed prefix native media guards use when a history cannot be continued
+ * from the held image/audio state. The session layer recognizes this exact
+ * prefix and transparently replays the complete structured conversation.
  *
  * MUST stay byte-for-byte identical to the Rust constant
  * `IMAGE_CHANGE_RESTART_PREFIX` in
  * `crates/mlx-core/src/engine/cache.rs` — it is not exported across the
  * NAPI boundary, so the two literals are kept in sync by hand. The
  * native message starts with this prefix and is delivered as the
- * `Error.message`: on the sync delta path as a rejected promise, and on
- * the streaming delta path as a thrown error on the generator's first
+ * `Error.message`: on the sync path as a rejected promise, and on
+ * the streaming path as a thrown error on the generator's first
  * iteration (the native worker-thread sink error is re-thrown by the
  * `packages/lm/src/stream.ts` bridge before any chunk is yielded).
  */
@@ -213,8 +209,10 @@ function toAssistantToolCalls(toolCalls: readonly ToolCallResult[] | undefined):
 
 /**
  * Build an assistant `ChatMessage` from a just-completed turn's
- * decoded text, tool-call list, reasoning body, and resolved thinking
- * mode. The assistant entry is appended to `this.history` after every
+ * decoded text, exact raw text, tool-call list, reasoning body, and resolved
+ * thinking mode. LFM2 replays the exact raw content because its checkpoint
+ * template does not consume structured reasoning; Qwen/Gemma retain their
+ * structured fields. The assistant entry is appended to `this.history` after every
  * successful turn and is later read back by the native
  * `chatSessionStart` cold-replay path (image-change mid-session
  * restart, `startFromHistory*`, server-side `SessionRegistry`
@@ -228,36 +226,30 @@ function buildAssistantMessage(
   text: string,
   toolCalls: readonly ToolCallResult[] | undefined,
   thinking: string | null | undefined,
-  thinkingEnabled: boolean | undefined,
+  thinkingEnabled: boolean,
+  rawText: string | null | undefined,
+  replayRawText: boolean,
 ): ChatMessage {
-  const message: ChatMessage = { role: 'assistant', content: text };
+  if (replayRawText) {
+    return {
+      role: 'assistant',
+      content: rawText ?? text,
+      thinkingEnabled,
+    };
+  }
   const calls = toAssistantToolCalls(toolCalls);
-  if (calls) message.toolCalls = calls;
-  if (thinking != null && thinking.length > 0) {
+  const message: ChatMessage = {
+    role: 'assistant',
+    content: text,
+    thinkingEnabled,
+  };
+  if (calls) {
+    message.toolCalls = calls;
+  }
+  if (thinking != null) {
     message.reasoningContent = thinking;
   }
-  if (thinkingEnabled !== undefined) {
-    message.thinkingEnabled = thinkingEnabled;
-  }
   return message;
-}
-
-/**
- * Mirror Rust's `resolve_enable_thinking`: explicit effort values resolve to
- * per-turn provenance while an omitted/unknown value stays undefined so the
- * model's own template default remains authoritative.
- */
-function resolveThinkingEnabled(config: ChatConfig): boolean | undefined {
-  switch (config.reasoningEffort) {
-    case 'none':
-    case 'low':
-      return false;
-    case 'medium':
-    case 'high':
-      return true;
-    default:
-      return undefined;
-  }
 }
 
 /**
@@ -277,6 +269,70 @@ function countOkToolCalls(toolCalls: readonly ToolCallResult[] | undefined): num
     if (c.status === 'ok') n++;
   }
   return n;
+}
+
+/**
+ * Select the assistant text committed after a successful stream.
+ *
+ * Default emitters expose parsed text on the terminal event, so an empty
+ * value is authoritative for a tool-only turn and must not fall back to raw
+ * streamed tool markup. Gemma's channel-aware emitter instead sends visible
+ * text as deltas and an empty terminal value for ordinary no-tool replies, so
+ * retain the accumulated visible text in that distinct shape.
+ */
+function selectCommittedStreamText(
+  finalText: string | null,
+  accumulatedVisible: string,
+  terminalTextAuthoritative: boolean | undefined,
+): string {
+  if (finalText == null) return accumulatedVisible;
+  if (terminalTextAuthoritative === true) return finalText;
+  if (terminalTextAuthoritative === false) return accumulatedVisible;
+  if (finalText !== '') return finalText;
+  return accumulatedVisible;
+}
+
+type ReplayCaptureResult = ChatResult & { publicRawText?: string };
+type ReplayCaptureStreamEvent = ChatStreamEvent & {
+  publicRawText?: string;
+  textAuthoritative?: boolean;
+};
+
+/** Mirror the native default used by `resolve_include_reasoning`. */
+function includesReasoning(config: ChatConfig): boolean {
+  return config.includeReasoning ?? config.reasoningEffort !== 'none';
+}
+
+/**
+ * Session history must retain reasoning even when the caller hides it. Ask
+ * native finalization for the full parsed turn without mutating the committed
+ * request config; the public view is redacted again below.
+ */
+function withReplayReasoning(config: ChatConfig, model: SessionCapableModel): ChatConfig {
+  if (includesReasoning(config)) return config;
+  if (model.supportsReplayReasoningCapture?.() !== true) return config;
+  // A zero-budget "none" turn cannot produce a reasoning body worth
+  // replaying. Preserve the caller's native suppression flag for this common
+  // short-generation path (for example title generation).
+  if (config.reasoningEffort === 'none' && (config.thinkingTokenBudget ?? 0) <= 0) {
+    return config;
+  }
+  return { ...config, includeReasoning: true };
+}
+
+function publicChatResult(result: ChatResult, config: ChatConfig): ChatResult {
+  if (includesReasoning(config)) return result;
+  const safeRaw = (result as ReplayCaptureResult).publicRawText;
+  return { ...result, thinking: undefined, rawText: safeRaw ?? result.text };
+}
+
+function publicStreamEvent(event: ChatStreamEvent, config: ChatConfig): ChatStreamEvent | null {
+  if (includesReasoning(config)) return event;
+  if (!event.done) {
+    return event.isReasoning === true ? null : event;
+  }
+  const safeRaw = (event as ReplayCaptureStreamEvent).publicRawText;
+  return { ...event, thinking: null, rawText: safeRaw ?? event.text };
 }
 
 /**
@@ -323,19 +379,21 @@ export interface SessionCapableModel {
    * known to be available.
    */
   supportsImages?(): boolean;
+  /**
+   * Whether this bundled wrapper can capture full reasoning internally while
+   * returning a privacy-safe public result. Third-party implementations omit
+   * this capability and keep their original `includeReasoning` config.
+   */
+  supportsReplayReasoningCapture?(): boolean;
+  /**
+   * Whether this model's checkpoint template expects historical reasoning
+   * embedded in `message.content` instead of the structured
+   * `reasoningContent` field.
+   */
+  replaysAssistantRawText?(): boolean;
   chatSessionStart(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
-  chatSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null,
-    audio: Uint8Array[] | null,
-    config?: ChatConfig | null,
-  ): Promise<ChatResult>;
-  chatSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | null,
-    isError?: boolean | null,
-  ): Promise<ChatResult>;
+  chatSessionContinue(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
+  chatSessionContinueTool(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
   /**
    * The optional `signal` parameter on every streaming entry point is
    * plumbed into the `_runChatStream` fast-abort path in the wrapper
@@ -351,18 +409,14 @@ export interface SessionCapableModel {
     signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent>;
   chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null,
-    audio: Uint8Array[] | null,
+    messages: ChatMessage[],
     config?: ChatConfig | null,
     signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent>;
   chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
+    messages: ChatMessage[],
     config?: ChatConfig | null,
     signal?: AbortSignal,
-    isError?: boolean | null,
   ): AsyncGenerator<ChatStreamEvent>;
   resetCaches(): void;
   /**
@@ -630,12 +684,13 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   private readonly model: M;
   private readonly system: string | undefined;
   private readonly defaultConfig: ChatConfig;
+  /** Tool definitions are conversation state for deterministic template replay. */
+  private activeTools: ToolDefinition[] | undefined;
 
   /**
    * Full conversation history tracked on the TS side. Appended to on
-   * every successful turn. Only read back when the image-change path
-   * triggers a restart — normal text continues use the server-side
-   * cache, not this array.
+   * every successful turn and sent on every role-aware native turn so
+   * the model-provided template remains the sole prompt authority.
    */
   private history: ChatMessage[] = [];
 
@@ -657,7 +712,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
 
   private turnCount = 0;
   private inFlight = false;
-  /** A failed/abandoned native delta must be followed by a full replay. */
+  /** A failed/abandoned native turn must be followed by a full replay. */
   private needsFullReplay = false;
 
   /**
@@ -686,6 +741,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     this.model = model;
     this.system = options.system;
     this.defaultConfig = options.defaultConfig ?? {};
+    this.activeTools = this.defaultConfig.tools;
   }
 
   /**
@@ -776,9 +832,10 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   /**
    * Send a user message and resolve with the assistant reply.
    *
-   * Turn 0 and any turn whose image set has changed dispatch through
-   * `chatSessionStart` with the full history. All other turns use
-   * the cheap `chatSessionContinue` delta path.
+   * Turn 0 and any turn whose image set changed dispatch through
+   * `chatSessionStart`. Later turns pass the same complete structured
+   * history through `chatSessionContinue`; native code renders the
+   * model template and reuses KV on an exact token-prefix match.
    */
   async send(userMessage: string, opts: SendOptions = {}): Promise<ChatResult> {
     if (this.inFlight) {
@@ -790,11 +847,11 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const mergedConfig = this.mergeConfig(opts.config);
       const newImagesKey = computeImagesKey(opts.images);
       const newAudioKey = computeAudioKey(opts.audio);
-      // Only an explicit NEW image/audio set can trigger a restart. Omitting
+      // Only an explicit NEW image/audio set can trigger a forced restart. Omitting
       // `images`/`audio` (key === null) is interpreted as "keep the current
       // media cache state" — the server-side cache already holds any prior
       // media context, so a text-only follow-up like "what about the
-      // top-right?" can stay on the cheap delta path even after a media turn.
+      // top-right?" can ask native code to verify/reuse the templated history.
       const imageChanged = newImagesKey !== null && newImagesKey !== this.lastImagesKey;
       const audioChanged = newAudioKey !== null && newAudioKey !== this.lastAudioKey;
       const isFirstTurn = this.turnCount === 0;
@@ -811,28 +868,29 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         );
       }
 
-      // Delta continue: text-only, images/audio always null. The server
-      // cache already holds all prior turns (including any media from an
-      // earlier restart), so we only need to ship the new user string.
+      // Role-aware continuation: pass the complete structured transcript.
+      // Native code renders it with the checkpoint template and only reuses
+      // the live cache when the resulting tokens exactly extend that cache.
       const pendingUser: ChatMessage = { role: 'user', content: userMessage };
-      const constrainedConfig = await this.constrainToContextCapacity(
-        this.historyWithPending(pendingUser),
-        mergedConfig,
-      );
+      const pendingHistory = this.historyWithPending(pendingUser);
+      const constrainedConfig = await this.constrainToContextCapacity(pendingHistory, mergedConfig);
       let result: ChatResult;
       try {
-        result = await this.model.chatSessionContinue(userMessage, null, null, constrainedConfig);
+        result = await this.model.chatSessionContinue(
+          pendingHistory,
+          withReplayReasoning(constrainedConfig, this.model),
+        );
       } catch (err) {
         if (!isMediaHeldRestartError(err)) {
           this.needsFullReplay = true;
           throw err;
         }
         // The native session holds media KV (gemma4 after an image/audio
-        // turn) and refused the text delta. Transparently replay the full
+        // turn) and refused the continuation. Transparently replay the full
         // conversation through the cold start path. The earlier media turn
         // already lives in `this.history`, so the start path re-renders it;
         // the trailing-media keys keep `lastImagesKey`/`lastAudioKey`
-        // consistent across the replay. The delta path has NOT pushed
+        // consistent across the replay. The continuation path has NOT pushed
         // `userMessage` yet, so `runStartPath` pushing it adds no duplicate.
         return await this.runStartPath(userMessage, undefined, undefined, true, false, constrainedConfig);
       }
@@ -842,12 +900,15 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           result.text,
           result.toolCalls,
           result.thinking,
-          resolveThinkingEnabled(constrainedConfig),
+          result.thinkingEnabled,
+          result.rawText,
+          this.model.replaysAssistantRawText?.() === true,
         ),
       );
       this.turnCount++;
+      this.commitActiveTools(constrainedConfig);
       this.recordToolCallFanout(result.toolCalls);
-      return result;
+      return publicChatResult(result, constrainedConfig);
     } finally {
       this.inFlight = false;
     }
@@ -899,16 +960,17 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
 
       // Delta continue stream: text-only.
       const pendingUser: ChatMessage = { role: 'user', content: userMessage };
-      const constrainedConfig = await this.constrainToContextCapacity(
-        this.historyWithPending(pendingUser),
-        mergedConfig,
-      );
+      const pendingHistory = this.historyWithPending(pendingUser);
+      const constrainedConfig = await this.constrainToContextCapacity(pendingHistory, mergedConfig);
       let sawFinal = false;
       let accumulated = '';
       let accumulatedVisible = '';
       let finalRaw: string | null = null;
+      let finalReplayRaw: string | null = null;
+      let finalTextAuthoritative: boolean | undefined;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
-      let finalThinking: string | null | undefined;
+      let finalThinking: string | null = null;
+      let finalThinkingEnabled = false;
       // Set when the media-held rejection re-routes this turn through the
       // cold start stream. The replay path owns the history push, turnCount
       // increment, and media-key rehydration, so the commit `finally` below
@@ -917,18 +979,19 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       try {
         try {
           for await (const event of this.model.chatStreamSessionContinue(
-            userMessage,
-            null,
-            null,
-            constrainedConfig,
+            pendingHistory,
+            withReplayReasoning(constrainedConfig, this.model),
             opts.signal,
           )) {
             if (event.done) {
               if (event.finishReason !== 'error') {
                 sawFinal = true;
                 finalRaw = event.text;
+                finalReplayRaw = event.rawText;
+                finalTextAuthoritative = (event as ReplayCaptureStreamEvent).textAuthoritative;
                 finalToolCalls = event.toolCalls;
                 finalThinking = event.thinking;
+                finalThinkingEnabled = event.thinkingEnabled;
               }
             } else {
               accumulated += event.text;
@@ -936,7 +999,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
                 accumulatedVisible += event.text;
               }
             }
-            yield event;
+            const publicEvent = publicStreamEvent(event, constrainedConfig);
+            if (publicEvent !== null) yield publicEvent;
           }
         } catch (err) {
           // The native session holds media KV (gemma4 after an image/audio
@@ -976,13 +1040,16 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           this.history.push(pendingUser);
           this.history.push(
             buildAssistantMessage(
-              finalRaw || accumulatedVisible,
+              selectCommittedStreamText(finalRaw, accumulatedVisible, finalTextAuthoritative),
               finalToolCalls,
               finalThinking,
-              resolveThinkingEnabled(constrainedConfig),
+              finalThinkingEnabled,
+              finalReplayRaw,
+              this.model.replaysAssistantRawText?.() === true,
             ),
           );
           this.turnCount++;
+          this.commitActiveTools(constrainedConfig);
           this.recordToolCallFanout(finalToolCalls);
         } else if (!delegated) {
           // Qwen commits cancelled/failed delta tokens to its native cached
@@ -997,9 +1064,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   }
 
   /**
-   * Send a tool-result turn. Always dispatches
-   * `chatSessionContinueTool` — tool turns never change image state,
-   * so there is no restart path here.
+   * Send a tool-result turn. The declaring assistant tool call and the
+   * pending result are both included in the full history passed to
+   * `chatSessionContinueTool`.
    *
    * Rejects if the prior assistant turn emitted more than one `ok`
    * tool call: the chat-session API only supports exactly one tool
@@ -1037,8 +1104,14 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     try {
       const { isError, config } = opts;
       const mergedConfig = this.mergeConfig(config);
-      const toolMsg: ChatMessage = { role: 'tool', content, toolCallId, isError };
-      const constrainedConfig = await this.constrainToContextCapacity(this.historyWithPending(toolMsg), mergedConfig);
+      const toolMsg: ChatMessage = {
+        role: 'tool',
+        content,
+        toolCallId,
+        isError,
+      };
+      const pendingHistory = this.historyWithPending(toolMsg);
+      const constrainedConfig = await this.constrainToContextCapacity(pendingHistory, mergedConfig);
       // A cold native session (turnCount===0) has no live KV to delta
       // against — the typical cause is an interrupted media-held replay
       // whose rollback wiped the cache and reset the counter while
@@ -1054,10 +1127,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       }
       try {
         const result = await this.model.chatSessionContinueTool(
-          toolCallId,
-          content,
-          constrainedConfig,
-          isError ?? null,
+          pendingHistory,
+          withReplayReasoning(constrainedConfig, this.model),
         );
         this.history.push({ role: 'tool', content, toolCallId, isError });
         this.history.push(
@@ -1065,12 +1136,15 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
             result.text,
             result.toolCalls,
             result.thinking,
-            resolveThinkingEnabled(constrainedConfig),
+            result.thinkingEnabled,
+            result.rawText,
+            this.model.replaysAssistantRawText?.() === true,
           ),
         );
         this.turnCount++;
+        this.commitActiveTools(constrainedConfig);
         this.recordToolCallFanout(result.toolCalls);
-        return result;
+        return publicChatResult(result, constrainedConfig);
       } catch (err) {
         if (!isMediaHeldRestartError(err)) {
           this.needsFullReplay = true;
@@ -1131,8 +1205,14 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     try {
       const { isError, config, signal } = opts;
       const mergedConfig = this.mergeConfig(config);
-      const toolMsg: ChatMessage = { role: 'tool', content, toolCallId, isError };
-      const constrainedConfig = await this.constrainToContextCapacity(this.historyWithPending(toolMsg), mergedConfig);
+      const toolMsg: ChatMessage = {
+        role: 'tool',
+        content,
+        toolCallId,
+        isError,
+      };
+      const pendingHistory = this.historyWithPending(toolMsg);
+      const constrainedConfig = await this.constrainToContextCapacity(pendingHistory, mergedConfig);
       // A cold native session (turnCount===0) has no live KV to delta
       // against — typically the residue of an interrupted media-held
       // replay whose rollback wiped the cache and reset the counter
@@ -1151,8 +1231,11 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let accumulated = '';
       let accumulatedVisible = '';
       let finalRaw: string | null = null;
+      let finalReplayRaw: string | null = null;
+      let finalTextAuthoritative: boolean | undefined;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
-      let finalThinking: string | null | undefined;
+      let finalThinking: string | null = null;
+      let finalThinkingEnabled = false;
       // Set when the media-held rejection re-routes this tool turn
       // through the cold start stream. The replay path owns the history
       // push, turnCount increment, and media-key rehydration, so the
@@ -1161,18 +1244,19 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       try {
         try {
           for await (const event of this.model.chatStreamSessionContinueTool(
-            toolCallId,
-            content,
-            constrainedConfig,
+            pendingHistory,
+            withReplayReasoning(constrainedConfig, this.model),
             signal,
-            isError ?? null,
           )) {
             if (event.done) {
               if (event.finishReason !== 'error') {
                 sawFinal = true;
                 finalRaw = event.text;
+                finalReplayRaw = event.rawText;
+                finalTextAuthoritative = (event as ReplayCaptureStreamEvent).textAuthoritative;
                 finalToolCalls = event.toolCalls;
                 finalThinking = event.thinking;
+                finalThinkingEnabled = event.thinkingEnabled;
               }
             } else {
               accumulated += event.text;
@@ -1180,7 +1264,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
                 accumulatedVisible += event.text;
               }
             }
-            yield event;
+            const publicEvent = publicStreamEvent(event, constrainedConfig);
+            if (publicEvent !== null) yield publicEvent;
           }
         } catch (err) {
           // The native session holds media KV (gemma4 after an image/audio
@@ -1212,13 +1297,16 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           this.history.push({ role: 'tool', content, toolCallId, isError });
           this.history.push(
             buildAssistantMessage(
-              finalRaw || accumulatedVisible,
+              selectCommittedStreamText(finalRaw, accumulatedVisible, finalTextAuthoritative),
               finalToolCalls,
               finalThinking,
-              resolveThinkingEnabled(constrainedConfig),
+              finalThinkingEnabled,
+              finalReplayRaw,
+              this.model.replaysAssistantRawText?.() === true,
             ),
           );
           this.turnCount++;
+          this.commitActiveTools(constrainedConfig);
           this.recordToolCallFanout(finalToolCalls);
         } else if (!delegated) {
           this.needsFullReplay = true;
@@ -1284,6 +1372,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     this.turnCount = 0;
     this.unresolvedOkToolCallCount = null;
     this.needsFullReplay = false;
+    this.activeTools = this.defaultConfig.tools;
   }
 
   /**
@@ -1353,21 +1442,27 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const mergedConfig = this.mergeConfig(config);
       const historySnapshot = this.history.slice();
       const constrainedConfig = await this.constrainToContextCapacity(historySnapshot, mergedConfig);
-      const result = await this.model.chatSessionStart(historySnapshot, constrainedConfig);
+      const result = await this.model.chatSessionStart(
+        historySnapshot,
+        withReplayReasoning(constrainedConfig, this.model),
+      );
       this.history.push(
         buildAssistantMessage(
           result.text,
           result.toolCalls,
           result.thinking,
-          resolveThinkingEnabled(constrainedConfig),
+          result.thinkingEnabled,
+          result.rawText,
+          this.model.replaysAssistantRawText?.() === true,
         ),
       );
       this.turnCount++;
       this.needsFullReplay = false;
       this.lastImagesKey = this.computeTrailingImagesKey();
       this.lastAudioKey = this.computeTrailingAudioKey();
+      this.commitActiveTools(constrainedConfig);
       this.recordToolCallFanout(result.toolCalls);
-      return result;
+      return publicChatResult(result, constrainedConfig);
     } finally {
       this.inFlight = false;
     }
@@ -1402,16 +1497,26 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let accumulated = '';
       let accumulatedVisible = '';
       let finalRaw: string | null = null;
+      let finalReplayRaw: string | null = null;
+      let finalTextAuthoritative: boolean | undefined;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
-      let finalThinking: string | null | undefined;
+      let finalThinking: string | null = null;
+      let finalThinkingEnabled = false;
       try {
-        for await (const event of this.model.chatStreamSessionStart(historySnapshot, constrainedConfig, signal)) {
+        for await (const event of this.model.chatStreamSessionStart(
+          historySnapshot,
+          withReplayReasoning(constrainedConfig, this.model),
+          signal,
+        )) {
           if (event.done) {
             if (event.finishReason !== 'error') {
               sawFinal = true;
               finalRaw = event.text;
+              finalReplayRaw = event.rawText;
+              finalTextAuthoritative = (event as ReplayCaptureStreamEvent).textAuthoritative;
               finalToolCalls = event.toolCalls;
               finalThinking = event.thinking;
+              finalThinkingEnabled = event.thinkingEnabled;
             }
           } else {
             accumulated += event.text;
@@ -1419,7 +1524,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
               accumulatedVisible += event.text;
             }
           }
-          yield event;
+          const publicEvent = publicStreamEvent(event, constrainedConfig);
+          if (publicEvent !== null) yield publicEvent;
         }
       } finally {
         // finally runs on normal completion, mid-stream throw, caller
@@ -1430,16 +1536,19 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         if (sawFinal) {
           this.history.push(
             buildAssistantMessage(
-              finalRaw || accumulatedVisible,
+              selectCommittedStreamText(finalRaw, accumulatedVisible, finalTextAuthoritative),
               finalToolCalls,
               finalThinking,
-              resolveThinkingEnabled(constrainedConfig),
+              finalThinkingEnabled,
+              finalReplayRaw,
+              this.model.replaysAssistantRawText?.() === true,
             ),
           );
           this.turnCount++;
           this.needsFullReplay = false;
           this.lastImagesKey = this.computeTrailingImagesKey();
           this.lastAudioKey = this.computeTrailingAudioKey();
+          this.commitActiveTools(constrainedConfig);
           this.recordToolCallFanout(finalToolCalls);
         }
       }
@@ -1552,10 +1661,24 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   }
 
   /**
+   * Persist the effective tools only when their turn commits successfully.
+   * Preflights and failed/abandoned turns intentionally never call this.
+   */
+  private commitActiveTools(config: ChatConfig): void {
+    if (config.tools !== undefined) {
+      this.activeTools = config.tools;
+    }
+  }
+
+  /**
    * Merge default + per-call config and force `reuseCache: true`.
    * The session path is a session-reuse operation by construction —
    * `reuseCache: false` on the continue path would wipe the very
    * cache the delta depends on.
+   *
+   * Tool resolution here is side-effect free because public capacity
+   * preflights use this same merge path. Successful turn commit sites call
+   * {@link commitActiveTools} after native inference finishes.
    *
    * MTP auto-default: if neither `defaultConfig` nor `overlay`
    * sets `enableMtp` AND the underlying model exposes
@@ -1573,6 +1696,14 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       ...overlay,
       reuseCache: true,
     };
+    // Tools are part of the committed conversation state. Constructor
+    // defaults seed that state, but must not overwrite a tool set committed by
+    // a later successful turn. A current-call overlay is the only higher
+    // precedence source; it remains provisional until a success site calls
+    // commitActiveTools().
+    if (overlay?.tools === undefined && this.activeTools !== undefined) {
+      merged.tools = this.activeTools;
+    }
     if (
       merged.enableMtp === undefined &&
       typeof this.model.hasMtpWeights === 'function' &&
@@ -1604,7 +1735,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       return config;
     }
 
-    const enableThinking = resolveThinkingEnabled(config) ?? null;
+    const effort = config.reasoningEffort;
+    const enableThinking =
+      effort === 'none' || effort === 'low' ? false : effort === 'medium' || effort === 'high' ? true : null;
     const tokens = await this.model.applyChatTemplate(messages, true, config.tools ?? null, enableThinking);
     const hasImages = messages.some((message) => (message.images?.length ?? 0) > 0);
     let promptTokens = tokens.length;
@@ -1696,13 +1829,18 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // (e.g. the assistant reply below) don't retroactively mutate
       // what the native side / any mock observed as its `messages`
       // argument.
-      const result = await this.model.chatSessionStart(this.history.slice(), constrainedConfig);
+      const result = await this.model.chatSessionStart(
+        this.history.slice(),
+        withReplayReasoning(constrainedConfig, this.model),
+      );
       this.history.push(
         buildAssistantMessage(
           result.text,
           result.toolCalls,
           result.thinking,
-          resolveThinkingEnabled(constrainedConfig),
+          result.thinkingEnabled,
+          result.rawText,
+          this.model.replaysAssistantRawText?.() === true,
         ),
       );
       this.turnCount++;
@@ -1716,8 +1854,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // turn to be mis-detected as a change and replayed twice.
       this.lastImagesKey = this.computeTrailingImagesKey();
       this.lastAudioKey = this.computeTrailingAudioKey();
+      this.commitActiveTools(constrainedConfig);
       this.recordToolCallFanout(result.toolCalls);
-      return result;
+      return publicChatResult(result, constrainedConfig);
     } catch (err) {
       // Roll back: drop the tentative user push so history stays
       // consistent with turnCount.
@@ -1780,19 +1919,29 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     let accumulated = '';
     let accumulatedVisible = '';
     let finalRaw: string | null = null;
+    let finalReplayRaw: string | null = null;
+    let finalTextAuthoritative: boolean | undefined;
     let finalToolCalls: readonly ToolCallResult[] | undefined;
-    let finalThinking: string | null | undefined;
+    let finalThinking: string | null = null;
+    let finalThinkingEnabled = false;
     // Snapshot the history before dispatch — see `runStartPath` for
     // the rationale.
     const historySnapshot = this.history.slice();
     try {
-      for await (const event of this.model.chatStreamSessionStart(historySnapshot, constrainedConfig, signal)) {
+      for await (const event of this.model.chatStreamSessionStart(
+        historySnapshot,
+        withReplayReasoning(constrainedConfig, this.model),
+        signal,
+      )) {
         if (event.done) {
           if (event.finishReason !== 'error') {
             sawFinal = true;
             finalRaw = event.text;
+            finalReplayRaw = event.rawText;
+            finalTextAuthoritative = (event as ReplayCaptureStreamEvent).textAuthoritative;
             finalToolCalls = event.toolCalls;
             finalThinking = event.thinking;
+            finalThinkingEnabled = event.thinkingEnabled;
           }
         } else {
           accumulated += event.text;
@@ -1800,7 +1949,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
             accumulatedVisible += event.text;
           }
         }
-        yield event;
+        const publicEvent = publicStreamEvent(event, constrainedConfig);
+        if (publicEvent !== null) yield publicEvent;
       }
     } finally {
       // finally runs in ALL termination paths: normal completion,
@@ -1814,10 +1964,12 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       if (sawFinal) {
         this.history.push(
           buildAssistantMessage(
-            finalRaw || accumulatedVisible,
+            selectCommittedStreamText(finalRaw, accumulatedVisible, finalTextAuthoritative),
             finalToolCalls,
             finalThinking,
-            resolveThinkingEnabled(constrainedConfig),
+            finalThinkingEnabled,
+            finalReplayRaw,
+            this.model.replaysAssistantRawText?.() === true,
           ),
         );
         this.turnCount++;
@@ -1831,6 +1983,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // turn to be mis-detected as a change and replayed twice.
         this.lastImagesKey = this.computeTrailingImagesKey();
         this.lastAudioKey = this.computeTrailingAudioKey();
+        this.commitActiveTools(constrainedConfig);
         this.recordToolCallFanout(finalToolCalls);
       } else {
         // Roll back: drop the tentative user push so history stays

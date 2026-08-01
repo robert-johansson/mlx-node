@@ -251,15 +251,33 @@ impl MetalState {
         "paged_attention_grouped_bfloat16_hs256_striped_reduce"
     }
 
-    /// Experimental Gemma 4 global-attention instantiation of the same
-    /// grouped paged kernel (BF16, D512, block size 16, 16Q/1KV).
-    pub fn paged_attention_grouped_gemma4_kernel_name() -> &'static str {
+    /// Geometry-based grouped paged kernel for BF16, D512, block size 16, and
+    /// the supported GQA layouts. The production specialization reads K/V
+    /// directly from device memory without threadgroup staging.
+    pub fn paged_attention_grouped_d512_kernel_name() -> &'static str {
         "paged_attention_grouped_bfloat16_hs512_bs16_striped"
     }
 
-    /// D512 reducer paired with `paged_attention_grouped_gemma4_kernel_name`.
-    pub fn paged_attention_grouped_gemma4_reduce_kernel_name() -> &'static str {
+    /// Cooperative-staging D512 variant retained for manual parity,
+    /// performance, and rollback comparisons. Production capability probing
+    /// does not select this pipeline.
+    pub fn paged_attention_grouped_d512_staged_kernel_name() -> &'static str {
+        "paged_attention_grouped_bfloat16_hs512_bs16_striped_staged"
+    }
+
+    /// D512 reducer paired with `paged_attention_grouped_d512_kernel_name`.
+    pub fn paged_attention_grouped_d512_reduce_kernel_name() -> &'static str {
         "paged_attention_grouped_bfloat16_hs512_striped_reduce"
+    }
+
+    /// Compatibility alias for existing downstream diagnostics.
+    pub fn paged_attention_grouped_gemma4_kernel_name() -> &'static str {
+        Self::paged_attention_grouped_d512_kernel_name()
+    }
+
+    /// Compatibility alias for existing downstream diagnostics.
+    pub fn paged_attention_grouped_gemma4_reduce_kernel_name() -> &'static str {
+        Self::paged_attention_grouped_d512_reduce_kernel_name()
     }
 
     /// Varlen counterparts to the V1/V2/reduce kernel name helpers above.

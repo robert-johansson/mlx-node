@@ -16,6 +16,7 @@ use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
 use crate::engine::decode::Top2;
+use crate::nn::Embedding;
 use crate::sampling::{self, SamplingConfig};
 
 // ---------------------------------------------------------------------------
@@ -737,14 +738,14 @@ pub(crate) fn trace_acceptance_dense(
 
 /// Closures for model-specific operations in the AR decode loop.
 ///
-/// `F`: forward pass — takes (input_ids [1,1], embedding_weight) → Result<(logits, needs_squeeze)>.
+/// `F`: forward pass — takes (input_ids [1,1], embedding) → Result<(logits, needs_squeeze)>.
 /// `E`: eval step — takes (next_token, logits, budget_forced) → schedules async eval.
 ///
 /// The engine's generic flow uses [`crate::engine::backend::DecodeStep`];
 /// `DecodeOps` is built by the `decode_loop!` call sites below.
 pub(crate) struct DecodeOps<F, E>
 where
-    F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, bool)>,
+    F: FnMut(&MxArray, &Embedding) -> Result<(MxArray, bool)>,
     E: Fn(&MxArray, &MxArray, bool),
 {
     pub forward: F,
@@ -931,10 +932,13 @@ macro_rules! decode_loop {
                             finish_reason: None,
                             tool_calls: None,
                             thinking: None,
+                            thinking_enabled: None,
                             num_tokens: None,
                             prompt_tokens: None,
                             reasoning_tokens: None,
                             raw_text: None,
+                            public_raw_text: None,
+                            text_authoritative: None,
                             cached_tokens: None,
                             performance: None,
                             is_reasoning: Some(_is_reasoning),
