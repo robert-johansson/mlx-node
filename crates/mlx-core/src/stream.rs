@@ -5,6 +5,8 @@
  * Streams allow overlapping computation and memory transfers.
  */
 use mlx_sys as sys;
+use napi::bindgen_prelude::*;
+use napi_derive::napi;
 
 /// Whether MLX's Metal backend is available on this host (cached; constant per
 /// process). False on the CUDA/Linux build, where secondary GPU streams + the
@@ -20,6 +22,94 @@ fn metal_backend_available() -> bool {
 pub enum DeviceType {
     Cpu = 0,
     Gpu = 1,
+}
+
+impl DeviceType {
+    /// Parse the JS-facing device name. `None` for anything but `"cpu"`/`"gpu"`.
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "cpu" => Some(DeviceType::Cpu),
+            "gpu" => Some(DeviceType::Gpu),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            DeviceType::Cpu => "cpu",
+            DeviceType::Gpu => "gpu",
+        }
+    }
+
+    fn from_code(code: i32) -> Self {
+        match code {
+            0 => DeviceType::Cpu,
+            _ => DeviceType::Gpu,
+        }
+    }
+}
+
+// ── NAPI exports: default device selection ─────────────────────────
+//
+// MLX ships a full CPU backend and `mlx-sys` compiles it in
+// (`.define("MLX_BUILD_CPU", "ON")`, crates/mlx-sys/build.rs). The C++ shim
+// (`mlx_set_default_device`, crates/mlx-sys/src/mlx_stream.cpp) and its FFI
+// declaration have existed since the stream work landed, but nothing exposed
+// them to JavaScript — so from Node the backend was unreachable. These two
+// exports are that bridge, mirroring Python MLX's `mx.set_default_device(mx.cpu)`.
+//
+// Why it is worth having: a GPU eval costs a fixed dispatch latency regardless
+// of problem size. For graphs of a few ops over a few dozen elements that is
+// pure overhead and the CPU backend wins by an order of magnitude. Large
+// models are unaffected — leave them on "gpu".
+//
+// CAUTION — this is a PROCESS-WIDE default. Ops given an explicit stream are
+// unaffected, but everything else follows it, and several of this fork's custom
+// primitives are GPU-only and throw on a CPU stream (`PagedKVWrite CPU NYI`,
+// `PagedAttention CPU NYI`, `PagedAttentionVarlen CPU NYI` —
+// crates/mlx-sys/src/mlx_paged_ops.h). A process that also decodes an LLM must
+// not leave the default on "cpu". Scope it instead:
+//
+//     const prev = defaultDevice()
+//     setDefaultDevice('cpu')
+//     try { /* small-graph work */ } finally { setDefaultDevice(prev) }
+//
+// A native scope helper is deliberately not provided: with a getter and a
+// setter the try/finally above is exact, and a napi callback bridge would add
+// cost and complexity for no added safety.
+
+/// The process-wide default device — `"cpu"` or `"gpu"`.
+#[napi]
+pub fn default_device() -> String {
+    DeviceType::from_code(unsafe { sys::mlx_default_device() })
+        .name()
+        .to_owned()
+}
+
+/// Set the process-wide default device. Accepts `"cpu"` or `"gpu"`.
+///
+/// Throws on an unrecognized name, and — because the underlying C++ shim logs
+/// and swallows its exceptions — also throws if the default did not actually
+/// change. A setter that can silently do nothing is worse than no setter.
+#[napi]
+pub fn set_default_device(device: String) -> Result<()> {
+    let requested = DeviceType::from_name(&device).ok_or_else(|| {
+        Error::from_reason(format!(
+            "unknown device {device:?} — expected \"cpu\" or \"gpu\""
+        ))
+    })?;
+
+    unsafe { sys::mlx_set_default_device(requested as i32) };
+
+    let actual = DeviceType::from_code(unsafe { sys::mlx_default_device() });
+    if actual != requested {
+        return Err(Error::from_reason(format!(
+            "failed to select device {:?}; the default is still {:?}",
+            requested.name(),
+            actual.name()
+        )));
+    }
+    Ok(())
 }
 
 /// MLX Stream wrapper

@@ -2861,6 +2861,9 @@ export declare function createRandomQwen35MoeCheckpoint(config: Qwen35MoeConfig,
  */
 export declare function createRandomQwen3Checkpoint(config: Qwen3Config, savePath: string): Promise<undefined>;
 
+/** The process-wide default device — `"cpu"` or `"gpu"`. */
+export declare function defaultDevice(): string;
+
 /** Document element - either a table or paragraph */
 export interface DocumentElement {
   elementType: ElementType;
@@ -4545,6 +4548,15 @@ export interface SamplingConfig {
  * ```
  */
 export declare function saveToXlsx(text: string, filePath: string): void;
+
+/**
+ * Set the process-wide default device. Accepts `"cpu"` or `"gpu"`.
+ *
+ * Throws on an unrecognized name, and — because the underlying C++ shim logs
+ * and swallows its exceptions — also throws if the default did not actually
+ * change. A setter that can silently do nothing is worse than no setter.
+ */
+export declare function setDefaultDevice(device: string): void;
 
 /** Enable or disable profiling globally. */
 export declare function setProfilingEnabled(enabled: boolean): void;
