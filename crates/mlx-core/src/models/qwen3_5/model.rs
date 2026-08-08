@@ -738,6 +738,11 @@ pub(crate) struct Qwen35Inner {
     /// per-call latency grew across generateBatch calls (genmlx-d3yn). On
     /// CUDA, Stream::new already collapses to the default stream.
     pub(crate) generation_stream: Stream,
+    /// Turn-constant layer classification (`Linear` vs `FullAttentionPaged`),
+    /// computed once in [`Self::new`] instead of re-derived on every paged
+    /// decode step. Pure function of the immutable `config`. Mirrors the
+    /// `Gemma4Inner::layer_kinds` caching pattern.
+    pub(crate) layer_kinds: Vec<super::decoder_layer::Qwen3_5LayerKind>,
     pub(crate) embedding: Embedding,
     pub(crate) layers: Vec<DecoderLayer>,
     pub(crate) final_norm: RMSNorm,
@@ -822,6 +827,24 @@ pub(crate) struct Qwen35Inner {
     /// applied it to `mtp`. The module may exist from config alone; this
     /// flag prevents random-init MTP modules from advertising capability.
     pub(crate) mtp_weights_loaded: bool,
+    /// Aggregated first-draft acceptance counts (accepted / attempted at
+    /// draft slot 0) across completed depth-1 MTP turns, recorded by the
+    /// engine's `run_mtp_turn` end-of-turn hook. The MTP acceptance gate
+    /// ([`Self::mtp_gate_allows`]) disables speculation for the NEXT
+    /// depth-1 turn only when a 95% confidence bound on the aggregate
+    /// rate is below the break-even — so a single undersampled turn or a
+    /// short bad streak from a healthy head cannot wrongly gate. `None`-
+    /// equivalent (attempted == 0) = no history yet (the first turn
+    /// probes), the gate re-probed after
+    /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns, or a
+    /// full session reset cleared it.
+    mtp_draft_accepted: u64,
+    mtp_draft_attempted: u64,
+    /// Consecutive turns the MTP acceptance gate has blocked; after
+    /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns the gate
+    /// re-probes (the aggregate resets to zero) so a later easier turn
+    /// can re-enable speculation.
+    mtp_gated_turns: u32,
     /// Whether the CURRENT generic-flow turn is streaming. Set by the
     /// [`ChatBackend::profiler_label`] hook (the session core calls it
     /// exactly once per generic-flow turn, before `begin_decode`);
@@ -1277,6 +1300,13 @@ impl Qwen35Inner {
 
         let model_id = QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
+        // Layer classification is a pure function of the immutable config;
+        // compute once here (see the field rustdoc).
+        let layer_kinds =
+            super::decoder_layer::compute_layer_kinds(config.num_layers as usize, |i| {
+                config.is_linear_layer(i)
+            });
+
         // The physical paged pool is intentionally created only after weight
         // loading/materialization. At this point the MLX allocator does not yet
         // know the resident model footprint, so sizing here can overcommit
@@ -1297,6 +1327,7 @@ impl Qwen35Inner {
         Ok(Self {
             config,
             generation_stream: Stream::new(DeviceType::Gpu),
+            layer_kinds,
             embedding,
             layers,
             final_norm,
@@ -1326,6 +1357,9 @@ impl Qwen35Inner {
             training_state: None,
             mtp,
             mtp_weights_loaded: false,
+            mtp_draft_accepted: 0,
+            mtp_draft_attempted: 0,
+            mtp_gated_turns: 0,
             turn_is_streaming: Cell::new(false),
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
             draft: None,
@@ -1583,6 +1617,12 @@ impl Qwen35Inner {
         }
         self.caches = None;
         self.clear_reuse_state();
+        // A full session reset must also clear the MTP acceptance gate
+        // state: a new independent chat on this model starts fresh (probes)
+        // instead of inheriting the previous chat's rejection.
+        self.mtp_draft_accepted = 0;
+        self.mtp_draft_attempted = 0;
+        self.mtp_gated_turns = 0;
         Ok(())
     }
 
@@ -9385,10 +9425,6 @@ impl DecodeStep for Qwen35PagedDecode<'_> {
         // signature parity).
         let logits = {
             let embed = self.inner.embedding.clone();
-            let layer_kinds = super::decoder_layer::compute_layer_kinds(
-                self.inner.config.num_layers as usize,
-                |i| self.inner.config.is_linear_layer(i),
-            );
             let caches_ref = self.inner.caches.as_mut().ok_or_else(|| {
                 Error::from_reason("Qwen35PagedDecode::forward: caches dropped mid-decode")
             })?;
@@ -9402,7 +9438,7 @@ impl DecodeStep for Qwen35PagedDecode<'_> {
                 caches_ref,
                 &self.inner.final_norm,
                 &self.inner.lm_head,
-                &layer_kinds,
+                &self.inner.layer_kinds,
                 adapter,
                 self.inner.cached_rope_deltas.unwrap_or(0),
             )?
@@ -9899,7 +9935,17 @@ impl Qwen35Inner {
         // These legacy whole-turn cores still extract their own `ChatParams`,
         // so project the selected decoder back into their config instead of
         // letting the raw request independently re-open the MTP gate.
-        let planned_mtp = apply_qwen35_dense_planned_decoder(&mut config, args.plan.decoder);
+        let mut planned_mtp = apply_qwen35_dense_planned_decoder(&mut config, args.plan.decoder);
+        // MTP acceptance gate: a previous turn whose draft head accepted
+        // below break-even disables speculation for THIS turn (plain AR),
+        // so the verify cost is not paid for zero speedup.
+        if planned_mtp
+            && !config.mtp_adaptive_depth.unwrap_or(false)
+            && !self.mtp_gate_allows(config.mtp_depth.unwrap_or(1).max(1) as u32)
+        {
+            planned_mtp = false;
+            config.enable_mtp = Some(false);
+        }
         debug_assert!(!planned_mtp || self.has_mtp_weights());
         let thinking = args.thinking;
         match (args.sink, args.cancelled) {
@@ -9963,7 +10009,15 @@ impl Qwen35Inner {
         // honors them too (no-op when the checkpoint ships none).
         let mut config = args.config.clone();
         crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
-        let planned_mtp = apply_qwen35_dense_planned_decoder(&mut config, args.plan.decoder);
+        let mut planned_mtp = apply_qwen35_dense_planned_decoder(&mut config, args.plan.decoder);
+        // MTP acceptance gate (same policy as the sync whole-turn core).
+        if planned_mtp
+            && !config.mtp_adaptive_depth.unwrap_or(false)
+            && !self.mtp_gate_allows(config.mtp_depth.unwrap_or(1).max(1) as u32)
+        {
+            planned_mtp = false;
+            config.enable_mtp = Some(false);
+        }
         debug_assert!(!planned_mtp || self.has_mtp_weights());
         let mut p = extract_chat_params(&config);
         p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
@@ -10663,10 +10717,9 @@ impl MtpBackend for Qwen35Inner {
         // paged forwards need the per-layer kind classification (unused flat).
         let (mode, layer_kinds) = match self.paged_adapter.take() {
             Some(adapter) => {
-                let layer_kinds = super::decoder_layer::compute_layer_kinds(
-                    self.config.num_layers as usize,
-                    |i| self.config.is_linear_layer(i),
-                );
+                // Cached once at construction (see the field rustdoc); clone is
+                // a copy of the turn-constant classification.
+                let layer_kinds = self.layer_kinds.clone();
                 (MtpStepMode::Paged(Box::new(adapter)), layer_kinds)
             }
             None => (MtpStepMode::Flat, Vec::new()),
@@ -10768,6 +10821,53 @@ impl MtpBackend for Qwen35Inner {
         }
 
         Ok(stepper)
+    }
+
+    fn record_turn_mtp_acceptance(&mut self, accepted: u64, attempted: u64) {
+        // Aggregate across turns so the confidence-aware gate decision has
+        // a growing sample — but bound it so a long healthy phase cannot
+        // drown out a later degradation (see `mtp_bound_gate_history`).
+        self.mtp_draft_accepted += accepted;
+        self.mtp_draft_attempted += attempted;
+        mtp_decode::mtp_bound_gate_history(
+            &mut self.mtp_draft_accepted,
+            &mut self.mtp_draft_attempted,
+        );
+        self.mtp_gated_turns = 0;
+    }
+}
+
+impl Qwen35Inner {
+    /// MTP acceptance gate — see `mtp_decode::mtp_accept_gate_enabled`.
+    /// `false` means the aggregated first-draft acceptance rate is below
+    /// the break-even bound WITH 95% confidence, so this turn should run
+    /// plain AR instead of paying the verify cost for zero speedup.
+    /// Depth-1-scoped: the 0.6 threshold is depth-1 calibrated, and at
+    /// depth > 1 the verify cost vs deeper-slot acceptance economics are
+    /// not captured by a single threshold — the gate never blocks a
+    /// depth>1 turn. First turn (no history) probes; after
+    /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] consecutive gated
+    /// turns the gate re-probes; the env knob disables the gate entirely.
+    /// `&mut self` because a blocked turn advances the gated-turn counter
+    /// and may trigger the re-probe reset.
+    fn mtp_gate_allows(&mut self, requested_depth: u32) -> bool {
+        if !mtp_decode::mtp_accept_gate_enabled() || requested_depth > 1 {
+            return true;
+        }
+        let attempted = self.mtp_draft_attempted;
+        if attempted == 0 {
+            return true; // no history — probe
+        }
+        if !mtp_decode::mtp_accept_gate_blocks(self.mtp_draft_accepted, attempted) {
+            return true; // not confident the head is below break-even
+        }
+        self.mtp_gated_turns += 1;
+        if self.mtp_gated_turns >= mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS {
+            self.mtp_gated_turns = 0;
+            self.mtp_draft_accepted = 0;
+            self.mtp_draft_attempted = 0; // re-probe next turn
+        }
+        false
     }
 }
 
@@ -16867,5 +16967,184 @@ mod paged_construction_tests {
         let _ = adapter.register_full_blocks_for_reuse(&[], 0);
         adapter.release_request().expect("release_request");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+#[cfg(test)]
+mod layer_kinds_cache_tests {
+    //! The paged decode steppers consume `Qwen35Inner::layer_kinds` (cached
+    //! at construction) instead of re-deriving it per step. Pin the
+    //! invariant: the cached classification must equal a fresh from-scratch
+    //! computation over the same config (mirrors the gemma4
+    //! `test_gemma4_inner_caches_layer_kinds_matching_fresh_compute` test).
+    //! Construction-only: `Qwen35Inner::new` defers the Metal paged pool to
+    //! `initialize_paged_adapter`, so this needs no GPU.
+
+    use super::*;
+    use crate::models::qwen3_5::config::Qwen3_5Config;
+    use crate::models::qwen3_5::decoder_layer::compute_layer_kinds;
+
+    fn tiny_cfg() -> Qwen3_5Config {
+        Qwen3_5Config {
+            vocab_size: 1024,
+            hidden_size: 64,
+            num_layers: 8,
+            num_heads: 4,
+            num_kv_heads: 2,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            head_dim: 16,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 1024,
+            pad_token_id: 0,
+            eos_token_id: 0,
+            bos_token_id: 0,
+            linear_num_value_heads: 4,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 0.25,
+            rope_theta: 100_000.0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: None,
+            persist_paged_cache: None,
+            n_mtp_layers: 0,
+        }
+    }
+
+    #[test]
+    fn inner_caches_layer_kinds_matching_fresh_compute() {
+        let cfg = tiny_cfg();
+        let inner = Qwen35Inner::new(cfg.clone()).expect("construct");
+        let fresh = compute_layer_kinds(cfg.num_layers as usize, |i| cfg.is_linear_layer(i));
+        assert_eq!(
+            inner.layer_kinds, fresh,
+            "cached layer classification must equal a fresh compute over the same config"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mtp_gate_state_tests {
+    //! Cheap construction-only tests for the MTP acceptance-gate state on
+    //! `Qwen35Inner` (no Metal: `new` defers the paged pool, and
+    //! `reset_caches_sync` on a fresh inner touches no GPU state).
+
+    use super::*;
+    use crate::models::qwen3_5::config::Qwen3_5Config;
+
+    fn tiny_cfg() -> Qwen3_5Config {
+        Qwen3_5Config {
+            vocab_size: 1024,
+            hidden_size: 64,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: 2,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            head_dim: 16,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 1024,
+            pad_token_id: 0,
+            eos_token_id: 0,
+            bos_token_id: 0,
+            linear_num_value_heads: 4,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 0.25,
+            rope_theta: 100_000.0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: None,
+            persist_paged_cache: None,
+            n_mtp_layers: 0,
+        }
+    }
+
+    #[test]
+    fn reset_caches_clears_mtp_acceptance_gate_state() {
+        // A full session reset must clear the MTP acceptance-gate history
+        // so a new independent chat on this model probes instead of
+        // inheriting the previous chat's rejection.
+        let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct");
+        inner.mtp_draft_accepted = 1;
+        inner.mtp_draft_attempted = 4;
+        inner.mtp_gated_turns = 2;
+        inner.reset_caches_sync().expect("reset");
+        assert_eq!(inner.mtp_draft_accepted, 0, "gate history cleared");
+        assert_eq!(inner.mtp_draft_attempted, 0, "gate history cleared");
+        assert_eq!(inner.mtp_gated_turns, 0, "gated-turn streak cleared");
+    }
+
+    #[test]
+    fn gate_is_depth_1_scoped() {
+        // The 0.6 threshold is depth-1 calibrated; a depth>1 turn is never
+        // gated even when the aggregated rate is confidently below
+        // break-even (the verify cost vs deeper-slot acceptance economics
+        // at depth>1 are not captured by a single threshold).
+        let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct");
+        inner.mtp_draft_accepted = 0;
+        inner.mtp_draft_attempted = 4; // 0/4: confident below break-even
+        assert!(
+            inner.mtp_gate_allows(2),
+            "depth>1 request must not be gated by the depth-1 threshold"
+        );
+        assert!(
+            !inner.mtp_gate_allows(1),
+            "a depth-1 request with confidently-low acceptance must be gated"
+        );
+    }
+
+    #[test]
+    fn gate_does_not_act_on_undersampled_or_marginal_rates() {
+        // The gate is confidence-aware: a 2-of-4 rate (upper Wilson 95%
+        // bound ~0.82) or a 1-of-4 rate (~0.64) is NOT confidently below
+        // break-even — a healthy 0.756 head hits 2-of-4 ~25% of the time.
+        let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct");
+        inner.mtp_draft_accepted = 2;
+        inner.mtp_draft_attempted = 4;
+        assert!(inner.mtp_gate_allows(1), "2-of-4 must not gate");
+        inner.mtp_draft_accepted = 1;
+        assert!(inner.mtp_gate_allows(1), "1-of-4 must not gate");
+        inner.mtp_draft_accepted = 0;
+        assert!(
+            !inner.mtp_gate_allows(1),
+            "0-of-4 must gate (~0.35% for a 0.756 head)"
+        );
+    }
+
+    #[test]
+    fn bounded_history_catches_late_degradation() {
+        // A long healthy phase must not drown out a later degradation:
+        // with the bounded history, a sustained run of rejected drafts
+        // pulls the window rate below break-even and the gate blocks.
+        let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct");
+        // 10,000 healthy depth-1 drafts, then a sustained bad streak
+        // (175 turns x 0-of-4). The history bound keeps the window finite.
+        inner.mtp_draft_accepted = 10_000;
+        inner.mtp_draft_attempted = 10_000;
+        for _ in 0..175 {
+            inner.record_turn_mtp_acceptance(0, 4);
+        }
+        let attempted = inner.mtp_draft_attempted;
+        assert!(
+            attempted <= mtp_decode::MTP_ACCEPT_GATE_HISTORY_CAP,
+            "history must stay bounded, got {attempted}"
+        );
+        assert!(
+            mtp_decode::mtp_accept_gate_blocks(inner.mtp_draft_accepted, attempted),
+            "sustained degradation must be confidently below break-even"
+        );
+        assert!(
+            !inner.mtp_gate_allows(1),
+            "the gate must block after a sustained degradation"
+        );
     }
 }

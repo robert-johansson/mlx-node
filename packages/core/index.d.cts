@@ -1410,6 +1410,36 @@ export declare class Qwen35MoeModel {
 }
 export type Qwen3_5MoeModel = Qwen35MoeModel;
 
+export declare class Qwen3AsrCapture {
+  get source(): Qwen3AsrCaptureSource;
+  get deviceName(): string;
+  get sampleRate(): number;
+  get channels(): number;
+  pause(): void;
+  resume(): void;
+  stop(): Promise<Qwen3AsrCaptureStats>;
+}
+
+export declare class Qwen3AsrModel {
+  static load(modelPath: string): Promise<Qwen3AsrModel>;
+  transcribe(audio: Float32Array, options?: Qwen3AsrTranscribeOptions | undefined | null): Promise<Qwen3AsrResult>;
+  createStream(options?: Qwen3AsrStreamOptions | undefined | null): Promise<Qwen3AsrStream>;
+}
+
+export declare class Qwen3AsrStream {
+  feed(samples: Float32Array): Promise<Qwen3AsrResult | undefined | null>;
+  finish(): Promise<Qwen3AsrResult>;
+  /**
+   * Start real-time microphone or system-output capture through Core Audio.
+   * The realtime callback only writes mono float PCM into a bounded lock-free
+   * ring; a separate worker drains it and feeds this streaming session.
+   */
+  startCapture(
+    options: Qwen3AsrCaptureOptions | undefined | null,
+    callback: (err: Error | null, arg: Qwen3AsrResult) => void,
+  ): Qwen3AsrCapture;
+}
+
 /**
  * Qwen3 Model with automatic differentiation support
  *
@@ -2320,6 +2350,14 @@ export interface ChatConfig {
    * loop (pure-Rust eager; qwen3.5 dense and MoE). Requires the model
    * checkpoint to carry an MTP head (otherwise silently ignored). Default:
    * `false`.
+   *
+   * The MTP acceptance gate (`MLX_MTP_ACCEPT_GATE`, default ON) also
+   * applies to explicit requests at depth 1: once the aggregated
+   * first-draft acceptance sample is large enough for a 95% confidence
+   * bound to sit below the break-even, the model runs plain AR for
+   * subsequent depth-1 turns. The gate is depth-1-scoped and exempts
+   * adaptive-depth turns (depth > 1 turns are never gated). Set the env
+   * var to `0` to bypass the gate and always run MTP when requested.
    */
   enableMtp?: boolean | undefined;
   /**
@@ -4419,6 +4457,145 @@ export interface Qwen35MoeGenerationResult {
   text: string;
   numTokens: number;
   finishReason: string;
+}
+
+export interface Qwen3AsrAudioDevice {
+  id: string;
+  name: string;
+  source: Qwen3AsrCaptureSource;
+  isDefault: boolean;
+  sampleRate: number;
+  channels: number;
+}
+
+export declare function qwen3AsrAudioDevices(): Array<Qwen3AsrAudioDevice>;
+
+export interface Qwen3AsrCaptureOptions {
+  /** Audio source. Omit to capture the microphone. */
+  source?: Qwen3AsrCaptureSource;
+  /**
+   * Stable Core Audio device UID returned by `qwen3AsrAudioDevices()` or
+   * `qwen3AsrInputDevices()`.
+   */
+  deviceId?: string;
+  /**
+   * Device name. Omit to use the default input or output device for the
+   * selected source.
+   */
+  deviceName?: string;
+  /**
+   * For system audio, optionally capture only processes with these bundle
+   * identifiers. Empty or omitted captures all audio sent to the device.
+   */
+  applicationBundleIds?: Array<string>;
+  /** Lock-free callback ring capacity in seconds (default 10). */
+  ringSeconds?: number;
+  /** Amount drained from the ring into each model feed (default 100 ms). */
+  feedMilliseconds?: number;
+}
+
+export declare const enum Qwen3AsrCaptureSource {
+  Microphone = 'microphone',
+  SystemAudio = 'systemAudio',
+}
+
+export interface Qwen3AsrCaptureStats {
+  capturedFrames: number;
+  droppedFrames: number;
+}
+
+export interface Qwen3AsrInputDevice {
+  id: string;
+  name: string;
+  isDefault: boolean;
+  sampleRate: number;
+  channels: number;
+  sampleFormat: string;
+}
+
+export declare function qwen3AsrInputDevices(): Array<Qwen3AsrInputDevice>;
+
+export interface Qwen3AsrResult {
+  /**
+   * Complete transcription for the latest rolling revision. The trailing
+   * provisional region may be replaced by the next revision.
+   */
+  text: string;
+  /**
+   * Prefix that survived the stream's provisional-token rollback window.
+   * Equals `text` for a final or one-shot result.
+   */
+  stableText: string;
+  /**
+   * Trailing text that may be replaced by the next rolling revision.
+   * Empty for a final or one-shot result.
+   */
+  provisionalText: string;
+  language?: string;
+  tokenIds: Array<number>;
+  /**
+   * True when generation used the entire configured token budget without
+   * reaching an end token. The revision may contain incomplete or repeated
+   * text and callers may choose to flag it for review.
+   */
+  reachedMaxTokens: boolean;
+  /** Total audio committed by this stream, or the full one-shot duration. */
+  audioSeconds: number;
+  /** Newly consumed audio duration for this update. */
+  segmentAudioSeconds: number;
+  featureMs: number;
+  encoderMs: number;
+  prefillMs: number;
+  decodeMs: number;
+  totalMs: number;
+  tokensPerSecond: number;
+  realTimeFactor: number;
+  /**
+   * Streaming revisions increment whenever a rolling decode replaces
+   * previously provisional text. Zero for one-shot transcription.
+   */
+  revision: number;
+  isFinal: boolean;
+}
+
+export interface Qwen3AsrStreamOptions {
+  sampleRate?: number;
+  prompt?: string;
+  language?: string;
+  /**
+   * Maximum continuation tokens generated per revision (default 32).
+   * Keeping this bounded is essential for realtime latency.
+   */
+  maxTokens?: number;
+  /** Minimum newly buffered audio before a rolling decode (default 2 s). */
+  chunkSeconds?: number;
+  /**
+   * Number of trailing raw decoder tokens rolled back and regenerated on
+   * the next revision (default 5).
+   */
+  provisionalTokens?: number;
+  /**
+   * Number of initial chunks decoded without transcript conditioning
+   * (default 2), matching Qwen's official streaming policy.
+   */
+  unfixedChunks?: number;
+}
+
+export interface Qwen3AsrTranscribeOptions {
+  /**
+   * Sampling rate of `audio`. Inputs are resampled to the checkpoint's
+   * native 16 kHz rate before feature extraction.
+   */
+  sampleRate?: number;
+  /** Optional domain/context prompt placed in the system turn. */
+  prompt?: string;
+  /**
+   * Language code (`en`, `zh`, ...) or canonical language name. Omit for
+   * automatic language detection.
+   */
+  language?: string;
+  /** Maximum number of newly generated tokens (default 256). */
+  maxTokens?: number;
 }
 
 /** Qwen3 model configuration */

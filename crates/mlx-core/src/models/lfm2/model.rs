@@ -65,6 +65,11 @@ fn conv_state_reuse_enabled() -> bool {
 /// No `Arc<RwLock<>>` — the model thread has sole ownership.
 pub(crate) struct Lfm2Inner {
     pub(crate) config: Lfm2Config,
+    /// Turn-constant layer classification (`FullAttention` vs `Conv`),
+    /// computed once in [`Self::new`] instead of re-derived on every paged
+    /// decode step. Pure function of the immutable `config` + layer count.
+    /// Mirrors the `Gemma4Inner::layer_kinds` caching pattern.
+    pub(crate) layer_kinds: Vec<Lfm2LayerKind>,
     pub(crate) embed_tokens: Embedding,
     pub(crate) layers: Vec<Lfm2DecoderLayer>,
     /// Output norm (called "embedding_norm" in HF, applied AFTER all layers).
@@ -336,8 +341,13 @@ impl Lfm2Inner {
             None
         };
 
+        // Layer classification is a pure function of the immutable config +
+        // layer count; compute once here (see the field rustdoc).
+        let layer_kinds = compute_layer_kinds_for(&config, num_layers);
+
         Ok(Self {
             config,
+            layer_kinds,
             embed_tokens,
             layers,
             embedding_norm,
@@ -696,7 +706,9 @@ impl Lfm2Inner {
                 .map_err(Error::from_reason)?;
         }
 
-        let layer_kinds = self.compute_layer_kinds();
+        // Turn-constant classification, cached once at construction (see the
+        // field rustdoc) instead of re-derived every decode step.
+        let layer_kinds = &self.layer_kinds;
 
         let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
         let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
@@ -1910,7 +1922,7 @@ mod paged_adapter_construction_tests {
     //! "default = no allocation" invariant and verify that flipping the
     //! flag wires up a real adapter without churning forward-path code.
 
-    use super::Lfm2Inner;
+    use super::{Lfm2Inner, compute_layer_kinds_for};
     use crate::models::lfm2::Lfm2Config;
 
     /// Tiny LFM2-shaped config compatible with `LayerKVPool`'s validate
@@ -2291,6 +2303,20 @@ mod paged_adapter_construction_tests {
             err_msg.contains("no full_attention layers")
                 || err_msg.contains("No Metal device found"),
             "expected clear error about missing attention layers, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn inner_caches_layer_kinds_matching_fresh_compute() {
+        // The paged decode stepper consumes the cached classification
+        // instead of re-deriving it per step; pin cache == fresh compute
+        // (paged OFF so construction needs no Metal pool).
+        let cfg = paged_tiny_config(Some(false));
+        let inner = Lfm2Inner::new(cfg.clone()).expect("construct");
+        let fresh = compute_layer_kinds_for(&cfg, cfg.num_hidden_layers as usize);
+        assert_eq!(
+            inner.layer_kinds, fresh,
+            "cached layer classification must equal a fresh compute over the same config"
         );
     }
 }

@@ -5305,7 +5305,8 @@ mod tests {
         ]);
         let message = preserved_source_quantization(&gguf, true)
             .unwrap_err()
-            .reason;
+            .reason
+            .clone();
         assert!(
             message.contains("4-bit affine (group_size 32, symmetric zero point 8)"),
             "{message}"

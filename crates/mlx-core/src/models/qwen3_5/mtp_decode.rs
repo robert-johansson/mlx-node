@@ -118,6 +118,131 @@ pub(crate) fn mtp_defer_verify_hidden_eval() -> bool {
     })
 }
 
+/// Break-even first-draft acceptance rate for the MTP acceptance gate.
+///
+/// The gate signal is the per-position acceptance at draft slot 0 (the
+/// FIRST draft's acceptance rate) — the depth-agnostic measure of whether
+/// speculation pays. At depth 1 it equals the accepted/attempted ratio,
+/// where the break-even is ~0.6 (a depth-1 verify costs ~1.4-1.6× an AR
+/// step). At depth > 1 the verify amortizes over more tokens, so the
+/// first-draft rate is the right comparison: a head accepting its first
+/// draft at ~73% is profitable (docs' depth-3 workload: per-position
+/// [0.735, 0.471, 0.235]) even though the accepted/attempted average is
+/// only ~0.48. Measured first-draft acceptance on real checkpoints:
+/// 1.000 (qwen3.5-4b, counting prompt), 0.756 (qwen3.5-4b, complex task),
+/// 0.000 (qwen3.5-0.8b — MTP is a net loss there and the gate is what
+/// keeps it from auto-enabling).
+pub(crate) const MTP_ACCEPT_GATE_THRESHOLD: f64 = 0.6;
+
+/// After this many consecutive gated (MTP-disabled) turns, the MTP
+/// acceptance gate re-probes: the model resets its recorded acceptance to
+/// `None` so the next turn runs speculation again. Without this, one hard
+/// first turn would permanently disable MTP for the model's lifetime — a
+/// genuinely weak head (e.g. qwen3.5-0.8b, acceptance 0.0) re-gates after
+/// one probe, while a prompt-dependent head (qwen3.5-4b: 0.756 on complex
+/// tasks, 1.0 on counting) can recover on an easier later turn.
+pub(crate) const MTP_ACCEPT_GATE_REPROBE_TURNS: u32 = 3;
+
+/// Cap on the aggregated acceptance-history sample the MTP gate carries.
+///
+/// Without a bound, lifetime counters let a long healthy phase drown out
+/// a later degradation: after 10,000 accepted drafts a head would need
+/// ~6,667 consecutive rejects just to pull the raw rate below 0.6.
+/// When the aggregate exceeds this cap the counters are halved (rate
+/// preserved, sample bounded), so the gate's confidence bound reflects
+/// roughly the most recent ~512-1024 depth-1 drafts and reacts to a
+/// sustained degradation within a turn or two.
+pub(crate) const MTP_ACCEPT_GATE_HISTORY_CAP: u64 = 512;
+
+/// Bound the aggregated gate history: halve both counters until the
+/// sample fits under [`MTP_ACCEPT_GATE_HISTORY_CAP`], preserving the
+/// rate while keeping the window finite. Integer-only (no float drift).
+pub(crate) fn mtp_bound_gate_history(accepted: &mut u64, attempted: &mut u64) {
+    while *attempted > MTP_ACCEPT_GATE_HISTORY_CAP {
+        *accepted /= 2;
+        *attempted /= 2;
+    }
+}
+
+/// MTP acceptance gate — `MLX_MTP_ACCEPT_GATE` (default ON).
+///
+/// When ON, the model AGGREGATES the first-draft acceptance counts
+/// (accepted / attempted at draft slot 0, see
+/// [`MTP_ACCEPT_GATE_THRESHOLD`]) across completed FIXED depth-1 turns
+/// and disables speculative decoding for the NEXT fixed depth-1 turn
+/// only when an exact-binomial test at the 5% level shows the aggregate
+/// is inconsistent with the break-even rate — falling back to the exact
+/// target autoregressive path. The exact test preserves a UNIFORM
+/// false-gate bound at every reachable sample size: a 1-cycle turn
+/// (exactly 0.0 or 1.0), a 2-of-4 streak from a healthy 0.756 head
+/// (~25% of turns), and 0-of-2 / 0-of-3 / 1-of-5 aggregates (~5.95% /
+/// 1.45% / 1.43% false rates) never gate; only extreme aggregates like
+/// 0-of-4 (false rate ~0.35%) do. The aggregate is BOUNDED
+/// ([`MTP_ACCEPT_GATE_HISTORY_CAP`]) so a long healthy phase cannot
+/// drown out a later degradation. The gate is **depth-1-scoped and
+/// adaptive-exempt**: the 0.6 threshold is depth-1 calibrated, and at
+/// depth > 1 (or when `mtpAdaptiveDepth` sweeps depths 1-5) the verify
+/// cost vs deeper-slot acceptance economics are not captured by a single
+/// threshold — such turns are never gated and do not publish gate
+/// history. The first turn of a model load has no history and probes;
+/// after [`MTP_ACCEPT_GATE_REPROBE_TURNS`] consecutive gated turns the
+/// gate re-probes. A full session reset (`reset_caches`) clears the
+/// history so a new independent chat starts fresh. The state is
+/// **per-model** (one loaded checkpoint, shared by every ChatSession over
+/// it), not per-session. The gate reuses the existing "unsupported
+/// combination disables speculation for this turn" routing.
+///
+/// Opt-out: `MLX_MTP_ACCEPT_GATE=0` (or `false` / `off`) disables the
+/// gate so MTP always runs when requested. Read once per process and
+/// cached.
+pub(crate) fn mtp_accept_gate_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_ACCEPT_GATE") {
+        Ok(v) => {
+            let v = v.trim();
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true, // default ON — a head that never accepts must not tax every turn
+    })
+}
+
+/// Exact-binomial MTP acceptance-gate decision: gate only when the
+/// observed (accepted, attempted) first-draft counts are inconsistent
+/// with the break-even rate at the 5% level — i.e. when
+/// `P(Binomial(attempted, 0.6) <= accepted) < 0.05`.
+///
+/// This preserves a UNIFORM false-gate bound at every reachable
+/// aggregate size, unlike a fixed sample floor (which only protects
+/// exactly at its own threshold: 1-of-5 would otherwise gate with a
+/// ~1.43% false rate for a 0.756 head) or the normal-approximation
+/// Wilson bound (which under-covers small/extreme samples). Verified
+/// behavior: 0-of-1/2/3 and 1-of-4, 2-of-4, 1-of-5, 2-of-5 never gate
+/// (p-value >= 0.064); 0-of-4 (0.0256) and 0-of-5+ gate — the false
+/// rate for the documented 0.756 head stays ~0.35% and below.
+pub(crate) fn mtp_accept_gate_blocks(accepted: u64, attempted: u64) -> bool {
+    if attempted == 0 {
+        return false;
+    }
+    let n = attempted;
+    let k = accepted.min(n);
+    let p = MTP_ACCEPT_GATE_THRESHOLD;
+    let q = 1.0 - p;
+    // Iterative binomial PMF: pmf(0) = q^n;
+    // pmf(i+1) = pmf(i) * (n-i)/(i+1) * p/q. Accumulate the lower tail
+    // and early-exit once it reaches the significance level (later terms
+    // are all positive, so the tail can only grow).
+    let mut pmf = q.powi(n as i32);
+    let mut cdf = pmf;
+    for i in 1..=k {
+        pmf *= (n - i + 1) as f64 / i as f64 * p / q;
+        cdf += pmf;
+        if cdf >= 0.05 {
+            return false;
+        }
+    }
+    cdf < 0.05
+}
+
 // MTPLX-style stochastic verify scheduling.
 //
 // In the T>0 sparse-accept path, target top-k distributions are the first
@@ -1036,7 +1161,8 @@ impl MtpVerifyOutput {
 #[cfg(test)]
 mod mtp_history_policy_tests {
     use super::{
-        MtpHistoryPolicy, MtpPromptHistorySelection, resolve_mtp_prompt_history_selection,
+        MTP_ACCEPT_GATE_HISTORY_CAP, MtpHistoryPolicy, MtpPromptHistorySelection,
+        mtp_accept_gate_blocks, mtp_bound_gate_history, resolve_mtp_prompt_history_selection,
     };
 
     #[test]
@@ -1073,5 +1199,65 @@ mod mtp_history_policy_tests {
                 position_base: 6,
             }
         );
+    }
+
+    #[test]
+    fn confidence_gate_ignores_undersampled_and_marginal_rates() {
+        // 2-of-4 and 1-of-4 are NOT confidently below break-even — a
+        // healthy 0.756 head hits 2-of-4 in ~25% of 4-cycle turns, so
+        // those must not gate. Small aggregates never gate, even at
+        // rate 0 (0-of-2 has p-value 0.16, 0-of-3 0.064).
+        assert!(!mtp_accept_gate_blocks(2, 4), "2-of-4 must not gate");
+        assert!(!mtp_accept_gate_blocks(1, 4), "1-of-4 must not gate");
+        assert!(!mtp_accept_gate_blocks(0, 1), "0-of-1 must not gate");
+        assert!(!mtp_accept_gate_blocks(0, 2), "0-of-2 must not gate");
+        assert!(!mtp_accept_gate_blocks(0, 3), "0-of-3 must not gate");
+        // 1-of-5 (p-value 0.087) and 2-of-5 must not gate either — the
+        // exact test preserves the false-gate bound at every size, not
+        // just at four samples.
+        assert!(
+            !mtp_accept_gate_blocks(1, 5),
+            "1-of-5 must not gate (~1.43% false rate for a 0.756 head)"
+        );
+        assert!(!mtp_accept_gate_blocks(2, 5), "2-of-5 must not gate");
+    }
+
+    #[test]
+    fn confidence_gate_gates_only_extreme_rates() {
+        // 0-of-4 gates (p-value 0.0256); the false-gate rate for a
+        // 0.756 head is P(0-of-4) ≈ 0.35%.
+        assert!(mtp_accept_gate_blocks(0, 4), "0-of-4 must gate");
+        assert!(mtp_accept_gate_blocks(0, 64), "0-of-64 must gate");
+        // A clearly-below-break-even head gates once the sample is large
+        // enough for the test to have power (19/64 = 0.297).
+        assert!(mtp_accept_gate_blocks(19, 64), "19-of-64 must gate");
+    }
+
+    #[test]
+    fn confidence_gate_never_gates_a_healthy_head() {
+        // The documented 0.756 head: at ~0.75 observed rates the p-value
+        // is large at any sample size.
+        assert!(!mtp_accept_gate_blocks(3, 4));
+        assert!(!mtp_accept_gate_blocks(24, 32));
+        assert!(!mtp_accept_gate_blocks(193, 256));
+    }
+
+    #[test]
+    fn gate_history_is_bounded_and_preserves_rate() {
+        // A long healthy phase must not persist forever: halving preserves
+        // the rate while capping the window.
+        let (mut a, mut t) = (10_000u64, 20_000u64); // rate 0.5
+        mtp_bound_gate_history(&mut a, &mut t);
+        assert!(t <= MTP_ACCEPT_GATE_HISTORY_CAP, "sample bounded");
+        assert!(t > 0, "sample never empties");
+        let rate = a as f64 / t as f64;
+        assert!((rate - 0.5).abs() < 0.01, "rate preserved, got {rate}");
+    }
+
+    #[test]
+    fn gate_history_under_cap_is_untouched() {
+        let (mut a, mut t) = (300u64, 500u64); // under cap
+        mtp_bound_gate_history(&mut a, &mut t);
+        assert_eq!((a, t), (300, 500));
     }
 }

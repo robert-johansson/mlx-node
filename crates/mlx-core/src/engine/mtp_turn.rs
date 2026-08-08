@@ -2055,6 +2055,31 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // post-macro `mtp_desynced.get()` read does. Paged MUST return false.
     let desynced = step.into_desynced();
 
+    // Publish this turn's first-draft acceptance counts for the NEXT
+    // turn's MTP admission gate (backend-owned; default no-op). Only on
+    // the normal completion path — a replayed/aborted turn must not
+    // masquerade as a healthy speculative sample, and a USER-CANCELLED
+    // turn is not a representative acceptance sample either (it may
+    // contain only the hard first cycles). Only FIXED depth-1 turns
+    // publish: the gate's 0.6 threshold is depth-1-calibrated, and at
+    // depth > 1 (or when the adaptive policy sweeps depths 1-5) the full
+    // economics (verify cost vs deeper-slot acceptance) are not captured
+    // by a single threshold — see `mtp_gate_allows`. The check uses the
+    // REQUESTED depth (`p.mtp_depth`), not the observed mean: the
+    // near-tail budget cap can reduce every executed cycle of a depth>1
+    // request to depth 1, and such a turn is still depth-1-exempt.
+    // Adaptive turns are exempt from the gate, so they must not pollute
+    // its history either. The family aggregates the counts, so a single
+    // undersampled turn cannot wrongly gate (the exact-binomial decision
+    // in `mtp_accept_gate_blocks`).
+    if *reason != "cancelled"
+        && !p.mtp_adaptive_depth
+        && p.mtp_depth == 1
+        && let Some((accepted, attempted)) = profiler.mtp_first_draft_counts()
+    {
+        backend.record_turn_mtp_acceptance(accepted, attempted);
+    }
+
     Ok(MtpTurnOutcome {
         last_in_cache,
         desynced,
@@ -2111,6 +2136,7 @@ mod tests {
         RollbackUnemitted { unemitted: usize },
         TakeReplayError,
         IntoDesynced,
+        RecordTurnMtpAcceptance,
     }
 
     /// Tiny lazy `[1, 1]` array — fabricated WITHOUT Metal (mlx arrays are
@@ -3816,6 +3842,9 @@ mod tests {
         ledger: Rc<RefCell<Vec<Call>>>,
         /// Records that `begin_mtp_decode` ran exactly once.
         begin_calls: std::cell::Cell<usize>,
+        /// Last counts passed to `record_turn_mtp_acceptance` (the
+        /// engine's acceptance-gate hook); `None` when never called.
+        recorded_counts: std::cell::RefCell<Option<(u64, u64)>>,
     }
 
     impl MockMtpBackend {
@@ -3835,6 +3864,7 @@ mod tests {
                 replay_error: None,
                 ledger: Rc::new(RefCell::new(Vec::new())),
                 begin_calls: std::cell::Cell::new(0),
+                recorded_counts: std::cell::RefCell::new(None),
             }
         }
 
@@ -3918,6 +3948,11 @@ mod tests {
             }
             step.shared_ledger = Some(Rc::clone(&self.ledger));
             Ok(step)
+        }
+
+        fn record_turn_mtp_acceptance(&mut self, accepted: u64, attempted: u64) {
+            self.ledger.borrow_mut().push(Call::RecordTurnMtpAcceptance);
+            *self.recorded_counts.borrow_mut() = Some((accepted, attempted));
         }
     }
 
@@ -4112,6 +4147,97 @@ mod tests {
             count(&out.ledger, |c| matches!(c, Call::IntoDesynced)),
             1,
             "engine consumes the stepper's desync out once"
+        );
+        // The MTP acceptance-gate hook only fires for DEPTH-1 turns (the
+        // threshold's calibration domain). This run is depth 2 then a
+        // near-tail depth-1 cap (mean 1.5), so it must NOT publish history.
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::RecordTurnMtpAcceptance)),
+            0,
+            "a mixed-depth turn must not publish gate history"
+        );
+        assert!(
+            backend.recorded_counts.borrow().is_none(),
+            "no acceptance sample recorded for a mixed-depth turn"
+        );
+    }
+
+    #[test]
+    fn run_mtp_turn_depth1_records_acceptance() {
+        let _chained_off = force_chained_off();
+        // depth 1, full accept (draft 4 + bonus 5), clean length exit:
+        //   gen: [3] (seed) + N x (Step A + cycle)
+        let cycle = CycleArgmax {
+            draft_argmax: vec![4],
+            verify_argmax: vec![4, 5],
+        };
+        let mut backend = MockMtpBackend::new(16, 4, vec![7, 8, 9, 10, 11], vec![cycle; 8], false);
+        let out = drive_turn(&mut backend, 3, 13, 15, 1);
+        assert_eq!(out.finish_reason, "length");
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::RecordTurnMtpAcceptance)),
+            1,
+            "a depth-1 turn publishes its acceptance counts exactly once"
+        );
+        let recorded = *backend.recorded_counts.borrow();
+        assert!(
+            matches!(recorded, Some((a, t)) if t > 0 && a == t),
+            "full-accept depth-1 turn records accepted == attempted counts, got {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn run_mtp_turn_single_cycle_still_records_counts() {
+        let _chained_off = force_chained_off();
+        // A 1-cycle depth-1 turn records its raw (accepted, attempted)
+        // counts — undersampling is NOT filtered at the recording layer;
+        // the gate's confidence-aware decision (mtp_accept_gate_blocks)
+        // is what prevents a single 0-of-1 fluke from wrongly gating.
+        let cycle = CycleArgmax {
+            draft_argmax: vec![4],
+            verify_argmax: vec![4, 5],
+        };
+        let mut backend = MockMtpBackend::new(16, 4, vec![7, 8], vec![cycle; 2], false);
+        let out = drive_turn(&mut backend, 3, 4, 15, 1);
+        assert_eq!(out.finish_reason, "length");
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::RecordTurnMtpAcceptance)),
+            1,
+            "a depth-1 turn always publishes its acceptance counts"
+        );
+        assert!(
+            backend.recorded_counts.borrow().is_some(),
+            "a 1-cycle depth-1 turn still records (1,1)"
+        );
+    }
+
+    #[test]
+    fn run_mtp_turn_requested_depth_gt_1_never_publishes() {
+        let _chained_off = force_chained_off();
+        // The gate is scoped to REQUESTED depth-1 turns: eligibility is
+        // decided by `p.mtp_depth`, not the observed mean. A depth-2
+        // request whose only cycle is near-tail-capped to depth 1 observes
+        // a mean depth of EXACTLY 1.0 — the old mean-based check would have
+        // published history for it, but the request is depth-2 and must not.
+        let cycle = CycleArgmax {
+            draft_argmax: vec![4],
+            verify_argmax: vec![4, 5],
+        };
+        let mut backend = MockMtpBackend::new(16, 4, vec![7, 8], vec![cycle; 2], false);
+        // Budget 4: seed (3), Step A (7), then remaining=2 near-tail-caps the
+        // depth-2 request's cycle to depth 1 -> emits 4 + bonus 5, length stop.
+        let out = drive_turn(&mut backend, 3, 4, 15, 2);
+        assert_eq!(out.finish_reason, "length");
+        assert_eq!(out.generated, vec![3, 7, 4, 5]);
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::RecordTurnMtpAcceptance)),
+            0,
+            "a depth-2 request must never publish gate history, even when every \
+             cycle is near-tail-capped to depth 1"
+        );
+        assert!(
+            backend.recorded_counts.borrow().is_none(),
+            "no acceptance sample recorded for a depth-2 request"
         );
     }
 
@@ -4325,9 +4451,48 @@ mod tests {
         let ledger = backend.ledger_snapshot();
         assert_eq!(count(&ledger, |c| matches!(c, Call::TakeReplayError)), 1);
         assert_eq!(
+            count(&ledger, |c| matches!(c, Call::RecordTurnMtpAcceptance)),
+            0,
+            "a replayed/aborted turn must not publish an acceptance sample"
+        );
+        assert_eq!(
             count(&ledger, |c| matches!(c, Call::IntoDesynced)),
             0,
             "the error returns before consuming the successful outcome"
         );
+    }
+
+    #[test]
+    fn mtp_first_draft_counts_from_profiler() {
+        use crate::decode_profiler::DecodeProfiler;
+        // 10 depth-1 cycles, first draft accepted 7 times => (7, 10).
+        let mut profiler = DecodeProfiler::new("test", "test");
+        for i in 0..10 {
+            profiler.record_mtp_cycle(1, if i < 7 { 1 } else { 0 });
+        }
+        let (accepted, attempted) = profiler.mtp_first_draft_counts().expect("cycles recorded");
+        assert_eq!((accepted, attempted), (7, 10));
+    }
+
+    #[test]
+    fn mtp_first_draft_counts_is_none_when_no_cycle_ran() {
+        use crate::decode_profiler::DecodeProfiler;
+        // A plain-AR turn records no speculative cycle -> no counts are
+        // published (the family keeps its prior gate state).
+        let profiler = DecodeProfiler::new("test", "test");
+        assert!(profiler.mtp_first_draft_counts().is_none());
+    }
+
+    #[test]
+    fn mtp_first_draft_counts_count_only_slot_zero() {
+        use crate::decode_profiler::DecodeProfiler;
+        // Depth-3 cycles: the counts must reflect ONLY draft slot 0
+        // (leading-acceptance model: cycle k accepts positions 0..k).
+        let mut profiler = DecodeProfiler::new("test", "test");
+        profiler.record_mtp_cycle(3, 2); // position 0 accepted
+        profiler.record_mtp_cycle(3, 1); // position 0 accepted
+        profiler.record_mtp_cycle(3, 0); // position 0 rejected
+        let (accepted, attempted) = profiler.mtp_first_draft_counts().expect("cycles recorded");
+        assert_eq!((accepted, attempted), (2, 3));
     }
 }

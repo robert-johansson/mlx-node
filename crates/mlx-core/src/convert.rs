@@ -184,7 +184,7 @@ pub(crate) mod recipe {
 
         /// True when the family opts INTO quantizing the token embedding (its
         /// packed-quantized embedding backend handles gather-dequant). Replaces
-        /// the inline `embed_quantizable` match (lfm2, lfm2_moe).
+        /// the inline `embed_quantizable` match (qwen3_asr, lfm2, lfm2_moe).
         fn embed_quantizable(&self) -> bool {
             false
         }
@@ -1715,6 +1715,85 @@ pub(crate) mod recipe {
         }
     }
 
+    /// Qwen3-ASR. Hugging Face stores the full conditional-generation model
+    /// below a single `model.` prefix and its Conv2d kernels in PyTorch OIHW
+    /// layout. The runtime uses canonical prefix-free component names and MLX
+    /// OHWI kernels, so conversion performs exactly those two transforms.
+    ///
+    /// A previously converted checkpoint is already prefix-free. Treating the
+    /// removed prefix as the source-format witness makes this sanitizer
+    /// idempotent and avoids the shape heuristics that are ambiguous for the
+    /// square 480-channel Conv2d kernels.
+    pub(crate) struct Qwen3AsrRecipe;
+
+    impl ConversionRecipe for Qwen3AsrRecipe {
+        fn model_types(&self) -> &'static [&'static str] {
+            &["qwen3_asr"]
+        }
+
+        fn sanitize(
+            &self,
+            weights: HashMap<String, MxArray>,
+            _config: &serde_json::Value,
+            _target_dtype_str: &str,
+            tie_word_embeddings: bool,
+            verbose: bool,
+        ) -> Result<HashMap<String, MxArray>> {
+            let mut sanitized = HashMap::with_capacity(weights.len());
+            let mut transposed_conv_weights = 0usize;
+
+            for (source_key, array) in weights {
+                let (key, is_hf_layout) = match source_key.strip_prefix("model.") {
+                    Some(stripped) => (stripped, true),
+                    None => (source_key.as_str(), false),
+                };
+
+                if tie_word_embeddings && key == "lm_head.weight" {
+                    continue;
+                }
+
+                let is_audio_conv = matches!(
+                    key,
+                    "audio_tower.conv2d1.weight"
+                        | "audio_tower.conv2d2.weight"
+                        | "audio_tower.conv2d3.weight"
+                );
+                let array = if is_hf_layout && is_audio_conv {
+                    if array.ndim()? != 4 {
+                        return Err(Error::from_reason(format!(
+                            "Qwen3-ASR Conv2d weight '{source_key}' must be rank 4"
+                        )));
+                    }
+                    let transposed = array.transpose(Some(&[0, 2, 3, 1]))?;
+                    transposed.eval();
+                    transposed_conv_weights += 1;
+                    transposed
+                } else {
+                    array
+                };
+
+                if sanitized.insert(key.to_string(), array).is_some() {
+                    return Err(Error::from_reason(format!(
+                        "Qwen3-ASR conversion produced duplicate canonical tensor key '{key}'"
+                    )));
+                }
+            }
+
+            if verbose {
+                info!(
+                    "  Qwen3-ASR sanitize: kept {} tensors, transposed {} Conv2d kernels",
+                    sanitized.len(),
+                    transposed_conv_weights
+                );
+            }
+            Ok(sanitized)
+        }
+
+        fn embed_quantizable(&self) -> bool {
+            true
+        }
+    }
+
     /// openai/privacy-filter. Ships MLX-loadable safetensors already (identity
     /// sanitize) but manages its OWN quantization, so the generic quantize
     /// block must be suppressed.
@@ -1902,6 +1981,7 @@ pub(crate) mod recipe {
     /// the registry-consistency test; each entry MUST resolve via
     /// [`recipe_for`] (asserted in `recipe_registry_reproduces_inline_flags`).
     pub(crate) const CONVERTIBLE_MODEL_TYPES: &[&str] = &[
+        "qwen3_asr",
         "qwen3_5",
         "qwen3_5_moe",
         "lfm2",
@@ -1918,6 +1998,7 @@ pub(crate) mod recipe {
     /// dispatch keeps its own unknown-type error).
     pub(crate) fn recipe_for(model_type: &str) -> Option<Box<dyn ConversionRecipe>> {
         match model_type {
+            "qwen3_asr" => Some(Box::new(Qwen3AsrRecipe)),
             "qwen3_5" => Some(Box::new(Qwen35Recipe { is_moe: false })),
             "qwen3_5_moe" => Some(Box::new(Qwen35Recipe { is_moe: true })),
             "lfm2" | "lfm2_moe" => Some(Box::new(Lfm2Recipe)),
@@ -2040,6 +2121,26 @@ fn reject_dense_only_family_quantization(
          its Rust inference runtime is dense-only and does not consume packed weights or \
          quantization metadata. Convert this family without quantization."
     )))
+}
+
+/// Qwen3-ASR's loader accepts one uniform packed format for the text tower.
+/// Mixed recipes emit per-layer metadata that the runtime intentionally
+/// rejects, and the remaining quantization modes have no ASR dispatch.
+fn validate_qwen3_asr_quantization(
+    model_type: Option<&str>,
+    do_quantize: bool,
+    quant_mode: &str,
+    quant_recipe: Option<&str>,
+) -> Result<()> {
+    if model_type != Some("qwen3_asr") || !do_quantize {
+        return Ok(());
+    }
+    if !matches!(quant_mode, "affine" | "mxfp4" | "mxfp8") || quant_recipe.is_some() {
+        return Err(Error::from_reason(
+            "Qwen3-ASR packed conversion supports uniform affine, mxfp4, or mxfp8 quantization; omit quant_recipe",
+        ));
+    }
+    Ok(())
 }
 
 /// Identify dense-only inference families from the source checkpoint itself.
@@ -2219,6 +2320,12 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // dense. Fail before mode-specific validation, input I/O, the conversion
     // mutex, or any MLX operation.
     reject_dense_only_family_quantization(model_type.as_deref(), do_quantize, &quant_mode)?;
+    validate_qwen3_asr_quantization(
+        model_type.as_deref(),
+        do_quantize,
+        &quant_mode,
+        quant_recipe.as_deref(),
+    )?;
 
     // "drafter" is accepted as an alias for "split" and normalized above.
     const VALID_MTP_QUANT_POLICIES: &[&str] = &["off", "cyankiwi", "all", "split", "drafter"];
@@ -3567,14 +3674,12 @@ const MTP_QUANT_GROUP_SIZE: i32 = 32;
 /// Determine whether a weight key should be quantized.
 ///
 /// `embed_quantizable` opts the model family INTO quantizing the token
-/// embedding (`embed_tokens` / `embedding.`). This is `true` ONLY for
-/// lfm2/lfm2_moe, whose `nn::Embedding` now installs a PACKED-quantized backend
-/// (`load_quantized_packed`) that gather-then-dequantizes on lookup and runs a
-/// quantized matmul for the tied head — so the embedding can be quantized for
-/// real memory savings. For every other family (qwen3_5, gemma4, …) it is
-/// `false` and the embedding is skipped, preserving the prior behavior. A TIED
-/// `lm_head` is always excluded (it is dropped at sanitize time) — the
-/// `lm_head` skip below is unconditional.
+/// embedding (`embed_tokens` / `embedding.`). Qwen3-ASR and lfm2/lfm2_moe opt
+/// in because their packed-quantized embedding paths gather-then-dequantize on
+/// lookup and support the tied-head projection. For every other family
+/// (qwen3_5, gemma4, …) it is `false` and the embedding is skipped, preserving
+/// the prior behavior. A TIED `lm_head` is always excluded (it is dropped at
+/// sanitize time) — the `lm_head` skip below is unconditional.
 fn should_quantize(key: &str, embed_quantizable: bool) -> bool {
     // Only .weight keys (not .scales, .biases, etc.)
     if !key.ends_with(".weight") {
@@ -3583,6 +3688,18 @@ fn should_quantize(key: &str, embed_quantizable: bool) -> bool {
 
     // Exclude vision encoder weights (keep bf16 for quality)
     if key.contains("vision_tower") || key.contains("visual.") {
+        return false;
+    }
+
+    // Audio encoders/projectors are consumed by dense Conv2d/Linear loaders.
+    // Qwen3-ASR quantizes only its Qwen text decoder (including the packed tied
+    // embedding); packing any audio-tower weight would make the audio tower
+    // reinterpret uint32 storage as a dense matrix. Gemma's supported
+    // `embed_audio.embedding_projection` path is intentionally not excluded.
+    if key.contains("audio_tower")
+        || key.contains("audio_encoder")
+        || key.contains("multi_modal_projector")
+    {
         return false;
     }
 
@@ -3609,9 +3726,9 @@ fn should_quantize(key: &str, embed_quantizable: bool) -> bool {
         return false;
     }
 
-    // Token embeddings: excluded by default (vocab-dim tensor). lfm2/lfm2_moe
-    // opt in via `embed_quantizable` — their packed embedding backend handles
-    // a quantized table (gather-dequant lookup + quantized tied-head matmul).
+    // Token embeddings are excluded by default (vocab-dim tensor). Qwen3-ASR
+    // and lfm2/lfm2_moe opt in via `embed_quantizable`; their packed embedding
+    // paths handle gather-dequant lookup and the tied-head projection.
     if !embed_quantizable && (key.contains("embed_tokens") || key.contains("embedding.")) {
         return false;
     }
@@ -6734,14 +6851,11 @@ fn resolve_legacy_entry(
         return Ok(None);
     }
 
-    // EXCEPTION (lfm2/lfm2_moe): when `embed_quantizable`, the lfm2 PACKED
-    // embedding backend (`load_quantized_packed`) DOES support mxfp4/mxfp8/nvfp4
-    // (mode threaded through gather-dequant + quantized matmul), so the
-    // embedding keys must NOT be force-downgraded to affine below — they keep
-    // the global non-affine mode.
-    let is_lfm2_packed_embed =
+    // When `embed_quantizable`, the packed embedding path supports the active
+    // non-affine mode, so embedding keys must not be force-downgraded below.
+    let is_packed_embed =
         embed_quantizable && (key.contains("embed_tokens") || key.contains("embedding."));
-    // sym8 is the EXCEPTION-to-the-exception: keep the lfm2 embedding DENSE bf16
+    // sym8 is the EXCEPTION-to-the-exception: keep the packed embedding DENSE bf16
     // (NO QuantEntry at all) under a sym8 default. The packed backend has no
     // sym8 gather-dequant, and the previous forced-affine-8 downgrade emitted
     // `embed_tokens.scales`, which bars the ENTIRE lfm2 compiled path at load
@@ -6750,7 +6864,7 @@ fn resolve_legacy_entry(
     // Dense bf16 keeps sym8 checkpoints compiled-eligible, matching main-branch
     // quantized-lfm2 behavior (every other quantized lfm2 recipe leaves the
     // compiled path on).
-    if default_mode == "sym8" && is_lfm2_packed_embed {
+    if default_mode == "sym8" && is_packed_embed {
         return Ok(None);
     }
 
@@ -6775,9 +6889,9 @@ fn resolve_legacy_entry(
         || default_mode == "mxfp8"
         || default_mode == "nvfp4"
         || default_mode == "sym8";
-    // (`is_lfm2_packed_embed` under a sym8 default already returned above, so
+    // (`is_packed_embed` under a sym8 default already returned above, so
     // here it always means "keeps the non-affine default".)
-    if is_non_affine_default && is_affine_only_key(key) && !is_lfm2_packed_embed {
+    if is_non_affine_default && is_affine_only_key(key) && !is_packed_embed {
         return Ok(Some(QuantEntry {
             key: key.to_string(),
             bits: 8,
@@ -7224,9 +7338,9 @@ pub(crate) fn build_quantization_object(
 /// Public wrapper for quantize_weights, accessible from other crate modules (e.g., GGUF converter).
 /// Returns the per-layer override map; see `quantize_weights` for why this matters.
 ///
-/// `embed_quantizable` gates quantizing the token embedding (lfm2/lfm2_moe only);
-/// see `should_quantize`. GGUF/other callers pass `false` to preserve the
-/// embedding-skip behavior.
+/// `embed_quantizable` gates quantizing the token embedding for model families
+/// with a compatible packed embedding path; see `should_quantize`. GGUF/other
+/// callers pass `false` to preserve the embedding-skip behavior.
 pub(crate) fn quantize_weights_pub(
     weights: &mut HashMap<String, MxArray>,
     bits: i32,
@@ -7241,8 +7355,8 @@ pub(crate) fn quantize_weights_pub(
 /// Used by GGUF converter and convert_model when a recipe is specified.
 ///
 /// `embed_quantizable` only affects the predicate's `Default` fall-through and
-/// the legacy `is_affine_only_key` force (lfm2/lfm2_moe opt-in); a recipe that
-/// emits explicit `Custom`/`Skip` decisions for the embedding is unaffected.
+/// the legacy `is_affine_only_key` force; a recipe that emits explicit
+/// `Custom`/`Skip` decisions for the embedding is unaffected.
 pub(crate) fn quantize_weights_with_recipe_pub(
     weights: &mut HashMap<String, MxArray>,
     bits: i32,
@@ -8094,10 +8208,10 @@ mod tests {
                 "{mt}: owns_dtype_cast mismatch vs inline has_custom_sanitizer"
             );
 
-            // embed_quantizable == old embed_quantizable match.
+            // embed_quantizable must match the packed-embedding allowlist.
             assert_eq!(
                 r.embed_quantizable(),
-                matches!(mt, "lfm2" | "lfm2_moe"),
+                matches!(mt, "qwen3_asr" | "lfm2" | "lfm2_moe"),
                 "{mt}: embed_quantizable mismatch vs inline match"
             );
 
@@ -8162,6 +8276,70 @@ mod tests {
         assert!(recipe::recipe_for("qwen3_5_moe").unwrap().sym8_supported());
     }
 
+    #[test]
+    fn qwen3_asr_recipe_canonicalizes_hf_keys_and_conv_layout() {
+        use recipe::ConversionRecipe;
+
+        let conv = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 1, 2, 2])
+            .expect("conv");
+        let embedding =
+            MxArray::from_float32(&[9.0, 10.0, 11.0, 12.0], &[2, 2]).expect("embedding");
+        let weights = HashMap::from([
+            ("model.audio_tower.conv2d1.weight".to_string(), conv),
+            (
+                "model.language_model.embed_tokens.weight".to_string(),
+                embedding,
+            ),
+        ]);
+
+        let out = recipe::Qwen3AsrRecipe
+            .sanitize(weights, &serde_json::json!({}), "bfloat16", true, false)
+            .expect("sanitize");
+
+        assert!(!out.keys().any(|key| key.starts_with("model.")));
+        let conv = &out["audio_tower.conv2d1.weight"];
+        assert_eq!(conv.shape().expect("shape").as_ref(), &[2, 2, 2, 1]);
+        assert_eq!(
+            conv.to_float32().expect("values").to_vec(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        );
+        assert!(out.contains_key("language_model.embed_tokens.weight"));
+    }
+
+    #[test]
+    fn qwen3_asr_recipe_is_idempotent_for_canonical_mlx_layout() {
+        use recipe::ConversionRecipe;
+
+        let canonical =
+            MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 2, 2, 1])
+                .expect("canonical conv");
+        let source_handle = canonical.as_raw_ptr();
+        let out = recipe::Qwen3AsrRecipe
+            .sanitize(
+                HashMap::from([("audio_tower.conv2d1.weight".to_string(), canonical)]),
+                &serde_json::json!({}),
+                "bfloat16",
+                true,
+                false,
+            )
+            .expect("sanitize");
+
+        let result = &out["audio_tower.conv2d1.weight"];
+        assert_eq!(result.shape().expect("shape").as_ref(), &[2, 2, 2, 1]);
+        assert_eq!(result.as_raw_ptr(), source_handle);
+        assert!(recipe::Qwen3AsrRecipe.embed_quantizable());
+        assert!(should_quantize(
+            "language_model.layers.0.mlp.gate_proj.weight",
+            true
+        ));
+        assert!(should_quantize("language_model.embed_tokens.weight", true));
+        assert!(!should_quantize("audio_tower.layers.0.fc1.weight", true));
+        assert!(!should_quantize(
+            "multi_modal_projector.linear_1.weight",
+            true
+        ));
+    }
+
     /// Every quant mode accepted by the public convert API must fail at the
     /// family capability gate for every explicit dense-only model type. The helper is
     /// called before input validation and MLX setup, so this also proves the
@@ -8176,7 +8354,7 @@ mod tests {
                     mode,
                 )
                 .expect_err("dense-only OCR runtime must reject quantization");
-                let message = err.reason;
+                let message = &err.reason;
                 assert!(message.contains(model_type), "{message}");
                 assert!(message.contains(mode), "{message}");
                 assert!(message.contains("dense-only"), "{message}");
@@ -8217,6 +8395,75 @@ mod tests {
             )
             .is_ok(),
             "unrecognized model types remain the later dispatch guard's responsibility"
+        );
+    }
+
+    #[test]
+    fn qwen3_asr_rejects_mixed_or_unsupported_native_quantization() {
+        for mode in ["affine", "mxfp4", "mxfp8"] {
+            validate_qwen3_asr_quantization(Some("qwen3_asr"), true, mode, None)
+                .expect("uniform ASR packed mode must remain supported");
+        }
+
+        for mode in ["nvfp4", "sym8"] {
+            let error = validate_qwen3_asr_quantization(Some("qwen3_asr"), true, mode, None)
+                .expect_err("unsupported ASR mode must fail before conversion I/O");
+            assert!(error.reason.contains("uniform"), "{}", error.reason);
+        }
+
+        let error =
+            validate_qwen3_asr_quantization(Some("qwen3_asr"), true, "affine", Some("mixed_4_6"))
+                .expect_err("ASR mixed recipe must fail before conversion I/O");
+        assert!(
+            error.reason.contains("omit quant_recipe"),
+            "{}",
+            error.reason
+        );
+
+        validate_qwen3_asr_quantization(Some("qwen3_asr"), false, "affine", Some("mixed_4_6"))
+            .expect("the existing generic recipe-without-quantize validation owns this case");
+        validate_qwen3_asr_quantization(Some("qwen3_5"), true, "affine", Some("mixed_4_6"))
+            .expect("other model families keep their recipe support");
+    }
+
+    #[tokio::test]
+    async fn qwen3_asr_native_recipe_rejection_precedes_converter_io() {
+        let base = std::env::temp_dir().join(format!(
+            "mlx-asr-invalid-recipe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let result = convert_model(ConversionOptions {
+            input_dir: base.join("absent-input").to_string_lossy().to_string(),
+            output_dir: base.join("output").to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("qwen3_asr".to_string()),
+            quantize: Some(true),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: Some("affine".to_string()),
+            quant_recipe: Some("mixed_4_6".to_string()),
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("native ASR recipe must fail before reading input"),
+        };
+        assert!(
+            error.reason.contains("omit quant_recipe"),
+            "{}",
+            error.reason
+        );
+        assert!(
+            !base.exists(),
+            "validation must not create converter output"
         );
     }
 
@@ -11172,7 +11419,8 @@ mod tests {
             let err = quantize_weights(&mut weights, 4, 64, "affine", false)
                 .err()
                 .unwrap_or_else(|| panic!("{mode} bytes relabelled affine must be rejected"))
-                .reason;
+                .reason
+                .clone();
             assert!(err.contains(prefix), "{mode}: {err}");
             assert!(err.contains("affine storage"), "{mode}: {err}");
         }
