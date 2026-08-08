@@ -18,6 +18,7 @@ pub mod engine;
 pub mod gradients;
 pub mod grpo;
 pub(crate) mod inference_trace;
+pub mod instance_guard;
 pub mod model_thread;
 pub mod models;
 pub mod moe;

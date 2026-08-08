@@ -1074,13 +1074,6 @@ export declare class QianfanOCRModel {
   ): Promise<ChatStreamHandle>;
 }
 
-/**
- * Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
- *
- * All inference and training state lives on a dedicated OS thread. NAPI methods
- * dispatch commands via channels and await responses. Training commands are
- * routed through `TrainingDispatch` to the model thread.
- */
 export declare class Qwen35Model {
   /**
    * Whether the block-paged KV cache adapter is active on this model
@@ -1109,6 +1102,11 @@ export declare class Qwen35Model {
    * per-request `enableMtp` flag.
    */
   hasMtpWeights(): boolean;
+  /**
+   * Whether a standalone two-model draft checkpoint was attached at
+   * load time via `draftModelPath` (genmlx-orsr).
+   */
+  hasDraftModel(): boolean;
   /**
    * Whether this loaded model instance can execute image-bearing turns.
    *
@@ -1147,7 +1145,11 @@ export declare class Qwen35Model {
    * serialized in practice (model-thread startup); callers that need both
    * modes load sequentially.
    */
-  static load(path: string, pagedOverride?: boolean | undefined | null): Promise<Qwen35Model>;
+  static load(
+    path: string,
+    pagedOverride?: boolean | undefined | null,
+    options?: Qwen35LoadOptions | undefined | null,
+  ): Promise<Qwen35Model>;
   /** Generate text from a prompt token sequence. */
   generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Promise<Qwen35GenerationResult>;
   /**
@@ -3845,6 +3847,30 @@ export declare const enum MultimodalContentOrder {
   ImagesThenText = 'imagesThenText',
 }
 
+/**
+ * Report pid, addon path, and duplicate-copy status for this native
+ * instance. Cheap; safe to call from telemetry paths.
+ */
+export declare function nativeInstanceInfo(): NativeInstanceInfo;
+
+/** Identity of the native-addon instance answering this call. */
+export interface NativeInstanceInfo {
+  /**
+   * OS process id. Cross-process confusion (a worker-pool process next
+   * to a trainer process) is the most common cause of "stats read 0".
+   */
+  pid: number;
+  /** On-disk path of THIS loaded copy of the addon library. */
+  addonPath?: string;
+  /**
+   * 1-based load order of this copy within the process. Anything above
+   * 1 means the process holds duplicate copies of the addon.
+   */
+  loadOrdinal: number;
+  /** Total addon copies the process had loaded when this call ran. */
+  processInstances: number;
+}
+
 /** Result from document orientation classification. */
 export interface OrientationResult {
   /** Detected rotation angle (0, 90, 180, or 270 degrees) */
@@ -4276,6 +4302,20 @@ export interface Qwen35GenerationResult {
   text: string;
   numTokens: number;
   finishReason: string;
+}
+
+/**
+ * Optional knobs for [`Qwen3_5Model::load`] (mirrors
+ * `Gemma4LoadOptions`).
+ */
+export interface Qwen35LoadOptions {
+  /**
+   * Directory of a standalone smaller checkpoint of the same family to
+   * attach as a speculative draft (two-model speculative decoding,
+   * genmlx-orsr). Dense, text-only, non-quantized, same vocabulary as
+   * the target; anything else is a load error.
+   */
+  draftModelPath?: string;
 }
 
 /**

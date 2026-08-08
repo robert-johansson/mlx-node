@@ -835,6 +835,26 @@ pub(crate) struct Qwen35Inner {
     /// ship no such file. Consumed by the [`ChatBackend`] sampling/EOS
     /// hooks and the raw `generate` loop.
     gen_defaults: crate::engine::ModelGenerationDefaults,
+    /// Standalone two-model draft for speculative decoding
+    /// (genmlx-orsr): a separately loaded smaller checkpoint of the same
+    /// family proposing tokens this target verifies. Loaded via
+    /// `loadModel`'s `draftModelPath`; mutually independent of the
+    /// in-checkpoint MTP head (`mtp`), and taking precedence over it in
+    /// `execution_plan` when both are present (an explicit draft is a
+    /// deliberate operator choice).
+    pub(crate) draft: Option<super::draft::Qwen35Draft>,
+    /// Checkpoint directory this model was loaded from (None for
+    /// random-init models). Retained so `save_model_sync` can copy
+    /// serving-critical sidecar files (chat_template.jinja, tokenizer
+    /// files, generation_config.json, …) into the saved checkpoint —
+    /// a save must reload-and-serve with no manual patching
+    /// (genmlx-4d29).
+    pub(crate) source_model_dir: Option<std::path::PathBuf>,
+    /// The raw config.json this model was loaded from. `save_model_sync`
+    /// merges the typed config OVER this, preserving keys the typed
+    /// struct does not model (vision_config, rope variants, …) — the
+    /// typed-only serialization silently dropped them (genmlx-4d29).
+    pub(crate) raw_config: Option<serde_json::Value>,
 }
 
 /// Build the dense media admission contract from the components wired into
@@ -898,11 +918,18 @@ fn qwen35_dense_session_media_matches_payloads(
 /// Make the resolved decoder authoritative for legacy Qwen3.5 whole-turn
 /// cores, which still derive their local `ChatParams` from a `ChatConfig`.
 fn apply_qwen35_dense_planned_decoder(config: &mut ChatConfig, decoder: DecoderPlan) -> bool {
+    // `enable_mtp` carries "speculation requested" into the dense cores for
+    // BOTH speculative kinds; the cores route by mechanism (`eager_draft`
+    // requires an attached draft, `eager_mtp` requires MTP weights), so a
+    // DraftModel plan can never light the MTP-head path or vice versa
+    // (genmlx-orsr). The bool return stays MTP-head-specific: its consumers
+    // assert `planned_mtp → has_mtp_weights()`.
+    let planned_speculative = matches!(decoder, DecoderPlan::Speculative(_));
     let planned_mtp = matches!(
         decoder,
         DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
     );
-    config.enable_mtp = Some(planned_mtp);
+    config.enable_mtp = Some(planned_speculative);
     planned_mtp
 }
 
@@ -1301,6 +1328,9 @@ impl Qwen35Inner {
             mtp_weights_loaded: false,
             turn_is_streaming: Cell::new(false),
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
+            draft: None,
+            source_model_dir: None,
+            raw_config: None,
         })
     }
 
@@ -2989,26 +3019,61 @@ impl Qwen35Inner {
             weights_metadata.insert(key.clone(), serde_json::Value::Object(param_info));
         }
 
-        // Config JSON
-        let mut config_value = serde_json::to_value(&self.config).map_err(|e| {
+        // Config JSON. Start from the raw config this model was loaded
+        // from (when available) and overlay the typed config on top: the
+        // typed struct does not model every key (vision_config, rope
+        // variants, …), so a typed-only dump produced checkpoints that
+        // needed hand-patching before they would reload (genmlx-4d29).
+        let typed_value = serde_json::to_value(&self.config).map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Failed to serialize config: {e}"),
             )
         })?;
+        let mut config_value = match &self.raw_config {
+            Some(raw) if raw.is_object() => raw.clone(),
+            _ => serde_json::json!({}),
+        };
         if let serde_json::Value::Object(ref mut map) = config_value {
-            map.insert("model_type".to_string(), serde_json::json!("qwen3_5"));
+            // A raw key the overlay must not resurrect: the loader reads
+            // the MTP count from either HF-convention key, so a stale
+            // `num_nextn_predict_layers` from the base config would
+            // override the corrected count below.
+            map.remove("num_nextn_predict_layers");
+            if let serde_json::Value::Object(typed) = typed_value {
+                for (k, v) in typed {
+                    map.insert(k, v);
+                }
+            }
+            // Preserve the source model_type when the raw config carried
+            // one (VLM variants); default to the family name otherwise.
+            map.entry("model_type".to_string())
+                .or_insert_with(|| serde_json::json!("qwen3_5"));
             // `parse_config` reads the MTP layer count ONLY from the
             // HF-convention keys `mtp_num_hidden_layers` /
             // `num_nextn_predict_layers`; the serde field name
-            // `n_mtp_layers` is ignored on load. Without this, a saved MTP
-            // checkpoint reloads with `n_mtp_layers = 0` and its head is
-            // silently dropped. Mirrors the MoE saver
-            // (`qwen3_5_moe::model::Qwen35MoeInner::save_model_sync`).
+            // `n_mtp_layers` is ignored on load. The count must describe
+            // the TENSORS THIS SAVE WRITES, not the loaded config: the
+            // weights block above only includes `mtp.*` when
+            // `mtp_weights_loaded`, so a base config advertising heads
+            // the export never shipped must save as 0 — otherwise every
+            // reload warns and disables speculation (genmlx-4d29).
+            let saved_mtp_layers = if self.mtp_weights_loaded {
+                self.config.n_mtp_layers
+            } else {
+                0
+            };
             map.insert(
                 "mtp_num_hidden_layers".to_string(),
-                serde_json::json!(self.config.n_mtp_layers),
+                serde_json::json!(saved_mtp_layers),
             );
+            // Same tensors-must-match-config rule for vision: visual.*
+            // tensors are saved only when a vision encoder is loaded, so
+            // a config carrying vision_config without them would fail
+            // reload with "Missing vision weight" (and vice versa).
+            if self.vision_encoder.is_none() {
+                map.remove("vision_config");
+            }
         }
 
         let weights_json = serde_json::json!({
@@ -3044,6 +3109,37 @@ impl Qwen35Inner {
         let weights_path = path.join("weights.mlx");
         std::fs::write(&weights_path, weights_str)?;
         info!("Saved weights.mlx metadata");
+
+        // Serving sidecars: a checkpoint must reload-and-serve with zero
+        // manual file surgery (genmlx-4d29). Copy every serving-critical
+        // sidecar present in the source checkpoint; a failed copy is a
+        // warning, not a failed save (weights are already on disk).
+        if let Some(src_dir) = &self.source_model_dir {
+            const SIDECARS: &[&str] = &[
+                "chat_template.jinja",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "generation_config.json",
+                "special_tokens_map.json",
+                "vocab.json",
+                "merges.txt",
+                "preprocessor_config.json",
+            ];
+            for name in SIDECARS {
+                let src = src_dir.join(name);
+                let dst = path.join(name);
+                if src.exists() && src != dst {
+                    match std::fs::copy(&src, &dst) {
+                        Ok(_) => info!("Copied sidecar {}", name),
+                        Err(e) => tracing::warn!(
+                            "Could not copy sidecar {} into checkpoint: {}",
+                            name,
+                            e
+                        ),
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
@@ -3665,13 +3761,25 @@ impl Qwen35Inner {
             prompt_hidden_position_base,
         } = inputs;
 
+        // Standalone two-model draft speculation (genmlx-orsr): same
+        // request opt-in flag (`enable_mtp` = "speculation requested"),
+        // flat text-only, and it takes precedence over the in-checkpoint
+        // MTP head — attaching a draft is an explicit operator choice
+        // (mirrors the execution-plan precedence).
+        let eager_draft = p.enable_mtp
+            && self.draft.is_some()
+            && self.paged_adapter.is_none()
+            && !has_images;
         // Pure-Rust ("eager") dense MTP. Gated on the same per-request /
         // per-checkpoint preconditions (`enable_mtp`, MTP weights present),
         // restricted to the dense FLAT path (no live paged adapter, text-only
         // — the paged adapter has its own MTP gate and VLM routes through the
         // text decode path).
-        let eager_mtp =
-            p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_none() && !has_images;
+        let eager_mtp = !eager_draft
+            && p.enable_mtp
+            && self.has_mtp_weights()
+            && self.paged_adapter.is_none()
+            && !has_images;
 
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
@@ -3724,7 +3832,52 @@ impl Qwen35Inner {
         // token so the save below can drop it from `cached_token_history`.
         let mut last_in_cache = true;
 
-        if eager_mtp {
+        if eager_draft {
+            // Two-model draft speculation (genmlx-orsr): engine-owned
+            // propose/verify loop (`engine::run_dspark_turn`) driving
+            // `Qwen35DraftStepper`. Fresh draft prefill per turn (the
+            // gemma4 DSpark stance).
+            let mut rng = rand::rng();
+            MxArray::async_eval_arrays(&[&y]);
+            self.prefill_draft_for_turn(&token_history, generation_stream)?;
+            let outcome = crate::engine::dspark_turn::run_dspark_turn(
+                self,
+                &mut rng,
+                crate::engine::dspark_turn::DsparkTurnArgs {
+                    y: y.clone(),
+                    block_size: p.mtp_depth.max(1),
+                    params: &p,
+                    reasoning_tracker: &mut reasoning_tracker,
+                    profiler: &mut profiler,
+                    max_new_tokens,
+                    eos_id,
+                    generated_tokens: &mut generated_tokens,
+                    token_history: &mut token_history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant: &mut first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream,
+                },
+                // SYNC site: no streaming sink.
+                None,
+            );
+            match outcome {
+                Ok(outcome) => {
+                    last_in_cache = outcome.last_in_cache;
+                }
+                Err(e) => {
+                    // Fail closed: target caches may sit mid-cycle. The
+                    // flat desync latch forces a full re-prefill next
+                    // turn; the draft rebuilds at its next turn prefill.
+                    self.flat_mtp_caches_desynced = true;
+                    if let Some(d) = self.draft.as_mut() {
+                        d.model.caches = None;
+                        d.committed_len = 0;
+                    }
+                    return Err(e);
+                }
+            }
+        } else if eager_mtp {
             // Pure-Rust eager dense MTP — the propose/verify whole-turn loop is
             // engine-owned (`engine::run_mtp_turn`) and drives the
             // `DenseMtpStepper` (`MtpBackend::begin_mtp_decode`). The stepper
@@ -4001,6 +4154,126 @@ impl Qwen35Inner {
             self.flat_mtp_caches_desynced = true;
         }
 
+        Ok(())
+    }
+
+    /// Streaming flat two-model-draft turn (genmlx-orsr) — the
+    /// [`Self::run_flat_stream_eager_mtp`] analog driving the engine-owned
+    /// external-draft loop (`engine::dspark_turn::run_dspark_turn`).
+    #[allow(clippy::too_many_arguments)]
+    fn run_flat_stream_eager_draft<'a>(
+        &mut self,
+        y: MxArray,
+        token_history: &mut Vec<u32>,
+        generated_tokens: &mut Vec<u32>,
+        finish_reason: &mut String,
+        reasoning_tracker: &mut engine::ReasoningTracker,
+        profiler: &mut crate::decode_profiler::DecodeProfiler,
+        first_token_instant: &mut Option<std::time::Instant>,
+        streamed_text_len: &mut usize,
+        last_is_reasoning: &mut bool,
+        decode_stream: &mut tokenizers::DecodeStream<
+            'a,
+            tokenizers::ModelWrapper,
+            tokenizers::NormalizerWrapper,
+            tokenizers::PreTokenizerWrapper,
+            tokenizers::PostProcessorWrapper,
+            tokenizers::DecoderWrapper,
+        >,
+        tokenizer: &'a Arc<Qwen3Tokenizer>,
+        cb: &StreamSender<'_>,
+        cancelled: &AtomicBool,
+        p: &engine::ChatParams,
+        eos_id: u32,
+        max_new_tokens: i32,
+        generation_stream: Stream,
+        last_in_cache: &mut bool,
+    ) -> Result<()> {
+        MxArray::async_eval_arrays(&[&y]);
+        let mut rng = rand::rng();
+
+        // v1 draft-context policy: fresh prefill over the full history
+        // every turn (the gemma4 DSpark stance) — simple, correct, and
+        // cheap for the small drafts this path exists for.
+        self.prefill_draft_for_turn(token_history, generation_stream)?;
+
+        let mut emitter = crate::engine::backend::DefaultStreamEmitter;
+        let streaming = crate::engine::decode::StreamingCtx {
+            callback: cb.0,
+            cancelled,
+            decode_stream,
+            tokenizer: tokenizer.inner(),
+            streamed_text_len,
+            last_is_reasoning,
+            emitter: &mut emitter,
+        };
+
+        let outcome = crate::engine::dspark_turn::run_dspark_turn(
+            self,
+            &mut rng,
+            crate::engine::dspark_turn::DsparkTurnArgs {
+                y,
+                block_size: p.mtp_depth.max(1),
+                params: p,
+                reasoning_tracker,
+                profiler,
+                max_new_tokens,
+                eos_id,
+                generated_tokens,
+                token_history,
+                finish_reason,
+                first_token_instant,
+                report_perf: p.report_performance,
+                generation_stream,
+            },
+            Some(streaming),
+        );
+        match outcome {
+            Ok(outcome) => {
+                *last_in_cache = outcome.last_in_cache;
+                Ok(())
+            }
+            Err(e) => {
+                // Fail closed: the target caches may sit mid-cycle. The
+                // flat desync latch forces a full re-prefill next turn;
+                // the draft rebuilds from scratch at its next turn
+                // prefill anyway.
+                self.flat_mtp_caches_desynced = true;
+                if let Some(d) = self.draft.as_mut() {
+                    d.model.caches = None;
+                    d.committed_len = 0;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Reset + fully prefill the standalone draft's caches over
+    /// `token_history` for this turn (genmlx-orsr).
+    fn prefill_draft_for_turn(
+        &mut self,
+        token_history: &[u32],
+        generation_stream: Stream,
+    ) -> Result<()> {
+        let draft = self.draft.as_mut().ok_or_else(|| {
+            Error::from_reason("prefill_draft_for_turn: no draft model loaded")
+        })?;
+        let m = &mut *draft.model;
+        m.caches = Some(fresh_dense_layer_caches(&m.config));
+        if !token_history.is_empty() {
+            let ids: Vec<i32> = token_history.iter().map(|&t| t as i32).collect();
+            let prompt = MxArray::from_int32(&ids, &[1, ids.len() as i64])?;
+            let _ = chunked_prefill(
+                &prompt,
+                &m.embedding,
+                &mut m.layers,
+                &mut m.caches,
+                &m.final_norm,
+                &m.lm_head,
+                generation_stream,
+            )?;
+        }
+        draft.committed_len = token_history.len();
         Ok(())
     }
 
@@ -6700,19 +6973,47 @@ impl Qwen35Inner {
         let mut last_is_reasoning = starts_in_thinking;
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
+        // Two-model draft gate (genmlx-orsr): precedence over the MTP head,
+        // same opt-in flag. Flat text-only by construction here.
+        let eager_draft =
+            p.enable_mtp && self.draft.is_some() && self.paged_adapter.is_none();
         // Pure-Rust ("eager") dense MTP gate for the FLAT streaming delta path.
         // Delta is text-only (no `has_images`) by construction; paged sessions
         // returned earlier. Continuations have a live cache prefix so the
         // committed-history builds from decode tokens with NO prompt seed
         // (mirrors the non-stream delta path's `None, None, 0`).
-        let eager_mtp = p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_none();
+        let eager_mtp = !eager_draft
+            && p.enable_mtp
+            && self.has_mtp_weights()
+            && self.paged_adapter.is_none();
 
         // Whether the final committed token reached the physical KV/GDN cache;
         // written by the decode driver so the save below drops it when it was
         // never forwarded (unforwarded stop token).
         let mut last_in_cache = true;
 
-        if eager_mtp {
+        if eager_draft {
+            self.run_flat_stream_eager_draft(
+                y,
+                &mut token_history,
+                &mut generated_tokens,
+                &mut finish_reason,
+                &mut reasoning_tracker,
+                &mut profiler,
+                &mut first_token_instant,
+                &mut streamed_text_len,
+                &mut last_is_reasoning,
+                &mut decode_stream,
+                &tokenizer_for_decode,
+                cb,
+                cancelled,
+                &p,
+                eos_id,
+                p.max_new_tokens,
+                generation_stream,
+                &mut last_in_cache,
+            )?;
+        } else if eager_mtp {
             self.run_flat_stream_eager_mtp(
                 y,
                 &mut token_history,
@@ -7150,12 +7451,21 @@ impl Qwen35Inner {
         profiler.set_prompt_tokens(prefill_tokens.len() as u32);
         profiler.snapshot_memory_before();
 
+        // Two-model draft gate (genmlx-orsr): precedence over the MTP
+        // head, same opt-in flag, flat text-only.
+        let eager_draft = p.enable_mtp
+            && self.draft.is_some()
+            && self.paged_adapter.is_none()
+            && !has_images;
         // Pure-Rust ("eager") dense MTP gate for the FLAT streaming path.
         // Same preconditions as `chat_with_caches_inner`: per-request /
         // per-checkpoint enablement, no live paged adapter (paged streams
         // returned earlier), text-only.
-        let eager_mtp =
-            p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_none() && !has_images;
+        let eager_mtp = !eager_draft
+            && p.enable_mtp
+            && self.has_mtp_weights()
+            && self.paged_adapter.is_none()
+            && !has_images;
         // The committed-history v2 seed needs the prompt tail's hiddens, which
         // only the hidden-emitting prefill produces. Skip on cache-reuse turns
         // (the captured hidden would cover the SUFFIX, not the full prompt) —
@@ -7239,7 +7549,28 @@ impl Qwen35Inner {
         // never forwarded (unforwarded stop token).
         let mut last_in_cache = true;
 
-        if eager_mtp {
+        if eager_draft {
+            self.run_flat_stream_eager_draft(
+                y,
+                &mut token_history,
+                &mut generated_tokens,
+                &mut finish_reason,
+                &mut reasoning_tracker,
+                &mut profiler,
+                &mut first_token_instant,
+                &mut streamed_text_len,
+                &mut last_is_reasoning,
+                &mut decode_stream,
+                &tokenizer_for_decode,
+                cb,
+                cancelled,
+                &p,
+                eos_id,
+                p.max_new_tokens,
+                generation_stream,
+                &mut last_in_cache,
+            )?;
+        } else if eager_mtp {
             self.run_flat_stream_eager_mtp(
                 y,
                 &mut token_history,
@@ -10694,18 +11025,31 @@ impl ChatBackend for Qwen35Inner {
             paged_attention: self.paged_adapter.as_ref().map(|_| PagedAttentionPlan {
                 supports_delta: true,
             }),
-            speculative: self.has_mtp_weights().then_some(SpeculativePlan {
-                kind: SpeculativeKind::NativeMtp,
-                supported_input_media: MediaCapabilities::NONE,
-                // A text delta can continue an image-derived live session
-                // with native MTP. The current turn carries no image bytes;
-                // the eager paged-MTP core verifies against the target's
-                // existing paged KV context. This is the same route the old
-                // session dispatcher selected: its paged probe ran before the
-                // MTP probe and dense `paged_turn` handled MTP directly.
-                supported_context_media: MediaCapabilities::IMAGES,
-                supports_paged_attention: true,
-            }),
+            speculative: if self.draft.is_some() {
+                // A standalone two-model draft (genmlx-orsr) takes
+                // precedence over an in-checkpoint MTP head: attaching a
+                // draft is an explicit operator choice. Flat text-only —
+                // the draft turn core has no paged or vision arm.
+                Some(SpeculativePlan {
+                    kind: SpeculativeKind::DraftModel,
+                    supported_input_media: MediaCapabilities::NONE,
+                    supported_context_media: MediaCapabilities::NONE,
+                    supports_paged_attention: false,
+                })
+            } else {
+                self.has_mtp_weights().then_some(SpeculativePlan {
+                    kind: SpeculativeKind::NativeMtp,
+                    supported_input_media: MediaCapabilities::NONE,
+                    // A text delta can continue an image-derived live session
+                    // with native MTP. The current turn carries no image bytes;
+                    // the eager paged-MTP core verifies against the target's
+                    // existing paged KV context. This is the same route the old
+                    // session dispatcher selected: its paged probe ran before the
+                    // MTP probe and dense `paged_turn` handled MTP directly.
+                    supported_context_media: MediaCapabilities::IMAGES,
+                    supports_paged_attention: true,
+                })
+            },
         }
     }
 
@@ -10770,12 +11114,16 @@ impl ChatBackend for Qwen35Inner {
 
     fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         // The execution plan has already established request opt-in, loaded
-        // MTP weights, flat-cache admission, and text-only input. The dense
-        // core retains the algorithm-specific MTP gate and AR fallback.
+        // MTP weights / attached draft, flat-cache admission, and text-only
+        // input. The dense core retains the algorithm-specific gates
+        // (`eager_draft` / `eager_mtp`) and AR fallback: both speculative
+        // kinds route through it (genmlx-orsr).
         debug_assert!(args.media.is_empty());
         debug_assert!(matches!(
             args.plan.decoder,
-            DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
+            DecoderPlan::Speculative(
+                SpeculativeKind::NativeMtp | SpeculativeKind::DraftModel
+            )
         ));
         self.dense_whole_turn(args)
     }
@@ -10844,6 +11192,456 @@ use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHa
 /// All inference and training state lives on a dedicated OS thread. NAPI methods
 /// dispatch commands via channels and await responses. Training commands are
 /// routed through `TrainingDispatch` to the model thread.
+// ===== Two-model draft speculative decoding (genmlx-orsr) ==============
+//
+// The engine-owned external-draft loop (`engine::dspark_turn::
+// run_dspark_turn`) drives this stepper: `propose` runs the standalone
+// draft checkpoint autoregressively over its OWN caches, `verify` is one
+// batched target forward with the same pre-verify snapshot + GDN tape the
+// MTP path records, and `commit(keep, total_written)` is the MTP
+// `rollback` math with `accepted_steps = keep` on the target plus a
+// restore-and-refeed on the draft. Only token ids and logits cross the
+// trait — no hidden states — which is what lets an unrelated (smaller)
+// checkpoint of the same family act as the draft.
+
+pub(crate) struct Qwen35DraftStepper<'a> {
+    /// The target model. Owns layers / caches / final_norm / lm_head and
+    /// the `flat_mtp_caches_desynced` latch.
+    inner: &'a mut Qwen35Inner,
+    /// The standalone draft, taken out of `inner.draft` for the turn and
+    /// restored by [`Drop`] on every exit path.
+    draft: Option<super::draft::Qwen35Draft>,
+    /// Pre-verify snapshot of the TARGET caches (offsets for
+    /// full-attention layers, deep copies for GDN), consumed by `commit`.
+    snap: Option<Vec<super::layer_cache::Qwen3_5LayerSnapshot>>,
+    /// Target GDN tape recorded by `verify`, consumed by `commit`.
+    tape: Vec<Option<super::gated_delta_net::GdnLayerTape>>,
+    /// Pre-propose snapshot of the DRAFT caches, consumed by `commit`
+    /// (restore, then re-feed the kept prefix).
+    draft_snap: Option<Vec<super::layer_cache::Qwen3_5LayerSnapshot>>,
+    /// The ids `verify` wrote (`[anchor, d_0..d_{L-1}]`), kept so `commit`
+    /// can re-feed `verify_ids[..keep]` into the draft.
+    verify_stash: Vec<i32>,
+    /// Guard: a verify's written slot count, cleared by commit. A second
+    /// verify (or a commit without one) while set is a stepper-order bug.
+    pending_written: Option<usize>,
+    /// Latched by `enter_ar_fallback`: the rest of the turn is exact
+    /// target-only AR; `propose` errors defensively and `verify` accepts
+    /// only single-token blocks.
+    ar_fallback: bool,
+}
+
+impl Drop for Qwen35DraftStepper<'_> {
+    fn drop(&mut self) {
+        // Restore the draft into the model on EVERY exit path (Ok tail,
+        // mid-loop `?`, engine error) — mirrors `DenseMtpStepper`'s paged
+        // adapter restore.
+        if let Some(d) = self.draft.take() {
+            self.inner.draft = Some(d);
+        }
+    }
+}
+
+impl Qwen35DraftStepper<'_> {
+    /// Target-side commit: keep the first `keep` of the slots the verify
+    /// forward wrote and roll back the rest — the `DenseMtpStepper::
+    /// rollback` math with `accepted_steps = keep`, flat-only and
+    /// fallible (the dspark trait has a fallible commit, so no stash).
+    fn target_commit_flat(&mut self, keep: usize) -> Result<()> {
+        let snap = self.snap.take().ok_or_else(|| {
+            Error::from_reason("draft-spec commit: target snapshot missing (verify did not run)")
+        })?;
+        let tape = std::mem::take(&mut self.tape);
+        let inner = &mut *self.inner;
+        let caches = inner
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("draft-spec commit: target caches is None"))?;
+        if caches.len() != snap.len() || caches.len() != tape.len() {
+            return Err(Error::from_reason(format!(
+                "draft-spec commit: length mismatch (caches {}, snapshot {}, tape {})",
+                caches.len(),
+                snap.len(),
+                tape.len(),
+            )));
+        }
+        for (idx, cache) in caches.iter_mut().enumerate() {
+            let Some(layer_tape) = tape[idx].as_ref() else {
+                // Full-attention layer: rewind the offset to
+                // `snapshot_offset + keep` so the next forward overwrites
+                // the rejected slots. No-op on full accept.
+                match &snap[idx] {
+                    super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { offset, .. } => {
+                        let kv = cache.as_kv_cache_mut().ok_or_else(|| {
+                            Error::from_reason(format!(
+                                "draft-spec commit: layer {idx} has a FullAttention \
+                                 snapshot but its cache slot is not FullAttention",
+                            ))
+                        })?;
+                        kv.trim(*offset + keep as i32);
+                    }
+                    super::layer_cache::Qwen3_5LayerSnapshot::Linear { .. } => {
+                        return Err(Error::from_reason(format!(
+                            "draft-spec commit: layer {idx} has no GDN tape but a \
+                             Linear snapshot",
+                        )));
+                    }
+                }
+                continue;
+            };
+            let arrays = cache.as_arrays_cache_mut().ok_or_else(|| {
+                Error::from_reason(format!(
+                    "draft-spec commit: layer {idx} has a GDN tape but its cache \
+                     slot is not Linear",
+                ))
+            })?;
+            let (snap_conv, snap_rec) = match &snap[idx] {
+                super::layer_cache::Qwen3_5LayerSnapshot::Linear {
+                    conv_state,
+                    recurrent_state,
+                } => (conv_state.as_ref(), recurrent_state.as_ref()),
+                super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { .. } => {
+                    return Err(Error::from_reason(format!(
+                        "draft-spec commit: layer {idx} GDN tape but FullAttention \
+                         snapshot",
+                    )));
+                }
+            };
+            let window = layer_tape.kernel.window_len()? as usize;
+            if keep > window {
+                return Err(Error::from_reason(format!(
+                    "draft-spec commit: keep {keep} exceeds recorded window {window} \
+                     at layer {idx}",
+                )));
+            }
+            layer_tape.replay_into(arrays, snap_conv, snap_rec, keep)?;
+        }
+        Ok(())
+    }
+
+    fn draft_mut(&mut self) -> Result<&mut super::draft::Qwen35Draft> {
+        self.draft
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("draft-spec: draft model missing from stepper"))
+    }
+}
+
+impl crate::engine::backend::DsparkStepper for Qwen35DraftStepper<'_> {
+    fn supports_adaptive_ar_fallback(&self) -> bool {
+        true
+    }
+
+    fn enter_ar_fallback(&mut self) -> Result<()> {
+        if self.pending_written.is_some() {
+            return Err(Error::from_reason(
+                "draft-spec enter_ar_fallback: a verify is pending commit",
+            ));
+        }
+        // Free the draft's cache memory — the rest of the turn never
+        // proposes again. Next turn's prefill rebuilds it from scratch.
+        let draft = self.draft_mut()?;
+        draft.model.caches = None;
+        draft.committed_len = 0;
+        self.draft_snap = None;
+        self.ar_fallback = true;
+        Ok(())
+    }
+
+    fn materialize_adaptive_state(&self) -> Result<()> {
+        if let Some(d) = self.draft.as_ref() {
+            eval_layer_caches(&d.model.caches)?;
+        }
+        Ok(())
+    }
+
+    fn verify_ar_probe(&mut self, anchor_id: u32) -> Result<crate::engine::backend::DsparkVerifyOutput> {
+        if self.pending_written.is_some() {
+            return Err(Error::from_reason(
+                "draft-spec verify_ar_probe: a verify is pending commit",
+            ));
+        }
+        // Single-token target forward, no rollback state (the anchor's
+        // slot is unconditionally kept).
+        let arr = MxArray::from_int32(&[anchor_id as i32], &[1, 1])?;
+        let inner = &mut *self.inner;
+        let out = eager_verify_step(
+            &mut inner.layers,
+            &mut inner.caches,
+            &inner.final_norm,
+            &inner.lm_head,
+            &arr,
+            &inner.embedding,
+            None,
+        )?;
+        self.verify_stash = vec![anchor_id as i32];
+        self.pending_written = Some(1);
+        let logits = out
+            .logits
+            .ok_or_else(|| Error::from_reason("draft-spec verify_ar_probe: no logits"))?;
+        Ok(crate::engine::backend::DsparkVerifyOutput { logits })
+    }
+
+    fn commit_ar_probe(&mut self) -> Result<()> {
+        let written = self.pending_written.take().ok_or_else(|| {
+            Error::from_reason("draft-spec commit_ar_probe: no pending verify")
+        })?;
+        if written != 1 {
+            return Err(Error::from_reason(format!(
+                "draft-spec commit_ar_probe: expected 1 written slot, found {written}"
+            )));
+        }
+        // Advance the draft over the anchor so its context stays aligned
+        // for the next speculative cycle.
+        let anchor = *self.verify_stash.first().ok_or_else(|| {
+            Error::from_reason("draft-spec commit_ar_probe: verify stash empty")
+        })?;
+        let draft = self.draft_mut()?;
+        let arr = MxArray::from_int32(&[anchor], &[1, 1])?;
+        let m = &mut *draft.model;
+        let _ = eager_verify_step(
+            &mut m.layers,
+            &mut m.caches,
+            &m.final_norm,
+            &m.lm_head,
+            &arr,
+            &m.embedding,
+            None,
+        )?;
+        draft.committed_len += 1;
+        Ok(())
+    }
+
+    fn propose(
+        &mut self,
+        anchor_id: u32,
+        max_len: usize,
+        params: &crate::engine::params::ChatParams,
+        rng: &mut dyn rand::Rng,
+    ) -> Result<crate::engine::backend::DsparkProposal> {
+        if self.ar_fallback {
+            return Err(Error::from_reason(
+                "draft-spec propose: called after enter_ar_fallback",
+            ));
+        }
+        // Snapshot the draft's caches; commit restores this and re-feeds
+        // only the kept prefix (the draft's GDN state is as
+        // non-rewindable as the target's).
+        let snap = {
+            let draft = self
+                .draft
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("draft-spec: draft model missing"))?;
+            let caches = draft.model.caches.as_ref().ok_or_else(|| {
+                Error::from_reason("draft-spec propose: draft caches missing (no prefill?)")
+            })?;
+            super::layer_cache::snapshot_all(caches)?
+        };
+        self.draft_snap = Some(snap);
+        // Must agree with the engine's greedy gate: same predicate, same
+        // temperature resolution (`dspark_turn.rs`).
+        let temperature = params
+            .sampling_config
+            .and_then(|c| c.temperature)
+            .unwrap_or(1.0);
+        let greedy = crate::sampling::is_greedy_temperature(temperature);
+        let cfg = params.sampling_config.unwrap_or_default();
+
+        let draft = self
+            .draft
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("draft-spec: draft model missing from stepper"))?;
+        let vocab = draft.model.config.vocab_size as i64;
+        let mut ids: Vec<i32> = Vec::with_capacity(max_len);
+        let mut dists: Vec<MxArray> = Vec::new();
+        let mut cur = anchor_id as i32;
+        for _ in 0..max_len {
+            let arr = MxArray::from_int32(&[cur], &[1, 1])?;
+            let m = &mut *draft.model;
+            let out = eager_verify_step(
+                &mut m.layers,
+                &mut m.caches,
+                &m.final_norm,
+                &m.lm_head,
+                &arr,
+                &m.embedding,
+                None,
+            )?;
+            let logits = out
+                .logits
+                .ok_or_else(|| Error::from_reason("draft-spec propose: no draft logits"))?;
+            let row = logits.reshape(&[vocab])?;
+            let tok = if greedy {
+                let idx = row
+                    .argmax(0, Some(false))?
+                    .astype(crate::array::DType::Int32)?;
+                idx.eval();
+                idx.item_at_int32(0)?
+            } else {
+                // The dist pushed MUST be the exact distribution the draw
+                // came from — `accept_with_residual` computes the residual
+                // from it.
+                let dist = crate::sampling::sampling_distribution(&row, Some(cfg))?
+                    .astype(crate::array::DType::Float32)?;
+                dist.eval();
+                let probs = dist.to_float32()?;
+                let tok = crate::models::gemma4::dspark::sample_index_from_probs(&probs, rng)?;
+                dists.push(dist);
+                tok
+            };
+            ids.push(tok);
+            cur = tok;
+        }
+        Ok(crate::engine::backend::DsparkProposal {
+            draft_ids: ids,
+            draft_dists: dists,
+        })
+    }
+
+    fn verify(&mut self, verify_ids: &[u32]) -> Result<crate::engine::backend::DsparkVerifyOutput> {
+        if self.pending_written.is_some() {
+            return Err(Error::from_reason(
+                "draft-spec verify: previous verify not committed",
+            ));
+        }
+        if verify_ids.is_empty() {
+            return Err(Error::from_reason("draft-spec verify: empty block"));
+        }
+        if self.ar_fallback && verify_ids.len() != 1 {
+            return Err(Error::from_reason(format!(
+                "draft-spec verify: {}-token block after AR fallback",
+                verify_ids.len()
+            )));
+        }
+        let ids: Vec<i32> = verify_ids.iter().map(|&t| t as i32).collect();
+        let arr = MxArray::from_int32(&ids, &[1, ids.len() as i64])?;
+        let inner = &mut *self.inner;
+        // In AR fallback there is nothing to roll back (single kept slot):
+        // skip the snapshot + tape entirely.
+        let tape = if self.ar_fallback {
+            None
+        } else {
+            let caches = inner
+                .caches
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("draft-spec verify: target caches is None"))?;
+            self.snap = Some(super::layer_cache::snapshot_all_mtp(caches, false)?);
+            Some(&mut self.tape)
+        };
+        let out = eager_verify_step(
+            &mut inner.layers,
+            &mut inner.caches,
+            &inner.final_norm,
+            &inner.lm_head,
+            &arr,
+            &inner.embedding,
+            tape,
+        )?;
+        self.verify_stash = ids;
+        self.pending_written = Some(verify_ids.len());
+        let logits = out
+            .logits
+            .ok_or_else(|| Error::from_reason("draft-spec verify: no logits"))?;
+        Ok(crate::engine::backend::DsparkVerifyOutput { logits })
+    }
+
+    fn commit(&mut self, keep: usize, total_written: usize) -> Result<()> {
+        let written = self.pending_written.take().ok_or_else(|| {
+            Error::from_reason("draft-spec commit: no pending verify")
+        })?;
+        if written != total_written {
+            return Err(Error::from_reason(format!(
+                "draft-spec commit: engine says total_written={total_written}, \
+                 verify wrote {written}"
+            )));
+        }
+        if keep < 1 || keep > total_written {
+            return Err(Error::from_reason(format!(
+                "draft-spec commit: keep {keep} out of range 1..={total_written}"
+            )));
+        }
+        if self.ar_fallback {
+            // Single-token AR through verify: the anchor slot is fully
+            // kept, the draft is retired for this turn.
+            if keep != 1 || total_written != 1 {
+                return Err(Error::from_reason(format!(
+                    "draft-spec commit: AR-fallback cycle must be (1,1), got \
+                     ({keep},{total_written})"
+                )));
+            }
+            return Ok(());
+        }
+        // Target: trim + tape-replay to the kept prefix.
+        self.target_commit_flat(keep)?;
+        // Draft: back to the pre-propose state, then advance over exactly
+        // the kept ids (`[anchor, d_0..d_{keep-2}]`) in one batched
+        // forward — the only way to carry its GDN state forward
+        // correctly. On a degenerate cycle (`L == 0`, propose skipped)
+        // there is no snapshot and the feed is just the anchor.
+        let feed: Vec<i32> = self.verify_stash[..keep].to_vec();
+        let draft_snap = self.draft_snap.take();
+        let draft = self.draft_mut()?;
+        if let Some(snap) = draft_snap {
+            let caches = draft.model.caches.as_mut().ok_or_else(|| {
+                Error::from_reason("draft-spec commit: draft caches missing")
+            })?;
+            super::layer_cache::restore_all(caches, &snap)?;
+        }
+        let arr = MxArray::from_int32(&feed, &[1, feed.len() as i64])?;
+        let m = &mut *draft.model;
+        let _ = eager_verify_step(
+            &mut m.layers,
+            &mut m.caches,
+            &m.final_norm,
+            &m.lm_head,
+            &arr,
+            &m.embedding,
+            None,
+        )?;
+        draft.committed_len += keep;
+        Ok(())
+    }
+
+    fn eval_boundary(&self, token: &MxArray) {
+        MxArray::async_eval_arrays(&[token]);
+    }
+}
+
+impl crate::engine::backend::DsparkBackend for Qwen35Inner {
+    type DsparkDecode<'a> = Qwen35DraftStepper<'a>;
+
+    fn begin_dspark_decode(
+        &mut self,
+        _setup: &crate::engine::backend::DsparkTurnSetup<'_>,
+    ) -> Result<Qwen35DraftStepper<'_>> {
+        let draft = self.draft.take().ok_or_else(|| {
+            Error::from_reason(
+                "begin_dspark_decode: no draft model loaded (draftModelPath missing?)",
+            )
+        })?;
+        Ok(Qwen35DraftStepper {
+            inner: self,
+            draft: Some(draft),
+            snap: None,
+            tape: Vec::new(),
+            draft_snap: None,
+            verify_stash: Vec::new(),
+            pending_written: None,
+            ar_fallback: false,
+        })
+    }
+}
+
+/// Optional knobs for [`Qwen3_5Model::load`] (mirrors
+/// `Gemma4LoadOptions`).
+#[napi(object)]
+pub struct Qwen35LoadOptions {
+    /// Directory of a standalone smaller checkpoint of the same family to
+    /// attach as a speculative draft (two-model speculative decoding,
+    /// genmlx-orsr). Dense, text-only, non-quantized, same vocabulary as
+    /// the target; anything else is a load error.
+    pub draft_model_path: Option<String>,
+}
+
 #[napi]
 pub struct Qwen3_5Model {
     /// Dedicated model thread for inference and training.
@@ -10864,6 +11662,13 @@ pub struct Qwen3_5Model {
     /// auto-default `enableMtp = true` for checkpoints that ship an MTP
     /// head without round-tripping through the model thread.
     pub(crate) mtp_active: bool,
+    /// Snapshot of `Qwen35Inner::draft.is_some()` at construction: a
+    /// standalone two-model draft was attached via `draftModelPath`
+    /// (genmlx-orsr). ORed into `hasMtpWeights()` — the gemma4
+    /// convention: the same JS getter reports "can run speculative",
+    /// whatever the mechanism — and surfaced alone via
+    /// `hasDraftModel()`.
+    pub(crate) draft_active: bool,
     /// Snapshot of the fully loaded image execution stack. `true` only when
     /// the vision encoder and image processor were both installed and the
     /// block-paged adapter required by the Qwen3.5 vision core is active.
@@ -10915,7 +11720,17 @@ impl Qwen3_5Model {
     /// per-request `enableMtp` flag.
     #[napi]
     pub fn has_mtp_weights(&self) -> bool {
-        self.mtp_active
+        // A standalone draft (genmlx-orsr) also means "speculative decode
+        // available" — same JS-getter convention as gemma4's external
+        // drafts, so ChatSession's enableMtp auto-default covers both.
+        self.mtp_active || self.draft_active
+    }
+
+    /// Whether a standalone two-model draft checkpoint was attached at
+    /// load time via `draftModelPath` (genmlx-orsr).
+    #[napi]
+    pub fn has_draft_model(&self) -> bool {
+        self.draft_active
     }
 
     /// Whether this loaded model instance can execute image-bearing turns.
@@ -10971,7 +11786,11 @@ impl Qwen3_5Model {
     /// serialized in practice (model-thread startup); callers that need both
     /// modes load sequentially.
     #[napi]
-    pub async fn load(path: String, paged_override: Option<bool>) -> Result<Qwen3_5Model> {
+    pub async fn load(
+        path: String,
+        paged_override: Option<bool>,
+        options: Option<Qwen35LoadOptions>,
+    ) -> Result<Qwen3_5Model> {
         if let Some(v) = paged_override {
             // SAFETY: env mutation is process-global; this runs on the napi
             // worker before the model thread spawns, and the only reader is
@@ -10980,7 +11799,8 @@ impl Qwen3_5Model {
                 std::env::set_var("MLX_QWEN35_PAGED_OVERRIDE", if v { "1" } else { "0" });
             }
         }
-        persistence::load_with_thread(&path).await
+        let draft_path = options.and_then(|o| o.draft_model_path);
+        persistence::load_with_thread_and_draft(&path, draft_path.as_deref()).await
     }
 
     /// Generate text from a prompt token sequence.
@@ -14868,11 +15688,247 @@ mod paged_construction_tests {
         ));
         assert_eq!(config.enable_mtp, Some(true));
 
+        // DraftModel (genmlx-orsr): speculation IS requested — the flag
+        // carries it to the dense cores' `eager_draft` gate — but the
+        // MTP-head-specific return stays false (its consumers assert
+        // `planned_mtp → has_mtp_weights()`).
         assert!(!apply_qwen35_dense_planned_decoder(
             &mut config,
             DecoderPlan::Speculative(SpeculativeKind::DraftModel)
         ));
-        assert_eq!(config.enable_mtp, Some(false));
+        assert_eq!(config.enable_mtp, Some(true));
+    }
+
+    /// Greedy two-model speculation must be TOKEN-IDENTICAL to plain AR
+    /// decoding of the target — for ANY draft, even one with random
+    /// weights: exact verification accepts a draft token only when it
+    /// equals the target's own argmax, and every rejection is replaced by
+    /// that argmax. A mismatch here means the target cache
+    /// rollback (KV trim / GDN tape replay) or the draft-side
+    /// restore+refeed corrupted state between cycles (genmlx-orsr).
+    #[test]
+    fn draft_speculation_greedy_matches_ar_reference() {
+        let label = "draft_speculation_greedy_matches_ar_reference";
+        let cfg = tiny_cfg(false);
+        let mut target = match Qwen35Inner::new(cfg.clone()) {
+            Ok(t) => t,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected Qwen35Inner::new failure in {label}: {msg}");
+            }
+        };
+        cast_qwen35_inner_weights_bf16(&mut target);
+
+        let prompt_ids: Vec<i32> = vec![5, 17, 23, 42, 7];
+        let prompt_u32: Vec<u32> = prompt_ids.iter().map(|&t| t as u32).collect();
+        let max_new = 10usize;
+        let never_eos: u32 = u32::MAX;
+
+        fn argmax_last(logits: &MxArray, vocab: i64) -> Result<i32> {
+            let t = logits.shape_at(1)?;
+            let row = logits
+                .slice_axis(1, t - 1, t)?
+                .reshape(&[vocab])?
+                .argmax(0, Some(false))?
+                .astype(crate::array::DType::Int32)?;
+            row.eval();
+            row.item_at_int32(0)
+        }
+
+        // --- AR reference: prefill + greedy single-token loop ---
+        eprintln!("[{label}] stage: AR reference");
+        let vocab = cfg.vocab_size as i64;
+        target.caches = Some(fresh_dense_layer_caches(&cfg));
+        let prompt =
+            MxArray::from_int32(&prompt_ids, &[1, prompt_ids.len() as i64]).unwrap();
+        let out = eager_verify_step(
+            &mut target.layers,
+            &mut target.caches,
+            &target.final_norm,
+            &target.lm_head,
+            &prompt,
+            &target.embedding,
+            None,
+        )
+        .unwrap();
+        let mut cur = argmax_last(&out.logits.unwrap(), vocab).unwrap();
+        let mut ar_tokens: Vec<u32> = vec![cur as u32];
+        for _ in 1..max_new {
+            let a = MxArray::from_int32(&[cur], &[1, 1]).unwrap();
+            let out = eager_verify_step(
+                &mut target.layers,
+                &mut target.caches,
+                &target.final_norm,
+                &target.lm_head,
+                &a,
+                &target.embedding,
+                None,
+            )
+            .unwrap();
+            cur = argmax_last(&out.logits.unwrap(), vocab).unwrap();
+            ar_tokens.push(cur as u32);
+        }
+
+        // --- Speculative run: fresh caches, random draft attached ---
+        eprintln!("[{label}] stage: spec prefill");
+        target.caches = Some(fresh_dense_layer_caches(&cfg));
+        let out = eager_verify_step(
+            &mut target.layers,
+            &mut target.caches,
+            &target.final_norm,
+            &target.lm_head,
+            &prompt,
+            &target.embedding,
+            None,
+        )
+        .unwrap();
+        let y_id = argmax_last(&out.logits.unwrap(), vocab).unwrap();
+        assert_eq!(y_id as u32, ar_tokens[0], "prefill argmax must be deterministic");
+
+        let mut draft_model = Qwen35Inner::new(cfg.clone())
+            .expect("draft tiny model constructs (device already proven above)");
+        cast_qwen35_inner_weights_bf16(&mut draft_model);
+        target.draft = Some(crate::models::qwen3_5::draft::Qwen35Draft {
+            model: Box::new(draft_model),
+            weight_bytes: 0,
+            committed_len: 0,
+        });
+        let stream = target.generation_stream;
+        eprintln!("[{label}] stage: draft prefill");
+        target
+            .prefill_draft_for_turn(&prompt_u32, stream)
+            .expect("draft prefill");
+        eprintln!("[{label}] stage: run_dspark_turn");
+
+        let params = crate::engine::params::ChatParams {
+            cache_owner_id: String::new(),
+            cache_root_owner_id: None,
+            max_new_tokens: max_new as i32,
+            repetition_penalty: 1.0,
+            repetition_context_size: 0,
+            presence_penalty: 0.0,
+            presence_context_size: 0,
+            frequency_penalty: 0.0,
+            frequency_context_size: 0,
+            max_consecutive_tokens: 0,
+            max_ngram_repeats: 0,
+            ngram_size: 0,
+            sampling_config: Some(SamplingConfig {
+                temperature: Some(0.0),
+                top_k: Some(0),
+                top_p: Some(1.0),
+                min_p: Some(0.0),
+            }),
+            report_performance: false,
+            reuse_cache: true,
+            include_reasoning: true,
+            extra_eos_ids: Vec::new(),
+            enable_mtp: true,
+            mtp_depth: 3,
+            mtp_adaptive_depth: false,
+        };
+        let thinking = crate::engine::backend::ThinkingSetup {
+            enabled: false,
+            budget: None,
+        };
+        let mut tracker = engine::ReasoningTracker::from_setup(&thinking, None);
+        let mut profiler =
+            crate::decode_profiler::DecodeProfiler::new("draft_spec_test", "qwen3_5");
+        let mut generated: Vec<u32> = Vec::new();
+        let mut hist = prompt_u32.clone();
+        let mut finish = String::from("length");
+        let mut first_tok: Option<std::time::Instant> = None;
+        let y = MxArray::from_int32(&[y_id], &[1]).unwrap();
+        let mut rng = rand::rng();
+        let outcome = crate::engine::dspark_turn::run_dspark_turn(
+            &mut target,
+            &mut rng,
+            crate::engine::dspark_turn::DsparkTurnArgs {
+                y,
+                block_size: 3,
+                params: &params,
+                reasoning_tracker: &mut tracker,
+                profiler: &mut profiler,
+                max_new_tokens: max_new as i32,
+                eos_id: never_eos,
+                generated_tokens: &mut generated,
+                token_history: &mut hist,
+                finish_reason: &mut finish,
+                first_token_instant: &mut first_tok,
+                report_perf: false,
+                generation_stream: stream,
+            },
+            None,
+        )
+        .expect("run_dspark_turn");
+        let _ = outcome;
+
+        // The draft must have been restored into the model by the
+        // stepper's Drop on the way out.
+        assert!(target.draft.is_some(), "draft restored after the turn");
+
+        // Exact verification guarantees DISTRIBUTION equality; bitwise
+        // greedy identity additionally requires batch-invariant kernels,
+        // which CUDA matmuls are not — the T=1+L batched verify and the
+        // T=1 AR forward can differ in low bits, flipping argmax at a
+        // logit near-tie (random bf16 tiny models hit ties often). So:
+        // identical output passes outright; a divergence is tolerated
+        // ONLY when the AR logits at the first divergent position are a
+        // genuine near-tie between the two candidate tokens. A rollback /
+        // cache-corruption bug diverges at a wide-margin position and
+        // still fails here.
+        if generated != ar_tokens {
+            let i = generated
+                .iter()
+                .zip(ar_tokens.iter())
+                .position(|(a, b)| a != b)
+                .expect("length mismatch implies an emit-loop bug, not numerics");
+            // Recompute the AR logits row after prompt + ar_tokens[..i]
+            // (deterministic same-shape replay of the reference run).
+            target.caches = Some(fresh_dense_layer_caches(&cfg));
+            let mut ctx: Vec<i32> = prompt_ids.clone();
+            ctx.extend(ar_tokens[..i].iter().map(|&t| t as i32));
+            let ctx_arr = MxArray::from_int32(&ctx, &[1, ctx.len() as i64]).unwrap();
+            let out = eager_verify_step(
+                &mut target.layers,
+                &mut target.caches,
+                &target.final_norm,
+                &target.lm_head,
+                &ctx_arr,
+                &target.embedding,
+                None,
+            )
+            .unwrap();
+            let logits = out.logits.unwrap();
+            let t = logits.shape_at(1).unwrap();
+            let row = logits
+                .slice_axis(1, t - 1, t)
+                .unwrap()
+                .reshape(&[vocab])
+                .unwrap()
+                .astype(crate::array::DType::Float32)
+                .unwrap();
+            row.eval();
+            let row_f32 = row.to_float32().unwrap();
+            let spec_tok = generated[i] as usize;
+            let ar_tok = ar_tokens[i] as usize;
+            let gap = (row_f32[ar_tok] - row_f32[spec_tok]).abs();
+            let scale = row_f32[ar_tok].abs().max(1.0);
+            eprintln!(
+                "[{label}] divergence at {i}: spec={spec_tok} ar={ar_tok} \
+                 logit gap={gap:.6} (scale {scale:.3}) — near-tie tolerance check"
+            );
+            assert!(
+                gap / scale < 5e-2,
+                "divergence at position {i} is NOT a near-tie (gap {gap:.6}, \
+                 scale {scale:.3}): spec {spec_tok} vs ar {ar_tok} — this \
+                 indicates real state corruption, not batch-variance"
+            );
+        }
     }
 
     /// When `use_block_paged_cache` is `None`, `paged_adapter` is None.

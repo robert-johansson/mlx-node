@@ -23,18 +23,27 @@ import { Gemma4Model, Lfm2Model, Qwen3Model, Qwen35Model, Qwen35MoeModel } from 
 /** Optional settings for {@link loadModel} / {@link loadSession}. */
 export interface LoadModelOptions {
   /**
-   * Gemma4 only: directory of an external draft checkpoint (config.json +
-   * model.safetensors) loaded alongside the target model for speculative
-   * decoding (forwarded as `Gemma4LoadOptions.draftModelPath`). Accepts
+   * Gemma4 + Qwen3.5 dense: directory of an external draft checkpoint
+   * loaded alongside the target model for speculative decoding.
+   *
+   * Gemma4 (forwarded as `Gemma4LoadOptions.draftModelPath`): accepts
    * either a DSpark draft or a Google gemma-4 assistant draft
    * (`google/gemma-4-*-it-assistant`); the variant is auto-detected from
    * the draft's config.json (`model_type` `gemma4_assistant` /
    * `gemma4_unified_assistant` → assistant, `architectures` containing
    * `Gemma4DSparkModel` → DSpark). When omitted, Gemma4 automatically loads
-   * an embedded draft from `<modelPath>/draft/` when present. Draft decoding
-   * runs on the flat KV-cache path, so the target checkpoint must not
-   * explicitly enable `use_block_paged_cache`. Setting this for any other
-   * model family is a hard error — no other loader accepts a draft model.
+   * an embedded draft from `<modelPath>/draft/` when present.
+   *
+   * Qwen3.5 dense (forwarded as `Qwen35LoadOptions.draftModelPath`,
+   * genmlx-orsr): a standalone smaller checkpoint of the same family
+   * (dense, text-only, non-quantized, same vocabulary) proposing tokens
+   * the target verifies exactly — e.g. a fine-tuned 0.8B drafting for the
+   * matching 4B.
+   *
+   * Draft decoding runs on the flat KV-cache path, so the target
+   * checkpoint must not explicitly enable `use_block_paged_cache`.
+   * Setting this for any other model family is a hard error — no other
+   * loader accepts a draft model.
    */
   draftModelPath?: string;
 }
@@ -140,8 +149,14 @@ const MODEL_FAMILY_REGISTRY = [
     modelType: 'qwen3_5',
     kind: 'trainable',
     match: { rawModelTypes: ['qwen3_5'] },
-    load: (modelPath: string) => Qwen35Model.load(modelPath),
+    load: (modelPath: string, options?: LoadModelOptions) =>
+      Qwen35Model.load(
+        modelPath,
+        null,
+        options?.draftModelPath === undefined ? null : { draftModelPath: options.draftModelPath },
+      ),
     nativeModelClass: NativeQwen35Model,
+    acceptsDraftModel: true,
   },
   {
     modelType: 'qwen3_5_moe',
@@ -338,7 +353,7 @@ function dispatchLoad(
   const family = findFamily(modelType);
   if (options?.draftModelPath !== undefined && family.acceptsDraftModel !== true) {
     throw new Error(
-      `draftModelPath (speculative-decoding draft) is only supported by gemma4 models; ` +
+      `draftModelPath (speculative-decoding draft) is only supported by gemma4 and qwen3_5 models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }

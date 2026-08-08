@@ -613,6 +613,11 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                         path,
                     ));
                     inner.set_tokenizer(Arc::new(tokenizer.clone()));
+                    // Checkpoint self-containment (genmlx-4d29): retain the
+                    // source dir + raw config for save_model_sync's sidecar
+                    // copies and raw-key-preserving config merge.
+                    inner.source_model_dir = Some(path.to_path_buf());
+                    inner.raw_config = Some(raw_config.clone());
 
                     // Load parameters into inner
                     let num_layers = config.num_layers as usize;

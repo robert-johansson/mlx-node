@@ -320,6 +320,13 @@ impl GdnKernelTape {
         start_state: &MxArray,
         accepted_steps: usize,
     ) -> Result<MxArray> {
+        // AR-exactness is per-BACKEND: on Metal, per-token decode runs the
+        // T=1 Metal kernel (bf16 state threading), so the replay must too;
+        // off-Metal (CUDA), per-token decode runs the T=1 ops path
+        // (`gated_delta_ops` — decode length is always below the chunked
+        // threshold), so replaying through the SAME call reproduces the AR
+        // carried state exactly (genmlx-orsr).
+        let use_kernel = metal_kernel_backend_available();
         let mut state = start_state.clone();
         for t in 0..accepted_steps as i64 {
             let q_t = self.q.slice_axis(1, t, t + 1)?; // [B, 1, Hv, Dk]
@@ -329,8 +336,11 @@ impl GdnKernelTape {
             let beta_t = self.beta.slice_axis(1, t, t + 1)?;
             // mask=None: the verify forward runs unmasked (same as AR decode),
             // so the replay must too.
-            let (_y, new_state) =
-                gated_delta_kernel(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, None)?;
+            let (_y, new_state) = if use_kernel {
+                gated_delta_kernel(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, None)?
+            } else {
+                gated_delta_ops(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, None)?
+            };
             state = new_state;
         }
         Ok(state)
@@ -832,6 +842,24 @@ pub(crate) fn gated_delta_update_with_tape(
             Some(s) => s.clone(),
             None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(v.dtype()?))?,
         };
+
+        // Record the verify window for the eager-MTP / draft-model rollback
+        // replay (genmlx-orsr). The ops path previously returned WITHOUT
+        // filling the sink, so off-Metal (CUDA) verifies produced no GDN
+        // tape and every speculative rollback failed — the actual
+        // "speculative decoding not on CUDA" gap. Shapes match the kernel
+        // path's tape contract: q/k GQA-expanded `[B,T,Hv,Dk]`,
+        // v `[B,T,Hv,Dv]`, g exp-space + beta post-sigmoid `[B,T,Hv]`.
+        // Lazy handle clones, no eval.
+        if let Some(sink) = tape_sink.take() {
+            *sink = Some(GdnKernelTape {
+                q: q.clone(),
+                k: k.clone(),
+                v: v.clone(),
+                g: g.clone(),
+                beta: beta.clone(),
+            });
+        }
 
         // CUDA prefill: collapse the O(T) per-step recurrence into O(T/BT) chunk-serial
         // batched matmuls (cuBLAS / tensor cores). Default on the CUDA ops path; reverts

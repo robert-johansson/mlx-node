@@ -320,6 +320,17 @@ pub(crate) struct Qwen35MoeInner {
     /// `eos_token_ids` extends the tokenizer EOS with extra stop ids.
     /// Default (empty) when the checkpoint ships no `generation_config.json`.
     gen_defaults: crate::engine::ModelGenerationDefaults,
+    /// Checkpoint directory this model was loaded from (None for
+    /// random-init models). Mirrors `Qwen35Inner::source_model_dir`:
+    /// `save_model_sync` copies serving-critical sidecar files from here
+    /// so a saved checkpoint reloads-and-serves with no manual patching
+    /// (genmlx-4d29).
+    pub(crate) source_model_dir: Option<std::path::PathBuf>,
+    /// The raw config.json this model was loaded from. Mirrors
+    /// `Qwen35Inner::raw_config`: `save_model_sync` merges the typed
+    /// config OVER this so keys the typed struct does not model
+    /// (vision_config, …) survive a save (genmlx-4d29).
+    pub(crate) raw_config: Option<serde_json::Value>,
     /// Tier-2 branchable caches (bean mlx-19wy). Each entry is an INDEPENDENT
     /// per-layer cache vector for a forked branch, keyed by an opaque
     /// monotonic id. Stored SEPARATELY from `self.caches` (the Tier-1
@@ -778,6 +789,8 @@ impl Qwen35MoeInner {
             training_state: None,
             turn_is_streaming: Cell::new(false),
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
+            source_model_dir: None,
+            raw_config: None,
             branch_caches: HashMap::new(),
             next_branch_id: 0,
         })
@@ -7103,25 +7116,54 @@ impl Qwen35MoeInner {
             weights_metadata.insert(key.clone(), serde_json::Value::Object(param_info));
         }
 
-        // Serialize config and inject model_type for detectModelType
-        let mut config_value = serde_json::to_value(&self.config).map_err(|e| {
+        // Serialize config: start from the raw config this model was
+        // loaded from (when available) and overlay the typed config, so
+        // keys the typed struct does not model (vision_config, …) survive
+        // the save; inject model_type for detectModelType (genmlx-4d29,
+        // mirrors the dense saver).
+        let typed_value = serde_json::to_value(&self.config).map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Failed to serialize config: {e}"),
             )
         })?;
+        let mut config_value = match &self.raw_config {
+            Some(raw) if raw.is_object() => raw.clone(),
+            _ => serde_json::json!({}),
+        };
         if let serde_json::Value::Object(ref mut map) = config_value {
-            map.insert("model_type".to_string(), serde_json::json!("qwen3_5_moe"));
+            // The loader reads the MTP count from either HF-convention
+            // key; a stale raw `num_nextn_predict_layers` must not
+            // override the corrected count below.
+            map.remove("num_nextn_predict_layers");
+            if let serde_json::Value::Object(typed) = typed_value {
+                for (k, v) in typed {
+                    map.insert(k, v);
+                }
+            }
+            map.entry("model_type".to_string())
+                .or_insert_with(|| serde_json::json!("qwen3_5_moe"));
             // `parse_config` reads the MTP layer count ONLY from the
             // HF-convention keys `mtp_num_hidden_layers` /
             // `num_nextn_predict_layers`; the serde field name
-            // `n_mtp_layers` is ignored on load. Without this, a saved MTP
-            // checkpoint reloads with `n_mtp_layers = 0` and its head is
-            // silently dropped.
+            // `n_mtp_layers` is ignored on load. The count must describe
+            // the TENSORS THIS SAVE WRITES: `mtp.*` is only included when
+            // `mtp_weights_loaded`, so a base config advertising heads the
+            // export never shipped must save as 0 (genmlx-4d29).
+            let saved_mtp_layers = if self.mtp_weights_loaded {
+                self.config.n_mtp_layers
+            } else {
+                0
+            };
             map.insert(
                 "mtp_num_hidden_layers".to_string(),
-                serde_json::json!(self.config.n_mtp_layers),
+                serde_json::json!(saved_mtp_layers),
             );
+            // Tensors-must-match-config for vision too: visual.* tensors
+            // are saved only when a vision encoder is loaded.
+            if self.vision_encoder.is_none() {
+                map.remove("vision_config");
+            }
         }
 
         let weights_json = serde_json::json!({
@@ -7157,6 +7199,36 @@ impl Qwen35MoeInner {
         let weights_path = path.join("weights.mlx");
         std::fs::write(&weights_path, weights_str)?;
         info!("Saved weights.mlx metadata");
+
+        // Serving sidecars: a checkpoint must reload-and-serve with zero
+        // manual file surgery (genmlx-4d29, mirrors the dense saver). A
+        // failed copy is a warning, not a failed save.
+        if let Some(src_dir) = &self.source_model_dir {
+            const SIDECARS: &[&str] = &[
+                "chat_template.jinja",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "generation_config.json",
+                "special_tokens_map.json",
+                "vocab.json",
+                "merges.txt",
+                "preprocessor_config.json",
+            ];
+            for name in SIDECARS {
+                let src = src_dir.join(name);
+                let dst = path.join(name);
+                if src.exists() && src != dst {
+                    match std::fs::copy(&src, &dst) {
+                        Ok(_) => info!("Copied sidecar {}", name),
+                        Err(e) => tracing::warn!(
+                            "Could not copy sidecar {} into checkpoint: {}",
+                            name,
+                            e
+                        ),
+                    }
+                }
+            }
+        }
 
         Ok(())
     }

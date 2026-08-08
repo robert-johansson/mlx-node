@@ -1704,6 +1704,11 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(
                         path,
                     ));
+                    // Checkpoint self-containment (genmlx-4d29): retain the
+                    // source dir + raw config for save_model_sync's sidecar
+                    // copies and raw-key-preserving config merge.
+                    inner.source_model_dir = Some(path.to_path_buf());
+                    inner.raw_config = Some(raw.clone());
 
                     // Apply weights directly to inner (no locks)
                     let plain_fp8_residency = apply_weights_moe_inner_with_residency(

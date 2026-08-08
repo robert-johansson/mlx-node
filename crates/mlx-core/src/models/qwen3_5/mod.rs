@@ -1,5 +1,6 @@
 pub(crate) mod adaptive_depth;
 pub mod arrays_cache;
+pub(crate) mod draft;
 pub mod attention;
 pub mod config;
 pub mod decoder_layer;

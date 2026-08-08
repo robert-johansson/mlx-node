@@ -1792,7 +1792,19 @@ fn validate_mandatory_weights(
 /// Spawns a `ModelThread<Qwen35Cmd>` that loads all weights inside the init_fn.
 /// Returns a `Qwen3_5Model` thin shell with the thread handle.
 pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
+    load_with_thread_and_draft(model_path, None).await
+}
+
+/// `load_with_thread` plus an optional standalone draft checkpoint for
+/// two-model speculative decoding (genmlx-orsr). The draft loads on the
+/// same model thread, after the target, so the stepper's `&mut` access
+/// to both stays single-threaded.
+pub async fn load_with_thread_and_draft(
+    model_path: &str,
+    draft_model_path: Option<&str>,
+) -> Result<Qwen3_5Model> {
     let model_path = model_path.to_string();
+    let draft_model_path = draft_model_path.map(|s| s.to_string());
 
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
         move || {
@@ -2012,6 +2024,12 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 // Create inner model
                 let mut inner = Qwen35Inner::new(config.clone())?;
                 inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(path));
+                // Checkpoint self-containment (genmlx-4d29): retain the
+                // source dir + raw config so save_model_sync can copy
+                // serving sidecars and preserve config keys the typed
+                // struct does not model (vision_config, …).
+                inner.source_model_dir = Some(path.to_path_buf());
+                inner.raw_config = Some(raw.clone());
 
                 // Apply weights (GPU finalize precompute reads now-resident pages).
                 let plain_fp8_residency = apply_weights_inner_with_residency(
@@ -2160,7 +2178,20 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
 
                 Ok((inner, weight_bytes))
             })();
-            let (inner, weight_bytes) = load_result?;
+            let (mut inner, mut weight_bytes) = load_result?;
+            // Standalone draft for two-model speculation (genmlx-orsr):
+            // loaded after the target so a draft failure surfaces as a
+            // load error with the target's diagnostics already logged.
+            // Its weight bytes fold into the same cache-limit total
+            // (mirrors gemma4's draft accounting).
+            if let Some(ref draft_path) = draft_model_path {
+                let draft = super::draft::load_draft(
+                    Path::new(draft_path),
+                    inner.config.vocab_size,
+                )?;
+                weight_bytes = weight_bytes.saturating_add(draft.weight_bytes);
+                inner.draft = Some(draft);
+            }
             let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
 
             let model_id = inner.model_id;
@@ -2170,6 +2201,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
             let mtp_active = inner.has_mtp_weights();
+            let draft_active = inner.draft.is_some();
             let vision_active = super::model::qwen35_dense_vision_active(
                 inner.vision_encoder.is_some(),
                 inner.image_processor.is_some(),
@@ -2189,6 +2221,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     cache_limit_guard,
                     paged_active,
                     mtp_active,
+                    draft_active,
                     vision_active,
                     context_limits,
                 ),
@@ -2206,6 +2239,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
         cache_limit_guard,
         paged_active,
         mtp_active,
+        draft_active,
         vision_active,
         context_limits,
     ) = init_rx
@@ -2217,6 +2251,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
         config,
         paged_active,
         mtp_active,
+        draft_active,
         vision_active,
         image_processor,
         spatial_merge_size,
@@ -2225,7 +2260,54 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
     })
 }
 /// Parse Qwen3.5 dense config from JSON.
-fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
+// ===== Standalone two-model draft loading (genmlx-orsr) =====
+// Restricted companions to the main load path, used only by
+// `super::draft::load_draft`. See draft.rs for the restriction rationale.
+
+/// CPU-prewarm a draft checkpoint's shard pages (same watchdog rationale
+/// as the main path's `prewarm_checkpoint_pages_with`; a draft has no MTP
+/// sidecar so the plain variant suffices).
+pub(crate) fn prewarm_draft_checkpoint(dir: &std::path::Path) {
+    crate::engine::persistence::prewarm_checkpoint_pages(dir);
+}
+
+/// mmap every safetensors shard of a draft checkpoint.
+pub(crate) fn load_draft_tensors(
+    dir: &std::path::Path,
+) -> Result<HashMap<String, MxArray>> {
+    load_all_safetensors(dir, true)
+}
+
+/// Sanitize + construct + apply + materialize a RESTRICTED dense
+/// non-quantized draft checkpoint. Returns the inner plus checkpoint
+/// tensor bytes for cache-limit accounting.
+pub(crate) fn build_draft_inner(
+    _dir: &std::path::Path,
+    config: Qwen3_5Config,
+    raw_params: HashMap<String, MxArray>,
+) -> Result<(Qwen35Inner, u64)> {
+    let params = sanitize_weights(raw_params, &config)?;
+    let weight_bytes: u64 = params.values().map(|a| a.nbytes() as u64).sum();
+    let mut inner = Qwen35Inner::new(config.clone())?;
+    let per_layer_quant: HashMap<String, PerLayerQuant> = HashMap::new();
+    let _residency = apply_weights_inner_with_residency(
+        &mut inner,
+        &params,
+        &config,
+        DEFAULT_QUANT_BITS,
+        DEFAULT_QUANT_GROUP_SIZE,
+        None,
+        &per_layer_quant,
+        false,
+    )?;
+    {
+        let arrays: Vec<&MxArray> = params.values().collect();
+        crate::array::memory::materialize_weights(&arrays)?;
+    }
+    Ok((inner, weight_bytes))
+}
+
+pub(crate) fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
     let text_cfg = raw.get("text_config");
 
     let gi = |keys: &[&str], default: i32| get_config_i32(raw, text_cfg, keys, default);
@@ -3184,6 +3266,164 @@ mod tests {
         assert_eq!(
             reparsed.n_mtp_layers, 1,
             "reloaded config must reconstruct the MTP module (n_mtp_layers)"
+        );
+    }
+
+    /// A base config can advertise MTP heads (`num_nextn_predict_layers: 1`)
+    /// that the export never shipped (community bf16 Qwen3.5 exports carry
+    /// the key with zero `mtp.*` tensors). The saver only writes `mtp.*`
+    /// tensors when `mtp_weights_loaded`, so the saved config must say 0 and
+    /// must not resurrect the stale raw key — a count describing tensors the
+    /// checkpoint does not carry makes every reload warn-and-disable
+    /// (genmlx-4d29).
+    #[test]
+    fn save_model_sync_zeroes_mtp_count_without_loaded_weights() {
+        let label = "save_model_sync_zeroes_mtp_count_without_loaded_weights";
+        let cfg = Qwen3_5Config {
+            n_mtp_layers: 1,
+            ..no_mtp_layer_cfg()
+        };
+
+        let mut inner = match Qwen35Inner::new(cfg) {
+            Ok(inner) => inner,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected Qwen35Inner::new failure in {label}: {msg}");
+            }
+        };
+        // mtp_weights_loaded stays false: the module exists from config
+        // alone, exactly the shape of a base checkpoint whose export
+        // dropped the head tensors.
+        inner.raw_config = Some(json!({
+            "model_type": "qwen3_5",
+            "num_nextn_predict_layers": 1,
+        }));
+
+        let ckpt_dir = std::env::temp_dir().join(format!(
+            "mlx-qwen35-dense-mtp-zeroed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before UNIX_EPOCH")
+                .as_nanos()
+        ));
+        struct DirCleanup(std::path::PathBuf);
+        impl Drop for DirCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = DirCleanup(ckpt_dir.clone());
+        let ckpt_path = ckpt_dir
+            .to_str()
+            .expect("temp checkpoint path is not valid UTF-8")
+            .to_string();
+
+        inner
+            .save_model_sync(&ckpt_path)
+            .unwrap_or_else(|err| panic!("save_model_sync failed in {label}: {}", err.reason));
+
+        let config_json = std::fs::read_to_string(ckpt_dir.join("config.json"))
+            .expect("saved config.json must be readable");
+        let raw: Value = serde_json::from_str(&config_json).expect("saved config.json is JSON");
+        assert_eq!(
+            raw.get("mtp_num_hidden_layers").and_then(|v| v.as_i64()),
+            Some(0),
+            "config must describe the saved tensors: no loaded MTP weights → 0"
+        );
+        assert!(
+            raw.get("num_nextn_predict_layers").is_none(),
+            "stale HF-convention MTP key from the base config must not survive"
+        );
+        let reparsed = parse_config(&raw).expect("saved config.json must re-parse");
+        assert_eq!(
+            reparsed.n_mtp_layers, 0,
+            "reloaded config must not reconstruct a head the checkpoint lacks"
+        );
+    }
+
+    /// Raw-config keys the typed struct does not model must survive a save
+    /// (vision_config was silently dropped, breaking VLM checkpoint reload
+    /// until config.json was hand-patched), serving sidecars must be copied
+    /// (a checkpoint without chat_template.jinja fails to serve), and
+    /// vision_config must be REMOVED when no vision encoder is loaded so the
+    /// config never advertises tensors the save did not write (genmlx-4d29).
+    #[test]
+    fn save_model_sync_preserves_raw_keys_and_copies_sidecars() {
+        let label = "save_model_sync_preserves_raw_keys_and_copies_sidecars";
+        let mut inner = match Qwen35Inner::new(no_mtp_layer_cfg()) {
+            Ok(inner) => inner,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected Qwen35Inner::new failure in {label}: {msg}");
+            }
+        };
+
+        let base = std::env::temp_dir().join(format!(
+            "mlx-qwen35-dense-selfcontain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before UNIX_EPOCH")
+                .as_nanos()
+        ));
+        struct DirCleanup(std::path::PathBuf);
+        impl Drop for DirCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = DirCleanup(base.clone());
+        let src_dir = base.join("src");
+        let dst_dir = base.join("dst");
+        std::fs::create_dir_all(&src_dir).expect("create src dir");
+        std::fs::write(src_dir.join("chat_template.jinja"), "{{ messages }}")
+            .expect("write template");
+        std::fs::write(src_dir.join("tokenizer_config.json"), "{}")
+            .expect("write tokenizer_config");
+
+        inner.source_model_dir = Some(src_dir.clone());
+        inner.raw_config = Some(json!({
+            "model_type": "qwen3_5",
+            "vision_config": {"num_layers": 3},
+            "quantization_aware_rope_variant": {"kind": "yarn"},
+        }));
+
+        let dst_path = dst_dir
+            .to_str()
+            .expect("temp checkpoint path is not valid UTF-8")
+            .to_string();
+        inner
+            .save_model_sync(&dst_path)
+            .unwrap_or_else(|err| panic!("save_model_sync failed in {label}: {}", err.reason));
+
+        let config_json = std::fs::read_to_string(dst_dir.join("config.json"))
+            .expect("saved config.json must be readable");
+        let raw: Value = serde_json::from_str(&config_json).expect("saved config.json is JSON");
+        assert!(
+            raw.get("quantization_aware_rope_variant").is_some(),
+            "raw config keys the typed struct does not model must survive the save"
+        );
+        assert!(
+            raw.get("vision_config").is_none(),
+            "no vision encoder loaded → vision_config must not survive (the save wrote no visual.* tensors)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst_dir.join("chat_template.jinja")).ok().as_deref(),
+            Some("{{ messages }}"),
+            "chat_template.jinja must be copied into the checkpoint"
+        );
+        assert!(
+            dst_dir.join("tokenizer_config.json").exists(),
+            "tokenizer_config.json must be copied into the checkpoint"
         );
     }
 

@@ -101,6 +101,13 @@ pub(crate) struct Qwen3Inner {
     /// ship no such file. Consumed by the [`ChatBackend`] sampling/EOS
     /// hooks and the raw `generate` loop.
     gen_defaults: crate::engine::ModelGenerationDefaults,
+    /// Checkpoint directory this model was loaded from (None for
+    /// random-init models). Mirrors `Qwen35Inner::source_model_dir`
+    /// (genmlx-4d29): `save_model_sync` copies serving sidecars from here.
+    pub(crate) source_model_dir: Option<std::path::PathBuf>,
+    /// The raw config.json this model was loaded from; the saver merges
+    /// the typed config OVER it so unmodeled keys survive (genmlx-4d29).
+    pub(crate) raw_config: Option<serde_json::Value>,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
@@ -449,6 +456,8 @@ impl Qwen3Inner {
             turn_is_streaming: Cell::new(false),
             training_state: None,
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
+            source_model_dir: None,
+            raw_config: None,
         })
     }
 
@@ -1678,16 +1687,29 @@ impl Qwen3Inner {
             weights_metadata.insert(key.clone(), serde_json::Value::Object(param_info));
         }
 
-        // Config JSON — inject `model_type: "qwen3"` so `detectModelType`
-        // routes the saved directory back to the Qwen3 loader.
-        let mut config_value = serde_json::to_value(&self.config).map_err(|e| {
+        // Config JSON — start from the raw loaded config (when available)
+        // and overlay the typed config so unmodeled keys survive the save
+        // (genmlx-4d29, mirrors the qwen3_5 savers); inject
+        // `model_type: "qwen3"` so `detectModelType` routes the saved
+        // directory back to the Qwen3 loader.
+        let typed_value = serde_json::to_value(&self.config).map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Failed to serialize config: {e}"),
             )
         })?;
+        let mut config_value = match &self.raw_config {
+            Some(raw) if raw.is_object() => raw.clone(),
+            _ => serde_json::json!({}),
+        };
         if let serde_json::Value::Object(ref mut map) = config_value {
-            map.insert("model_type".to_string(), serde_json::json!("qwen3"));
+            if let serde_json::Value::Object(typed) = typed_value {
+                for (k, v) in typed {
+                    map.insert(k, v);
+                }
+            }
+            map.entry("model_type".to_string())
+                .or_insert_with(|| serde_json::json!("qwen3"));
         }
 
         let weights_json = serde_json::json!({
@@ -1723,6 +1745,34 @@ impl Qwen3Inner {
         let weights_path = path.join("weights.mlx");
         std::fs::write(&weights_path, weights_str)?;
         info!("Saved weights.mlx metadata");
+
+        // Serving sidecars: a checkpoint must reload-and-serve with zero
+        // manual file surgery (genmlx-4d29, mirrors the qwen3_5 savers).
+        if let Some(src_dir) = &self.source_model_dir {
+            const SIDECARS: &[&str] = &[
+                "chat_template.jinja",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "generation_config.json",
+                "special_tokens_map.json",
+                "vocab.json",
+                "merges.txt",
+            ];
+            for name in SIDECARS {
+                let src = src_dir.join(name);
+                let dst = path.join(name);
+                if src.exists() && src != dst {
+                    match std::fs::copy(&src, &dst) {
+                        Ok(_) => info!("Copied sidecar {}", name),
+                        Err(e) => tracing::warn!(
+                            "Could not copy sidecar {} into checkpoint: {}",
+                            name,
+                            e
+                        ),
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
